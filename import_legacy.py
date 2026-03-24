@@ -187,10 +187,6 @@ def parse_dat_records(path: Path, year: int, categories: list[str], accounts: li
             else None
         )
 
-        # Dotazione iniziale is opening carry-over. Keep it only for 1990.
-        if category_name and "DOTAZIONE" in category_name.upper() and year != 1990:
-            continue
-
         acc1_code = conto1_raw.strip()
         acc1_idx = int(acc1_code) if acc1_code.isdigit() else 0
         account_primary_name = (
@@ -261,6 +257,36 @@ def find_single_file(folder: Path, pattern: str) -> Path:
     return candidates[0]
 
 
+def parse_sld_balances(folder: Path, n_accounts: int) -> dict[str, object] | None:
+    """
+    Legge *sld.aco come fa il programma legacy: prima riga valuta (L/E), poi N saldi.
+    Autoritativo per i saldi di chiusura anno (include effetto Dotazione iniziale).
+    """
+    candidates = sorted(folder.glob("*sld.aco"))
+    if len(candidates) != 1:
+        return None
+    lines = [ln.strip().strip('"') for ln in candidates[0].read_text(encoding="latin-1", errors="ignore").splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None
+    valuta = lines[0].upper()[:1]
+    raw_amounts = lines[1 : 1 + n_accounts]
+    if len(raw_amounts) < n_accounts:
+        return None
+    amounts: list[str] = []
+    for raw in raw_amounts:
+        clean = raw.replace(".", "").replace(",", ".") if "," in raw else raw
+        try:
+            dec = Decimal(clean)
+        except InvalidOperation:
+            dec = Decimal("0")
+        amounts.append(str(dec))
+    return {
+        "source_file": candidates[0].name,
+        "valuta": valuta,
+        "amounts": amounts,
+    }
+
+
 def parse_category_notes(folder: Path) -> list[str]:
     notes_files = sorted(folder.glob("*not.aco"))
     if not notes_files:
@@ -285,6 +311,7 @@ def load_year(folder: Path) -> dict:
     accounts = parse_aco_list(coc_file)
     records = parse_dat_records(dat_file, year, categories, accounts)
     category_notes = parse_category_notes(folder)
+    legacy_saldi = parse_sld_balances(folder, len(accounts))
 
     return {
         "year": year,
@@ -294,7 +321,9 @@ def load_year(folder: Path) -> dict:
             "cat": cat_file.name,
             "coc": coc_file.name,
             "not": not_candidates[0].name if not_candidates else None,
+            "sld": legacy_saldi["source_file"] if legacy_saldi else None,
         },
+        "legacy_saldi": legacy_saldi,
         "categories": [
             {
                 "code": str(i - 1),

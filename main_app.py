@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import platform
 import tkinter as tk
 from decimal import Decimal
 from pathlib import Path
@@ -21,6 +22,33 @@ DEFAULT_CDC_ROOT = Path("/Users/macand/Library/CloudStorage/Dropbox/CdC")
 DEFAULT_OUTPUT = Path("data/unified_legacy_import.json")
 DEFAULT_ENCRYPTED_DB = Path("data/conti_di_casa.enc")
 DEFAULT_KEY_FILE = Path("data/conti_di_casa.key")
+
+# Stessa regola della colonna Importo nella griglia movimenti.
+COLOR_AMOUNT_POS = "#006400"
+COLOR_AMOUNT_NEG = "#b22222"
+
+
+def app_title_text() -> str:
+    return f"Conti di casa - {date.today().strftime('%d/%m/%Y')}"
+
+
+def title_banner_font() -> tuple[str, int, str]:
+    if platform.system() == "Darwin":
+        return ("Helvetica Neue", 22, "bold")
+    return ("TkDefaultFont", 20, "bold")
+
+
+def pack_centered_page_title(parent: tk.Widget) -> None:
+    """Titolo app ripetuto in cima a ogni scheda, centrato e ben visibile."""
+    bar = ttk.Frame(parent)
+    bar.pack(fill=tk.X, pady=(0, 14))
+    tk.Label(
+        bar,
+        text=app_title_text(),
+        font=title_banner_font(),
+        fg="#111111",
+        anchor=tk.CENTER,
+    ).pack(fill=tk.X)
 
 
 def to_decimal(value: str) -> Decimal:
@@ -93,36 +121,96 @@ def format_amount_for_output(rec: dict) -> tuple[str, str]:
     return f"{prefix}{formatted} {currency}", ("neg" if value < 0 else "pos")
 
 
-def compute_latest_year_balances(db: dict) -> tuple[int, list[dict[str, str]]]:
+def format_saldo_cell(valuta: str, amount: Decimal) -> str:
+    """Allinea stile movimenti: lire senza decimali, euro con 2 decimali e suffisso valuta."""
+    if valuta == "L":
+        n = int(abs(amount).quantize(Decimal("1")))
+        body = f"{n:,}".replace(",", ".")
+        if amount < 0:
+            return f"-{body} L"
+        if amount > 0:
+            return f"+{body} L"
+        return f"{body} L"
+    txt = format_euro_it(amount)
+    if amount > 0 and not txt.startswith("+"):
+        txt = "+" + txt
+    return f"{txt} €"
+
+
+def _category_code_int(rec: dict) -> int | None:
+    raw = str(rec.get("category_code", "")).strip()
+    if not raw.isdigit():
+        return None
+    return int(raw)
+
+
+def is_giroconto_record(rec: dict) -> bool:
+    """Giroconto conto↔conto: stessa logica dei controlli in import_legacy (nome + fallback codice 1)."""
+    cat_name = (rec.get("category_name") or "").upper()
+    if "GIRATA.CONTO/CONTO" in cat_name or "GIRATA CONTO/CONTO" in cat_name:
+        return True
+    return _category_code_int(rec) == 1
+
+
+def is_dotazione_record(rec: dict) -> bool:
+    """Dotazione iniziale (cat. 0 nel legacy)."""
+    return _category_code_int(rec) == 0
+
+
+def compute_balances_from_2022(db: dict) -> tuple[int, list[str], list[Decimal]]:
+    """
+    Saldi dal 2022 all'ultimo anno incluso; dotazione iniziale (cat. 0) solo per il 2022.
+    Piano conti = ultimo anno. + sul conto 1; giroconto: − sul conto 2.
+    """
     latest_year = max(y["year"] for y in db["years"])
     year_data = next(y for y in db["years"] if y["year"] == latest_year)
     accounts = year_data["accounts"]
-    balances = [Decimal("0") for _ in accounts]
+    n_accounts = len(accounts)
 
-    for rec in year_data["records"]:
+    pool: list[dict] = []
+    for yd in db["years"]:
+        y = int(yd["year"])
+        if y < 2022 or y > latest_year:
+            continue
+        pool.extend(yd["records"])
+    pool.sort(key=lambda r: (int(r["year"]), r["source_folder"], r["source_file"], r["source_index"]))
+
+    balances = [Decimal("0") for _ in accounts]
+    for rec in pool:
+        if rec.get("is_cancelled"):
+            continue
+        y = int(rec["year"])
+        if is_dotazione_record(rec) and y != 2022:
+            continue
+
         amount = to_decimal(rec["amount_eur"])
         c1 = rec.get("account_primary_code", "")
         c2 = rec.get("account_secondary_code", "")
-        cat = rec.get("category_code", "")
 
-        c1_idx = int(c1) - 1 if c1.isdigit() else -1
-        c2_idx = int(c2) - 1 if c2.isdigit() else -1
+        c1_idx = int(c1) - 1 if str(c1).isdigit() else -1
+        c2_idx = int(c2) - 1 if str(c2).isdigit() else -1
 
-        if 0 <= c1_idx < len(balances):
+        if 0 <= c1_idx < n_accounts:
             balances[c1_idx] += amount
-        if cat == "1" and 0 <= c2_idx < len(balances):
+        if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts:
             balances[c2_idx] -= amount
 
-    rows: list[dict[str, str]] = []
-    for account, amount in zip(accounts, balances):
-        rows.append(
-            {
-                "code": account["code"],
-                "name": account["name"],
-                "balance_eur": format_euro_it(amount),
-            }
-        )
-    return latest_year, rows
+    names = [a["name"] for a in accounts]
+    return latest_year, names, balances
+
+
+def balance_amount_fg(value: Decimal) -> str:
+    """Rosso / verde come colonna Importo (zero trattato come non negativo)."""
+    return COLOR_AMOUNT_NEG if value < 0 else COLOR_AMOUNT_POS
+
+
+def show_record_in_movements_grid(rec: dict) -> bool:
+    """Dotazione iniziale: visibile solo per il 1990; resto sempre visibile."""
+    year = int(rec.get("year") or 0)
+    cat = str(rec.get("category_code", "")).strip()
+    if cat == "0" and year != 1990:
+        return False
+    return True
 
 
 def get_or_create_key(key_path: Path) -> bytes:
@@ -155,18 +243,15 @@ def load_encrypted_db(output_path: Path, key_path: Path) -> dict | None:
 
 
 def build_ui(db: dict) -> None:
-    latest_year, balances = compute_latest_year_balances(db)
+    # Riferimento mutabile: dopo import legacy da Opzioni, griglia e saldi devono usare il nuovo DB.
+    db_holder: list[dict] = [db]
+
+    def cur_db() -> dict:
+        return db_holder[0]
 
     root = tk.Tk()
-    root.title(f"Conti di casa - {date.today().strftime('%d/%m/%Y')}")
+    root.title(app_title_text())
     root.geometry("1200x760")
-
-    header = ttk.Frame(root, padding=8)
-    header.pack(fill=tk.X)
-    ttk.Label(
-        header,
-        text=f"Registrazioni importate: {db['records_total']} | Ultimo anno: {latest_year}",
-    ).pack(side=tk.LEFT)
 
     notebook = ttk.Notebook(root)
     notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -187,28 +272,30 @@ def build_ui(db: dict) -> None:
     notebook.add(aiuto_frame, text="Aiuto")
     notebook.select(0)
 
-    balances_frame = ttk.LabelFrame(movimenti_frame, text="Saldi conti (ultimo anno)", padding=8)
-    balances_frame.pack(fill=tk.X, pady=(0, 8))
-    bal_cols = ("code", "name", "balance_eur")
-    bal_tree = ttk.Treeview(balances_frame, columns=bal_cols, show="headings", height=12)
-    bal_tree.heading("code", text="Codice")
-    bal_tree.heading("name", text="Conto")
-    bal_tree.heading("balance_eur", text="Saldo EUR")
-    bal_tree.column("code", width=80, anchor=tk.CENTER)
-    bal_tree.column("name", width=260)
-    bal_tree.column("balance_eur", width=160, anchor=tk.E)
-    bal_tree.pack(fill=tk.X)
+    pack_centered_page_title(movimenti_frame)
 
-    for row in balances:
-        bal_tree.insert("", tk.END, values=(row["code"], row["name"], row["balance_eur"]))
-
-    records_frame = ttk.LabelFrame(movimenti_frame, text="Registrazioni importate", padding=8)
+    records_frame = ttk.Frame(movimenti_frame, padding=8)
     records_frame.pack(fill=tk.BOTH, expand=True)
 
-    accounts_by_year = year_accounts_map(db)
-    categories_by_year = year_categories_map(db)
+    mov_style = ttk.Style(root)
+    mov_style.configure(
+        "MovGrid.Treeview",
+        borderwidth=1,
+        relief="solid",
+        rowheight=22,
+        background="#ffffff",
+        fieldbackground="#ffffff",
+    )
+    mov_style.configure(
+        "MovGrid.Treeview.Heading",
+        borderwidth=1,
+        relief="flat",
+        background="#ebebeb",
+        foreground="#1a1a1a",
+        font=("TkDefaultFont", 10, "bold"),
+    )
 
-    rec_cols = (
+    mov_cols = (
         "legacy_registration_number",
         "date_it",
         "category_name",
@@ -218,113 +305,304 @@ def build_ui(db: dict) -> None:
         "cheque",
         "account_secondary_flags",
     )
-    rec_tree = ttk.Treeview(records_frame, columns=rec_cols, show="headings")
-    rec_tree.heading("legacy_registration_number", text="Reg.")
-    rec_tree.heading("date_it", text="Data")
-    rec_tree.heading("category_name", text="Categoria")
-    rec_tree.heading("account_primary_name", text="Conto 1")
-    rec_tree.heading("account_primary_flags", text="*1")
-    rec_tree.heading("account_secondary_name", text="Conto 2")
-    rec_tree.heading("cheque", text="Assegno")
-    rec_tree.heading("account_secondary_flags", text="*2")
-    rec_tree.column("legacy_registration_number", width=65, anchor=tk.E)
-    rec_tree.column("date_it", width=110, anchor=tk.CENTER)
-    rec_tree.column("category_name", width=180)
-    rec_tree.column("account_primary_name", width=150)
-    rec_tree.column("account_primary_flags", width=40, anchor=tk.CENTER)
-    rec_tree.column("account_secondary_name", width=170)
-    rec_tree.column("cheque", width=85, anchor=tk.CENTER)
-    rec_tree.column("account_secondary_flags", width=40, anchor=tk.CENTER)
+    mov_tree = ttk.Treeview(
+        records_frame,
+        columns=mov_cols,
+        show="headings",
+        selectmode="browse",
+        style="MovGrid.Treeview",
+    )
+    mov_tree.heading("legacy_registration_number", text="Reg.")
+    mov_tree.heading("date_it", text="Data")
+    mov_tree.heading("category_name", text="Categoria")
+    mov_tree.heading("account_primary_name", text="Conto 1")
+    mov_tree.heading("account_primary_flags", text="")
+    mov_tree.heading("account_secondary_name", text="Conto 2")
+    mov_tree.heading("cheque", text="Assegno")
+    mov_tree.heading("account_secondary_flags", text="")
+    mov_tree.column("legacy_registration_number", width=56, anchor=tk.E, stretch=False, minwidth=40)
+    mov_tree.column("date_it", width=100, anchor=tk.CENTER, stretch=False, minwidth=80)
+    mov_tree.column("category_name", width=160, stretch=True, minwidth=80)
+    mov_tree.column("account_primary_name", width=130, stretch=True, minwidth=70)
+    mov_tree.column("account_primary_flags", width=36, anchor=tk.CENTER, stretch=False, minwidth=32)
+    mov_tree.column("account_secondary_name", width=150, stretch=True, minwidth=70)
+    mov_tree.column("cheque", width=78, anchor=tk.CENTER, stretch=False, minwidth=60)
+    mov_tree.column("account_secondary_flags", width=36, anchor=tk.CENTER, stretch=False, minwidth=32)
 
-    amount_tree = ttk.Treeview(records_frame, columns=("amount_eur",), show="headings")
-    amount_tree.heading("amount_eur", text="Importo")
-    amount_tree.column("amount_eur", width=135, anchor=tk.E)
-    amount_tree.tag_configure("neg", foreground="#b22222")
-    amount_tree.tag_configure("pos", foreground="#006400")
+    mov_tree.tag_configure("stripe0", background="#f7f7f7")
+    mov_tree.tag_configure("stripe1", background="#ffffff")
 
-    note_tree = ttk.Treeview(records_frame, columns=("note",), show="headings")
+    # Importo (colori) prima di Nota: Treeview separato perché i tag colore valgono per riga intera.
+    amt_tree = ttk.Treeview(
+        records_frame,
+        columns=("amount_eur",),
+        show="headings",
+        selectmode="browse",
+        style="MovGrid.Treeview",
+    )
+    amt_tree.heading("amount_eur", text="Importo")
+    amt_tree.column("amount_eur", width=128, anchor=tk.E, stretch=False, minwidth=96)
+    amt_tree.tag_configure("neg", foreground=COLOR_AMOUNT_NEG)
+    amt_tree.tag_configure("pos", foreground=COLOR_AMOUNT_POS)
+    amt_tree.tag_configure("stripe0", background="#f7f7f7")
+    amt_tree.tag_configure("stripe1", background="#ffffff")
+
+    note_tree = ttk.Treeview(
+        records_frame,
+        columns=("note",),
+        show="headings",
+        selectmode="browse",
+        style="MovGrid.Treeview",
+    )
     note_tree.heading("note", text="Nota")
-    note_tree.column("note", width=320)
+    note_tree.column("note", width=280, stretch=True, minwidth=120)
+    note_tree.tag_configure("stripe0", background="#f7f7f7")
+    note_tree.tag_configure("stripe1", background="#ffffff")
 
-    def sync_scroll(*args: str) -> None:
-        rec_tree.yview(*args)
-        amount_tree.yview(*args)
-        note_tree.yview(*args)
+    yscroll = ttk.Scrollbar(records_frame, orient=tk.VERTICAL, command=mov_tree.yview)
+
+    _yscroll_lock = False
+
+    def mov_on_yscroll(first: str, last: str) -> None:
+        nonlocal _yscroll_lock
+        if _yscroll_lock:
+            return
+        _yscroll_lock = True
+        try:
+            yscroll.set(first, last)
+            f = float(first)
+            amt_tree.yview_moveto(f)
+            note_tree.yview_moveto(f)
+        finally:
+            _yscroll_lock = False
+
+    def amt_on_yscroll(first: str, last: str) -> None:
+        nonlocal _yscroll_lock
+        if _yscroll_lock:
+            return
+        _yscroll_lock = True
+        try:
+            yscroll.set(first, last)
+            f = float(first)
+            mov_tree.yview_moveto(f)
+            note_tree.yview_moveto(f)
+        finally:
+            _yscroll_lock = False
+
+    def note_on_yscroll(first: str, last: str) -> None:
+        nonlocal _yscroll_lock
+        if _yscroll_lock:
+            return
+        _yscroll_lock = True
+        try:
+            yscroll.set(first, last)
+            f = float(first)
+            mov_tree.yview_moveto(f)
+            amt_tree.yview_moveto(f)
+        finally:
+            _yscroll_lock = False
+
+    mov_tree.configure(yscrollcommand=mov_on_yscroll)
+    amt_tree.configure(yscrollcommand=amt_on_yscroll)
+    note_tree.configure(yscrollcommand=note_on_yscroll)
+
+    _sel_sync = False
+
+    def _clear_selection(tree: ttk.Treeview) -> None:
+        for iid in tree.selection():
+            tree.selection_remove(iid)
+
+    def sync_selection_mov(_event: tk.Event | None = None) -> None:
+        nonlocal _sel_sync
+        if _sel_sync:
+            return
+        _sel_sync = True
+        try:
+            sel = mov_tree.selection()
+            if sel:
+                amt_tree.selection_set(sel)
+                note_tree.selection_set(sel)
+                amt_tree.focus(sel[0])
+            else:
+                _clear_selection(amt_tree)
+                _clear_selection(note_tree)
+        finally:
+            _sel_sync = False
+
+    def sync_selection_amt(_event: tk.Event | None = None) -> None:
+        nonlocal _sel_sync
+        if _sel_sync:
+            return
+        _sel_sync = True
+        try:
+            sel = amt_tree.selection()
+            if sel:
+                mov_tree.selection_set(sel)
+                note_tree.selection_set(sel)
+                mov_tree.focus(sel[0])
+            else:
+                _clear_selection(mov_tree)
+                _clear_selection(note_tree)
+        finally:
+            _sel_sync = False
+
+    def sync_selection_note(_event: tk.Event | None = None) -> None:
+        nonlocal _sel_sync
+        if _sel_sync:
+            return
+        _sel_sync = True
+        try:
+            sel = note_tree.selection()
+            if sel:
+                mov_tree.selection_set(sel)
+                amt_tree.selection_set(sel)
+                mov_tree.focus(sel[0])
+            else:
+                _clear_selection(mov_tree)
+                _clear_selection(amt_tree)
+        finally:
+            _sel_sync = False
+
+    mov_tree.bind("<<TreeviewSelect>>", sync_selection_mov)
+    amt_tree.bind("<<TreeviewSelect>>", sync_selection_amt)
+    note_tree.bind("<<TreeviewSelect>>", sync_selection_note)
 
     def on_mousewheel(event: tk.Event) -> str:
-        # macOS/Windows wheel
         delta = 0
         if hasattr(event, "delta") and event.delta:
             delta = -1 if event.delta > 0 else 1
         if delta:
-            sync_scroll("scroll", delta, "units")
+            mov_tree.yview("scroll", str(delta), "units")
         return "break"
 
     def on_button_scroll(event: tk.Event) -> str:
-        # Linux wheel fallback
         if getattr(event, "num", None) == 4:
-            sync_scroll("scroll", -1, "units")
+            mov_tree.yview("scroll", "-1", "units")
         elif getattr(event, "num", None) == 5:
-            sync_scroll("scroll", 1, "units")
+            mov_tree.yview("scroll", "1", "units")
         return "break"
 
-    yscroll = ttk.Scrollbar(records_frame, orient=tk.VERTICAL, command=sync_scroll)
-    rec_tree.configure(yscrollcommand=yscroll.set)
-    amount_tree.configure(yscrollcommand=yscroll.set)
-    note_tree.configure(yscrollcommand=yscroll.set)
-    for tree in (rec_tree, amount_tree, note_tree):
-        tree.bind("<MouseWheel>", on_mousewheel)
-        tree.bind("<Button-4>", on_button_scroll)
-        tree.bind("<Button-5>", on_button_scroll)
-    rec_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    amount_tree.pack(side=tk.LEFT, fill=tk.Y)
-    note_tree.pack(side=tk.LEFT, fill=tk.Y)
-    yscroll.pack(side=tk.RIGHT, fill=tk.Y)
+    for _tree in (mov_tree, amt_tree, note_tree):
+        _tree.bind("<MouseWheel>", on_mousewheel)
+        _tree.bind("<Button-4>", on_button_scroll)
+        _tree.bind("<Button-5>", on_button_scroll)
 
-    records = [r for y in db["years"] for r in y["records"]]
-    # Output order follows legacy registration order, not transaction date.
-    records.sort(key=lambda r: (r["year"], r["source_folder"], r["source_file"], r["source_index"]))
-    for r in records:
-        year = r.get("year")
-        year_accounts = accounts_by_year.get(year, [])
-        year_categories = categories_by_year.get(year, [])
-        account_1_name = account_name_for_record(r, year_accounts, "primary")
-        account_2_name = account_name_for_record(r, year_accounts, "secondary")
-        category_name = category_name_for_record(r, year_categories)
-        stars_1 = r.get("account_primary_flags", "")
-        stars_2 = r.get("account_secondary_flags", "")
-        amount_text, amount_tag = format_amount_for_output(r)
-        rec_tree.insert(
-            "",
-            tk.END,
-            values=(
-                r.get("legacy_registration_number", r.get("source_index", "")),
-                to_italian_date(r["date_iso"]),
-                category_name,
-                account_1_name,
-                stars_1,
-                account_2_name,
-                r.get("cheque") or "",
-                stars_2,
-            ),
-        )
-        amount_tree.insert("", tk.END, values=(amount_text,), tags=(amount_tag,))
-        note_tree.insert("", tk.END, values=(r.get("note") or "",))
+    records_frame.grid_columnconfigure(0, weight=1, minsize=120)
+    records_frame.grid_columnconfigure(1, weight=0, minsize=104)
+    records_frame.grid_columnconfigure(2, weight=1, minsize=100)
+    records_frame.grid_columnconfigure(3, weight=0, minsize=20)
+    records_frame.grid_rowconfigure(0, weight=1)
+    mov_tree.grid(row=0, column=0, sticky="nsew")
+    amt_tree.grid(row=0, column=1, sticky="nsew")
+    note_tree.grid(row=0, column=2, sticky="nsew")
+    yscroll.grid(row=0, column=3, sticky="ns", padx=(2, 0))
+
+    def populate_movements_trees() -> None:
+        for iid in mov_tree.get_children():
+            mov_tree.delete(iid)
+        for iid in amt_tree.get_children():
+            amt_tree.delete(iid)
+        for iid in note_tree.get_children():
+            note_tree.delete(iid)
+        d = cur_db()
+        accounts_by_year = year_accounts_map(d)
+        categories_by_year = year_categories_map(d)
+        records = [r for y in d["years"] for r in y["records"]]
+        records.sort(key=lambda r: (r["year"], r["source_folder"], r["source_file"], r["source_index"]))
+        row_i = 0
+        for r in records:
+            if not show_record_in_movements_grid(r):
+                continue
+            year = r.get("year")
+            year_accounts = accounts_by_year.get(year, [])
+            year_categories = categories_by_year.get(year, [])
+            account_1_name = account_name_for_record(r, year_accounts, "primary")
+            account_2_name = account_name_for_record(r, year_accounts, "secondary")
+            category_name = category_name_for_record(r, year_categories)
+            stars_1 = r.get("account_primary_flags", "")
+            stars_2 = r.get("account_secondary_flags", "")
+            amount_text, amount_tag = format_amount_for_output(r)
+            stripe = f"stripe{row_i % 2}"
+            rid = str(row_i)
+            mov_tree.insert(
+                "",
+                tk.END,
+                iid=rid,
+                values=(
+                    r.get("legacy_registration_number", r.get("source_index", "")),
+                    to_italian_date(r["date_iso"]),
+                    category_name,
+                    account_1_name,
+                    stars_1,
+                    account_2_name,
+                    r.get("cheque") or "",
+                    stars_2,
+                ),
+                tags=(stripe,),
+            )
+            amt_tree.insert("", tk.END, iid=rid, values=(amount_text,), tags=(amount_tag, stripe))
+            note_tree.insert("", tk.END, iid=rid, values=(r.get("note") or "",), tags=(stripe,))
+            row_i += 1
+
+    populate_movements_trees()
+
+    balance_footer = ttk.Frame(movimenti_frame, padding=(0, 10, 0, 0))
+    balance_footer.pack(fill=tk.X)
+    balance_footer_row = tk.Frame(balance_footer)
+    balance_footer_row.pack(fill=tk.X, anchor=tk.W)
+
+    saldo_footer_font = ("TkDefaultFont", 11)
+
+    def refresh_balance_footer() -> None:
+        for w in balance_footer_row.winfo_children():
+            w.destroy()
+        ly, names, amts = compute_balances_from_2022(cur_db())
+        valuta = "E" if ly >= 2002 else "L"
+        total = sum(amts, Decimal("0"))
+
+        def plain(text: str) -> None:
+            tk.Label(balance_footer_row, text=text, font=saldo_footer_font).pack(side=tk.LEFT)
+
+        def colored_amount(amt: Decimal) -> None:
+            tk.Label(
+                balance_footer_row,
+                text=format_saldo_cell(valuta, amt),
+                font=saldo_footer_font,
+                fg=balance_amount_fg(amt),
+            ).pack(side=tk.LEFT)
+
+        plain("Saldo totale: ")
+        colored_amount(total)
+        for name, amt in zip(names, amts):
+            plain("    ")
+            plain(f"{name.strip()}: ")
+            colored_amount(amt)
+
+    refresh_balance_footer()
 
     # Placeholder pages for next implementation steps
+    pack_centered_page_title(nuovi_dati_frame)
     ttk.Label(nuovi_dati_frame, text="Pagina in preparazione").pack(anchor=tk.W)
+    pack_centered_page_title(verifica_frame)
     ttk.Label(verifica_frame, text="Pagina in preparazione").pack(anchor=tk.W)
+    pack_centered_page_title(statistiche_frame)
     ttk.Label(statistiche_frame, text="Pagina in preparazione").pack(anchor=tk.W)
+    pack_centered_page_title(budget_frame)
     ttk.Label(budget_frame, text="Pagina in preparazione").pack(anchor=tk.W)
+    pack_centered_page_title(aiuto_frame)
     ttk.Label(aiuto_frame, text="Pagina in preparazione").pack(anchor=tk.W)
 
     # Opzioni page
+    pack_centered_page_title(opzioni_frame)
+    opzioni_inner = ttk.Frame(opzioni_frame)
+    opzioni_inner.pack(fill=tk.BOTH, expand=True)
+
     legacy_path_var = tk.StringVar(value=str(DEFAULT_CDC_ROOT))
     data_file_var = tk.StringVar(value=str(DEFAULT_ENCRYPTED_DB))
     key_file_var = tk.StringVar(value=str(DEFAULT_KEY_FILE))
 
-    ttk.Label(opzioni_frame, text="Sorgente import legacy").grid(row=0, column=0, sticky="w", pady=(0, 6))
-    legacy_entry = ttk.Entry(opzioni_frame, textvariable=legacy_path_var, width=80)
+    ttk.Label(opzioni_inner, text="Sorgente import legacy").grid(row=0, column=0, sticky="w", pady=(0, 6))
+    legacy_entry = ttk.Entry(opzioni_inner, textvariable=legacy_path_var, width=80)
     legacy_entry.grid(row=1, column=0, sticky="we", padx=(0, 8))
 
     def browse_legacy() -> None:
@@ -332,10 +610,10 @@ def build_ui(db: dict) -> None:
         if picked:
             legacy_path_var.set(picked)
 
-    ttk.Button(opzioni_frame, text="Sfoglia...", command=browse_legacy).grid(row=1, column=1, sticky="w")
+    ttk.Button(opzioni_inner, text="Sfoglia...", command=browse_legacy).grid(row=1, column=1, sticky="w")
 
-    ttk.Label(opzioni_frame, text="File dati nuova app (criptato)").grid(row=2, column=0, sticky="w", pady=(12, 6))
-    data_entry = ttk.Entry(opzioni_frame, textvariable=data_file_var, width=80)
+    ttk.Label(opzioni_inner, text="File dati nuova app (criptato)").grid(row=2, column=0, sticky="w", pady=(12, 6))
+    data_entry = ttk.Entry(opzioni_inner, textvariable=data_file_var, width=80)
     data_entry.grid(row=3, column=0, sticky="we", padx=(0, 8))
 
     def browse_data_file() -> None:
@@ -348,10 +626,10 @@ def build_ui(db: dict) -> None:
         if picked:
             data_file_var.set(picked)
 
-    ttk.Button(opzioni_frame, text="Sfoglia...", command=browse_data_file).grid(row=3, column=1, sticky="w")
+    ttk.Button(opzioni_inner, text="Sfoglia...", command=browse_data_file).grid(row=3, column=1, sticky="w")
 
-    ttk.Label(opzioni_frame, text="File chiave cifratura").grid(row=4, column=0, sticky="w", pady=(12, 6))
-    key_entry = ttk.Entry(opzioni_frame, textvariable=key_file_var, width=80)
+    ttk.Label(opzioni_inner, text="File chiave cifratura").grid(row=4, column=0, sticky="w", pady=(12, 6))
+    key_entry = ttk.Entry(opzioni_inner, textvariable=key_file_var, width=80)
     key_entry.grid(row=5, column=0, sticky="we", padx=(0, 8))
 
     def browse_key_file() -> None:
@@ -364,10 +642,10 @@ def build_ui(db: dict) -> None:
         if picked:
             key_file_var.set(picked)
 
-    ttk.Button(opzioni_frame, text="Sfoglia...", command=browse_key_file).grid(row=5, column=1, sticky="w")
+    ttk.Button(opzioni_inner, text="Sfoglia...", command=browse_key_file).grid(row=5, column=1, sticky="w")
 
     status_var = tk.StringVar(value="")
-    ttk.Label(opzioni_frame, textvariable=status_var).grid(row=7, column=0, columnspan=2, sticky="w", pady=(10, 0))
+    ttk.Label(opzioni_inner, textvariable=status_var).grid(row=7, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
     def reload_legacy_overwrite() -> None:
         confirmed = messagebox.askyesno(
@@ -384,6 +662,9 @@ def build_ui(db: dict) -> None:
             run_import_legacy(legacy_root, output_json)
             new_db = json.loads(output_json.read_text(encoding="utf-8"))
             save_encrypted_db(new_db, Path(data_file_var.get()), Path(key_file_var.get()))
+            db_holder[0] = new_db
+            populate_movements_trees()
+            refresh_balance_footer()
             messagebox.showinfo(
                 "Import completato",
                 "Import legacy completato.\nIl database della nuova app è stato sovrascritto.",
@@ -394,12 +675,12 @@ def build_ui(db: dict) -> None:
             status_var.set(f"Errore: {exc}")
 
     ttk.Button(
-        opzioni_frame,
+        opzioni_inner,
         text="Ricarica importi legacy (sovrascrive dati nuova app)",
         command=reload_legacy_overwrite,
     ).grid(row=6, column=0, sticky="w", pady=(16, 0))
 
-    opzioni_frame.columnconfigure(0, weight=1)
+    opzioni_inner.columnconfigure(0, weight=1)
 
     root.mainloop()
 

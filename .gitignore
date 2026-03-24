@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+
+# Generated data artifacts
+data/*.json
+data/*.enc
+data/*.key
