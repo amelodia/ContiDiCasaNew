@@ -1,0 +1,2 @@
+# CursorAppMacCdc
+Progetto CursorMAC CdC
