@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import calendar
 import platform
 import sys
 import tkinter as tk
@@ -203,6 +204,51 @@ def compute_balances_from_2022(db: dict) -> tuple[int, list[str], list[Decimal]]
     return latest_year, names, balances
 
 
+def compute_balances_from_2022_asof(db: dict, *, cutoff_date_iso: str) -> tuple[int, list[str], list[Decimal]]:
+    """
+    Come `compute_balances_from_2022`, ma considera solo registrazioni con `date_iso <= cutoff_date_iso`.
+    Utile per "Saldi alla data di oggi" (escludendo date future).
+    """
+    latest_year = max(y["year"] for y in db["years"])
+    year_data = next(y for y in db["years"] if y["year"] == latest_year)
+    accounts = year_data["accounts"]
+    n_accounts = len(accounts)
+
+    pool: list[dict] = []
+    for yd in db["years"]:
+        y = int(yd["year"])
+        if y < 2022 or y > latest_year:
+            continue
+        pool.extend(yd["records"])
+    pool.sort(key=lambda r: (int(r["year"]), r["source_folder"], r["source_file"], r["source_index"]))
+
+    balances = [Decimal("0") for _ in accounts]
+    for rec in pool:
+        if rec.get("is_cancelled"):
+            continue
+        y = int(rec["year"])
+        if is_dotazione_record(rec) and y != 2022:
+            continue
+        r_date = str(rec.get("date_iso", ""))
+        if r_date and r_date > cutoff_date_iso:
+            continue
+
+        amount = to_decimal(rec["amount_eur"])
+        c1 = rec.get("account_primary_code", "")
+        c2 = rec.get("account_secondary_code", "")
+
+        c1_idx = int(c1) - 1 if str(c1).isdigit() else -1
+        c2_idx = int(c2) - 1 if str(c2).isdigit() else -1
+
+        if 0 <= c1_idx < n_accounts:
+            balances[c1_idx] += amount
+        if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts:
+            balances[c2_idx] -= amount
+
+    names = [a["name"] for a in accounts]
+    return latest_year, names, balances
+
+
 def balance_amount_fg(value: Decimal) -> str:
     """Rosso / verde come colonna Importo (zero trattato come non negativo)."""
     return COLOR_AMOUNT_NEG if value < 0 else COLOR_AMOUNT_POS
@@ -241,19 +287,31 @@ def filter_and_sort_movements_for_grid(
     order_by_date: bool,
     exclude_future_dates: bool,
     backward: bool,
+    date_from_iso: str | None = None,
+    date_to_iso: str | None = None,
 ) -> list[dict]:
     """
-    Applica filtro date future e ordinamento richiesto dalla pagina Movimenti.
+    Applica filtro date future + (opzionale) filtro intervallo date e ordinamento richiesto dalla pagina Movimenti.
     - order_by_date: True = per data, False = per numero di registrazione globale.
     - exclude_future_dates: True = nasconde registrazioni con data > oggi.
     - backward: True = dalla più recente / numero più alto; False = dalla più lontana / più basso.
+    - date_from_iso/date_to_iso: se presenti, restringono per intervallo inclusivo su `date_iso` (YYYY-MM-DD).
     """
     today = date.today().isoformat()
+    d_from = date_from_iso or None
+    d_to = date_to_iso or None
+    if d_from and d_to and d_from > d_to:
+        d_from, d_to = d_to, d_from
     pool: list[dict] = []
     for r in records_canonical:
         if not show_record_in_movements_grid(r):
             continue
-        if exclude_future_dates and str(r.get("date_iso", "")) > today:
+        r_date = str(r.get("date_iso", ""))
+        if exclude_future_dates and r_date > today:
+            continue
+        if d_from and r_date < d_from:
+            continue
+        if d_to and r_date > d_to:
             continue
         pool.append(r)
 
@@ -303,10 +361,40 @@ def build_ui(db: dict) -> None:
 
     root = tk.Tk()
     root.title(app_title_text())
-    root.geometry("1200x760")
+    # Avvio a finestra intera (massimizzata). Su macOS `state("zoomed")` può minimizzare:
+    # usiamo invece la geometria a schermo.
+    root.update_idletasks()
+    if platform.system() == "Darwin":
+        # Su macOS la geometria a schermo può portare a comportamenti strani (finestra che collassa).
+        # Usiamo fullscreen nativo e poi forziamo deiconify/lift.
+        try:
+            root.attributes("-fullscreen", True)
+        except Exception:
+            sw = root.winfo_screenwidth()
+            sh = root.winfo_screenheight()
+            root.geometry(f"{sw}x{sh}+0+0")
+
+        def _ensure_visible() -> None:
+            try:
+                root.deiconify()
+                root.lift()
+                root.focus_force()
+            except Exception:
+                pass
+
+        root.after(50, _ensure_visible)
+    else:
+        root.geometry("1200x760")
+        try:
+            root.state("zoomed")
+        except Exception:
+            pass
 
     notebook = ttk.Notebook(root)
     notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+    # Tab notebook: testo in bold (selettori pagine).
+    ttk.Style(root).configure("TNotebook.Tab", font=("TkDefaultFont", 13, "bold"))
 
     movimenti_frame = ttk.Frame(notebook, padding=8)
     nuovi_dati_frame = ttk.Frame(notebook, padding=8)
@@ -326,6 +414,17 @@ def build_ui(db: dict) -> None:
 
     pack_centered_page_title(movimenti_frame)
 
+    def _on_tab_changed(_e: tk.Event) -> None:
+        # Quando si torna alla scheda Movimenti, riallinea visibilità e tendine.
+        try:
+            if notebook.index(notebook.select()) == 0:
+                refresh_movement_filter_button_styles()
+                refresh_date_controls_visibility()
+        except Exception:
+            pass
+
+    notebook.bind("<<NotebookTabChanged>>", _on_tab_changed)
+
     # Preselezione (sei controlli) vs valori applicati alla griglia (solo con «Cerca»).
     filter_order_preview_var = tk.StringVar(value="date")
     filter_future_preview_var = tk.StringVar(value="include")
@@ -334,14 +433,275 @@ def build_ui(db: dict) -> None:
     filter_future_applied_var = tk.StringVar(value="include")
     filter_direction_applied_var = tk.StringVar(value="backward")
 
+    # Filtri testuali (solo Ricerca per data): preview vs applicato (solo con «Cerca»).
+    text_category_preview_var = tk.StringVar(value="")
+    text_account_preview_var = tk.StringVar(value="")
+    text_cheque_preview_var = tk.StringVar(value="")
+    text_note_preview_var = tk.StringVar(value="")
+    text_category_applied_var = tk.StringVar(value="")
+    text_account_applied_var = tk.StringVar(value="")
+    text_cheque_applied_var = tk.StringVar(value="")
+    text_note_applied_var = tk.StringVar(value="")
+
+    # Ricerca per registrazione: limiti progressivo (preview vs applicato).
+    reg_preset_preview_var = tk.StringVar(value="last_12")
+    reg_preset_applied_var = tk.StringVar(value="last_12")
+    reg_from_preview_var = tk.StringVar(value="")
+    reg_to_preview_var = tk.StringVar(value="")
+    reg_from_applied_var = tk.StringVar(value="")
+    reg_to_applied_var = tk.StringVar(value="")
+
+    # Intervallo date per «Ricerca per data»: preview (solo UI) vs applicato (solo con «Cerca»).
+    date_preset_preview_var = tk.StringVar(value="last_12")
+    date_preset_applied_var = tk.StringVar(value="last_12")
+    date_from_preview_var = tk.StringVar(value="")
+    date_to_preview_var = tk.StringVar(value="")
+    date_from_applied_var = tk.StringVar(value="")
+    date_to_applied_var = tk.StringVar(value="")
+    _dataset_min_date: date | None = None
+    _dataset_max_date: date | None = None
+    _dataset_years_with_records: list[int] = []
+    # Se l'utente modifica manualmente "Date a scelta" (calendar o campi),
+    # evitiamo di sovrascrivere la scelta quando cambia Comprese/Escluse o direzione.
+    date_custom_manual_override = False
+
+    # Bounds dataset iniziali (per calcolare subito i preset default).
+    try:
+        d0 = cur_db()
+        records0 = [r for y in d0.get("years", []) for r in y.get("records", [])]
+        parsed0: list[date] = []
+        for rr in records0:
+            iso = str(rr.get("date_iso", "")).strip()
+            if not iso:
+                continue
+            try:
+                parsed0.append(date.fromisoformat(iso))
+            except Exception:
+                continue
+        if parsed0:
+            _dataset_min_date = min(parsed0)
+            _dataset_max_date = max(parsed0)
+            _dataset_years_with_records = sorted({d.year for d in parsed0})
+        else:
+            _dataset_min_date = date.today()
+            _dataset_max_date = date.today()
+            _dataset_years_with_records = [date.today().year]
+    except Exception:
+        _dataset_min_date = date.today()
+        _dataset_max_date = date.today()
+        _dataset_years_with_records = [date.today().year]
+
     filters_row = ttk.Frame(movimenti_frame)
     filters_row.pack(fill=tk.X, pady=(0, 4))
 
     filters_search_row = ttk.Frame(movimenti_frame)
     filters_search_row.pack(fill=tk.X, pady=(0, 8))
 
+    # Riga controlli per Ricerca per registrazione (visibile solo in quella modalità)
+    reg_controls_row = ttk.Frame(filters_search_row)
+    reg_controls_row.pack(side=tk.LEFT, anchor=tk.W)
+    reg_controls_row.pack_forget()
+
+    filters_text_row = ttk.Frame(movimenti_frame)
+    filters_text_row.pack(fill=tk.X, pady=(0, 10))
+
+    # Riga filtri testuali (visibile solo in Ricerca per data)
+    filters_text_inner = ttk.Frame(filters_text_row)
+    filters_text_inner.pack(fill=tk.X, anchor=tk.W)
+
+    # Zona filtri: testo in bold (etichette, entry, combobox, pulsanti).
+    filter_ui_font = ("TkDefaultFont", 12, "bold")
+    ttk.Style(root).configure("Filters.TLabel", font=filter_ui_font)
+    ttk.Style(root).configure("Filters.TEntry", font=filter_ui_font)
+    ttk.Style(root).configure("Filters.TCombobox", font=filter_ui_font)
+    ttk.Style(root).configure("Filters.TButton", font=filter_ui_font)
+
+    _ALL_CATEGORIES_LABEL = "Tutte"
+    _ALL_ACCOUNTS_LABEL = "Tutti"
+
+    ttk.Label(filters_text_inner, text="Categoria", style="Filters.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+    category_entry = ttk.Combobox(
+        filters_text_inner,
+        textvariable=text_category_preview_var,
+        state="readonly",
+        width=22,
+        values=("",),
+        style="Filters.TCombobox",
+    )
+    category_entry.pack(side=tk.LEFT, padx=(0, 14))
+
+    ttk.Label(filters_text_inner, text="Conto", style="Filters.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+    account_entry = ttk.Combobox(
+        filters_text_inner,
+        textvariable=text_account_preview_var,
+        state="readonly",
+        width=22,
+        values=("",),
+        style="Filters.TCombobox",
+    )
+    account_entry.pack(side=tk.LEFT, padx=(0, 14))
+
+    ttk.Label(filters_text_inner, text="Assegno", style="Filters.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+    cheque_entry = ttk.Entry(
+        filters_text_inner,
+        textvariable=text_cheque_preview_var,
+        width=18,
+        style="Filters.TEntry",
+    )
+    cheque_entry.pack(side=tk.LEFT, padx=(0, 14))
+
+    ttk.Label(filters_text_inner, text="Nota", style="Filters.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+    note_entry = ttk.Entry(
+        filters_text_inner,
+        textvariable=text_note_preview_var,
+        width=40,
+        style="Filters.TEntry",
+    )
+    note_entry.pack(side=tk.LEFT, padx=(0, 0))
+
+    clear_filters_btn = ttk.Button(filters_text_inner, text="Pulisci filtri", style="Filters.TButton")
+    clear_filters_btn.pack(side=tk.LEFT, padx=(14, 0))
+
+    # ---- UI Ricerca per registrazione (preset + range reg + conto) ----
+    reg_controls_inner = ttk.Frame(reg_controls_row)
+    reg_controls_inner.pack(fill=tk.X, anchor=tk.W)
+
+    reg_btn_last12 = tk.Label(
+        reg_controls_inner,
+        text="Ultimi 12 mesi",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=8,
+        pady=6,
+    )
+    reg_btn_all = tk.Label(
+        reg_controls_inner,
+        text="Intero periodo",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=8,
+        pady=6,
+    )
+    reg_btn_last12.pack(side=tk.LEFT, padx=(0, 8))
+    reg_btn_all.pack(side=tk.LEFT, padx=(0, 16))
+
+    ttk.Label(reg_controls_inner, text="Dalla reg. #", style="Filters.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+    reg_from_entry = ttk.Entry(reg_controls_inner, textvariable=reg_from_preview_var, width=8, style="Filters.TEntry")
+    reg_from_entry.pack(side=tk.LEFT, padx=(0, 14))
+
+    ttk.Label(reg_controls_inner, text="Alla reg. #", style="Filters.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+    reg_to_entry = ttk.Entry(reg_controls_inner, textvariable=reg_to_preview_var, width=8, style="Filters.TEntry")
+    reg_to_entry.pack(side=tk.LEFT, padx=(0, 18))
+
+    ttk.Label(reg_controls_inner, text="Conto", style="Filters.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+    reg_account_entry = ttk.Combobox(
+        reg_controls_inner,
+        textvariable=text_account_preview_var,
+        state="readonly",
+        width=22,
+        values=(_ALL_ACCOUNTS_LABEL,),
+        style="Filters.TCombobox",
+    )
+    reg_account_entry.pack(side=tk.LEFT, padx=(0, 0))
+
+    def _sorted_with_preferred(values: set[str], preferred: str) -> tuple[str, ...]:
+        # Prefer match case-insensitive, ma restituisce la stringa originale presente nei dati.
+        preferred_actual = None
+        pref_l = preferred.lower()
+        for v in values:
+            if v.lower() == pref_l:
+                preferred_actual = v
+                break
+        rest = sorted((v for v in values if v != preferred_actual), key=lambda s: s.lower())
+        return ((preferred_actual,) if preferred_actual else tuple()) + tuple(rest)
+
+    def refresh_category_account_dropdowns() -> None:
+        """Popola le tendine con soli valori presenti nello scope date (preview)."""
+        if filter_order_preview_var.get() != "date":
+            return
+
+        # Limiti scope dalle date in finestra (preview) + Comprese/Escluse.
+        dmin = _parse_iso_to_date(date_from_preview_var.get())
+        dmax = _parse_iso_to_date(date_to_preview_var.get())
+        if not dmin or not dmax:
+            # se non ancora pronte, lascia almeno opzione vuota
+            category_entry.configure(values=(_ALL_CATEGORIES_LABEL,))
+            account_entry.configure(values=(_ALL_ACCOUNTS_LABEL,))
+            return
+        if dmin > dmax:
+            dmin, dmax = dmax, dmin
+
+        # Rispetta Escluse date future (solo per scope).
+        today = date.today()
+        if filter_future_preview_var.get() == "exclude" and dmax > today:
+            dmax = today
+        if filter_future_preview_var.get() == "exclude" and dmin > today:
+            dmin = today
+
+        d = cur_db()
+        accounts_by_year = year_accounts_map(d)
+        categories_by_year = year_categories_map(d)
+        records = [r for y in d["years"] for r in y["records"]]
+
+        cats: set[str] = set()
+        accs: set[str] = set()
+        for r in records:
+            try:
+                r_date = date.fromisoformat(str(r.get("date_iso", "")))
+            except Exception:
+                continue
+            if r_date < dmin or r_date > dmax:
+                continue
+            if not show_record_in_movements_grid(r):
+                continue
+            year = r.get("year")
+            year_accounts = accounts_by_year.get(year, [])
+            year_categories = categories_by_year.get(year, [])
+            c = category_name_for_record(r, year_categories)
+            a1 = account_name_for_record(r, year_accounts, "primary")
+            a2 = account_name_for_record(r, year_accounts, "secondary")
+            if c:
+                cats.add(str(c).strip())
+            if a1:
+                accs.add(str(a1).strip())
+            if a2:
+                accs.add(str(a2).strip())
+
+        cat_vals = (_ALL_CATEGORIES_LABEL,) + _sorted_with_preferred(cats, "Consumi ordinari")
+        acc_vals = (_ALL_ACCOUNTS_LABEL,) + _sorted_with_preferred(accs, "Cassa")
+        category_entry.configure(values=cat_vals)
+        account_entry.configure(values=acc_vals)
+
+        # Se la selezione corrente non è più valida, azzera.
+        if not text_category_preview_var.get():
+            text_category_preview_var.set(_ALL_CATEGORIES_LABEL)
+        if not text_account_preview_var.get():
+            text_account_preview_var.set(_ALL_ACCOUNTS_LABEL)
+        if (
+            text_category_preview_var.get()
+            and text_category_preview_var.get() != _ALL_CATEGORIES_LABEL
+            and text_category_preview_var.get() not in cats
+        ):
+            text_category_preview_var.set(_ALL_CATEGORIES_LABEL)
+        if (
+            text_account_preview_var.get()
+            and text_account_preview_var.get() != _ALL_ACCOUNTS_LABEL
+            and text_account_preview_var.get() not in accs
+        ):
+            text_account_preview_var.set(_ALL_ACCOUNTS_LABEL)
+
     records_frame = ttk.Frame(movimenti_frame, padding=8)
     records_frame.pack(fill=tk.BOTH, expand=True)
+
+    no_results_label = tk.Label(
+        records_frame,
+        text="Non ci sono registrazioni con questi filtri",
+        font=("TkDefaultFont", 16, "bold"),
+        fg="#444444",
+        bg="#ffffff",
+    )
 
     mov_style = ttk.Style(root)
     mov_style.configure(
@@ -351,6 +711,16 @@ def build_ui(db: dict) -> None:
         rowheight=22,
         background="#ffffff",
         fieldbackground="#ffffff",
+        font=("TkDefaultFont", 11, "bold"),
+    )
+    mov_style.configure(
+        "MovGridAmount.Treeview",
+        borderwidth=1,
+        relief="solid",
+        rowheight=22,
+        background="#ffffff",
+        fieldbackground="#ffffff",
+        font=("TkDefaultFont", 12, "bold"),
     )
     mov_style.configure(
         "MovGrid.Treeview.Heading",
@@ -371,48 +741,90 @@ def build_ui(db: dict) -> None:
         "account_primary_name",
         "account_primary_flags",
         "account_secondary_name",
-        "cheque",
         "account_secondary_flags",
+        "cheque",
     )
     mov_tree = ttk.Treeview(
         records_frame,
         columns=mov_cols,
-        show="headings",
+        show="tree",
         selectmode="browse",
         style="MovGrid.Treeview",
     )
     mov_tree.heading("mov_pad", text="")
     mov_tree.column("mov_pad", width=1, minwidth=1, stretch=False, anchor=tk.CENTER)
-    mov_tree.heading("reg_display", text="Reg.", anchor=tk.E)
-    mov_tree.column("reg_display", width=62, anchor=tk.E, stretch=False, minwidth=50)
-    mov_tree.heading("date_it", text="Data")
-    mov_tree.heading("category_name", text="Categoria")
-    mov_tree.heading("account_primary_name", text="Conto 1")
+    mov_tree.heading("reg_display", text="Reg #", anchor="e")
+    mov_tree.column("reg_display", width=62, anchor="e", stretch=False, minwidth=50)
+    mov_tree.heading("date_it", text="Data", anchor="e")
+    mov_tree.heading("category_name", text="Categoria", anchor="w")
+    mov_tree.heading("account_primary_name", text="Dal conto", anchor="w")
     mov_tree.heading("account_primary_flags", text="")
-    mov_tree.heading("account_secondary_name", text="Conto 2")
-    mov_tree.heading("cheque", text="Assegno")
+    mov_tree.heading("account_secondary_name", text="al conto", anchor="w")
     mov_tree.heading("account_secondary_flags", text="")
-    mov_tree.column("date_it", width=100, anchor=tk.CENTER, stretch=False, minwidth=80)
-    mov_tree.column("category_name", width=160, stretch=True, minwidth=80)
-    mov_tree.column("account_primary_name", width=130, stretch=True, minwidth=70)
+    mov_tree.heading("cheque", text="Assegno")
+    mov_tree.column("date_it", width=92, anchor="e", stretch=False, minwidth=80)
+    mov_tree.column("category_name", width=160, anchor="w", stretch=True, minwidth=80)
+    mov_tree.column("account_primary_name", width=130, anchor="w", stretch=True, minwidth=70)
     mov_tree.column("account_primary_flags", width=36, anchor=tk.CENTER, stretch=False, minwidth=32)
-    mov_tree.column("account_secondary_name", width=150, stretch=True, minwidth=70)
-    mov_tree.column("cheque", width=78, anchor=tk.CENTER, stretch=False, minwidth=60)
+    mov_tree.column("account_secondary_name", width=150, anchor="w", stretch=True, minwidth=70)
     mov_tree.column("account_secondary_flags", width=36, anchor=tk.CENTER, stretch=False, minwidth=32)
+    mov_tree.column("cheque", width=78, anchor=tk.CENTER, stretch=False, minwidth=60)
 
     mov_tree.tag_configure("stripe0", background="#f7f7f7")
     mov_tree.tag_configure("stripe1", background="#ffffff")
+
+    # Separatori verticali nel primo Treeview (mov_tree).
+    # ttk.Treeview non supporta vere gridline verticali; overlay con Frame 1px.
+    mov_tree_vlines: list[tk.Frame] = []
+
+    def _ensure_mov_tree_vlines() -> None:
+        nonlocal mov_tree_vlines
+        if mov_tree_vlines:
+            return
+        for _ in range(8):  # confini tra 9 colonne (mov_pad..flags2), escludiamo bordo finale
+            ln = tk.Frame(mov_tree, bg="#c0c0c0", width=1, highlightthickness=0)
+            mov_tree_vlines.append(ln)
+
+    def _position_mov_tree_vlines(_e: tk.Event | None = None) -> None:
+        _ensure_mov_tree_vlines()
+        # confini dopo queste colonne:
+        cols = [
+            "mov_pad",
+            "reg_display",
+            "date_it",
+            "category_name",
+            "account_primary_name",
+            "account_primary_flags",
+            "account_secondary_name",
+            "account_secondary_flags",
+            # cheque (ultimo) -> niente linea dopo
+        ]
+        x = 0
+        # piccolo offset per compensare bordo interno su macOS
+        x_offset = 1
+        for i, cid in enumerate(cols):
+            try:
+                w = int(mov_tree.column(cid, "width"))
+            except Exception:
+                w = 0
+            x += w
+            ln = mov_tree_vlines[i]
+            ln.place(x=x + x_offset, y=0, relheight=1.0)
+            ln.lift()
+
+    mov_tree.bind("<Configure>", _position_mov_tree_vlines, add=True)
+    root.after(0, _position_mov_tree_vlines)
 
     # Importo (colori) prima di Nota: Treeview separato perché i tag colore valgono per riga intera.
     amt_tree = ttk.Treeview(
         records_frame,
         columns=("amount_eur",),
-        show="headings",
+        show="tree",
         selectmode="browse",
-        style="MovGrid.Treeview",
+        style="MovGridAmount.Treeview",
     )
-    amt_tree.heading("amount_eur", text="Importo")
-    amt_tree.column("amount_eur", width=128, anchor=tk.E, stretch=False, minwidth=96)
+    amt_tree.heading("amount_eur", text="Importo", anchor="e")
+    amt_tree.column("amount_eur", width=128, anchor="e", stretch=False, minwidth=96)
     amt_tree.tag_configure("neg", foreground=COLOR_AMOUNT_NEG)
     amt_tree.tag_configure("pos", foreground=COLOR_AMOUNT_POS)
     amt_tree.tag_configure("stripe0", background="#f7f7f7")
@@ -421,17 +833,104 @@ def build_ui(db: dict) -> None:
     note_tree = ttk.Treeview(
         records_frame,
         columns=("note",),
-        show="headings",
+        show="tree",
         selectmode="browse",
         style="MovGrid.Treeview",
     )
-    note_tree.heading("note", text="Nota")
-    note_tree.column("note", width=280, stretch=True, minwidth=120)
+    note_tree.heading("note", text="Nota", anchor="w")
+    note_tree.column("note", width=280, anchor="w", stretch=True, minwidth=120)
     note_tree.tag_configure("stripe0", background="#f7f7f7")
     note_tree.tag_configure("stripe1", background="#ffffff")
 
+    mov_tree.column("#0", width=0, minwidth=0, stretch=False)
     amt_tree.column("#0", width=0, minwidth=0, stretch=False)
     note_tree.column("#0", width=0, minwidth=0, stretch=False)
+
+    # Intestazioni custom (su macOS ttk può ignorare l'allineamento delle headings).
+    header_bg = "#ebebeb"
+    header_fg = "#1a1a1a"
+    header_font = ("TkDefaultFont", 10, "bold")
+    header_row = tk.Frame(records_frame, bg=header_bg)
+    mov_hdr = tk.Frame(header_row, bg=header_bg)
+    amt_hdr = tk.Frame(header_row, bg=header_bg)
+    note_hdr = tk.Frame(header_row, bg=header_bg)
+    # Canale separatore: permette di posizionare la linea leggermente più a sinistra/destra.
+    _SEP_CH_W = 6
+    hdr_sep_1 = tk.Frame(header_row, bg=header_bg, width=_SEP_CH_W)
+    hdr_sep_2 = tk.Frame(header_row, bg=header_bg, width=_SEP_CH_W)
+    hdr_sep_1_line = tk.Frame(hdr_sep_1, bg="#c0c0c0", width=1)
+    hdr_sep_2_line = tk.Frame(hdr_sep_2, bg="#c0c0c0", width=1)
+
+    # La riga header deve seguire la griglia principale (mov / amt / note).
+    header_row.grid_columnconfigure(0, weight=1, minsize=120)  # mov_hdr
+    header_row.grid_columnconfigure(1, weight=0, minsize=_SEP_CH_W)    # sep
+    header_row.grid_columnconfigure(2, weight=0, minsize=104)  # amt_hdr
+    header_row.grid_columnconfigure(3, weight=0, minsize=_SEP_CH_W)    # sep
+    header_row.grid_columnconfigure(4, weight=1, minsize=100)  # note_hdr
+
+    # Mov header columns (pixel widths = come Treeview)
+    mov_hdr.grid_columnconfigure(0, minsize=1)    # mov_pad
+    mov_hdr.grid_columnconfigure(1, minsize=62)   # Reg #
+    mov_hdr.grid_columnconfigure(2, minsize=92)   # Data
+    mov_hdr.grid_columnconfigure(3, weight=1, minsize=160)  # Categoria
+    mov_hdr.grid_columnconfigure(4, weight=1, minsize=130)  # Dal conto
+    mov_hdr.grid_columnconfigure(5, minsize=36)   # flags
+    mov_hdr.grid_columnconfigure(6, weight=1, minsize=150)  # al conto
+    mov_hdr.grid_columnconfigure(7, minsize=36)   # flags2
+    mov_hdr.grid_columnconfigure(8, minsize=78)   # Assegno
+
+    tk.Label(mov_hdr, text="", bg=header_bg, fg=header_fg, font=header_font).grid(row=0, column=0, sticky="ew")
+    tk.Label(mov_hdr, text="Reg #", bg=header_bg, fg=header_fg, font=header_font, anchor="center").grid(row=0, column=1, sticky="ew")
+    tk.Label(mov_hdr, text="Data", bg=header_bg, fg=header_fg, font=header_font, anchor="center").grid(row=0, column=2, sticky="ew")
+    tk.Label(mov_hdr, text="Categoria", bg=header_bg, fg=header_fg, font=header_font, anchor="w").grid(row=0, column=3, sticky="ew")
+    tk.Label(mov_hdr, text="Dal conto", bg=header_bg, fg=header_fg, font=header_font, anchor="w").grid(row=0, column=4, sticky="ew")
+    tk.Label(mov_hdr, text="", bg=header_bg, fg=header_fg, font=header_font).grid(row=0, column=5, sticky="ew")
+    tk.Label(mov_hdr, text="al conto", bg=header_bg, fg=header_fg, font=header_font, anchor="w").grid(row=0, column=6, sticky="ew")
+    tk.Label(mov_hdr, text="", bg=header_bg, fg=header_fg, font=header_font).grid(row=0, column=7, sticky="ew")
+    tk.Label(mov_hdr, text="Assegno", bg=header_bg, fg=header_fg, font=header_font, anchor="center").grid(row=0, column=8, sticky="ew")
+
+    # Linee verticali in intestazione (mov_hdr): overlay, coerenti con le larghezze del Treeview.
+    mov_hdr_vlines: list[tk.Frame] = []
+
+    def _ensure_mov_hdr_vlines() -> None:
+        nonlocal mov_hdr_vlines
+        if mov_hdr_vlines:
+            return
+        for _ in range(8):
+            mov_hdr_vlines.append(tk.Frame(mov_hdr, bg="#c0c0c0", width=1, highlightthickness=0))
+
+    def _position_mov_hdr_vlines(_e: tk.Event | None = None) -> None:
+        _ensure_mov_hdr_vlines()
+        cols = [
+            "mov_pad",
+            "reg_display",
+            "date_it",
+            "category_name",
+            "account_primary_name",
+            "account_primary_flags",
+            "account_secondary_name",
+            "account_secondary_flags",
+        ]
+        x = 0
+        x_offset = 1
+        for i, cid in enumerate(cols):
+            try:
+                w = int(mov_tree.column(cid, "width"))
+            except Exception:
+                w = 0
+            x += w
+            ln = mov_hdr_vlines[i]
+            ln.place(x=x + x_offset, y=0, relheight=1.0)
+            ln.lift()
+
+    mov_hdr.bind("<Configure>", _position_mov_hdr_vlines, add=True)
+    root.after(0, _position_mov_hdr_vlines)
+
+    amt_hdr.grid_columnconfigure(0, weight=1, minsize=128)
+    tk.Label(amt_hdr, text="Importo", bg=header_bg, fg=header_fg, font=header_font, anchor="e").grid(row=0, column=0, sticky="ew")
+
+    note_hdr.grid_columnconfigure(0, weight=1, minsize=280)
+    tk.Label(note_hdr, text="Nota", bg=header_bg, fg=header_fg, font=header_font, anchor="w").grid(row=0, column=0, sticky="ew")
 
     yscroll = ttk.Scrollbar(records_frame, orient=tk.VERTICAL, command=mov_tree.yview)
 
@@ -578,21 +1077,57 @@ def build_ui(db: dict) -> None:
         _tree.bind("<Button-4>", on_button_scroll)
         _tree.bind("<Button-5>", on_button_scroll)
 
+    # Colonne griglia: mov | sep | amt | sep | note | scrollbar
     records_frame.grid_columnconfigure(0, weight=1, minsize=120)
-    records_frame.grid_columnconfigure(1, weight=0, minsize=104)
-    records_frame.grid_columnconfigure(2, weight=1, minsize=100)
-    records_frame.grid_columnconfigure(3, weight=0, minsize=20)
-    records_frame.grid_rowconfigure(0, weight=1)
-    mov_tree.grid(row=0, column=0, sticky="nsew")
-    amt_tree.grid(row=0, column=1, sticky="nsew")
-    note_tree.grid(row=0, column=2, sticky="nsew")
-    yscroll.grid(row=0, column=3, sticky="ns", padx=(2, 0))
+    records_frame.grid_columnconfigure(1, weight=0, minsize=_SEP_CH_W)
+    records_frame.grid_columnconfigure(2, weight=0, minsize=104)
+    records_frame.grid_columnconfigure(3, weight=0, minsize=_SEP_CH_W)
+    records_frame.grid_columnconfigure(4, weight=1, minsize=100)
+    records_frame.grid_columnconfigure(5, weight=0, minsize=20)
+    records_frame.grid_rowconfigure(0, weight=0)
+    records_frame.grid_rowconfigure(1, weight=1)
+    header_row.grid(row=0, column=0, columnspan=5, sticky="ew", pady=(0, 2))
+    mov_hdr.grid(row=0, column=0, sticky="ew")
+    hdr_sep_1.grid(row=0, column=1, sticky="nsw")
+    amt_hdr.grid(row=0, column=2, sticky="ew")
+    hdr_sep_2.grid(row=0, column=3, sticky="nsw")
+    note_hdr.grid(row=0, column=4, sticky="ew")
+
+    # Linee nei canali separatori: ancorate a sinistra (spostate "un po'" a sinistra).
+    # In intestazione manteniamo la linea visibile: ancorata al bordo sinistro del canale.
+    hdr_sep_1_line.place(x=0, y=0, relheight=1.0)
+    hdr_sep_2_line.place(x=0, y=0, relheight=1.0)
+
+    # Separator verticali: su macOS `ttk.Separator` può risultare poco visibile.
+    # Usiamo Frame 1px con colore fisso, allineati anche con l'intestazione.
+    sep_1 = tk.Frame(records_frame, bg=header_bg, width=_SEP_CH_W)
+    sep_2 = tk.Frame(records_frame, bg=header_bg, width=_SEP_CH_W)
+    sep_1_line = tk.Frame(sep_1, bg="#c0c0c0", width=1)
+    sep_2_line = tk.Frame(sep_2, bg="#c0c0c0", width=1)
+    mov_tree.grid(row=1, column=0, sticky="nsew")
+    sep_1.grid(row=1, column=1, sticky="nsw")
+    amt_tree.grid(row=1, column=2, sticky="nsew")
+    sep_2.grid(row=1, column=3, sticky="nsw")
+    note_tree.grid(row=1, column=4, sticky="nsew")
+    yscroll.grid(row=1, column=5, sticky="ns", padx=(2, 0))
+
+    sep_1_line.place(x=-3, y=0, relheight=1.0)
+    sep_2_line.place(x=-3, y=0, relheight=1.0)
 
     pending_movement_rows: list[
         tuple[str, str, tuple[object, ...], str, str, str, str]
     ] = []
+    movements_population_seq = 0
 
     def populate_movements_trees() -> None:
+        nonlocal movements_population_seq
+        movements_population_seq += 1
+        token_local = movements_population_seq
+        # Nascondi eventuale messaggio "no risultati"
+        try:
+            no_results_label.place_forget()
+        except Exception:
+            pass
         _clear_selection(mov_tree)
         _clear_selection(amt_tree)
         _clear_selection(note_tree)
@@ -609,15 +1144,68 @@ def build_ui(db: dict) -> None:
         records = [r for y in d["years"] for r in y["records"]]
         records.sort(key=lambda r: (r["year"], r["source_folder"], r["source_file"], r["source_index"]))
         reg_seq_map = unified_registration_sequence_map(records)
+
+        # Bounds date del dataset (servono per preset e per calendario).
+        nonlocal _dataset_min_date, _dataset_max_date
+        parsed_dates: list[date] = []
+        for rr in records:
+            iso = str(rr.get("date_iso", "")).strip()
+            if not iso:
+                continue
+            try:
+                parsed_dates.append(date.fromisoformat(iso))
+            except Exception:
+                continue
+        if parsed_dates:
+            _dataset_min_date = min(parsed_dates)
+            _dataset_max_date = max(parsed_dates)
+            _dataset_years_with_records = sorted({d.year for d in parsed_dates})
+        else:
+            _dataset_min_date = date.today()
+            _dataset_max_date = date.today()
+            _dataset_years_with_records = [date.today().year]
+
+        # Se la UI date è già stata creata, riallinea i campi preset su nuovi bounds (es. dopo import legacy).
+        try:
+            refresh_date_preview_from_modes()
+        except NameError:
+            pass
+
         pool = filter_and_sort_movements_for_grid(
             records,
             reg_seq_map,
             order_by_date=filter_order_applied_var.get() == "date",
             exclude_future_dates=filter_future_applied_var.get() == "exclude",
             backward=filter_direction_applied_var.get() == "backward",
+            date_from_iso=(
+                date_from_applied_var.get()
+                if filter_order_applied_var.get() == "date"
+                else (_scope_dates_for_registration(reg_preset_applied_var.get())[0] if filter_order_applied_var.get() == "registration" else None)
+            ),
+            date_to_iso=(
+                date_to_applied_var.get()
+                if filter_order_applied_var.get() == "date"
+                else (_scope_dates_for_registration(reg_preset_applied_var.get())[1] if filter_order_applied_var.get() == "registration" else None)
+            ),
         )
         pending_movement_rows.clear()
+        q_cat_raw = text_category_applied_var.get().strip()
+        q_acc_raw = text_account_applied_var.get().strip()
+        q_cat = "" if q_cat_raw in ("", _ALL_CATEGORIES_LABEL) else q_cat_raw.lower()
+        q_acc = "" if q_acc_raw in ("", _ALL_ACCOUNTS_LABEL) else q_acc_raw.lower()
+        q_chq = text_cheque_applied_var.get().strip().lower()
+        q_note = text_note_applied_var.get().strip().lower()
         row_i = 0
+        # Range registrazione (solo se Ricerca per registrazione)
+        reg_from_n = None
+        reg_to_n = None
+        if filter_order_applied_var.get() == "registration":
+            try:
+                reg_from_n = int(str(reg_from_applied_var.get()).strip())
+                reg_to_n = int(str(reg_to_applied_var.get()).strip())
+            except Exception:
+                reg_from_n = None
+                reg_to_n = None
         for r in pool:
             year = r.get("year")
             year_accounts = accounts_by_year.get(year, [])
@@ -627,6 +1215,29 @@ def build_ui(db: dict) -> None:
             category_name = category_name_for_record(r, year_categories)
             stars_1 = r.get("account_primary_flags", "")
             stars_2 = r.get("account_secondary_flags", "")
+            # Filtri testuali (solo se Ricerca per data).
+            if filter_order_applied_var.get() == "date":
+                if q_cat and q_cat != (category_name or "").lower():
+                    continue
+                if q_acc and q_acc not in (account_1_name or "").lower() and q_acc not in (account_2_name or "").lower():
+                    continue
+                if q_chq and q_chq not in str(r.get("cheque") or "").lower():
+                    continue
+                if q_note and q_note not in str(r.get("note") or "").lower():
+                    continue
+            elif filter_order_applied_var.get() == "registration":
+                # Filtro per range reg + (opzionale) conto nello scope
+                nreg = reg_seq_map[record_legacy_stable_key(r)]
+                if reg_from_n is not None and reg_to_n is not None:
+                    if filter_direction_applied_var.get() == "backward":
+                        if nreg > reg_from_n or nreg < reg_to_n:
+                            continue
+                    else:
+                        if nreg < reg_from_n or nreg > reg_to_n:
+                            continue
+                if q_acc and q_acc not in (account_1_name or "").lower() and q_acc not in (account_2_name or "").lower():
+                    continue
+
             amount_text, amount_tag = format_amount_for_output(r)
             stripe = f"stripe{row_i % 2}"
             rid = str(row_i)
@@ -637,8 +1248,8 @@ def build_ui(db: dict) -> None:
                 account_1_name,
                 stars_1,
                 account_2_name,
-                r.get("cheque") or "",
                 stars_2,
+                r.get("cheque") or "",
             )
             pending_movement_rows.append(
                 (rid, reg_text, mov_vals, amount_text, amount_tag, r.get("note") or "", stripe)
@@ -646,6 +1257,10 @@ def build_ui(db: dict) -> None:
             row_i += 1
 
         def flush_movement_batch(start: int) -> None:
+            # Evita race condition: se nel frattempo viene lanciato un nuovo populate,
+            # i batch vecchi non devono inserire nel Treeview corrente.
+            if token_local != movements_population_seq:
+                return
             end = min(start + MOVEMENTS_INSERT_BATCH, len(pending_movement_rows))
             for i in range(start, end):
                 rid, reg_text, mov_vals, amount_text, amount_tag, note_text, stripe = pending_movement_rows[i]
@@ -665,6 +1280,9 @@ def build_ui(db: dict) -> None:
 
         if pending_movement_rows:
             root.after(0, lambda: flush_movement_batch(0))
+        else:
+            # Nessun risultato: mostra testo centrato.
+            no_results_label.place(relx=0.5, rely=0.5, anchor="center")
 
     # Coppie tipo pulsante: su macOS tk.Button ignora spesso bg; usiamo Label cliccabili (bg rispettato).
     _FILTER_BG_OFF = "#ffffff"
@@ -695,6 +1313,7 @@ def build_ui(db: dict) -> None:
         text="Ricerca per data",
         cursor="hand2",
         highlightthickness=0,
+        font=filter_ui_font,
         padx=10,
         pady=5,
     )
@@ -703,6 +1322,7 @@ def build_ui(db: dict) -> None:
         text="Ricerca per registrazione",
         cursor="hand2",
         highlightthickness=0,
+        font=filter_ui_font,
         padx=10,
         pady=5,
     )
@@ -718,6 +1338,7 @@ def build_ui(db: dict) -> None:
         text="Comprese date future",
         cursor="hand2",
         highlightthickness=0,
+        font=filter_ui_font,
         padx=10,
         pady=5,
     )
@@ -726,6 +1347,7 @@ def build_ui(db: dict) -> None:
         text="Escluse date future",
         cursor="hand2",
         highlightthickness=0,
+        font=filter_ui_font,
         padx=10,
         pady=5,
     )
@@ -741,6 +1363,7 @@ def build_ui(db: dict) -> None:
         text="All'indietro, dalla più recente",
         cursor="hand2",
         highlightthickness=0,
+        font=filter_ui_font,
         padx=10,
         pady=5,
     )
@@ -749,6 +1372,7 @@ def build_ui(db: dict) -> None:
         text="In avanti, dalla più lontana",
         cursor="hand2",
         highlightthickness=0,
+        font=filter_ui_font,
         padx=10,
         pady=5,
     )
@@ -770,36 +1394,1133 @@ def build_ui(db: dict) -> None:
             return
         filter_order_preview_var.set(which)
         refresh_movement_filter_button_styles()
+        refresh_date_controls_visibility()
+        if which == "registration":
+            # Default preset per registrazione: ultimi 12 mesi
+            if reg_preset_preview_var.get() not in ("last_12", "all_time"):
+                reg_preset_preview_var.set("last_12")
+            refresh_reg_preset_button_styles()
+            try:
+                refresh_registration_scope_and_controls()
+            except Exception:
+                pass
 
     def pick_future(which: str) -> None:
         if filter_future_preview_var.get() == which:
             return
         filter_future_preview_var.set(which)
         refresh_movement_filter_button_styles()
+        refresh_date_preview_from_modes()
+        try:
+            refresh_registration_scope_and_controls()
+        except Exception:
+            pass
 
     def pick_direction(which: str) -> None:
         if filter_direction_preview_var.get() == which:
             return
         filter_direction_preview_var.set(which)
         refresh_movement_filter_button_styles()
+        refresh_date_preview_from_modes()
+        try:
+            refresh_registration_scope_and_controls()
+        except Exception:
+            pass
 
     def apply_movement_search(_event: tk.Event | None = None) -> None:
         o = filter_order_preview_var.get()
         f = filter_future_preview_var.get()
         d = filter_direction_preview_var.get()
+        df_preview = date_from_preview_var.get()
+        dt_preview = date_to_preview_var.get()
+        dp_preview = date_preset_preview_var.get()
+        cat_preview = text_category_preview_var.get()
+        acc_preview = text_account_preview_var.get()
+        chq_preview = text_cheque_preview_var.get()
+        note_preview = text_note_preview_var.get()
+        rp_preview = reg_preset_preview_var.get()
+        rf_preview = reg_from_preview_var.get()
+        rt_preview = reg_to_preview_var.get()
+
+        if o == "registration":
+            # Validazione limiti registrazione coerenti con scope (preset + include/exclude).
+            scope_from, scope_to = _scope_dates_for_registration(rp_preview)
+            ddb = cur_db()
+            recs = [r for y in ddb["years"] for r in y["records"]]
+            recs.sort(key=lambda r: (r["year"], r["source_folder"], r["source_file"], r["source_index"]))
+            rmap = unified_registration_sequence_map(recs)
+            scoped_nums: list[int] = []
+            for rr in recs:
+                if not show_record_in_movements_grid(rr):
+                    continue
+                iso = str(rr.get("date_iso", ""))
+                if iso < scope_from or iso > scope_to:
+                    continue
+                scoped_nums.append(rmap[record_legacy_stable_key(rr)])
+            mn_allowed = min(scoped_nums) if scoped_nums else 1
+            mx_allowed = max(scoped_nums) if scoped_nums else 1
+
+            def _parse_int(s: str) -> int | None:
+                s = (s or "").strip()
+                if not s:
+                    return None
+                if not s.isdigit():
+                    return None
+                try:
+                    return int(s)
+                except Exception:
+                    return None
+
+            rf = _parse_int(rf_preview)
+            rt = _parse_int(rt_preview)
+            if rf is None or rt is None:
+                messagebox.showerror("Valore non valido", "Inserisci numeri di registrazione validi.")
+                return
+            if rf < mn_allowed or rf > mx_allowed or rt < mn_allowed or rt > mx_allowed:
+                messagebox.showerror(
+                    "Fuori intervallo",
+                    f"I numeri di registrazione devono essere tra {mn_allowed} e {mx_allowed} per il periodo scelto.",
+                )
+                return
+
+            # Coerenza con direzione: backward -> dalla >= alla ; forward -> dalla <= alla
+            if d == "backward" and rf < rt:
+                messagebox.showerror("Ordine non coerente", "Con All'indietro, Dalla reg. # deve essere >= Alla reg. #.")
+                return
+            if d == "forward" and rf > rt:
+                messagebox.showerror("Ordine non coerente", "Con In avanti, Dalla reg. # deve essere <= Alla reg. #.")
+                return
+
         if (
             o == filter_order_applied_var.get()
             and f == filter_future_applied_var.get()
             and d == filter_direction_applied_var.get()
+            and dp_preview == date_preset_applied_var.get()
+            and df_preview == date_from_applied_var.get()
+            and dt_preview == date_to_applied_var.get()
+            and rp_preview == reg_preset_applied_var.get()
+            and rf_preview == reg_from_applied_var.get()
+            and rt_preview == reg_to_applied_var.get()
+            and cat_preview == text_category_applied_var.get()
+            and acc_preview == text_account_applied_var.get()
+            and chq_preview == text_cheque_applied_var.get()
+            and note_preview == text_note_applied_var.get()
         ):
             return
         filter_order_applied_var.set(o)
         filter_future_applied_var.set(f)
         filter_direction_applied_var.set(d)
+        date_preset_applied_var.set(dp_preview)
+        date_from_applied_var.set(df_preview)
+        date_to_applied_var.set(dt_preview)
+        reg_preset_applied_var.set(rp_preview)
+        reg_from_applied_var.set(rf_preview)
+        reg_to_applied_var.set(rt_preview)
+        text_category_applied_var.set(cat_preview)
+        text_account_applied_var.set(acc_preview)
+        text_cheque_applied_var.set(chq_preview)
+        text_note_applied_var.set(note_preview)
         populate_movements_trees()
 
+    # Enter nei filtri testuali = esegui Cerca
+    for _w in (category_entry, account_entry, cheque_entry, note_entry):
+        _w.bind("<Return>", apply_movement_search)
+
+    def clear_movement_text_filters() -> None:
+        text_category_preview_var.set(_ALL_CATEGORIES_LABEL)
+        text_account_preview_var.set(_ALL_ACCOUNTS_LABEL)
+        text_cheque_preview_var.set("")
+        text_note_preview_var.set("")
+        apply_movement_search()
+
+    clear_filters_btn.configure(command=clear_movement_text_filters)
+
+    # ------------------------------
+    # Ricerca per data: preset + intervallo (dalla/alla) + calendario
+    # ------------------------------
+    def _parse_iso_to_date(s: str) -> date | None:
+        s = (s or "").strip()
+        if not s:
+            return None
+        try:
+            return date.fromisoformat(s)
+        except Exception:
+            return None
+
+    def _add_months(d: date, months: int) -> date:
+        """Aggiunge/sottrae mesi, clampando sul fine mese."""
+        y = d.year + (d.month - 1 + months) // 12
+        m = (d.month - 1 + months) % 12 + 1
+        day = min(d.day, calendar.monthrange(y, m)[1])
+        return date(y, m, day)
+
+    def _normalize_range_preview() -> None:
+        d1 = _parse_iso_to_date(date_from_preview_var.get())
+        d2 = _parse_iso_to_date(date_to_preview_var.get())
+        if not d1 or not d2:
+            return
+        direction = filter_direction_preview_var.get()
+        # In avanti => "dalla data" dovrebbe essere la più bassa (d1 <= d2).
+        # All'indietro => "dalla data" dovrebbe essere la più alta (d1 >= d2).
+        if direction == "backward":
+            if d1 < d2:
+                date_from_preview_var.set(d2.isoformat())
+                date_to_preview_var.set(d1.isoformat())
+        else:
+            if d1 > d2:
+                date_from_preview_var.set(d2.isoformat())
+                date_to_preview_var.set(d1.isoformat())
+
+    def _dataset_minmax_safe() -> tuple[date, date]:
+        mn = _dataset_min_date or date.today()
+        mx = _dataset_max_date or date.today()
+        return mn, mx
+
+    def _compute_preset_range(preset_id: str) -> tuple[date, date]:
+        mn, mx = _dataset_minmax_safe()
+        allowed_min = mn
+        allowed_max = date.today() if filter_future_preview_var.get() == "exclude" else mx
+
+        if preset_id == "all_time":
+            return allowed_min, allowed_max
+
+        # I preset "Ultimi X mesi" sono sempre agganciati alla data massima consentita,
+        # così "In avanti, dalla più lontana" non sposta la finestra (solo l'ordine grid).
+        months = 12
+        if preset_id == "last_6":
+            months = 6
+        elif preset_id == "last_4":
+            months = 4
+        elif preset_id == "last_3":
+            months = 3
+        elif preset_id == "last_2":
+            months = 2
+        elif preset_id == "last_1":
+            months = 1
+        elif preset_id == "last_12":
+            months = 12
+
+        ref_end = allowed_max
+        start = _add_months(ref_end, -months)
+        # clamp start
+        start = max(allowed_min, min(start, allowed_max))
+        return start, ref_end
+
+    def refresh_date_fields_from_current_preset() -> None:
+        preset_id = date_preset_preview_var.get()
+        if preset_id == "custom":
+            _normalize_range_preview()
+            return
+        d_from, d_to = _compute_preset_range(preset_id)
+        direction = filter_direction_preview_var.get()
+        if direction == "backward":
+            # Mostriamo "dalla data" come la più alta.
+            date_from_preview_var.set(d_to.isoformat())
+            date_to_preview_var.set(d_from.isoformat())
+        else:
+            date_from_preview_var.set(d_from.isoformat())
+            date_to_preview_var.set(d_to.isoformat())
+        _normalize_range_preview()
+
+    def refresh_date_entry_states() -> None:
+        custom = date_preset_preview_var.get() == "custom"
+        # Non disabilitiamo l'Entry: su macOS il testo disabilitato può risultare poco leggibile.
+        # L'apertura calendario resta comunque subordinata a "Date a scelta".
+        date_from_entry.configure(state="normal")
+        date_to_entry.configure(state="normal")
+
+    def refresh_date_preview_from_modes() -> None:
+        preset_id = date_preset_preview_var.get()
+        mn, mx = _dataset_minmax_safe()
+        max_allowed = date.today() if filter_future_preview_var.get() == "exclude" else mx
+        min_allowed = mn
+
+        if preset_id != "custom":
+            refresh_date_fields_from_current_preset()
+        else:
+            if not date_custom_manual_override:
+                # Preimpostazione comodità: ultimi 12 mesi, ma i vincoli di scelta restano globali.
+                start_12 = _add_months(max_allowed, -12)
+                start_12 = max(min_allowed, min(start_12, max_allowed))
+                if filter_direction_preview_var.get() == "backward":
+                    date_from_preview_var.set(max_allowed.isoformat())
+                    date_to_preview_var.set(start_12.isoformat())
+                else:
+                    date_from_preview_var.set(start_12.isoformat())
+                    date_to_preview_var.set(max_allowed.isoformat())
+                _normalize_range_preview()
+            else:
+                # Clamp dei valori custom entro i limiti attuali.
+                d_from = _parse_iso_to_date(date_from_preview_var.get()) or min_allowed
+                d_to = _parse_iso_to_date(date_to_preview_var.get()) or max_allowed
+                d_from = max(min_allowed, min(d_from, max_allowed))
+                d_to = max(min_allowed, min(d_to, max_allowed))
+                date_from_preview_var.set(d_from.isoformat())
+                date_to_preview_var.set(d_to.isoformat())
+                _normalize_range_preview()
+
+        refresh_date_entry_states()
+        try:
+            refresh_category_account_dropdowns()
+        except Exception:
+            pass
+
+    def _scope_dates_for_registration(preset_id: str) -> tuple[str, str]:
+        """Restituisce (from_iso, to_iso) per lo scope '12 mesi' o 'intero periodo'."""
+        mn, mx = _dataset_minmax_safe()
+        max_allowed = date.today() if filter_future_preview_var.get() == "exclude" else mx
+        min_allowed = mn
+        if preset_id == "all_time":
+            return min_allowed.isoformat(), max_allowed.isoformat()
+        # last_12
+        start_12 = _add_months(max_allowed, -12)
+        start_12 = max(min_allowed, min(start_12, max_allowed))
+        return start_12.isoformat(), max_allowed.isoformat()
+
+    def refresh_registration_scope_and_controls() -> None:
+        """Preimposta reg_from/reg_to e aggiorna dropdown conto in base a preset + include/exclude + direzione."""
+        if filter_order_preview_var.get() != "registration":
+            return
+        scope_from, scope_to = _scope_dates_for_registration(reg_preset_preview_var.get())
+        d = cur_db()
+        records = [r for y in d["years"] for r in y["records"]]
+        records.sort(key=lambda r: (r["year"], r["source_folder"], r["source_file"], r["source_index"]))
+        reg_seq_map = unified_registration_sequence_map(records)
+
+        # scegli solo records nello scope date (e visibili) e (se exclude future) già incorporato in scope_to
+        def in_scope(r: dict) -> bool:
+            if not show_record_in_movements_grid(r):
+                return False
+            iso = str(r.get("date_iso", ""))
+            if iso < scope_from or iso > scope_to:
+                return False
+            return True
+
+        scoped = [r for r in records if in_scope(r)]
+        if scoped:
+            nums = [reg_seq_map[record_legacy_stable_key(r)] for r in scoped]
+            mn_reg = min(nums)
+            mx_reg = max(nums)
+        else:
+            mn_reg = 1
+            mx_reg = 1
+
+        # preimposta in base a direzione: backward -> from=max, to=min; forward -> from=min, to=max
+        if filter_direction_preview_var.get() == "backward":
+            reg_from_preview_var.set(str(mx_reg))
+            reg_to_preview_var.set(str(mn_reg))
+        else:
+            reg_from_preview_var.set(str(mn_reg))
+            reg_to_preview_var.set(str(mx_reg))
+
+        # aggiorna valori conto disponibili nello scope
+        accounts_by_year = year_accounts_map(d)
+        accs: set[str] = set()
+        for r in scoped:
+            year = r.get("year")
+            year_accounts = accounts_by_year.get(year, [])
+            a1 = account_name_for_record(r, year_accounts, "primary")
+            a2 = account_name_for_record(r, year_accounts, "secondary")
+            if a1:
+                accs.add(str(a1).strip())
+            if a2:
+                accs.add(str(a2).strip())
+        acc_vals = (_ALL_ACCOUNTS_LABEL,) + _sorted_with_preferred(accs, "Cassa")
+        reg_account_entry.configure(values=acc_vals)
+        if not text_account_preview_var.get():
+            text_account_preview_var.set(_ALL_ACCOUNTS_LABEL)
+        if text_account_preview_var.get() != _ALL_ACCOUNTS_LABEL and text_account_preview_var.get() not in accs:
+            text_account_preview_var.set(_ALL_ACCOUNTS_LABEL)
+
+    def open_calendar_for(which: str) -> tk.Toplevel | None:
+        if date_preset_preview_var.get() != "custom":
+            return None
+
+        mn, mx = _dataset_minmax_safe()
+        global_min = mn
+        global_max = date.today() if filter_future_preview_var.get() == "exclude" else mx
+
+        d_from = _parse_iso_to_date(date_from_preview_var.get())
+        d_to = _parse_iso_to_date(date_to_preview_var.get())
+
+        # Nei limiti globali il calendario consente l'intero periodo consentito
+        # (Include/Esclude date future). L'ordine "dalla/alla" viene poi sistemato
+        # da _normalize_range_preview() dopo la scelta.
+        field_min = global_min
+        field_max = global_max
+        if which == "from":
+            current = d_from or field_min
+        else:
+            current = d_to or field_min
+
+        if field_min > field_max:
+            field_min, field_max = field_max, field_min
+
+        # clamp current
+        if current < field_min:
+            current = field_min
+        if current > field_max:
+            current = field_max
+
+        top = tk.Toplevel(root)
+        top.title(
+            "Seleziona data di inizio ricerca"
+            if which == "from"
+            else "Seleziona data di fine ricerca"
+        )
+        top.transient(root)
+        # Non rendiamo modale (grab): serve poter cliccare di nuovo sulla casella data
+        # per chiudere il popup e passare alla digitazione manuale.
+        try:
+            top.grab_release()
+        except Exception:
+            pass
+        top.protocol("WM_DELETE_WINDOW", lambda: top.destroy())
+        try:
+            top.focus_force()
+        except Exception:
+            pass
+
+        selected_date = current
+        cur_year = current.year
+        cur_month = current.month
+
+        # Anni presenti nel DB (per evitare di scegliere anni vuoti).
+        years_available = [
+            y for y in _dataset_years_with_records if field_min.year <= y <= field_max.year
+        ]
+        if not years_available:
+            years_available = [cur_year]
+        if cur_year not in years_available:
+            # scegli l'anno più vicino in lista (preferendo quello superiore)
+            higher = [y for y in years_available if y >= cur_year]
+            cur_year = min(higher) if higher else max(years_available)
+
+        header = ttk.Frame(top, padding=6)
+        header.pack(fill=tk.X)
+        title_lbl = ttk.Label(header, font=("TkDefaultFont", 10, "bold"))
+        title_lbl.pack(side=tk.LEFT)
+
+        btns = ttk.Frame(header)
+        btns.pack(side=tk.RIGHT)
+
+        def _prev_month(y: int, m: int) -> tuple[int, int]:
+            return (y - 1, 12) if m == 1 else (y, m - 1)
+
+        def _next_month(y: int, m: int) -> tuple[int, int]:
+            return (y + 1, 1) if m == 12 else (y, m + 1)
+
+        def render() -> None:
+            nonlocal cur_year, cur_month
+            for child in list(days_frame.winfo_children()):
+                child.destroy()
+            title_lbl.configure(text=f"{calendar.month_name[cur_month]} {cur_year}")
+            _update_month_nav_state()
+            # Mantieni allineata la tendina anno anche se render è chiamato da altri percorsi.
+            nonlocal suppress_year_trace
+            if year_var.get() != str(cur_year):
+                suppress_year_trace = True
+                year_var.set(str(cur_year))
+                suppress_year_trace = False
+
+            first_wd = date(cur_year, cur_month, 1).weekday()  # Lun=0
+            days_in_month = calendar.monthrange(cur_year, cur_month)[1]
+
+            # intestazioni vuote
+            for i in range(first_wd):
+                ttk.Label(days_frame, text="").grid(row=0, column=i, padx=1, pady=1, sticky="nsew")
+
+            for day_num in range(1, days_in_month + 1):
+                idx = first_wd + day_num - 1
+                row = idx // 7
+                col = idx % 7
+                dsel = date(cur_year, cur_month, day_num)
+                in_bounds = field_min <= dsel <= field_max
+                # Su macOS i tk.Button possono ignorare bg/relief (si vede solo la cornice).
+                # Usiamo Label cliccabili per un look consistente.
+                cell = tk.Label(
+                    days_frame,
+                    text=str(day_num),
+                    width=3,
+                    padx=2,
+                    pady=2,
+                    fg="#111111",
+                    bg="#ffffff",
+                    relief=tk.RAISED,
+                    bd=1,
+                    highlightthickness=0,
+                )
+                if in_bounds:
+                    cell.configure(cursor="hand2")
+                    cell.bind("<Button-1>", lambda _e, dd=dsel: on_pick(dd))
+                else:
+                    cell.configure(fg="#999999", bg="#f5f5f5")
+
+                if dsel == selected_date:
+                    cell.configure(
+                        bg="#fff176",
+                        relief=tk.SUNKEN,
+                        bd=2,
+                        highlightthickness=1,
+                        highlightbackground="#9e9e9e",
+                        highlightcolor="#9e9e9e",
+                    )
+
+                cell.grid(row=row + 1, column=col, padx=1, pady=1, sticky="nsew")
+
+            for c in range(7):
+                days_frame.grid_columnconfigure(c, weight=1)
+
+        def on_pick(dsel: date) -> None:
+            if which == "from":
+                date_from_preview_var.set(dsel.isoformat())
+            else:
+                date_to_preview_var.set(dsel.isoformat())
+            nonlocal date_custom_manual_override
+            date_custom_manual_override = True
+            _normalize_range_preview()
+            refresh_date_entry_states()
+            top.destroy()
+
+        # Anni: menu a tendina (evita anni senza registrazioni).
+        year_var = tk.StringVar(value=str(cur_year))
+        year_menu = tk.OptionMenu(btns, year_var, *[str(y) for y in years_available])
+        year_menu.pack(side=tk.LEFT, padx=(0, 6))
+
+        suppress_year_trace = False
+
+        def _on_year_changed(*_args: object) -> None:
+            nonlocal cur_year
+            if suppress_year_trace:
+                return
+            y = int(year_var.get())
+            if y == cur_year:
+                return
+            cur_year = y
+            render()
+
+        year_var.trace_add("write", _on_year_changed)
+
+        btn_month_minus = ttk.Button(btns, text="<<", command=lambda: _jump_month(-1))
+        btn_month_plus = ttk.Button(btns, text=">>", command=lambda: _jump_month(1))
+        btn_month_minus.pack(side=tk.LEFT, padx=(0, 4))
+        btn_month_plus.pack(side=tk.LEFT, padx=(0, 0))
+
+        min_month_key = (field_min.year, field_min.month)
+        max_month_key = (field_max.year, field_max.month)
+
+        def _month_key(y: int, m: int) -> tuple[int, int]:
+            return (y, m)
+
+        def _update_month_nav_state() -> None:
+            prev_y, prev_m = _prev_month(cur_year, cur_month)
+            next_y, next_m = _next_month(cur_year, cur_month)
+            btn_month_minus.configure(
+                state=("normal" if _month_key(prev_y, prev_m) >= min_month_key else "disabled")
+            )
+            btn_month_plus.configure(
+                state=("normal" if _month_key(next_y, next_m) <= max_month_key else "disabled")
+            )
+
+        def _jump_month(delta: int) -> None:
+            nonlocal cur_year, cur_month
+            if delta < 0:
+                cur_year, cur_month = _prev_month(cur_year, cur_month)
+            else:
+                cur_year, cur_month = _next_month(cur_year, cur_month)
+            if cur_year not in years_available:
+                higher = [y for y in years_available if y >= cur_year]
+                cur_year = min(higher) if higher else max(years_available)
+            # sincronizza la tendina quando cambia anno (anche se l'anno è valido)
+            nonlocal suppress_year_trace
+            if year_var.get() != str(cur_year):
+                suppress_year_trace = True
+                year_var.set(str(cur_year))
+                suppress_year_trace = False
+            render()
+
+        # giorni settimana
+        labels = ttk.Frame(top, padding=(6, 0, 6, 0))
+        labels.pack(fill=tk.X)
+        for i, name in enumerate(["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]):
+            ttk.Label(labels, text=name).grid(row=0, column=i, padx=1, pady=2, sticky="nsew")
+
+        days_frame = tk.Frame(top, padx=6, pady=6)
+        days_frame.pack(fill=tk.BOTH, expand=True)
+        for c in range(7):
+            days_frame.grid_columnconfigure(c, weight=1)
+
+        footer = ttk.Frame(top, padding=6)
+        footer.pack(fill=tk.X)
+        ttk.Button(
+            footer,
+            text="Oggi",
+            command=lambda: _on_pick_today(),
+        ).pack(side=tk.LEFT)
+
+        def _on_pick_today() -> None:
+            today = date.today()
+            # rispetta solo i vincoli globali (include/exclude), poi normalizza l'ordine
+            # in base a "All'indietro/In avanti".
+            today_clamped = max(global_min, min(today, global_max))
+            if which == "from":
+                date_from_preview_var.set(today_clamped.isoformat())
+            else:
+                date_to_preview_var.set(today_clamped.isoformat())
+            _normalize_range_preview()
+            refresh_date_entry_states()
+            top.destroy()
+
+        render()
+        return top
+        _update_month_nav_state()
+
+    def refresh_date_controls_visibility() -> None:
+        mode = filter_order_preview_var.get()
+        if mode == "date":
+            date_controls_left.pack(side=tk.LEFT, anchor=tk.W)
+            # Re-pack before grid area so it doesn't end up after it.
+            filters_text_row.pack(fill=tk.X, pady=(0, 10), before=records_frame)
+            reg_controls_row.pack_forget()
+            refresh_category_account_dropdowns()
+        elif mode == "registration":
+            date_controls_left.pack_forget()
+            filters_text_row.pack_forget()
+            reg_controls_row.pack(side=tk.LEFT, anchor=tk.W)
+            try:
+                refresh_registration_scope_and_controls()
+            except Exception:
+                pass
+        else:
+            date_controls_left.pack_forget()
+            filters_text_row.pack_forget()
+            reg_controls_row.pack_forget()
+
+    def refresh_movement_date_controls_visibility() -> None:
+        refresh_date_controls_visibility()
+
+    def refresh_reg_preset_button_styles() -> None:
+        _set_filter_toggle_style(reg_btn_last12, reg_preset_preview_var.get() == "last_12")
+        _set_filter_toggle_style(reg_btn_all, reg_preset_preview_var.get() == "all_time")
+
+    def pick_reg_preset(preset_id: str) -> None:
+        if reg_preset_preview_var.get() == preset_id:
+            return
+        reg_preset_preview_var.set(preset_id)
+        refresh_reg_preset_button_styles()
+        try:
+            refresh_registration_scope_and_controls()
+        except Exception:
+            pass
+
+    reg_btn_last12.bind("<Button-1>", lambda _e: pick_reg_preset("last_12"))
+    reg_btn_all.bind("<Button-1>", lambda _e: pick_reg_preset("all_time"))
+
+    # Enter nei campi reg = esegui Cerca (con validazione in apply_movement_search)
+    reg_from_entry.bind("<Return>", apply_movement_search)
+    reg_to_entry.bind("<Return>", apply_movement_search)
+
+    # Controlli date in basso a destra della prima riga di filtri.
+    date_controls_left = ttk.Frame(filters_search_row)
+    date_controls_left.pack(side=tk.LEFT, anchor=tk.W)
+
+    _PRESETS: list[tuple[str, str]] = [
+        ("last_12", "Ultimi 12 mesi"),
+        ("all_time", "Intero periodo"),
+        ("last_6", "6 mesi"),
+        ("last_4", "4 mesi"),
+        ("last_3", "3 mesi"),
+        ("last_2", "2 mesi"),
+        ("last_1", "1 mese"),
+        ("custom", "Date a scelta"),
+    ]
+
+    date_preset_buttons: dict[str, tk.Label] = {}
+    presets_row = ttk.Frame(date_controls_left)
+    presets_row.pack(side=tk.LEFT)
+
+    def refresh_date_preset_button_styles() -> None:
+        for pid, btn in date_preset_buttons.items():
+            _set_filter_toggle_style(btn, date_preset_preview_var.get() == pid)
+
+    def pick_date_preset(preset_id: str) -> None:
+        if date_preset_preview_var.get() == preset_id:
+            return
+        date_preset_preview_var.set(preset_id)
+        nonlocal date_custom_manual_override
+        if preset_id == "custom":
+            date_custom_manual_override = False
+            # Quando si attiva "Date a scelta" i calendari devono permettere la scelta
+            # sull'intero periodo: impostiamo quindi dai limiti globali consentiti,
+            # tenendo conto di Comprese/Escluse e della direzione (All'indietro/In avanti).
+            mn = _dataset_min_date or date.today()
+            mx = _dataset_max_date or date.today()
+            global_max = date.today() if filter_future_preview_var.get() == "exclude" else mx
+            global_min = mn
+            # Preimpostazione comodità: ultimi 12 mesi (poi la scelta resta possibile su tutto il periodo).
+            start_12 = _add_months(global_max, -12)
+            start_12 = max(global_min, min(start_12, global_max))
+            if filter_direction_preview_var.get() == "backward":
+                date_from_preview_var.set(global_max.isoformat())
+                date_to_preview_var.set(start_12.isoformat())
+            else:
+                date_from_preview_var.set(start_12.isoformat())
+                date_to_preview_var.set(global_max.isoformat())
+            _normalize_range_preview()
+        else:
+            refresh_date_fields_from_current_preset()
+        refresh_date_preset_button_styles()
+        refresh_date_entry_states()
+        refresh_category_account_dropdowns()
+
+    for pid, text in _PRESETS:
+        b = tk.Label(
+            presets_row,
+            text=text,
+            cursor="hand2",
+            highlightthickness=0,
+            font=filter_ui_font,
+            padx=8,
+            pady=6,
+        )
+        b.bind("<Button-1>", lambda _e, _pid=pid: pick_date_preset(_pid))
+        b.pack(side=tk.LEFT, padx=(0, 8))
+        date_preset_buttons[pid] = b
+
+    fields_row = ttk.Frame(date_controls_left)
+    fields_row.pack(side=tk.LEFT, padx=(16, 0))
+
+    ttk.Label(fields_row, text="dalla data", style="Filters.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 6))
+    date_from_disp_var = tk.StringVar()
+    date_to_disp_var = tk.StringVar()
+    calendar_popup_from: tk.Toplevel | None = None
+    calendar_popup_to: tk.Toplevel | None = None
+    manual_mode_from = False
+    manual_mode_to = False
+    manual_restore_iso_from: str | None = None
+    manual_restore_iso_to: str | None = None
+    _DATE_MASK = "__/__/____"
+    _DATE_MASK_POS = (0, 1, 3, 4, 6, 7, 8, 9)
+
+    # Manteniamo testo sempre ben visibile (anche quando non è "Date a scelta").
+    ttk.Style(root).configure(
+        "DateEntry.TEntry",
+        foreground="#111111",
+        fieldbackground="#ffffff",
+        font=filter_ui_font,
+    )
+    date_from_entry = ttk.Entry(
+        fields_row,
+        textvariable=date_from_disp_var,
+        width=10,
+        style="DateEntry.TEntry",
+    )
+    date_from_entry.grid(row=0, column=1, sticky="w")
+    ttk.Label(fields_row, text="alla data", style="Filters.TLabel").grid(row=0, column=2, sticky="w", padx=(16, 6))
+    date_to_entry = ttk.Entry(
+        fields_row,
+        textvariable=date_to_disp_var,
+        width=10,
+        style="DateEntry.TEntry",
+    )
+    date_to_entry.grid(row=0, column=3, sticky="w")
+
+    def _close_calendar(which: str) -> None:
+        nonlocal calendar_popup_from, calendar_popup_to
+        pop = calendar_popup_from if which == "from" else calendar_popup_to
+        if pop is not None:
+            try:
+                pop.destroy()
+            except Exception:
+                pass
+        if which == "from":
+            calendar_popup_from = None
+        else:
+            calendar_popup_to = None
+
+    def _toggle_calendar_or_edit(which: str) -> None:
+        """In Date a scelta: 1° click apre calendario; 2° click chiude e abilita digitazione."""
+        if date_preset_preview_var.get() != "custom":
+            return
+        nonlocal calendar_popup_from, calendar_popup_to
+        nonlocal manual_mode_from, manual_mode_to, manual_restore_iso_from, manual_restore_iso_to
+
+        entry = date_from_entry if which == "from" else date_to_entry
+        disp_var = date_from_disp_var if which == "from" else date_to_disp_var
+        preview_var = date_from_preview_var if which == "from" else date_to_preview_var
+
+        # Se siamo già in modalità manuale, un click ripristina preselezione iniziale e riapre calendario.
+        if which == "from" and manual_mode_from:
+            manual_mode_from = False
+            if manual_restore_iso_from:
+                preview_var.set(manual_restore_iso_from)
+            _sync_date_displays_from_iso()
+            new_pop = open_calendar_for(which)
+            calendar_popup_from = new_pop
+            if new_pop is not None:
+                def _on_destroy(_e: tk.Event, _which: str = which) -> None:
+                    nonlocal calendar_popup_from
+                    calendar_popup_from = None
+                new_pop.bind("<Destroy>", _on_destroy)
+            return
+        if which == "to" and manual_mode_to:
+            manual_mode_to = False
+            if manual_restore_iso_to:
+                preview_var.set(manual_restore_iso_to)
+            _sync_date_displays_from_iso()
+            new_pop = open_calendar_for(which)
+            calendar_popup_to = new_pop
+            if new_pop is not None:
+                def _on_destroy(_e: tk.Event, _which: str = which) -> None:
+                    nonlocal calendar_popup_to
+                    calendar_popup_to = None
+                new_pop.bind("<Destroy>", _on_destroy)
+            return
+
+        pop = calendar_popup_from if which == "from" else calendar_popup_to
+        if pop is not None:
+            _close_calendar(which)
+            # Passa a modalità manuale: mostra placeholder e seleziona tutto.
+            if which == "from":
+                manual_mode_from = True
+                manual_restore_iso_from = preview_var.get() or manual_restore_iso_from
+            else:
+                manual_mode_to = True
+                manual_restore_iso_to = preview_var.get() or manual_restore_iso_to
+
+            disp_var.set(_DATE_MASK)
+            try:
+                entry.configure(foreground="#111111")
+            except Exception:
+                pass
+            entry.focus_set()
+            try:
+                entry.selection_clear()
+            except Exception:
+                pass
+            try:
+                entry.xview_moveto(0)
+                entry.icursor(0)
+            except Exception:
+                pass
+            return
+
+        new_pop = open_calendar_for(which)
+        if which == "from":
+            calendar_popup_from = new_pop
+        else:
+            calendar_popup_to = new_pop
+
+        if new_pop is not None:
+            # Se l'utente chiude il popup con la X, azzera lo stato.
+            def _on_destroy(_e: tk.Event, _which: str = which) -> None:
+                nonlocal calendar_popup_from, calendar_popup_to
+                if _which == "from":
+                    calendar_popup_from = None
+                else:
+                    calendar_popup_to = None
+
+            new_pop.bind("<Destroy>", _on_destroy)
+
+    def _on_date_click(which: str, _e: tk.Event) -> str:
+        _toggle_calendar_or_edit(which)
+        # Evita che l'Entry riposizioni il cursore in base al punto di click.
+        return "break"
+
+    date_from_entry.bind("<Button-1>", lambda e: _on_date_click("from", e))
+    date_to_entry.bind("<Button-1>", lambda e: _on_date_click("to", e))
+
+    def _sync_date_displays_from_iso() -> None:
+        df = date_from_preview_var.get()
+        dt = date_to_preview_var.get()
+        date_from_disp_var.set(to_italian_date(df) if df else "")
+        date_to_disp_var.set(to_italian_date(dt) if dt else "")
+
+    def _parse_italian_ddmmyyyy_to_iso(s: str) -> str | None:
+        s = (s or "").strip()
+        if not s:
+            return None
+        # Accetta anche ISO per resilienza.
+        if "-" in s:
+            parts = s.split("-")
+            if len(parts) == 3:
+                try:
+                    return date.fromisoformat(s).isoformat()
+                except Exception:
+                    return None
+        parts = s.split("/")
+        if len(parts) != 3:
+            return None
+        dd, mm, yyyy = parts
+        try:
+            return date(int(yyyy), int(mm), int(dd)).isoformat()
+        except Exception:
+            return None
+
+    def _validate_manual_date_and_apply(which: str) -> None:
+        if date_preset_preview_var.get() != "custom":
+            _sync_date_displays_from_iso()
+            return
+
+        # Valida formato e limiti come il calendario.
+        mn, mx = _dataset_minmax_safe()
+        global_min = mn
+        global_max = date.today() if filter_future_preview_var.get() == "exclude" else mx
+
+        raw = date_from_disp_var.get() if which == "from" else date_to_disp_var.get()
+        def _refocus_manual() -> None:
+            entry = date_from_entry if which == "from" else date_to_entry
+            try:
+                entry.focus_set()
+            except Exception:
+                pass
+            # porta il cursore al primo '_' disponibile
+            try:
+                s = (date_from_disp_var.get() if which == "from" else date_to_disp_var.get()) or _DATE_MASK
+                for i in _DATE_MASK_POS:
+                    if i < len(s) and s[i] == "_":
+                        entry.icursor(i)
+                        return
+                entry.icursor(0)
+            except Exception:
+                pass
+
+        if not raw or "_" in raw or raw.strip() == _DATE_MASK:
+            messagebox.showerror("Data non valida", "Inserisci una data completa nel formato gg/mm/aaaa.")
+            _refocus_manual()
+            return
+        iso = _parse_italian_ddmmyyyy_to_iso(raw or "")
+        if not iso:
+            messagebox.showerror("Data non valida", "Formato richiesto: gg/mm/aaaa.")
+            _refocus_manual()
+            return
+        try:
+            dsel = date.fromisoformat(iso)
+        except Exception:
+            messagebox.showerror("Data non valida", "Data non valida (giorno/mese/anno).")
+            _refocus_manual()
+            return
+        if dsel < global_min or dsel > global_max:
+            messagebox.showerror(
+                "Data fuori intervallo",
+                f"La data deve essere compresa tra {to_italian_date(global_min.isoformat())} e {to_italian_date(global_max.isoformat())}.",
+            )
+            _refocus_manual()
+            return
+
+        nonlocal date_custom_manual_override
+        date_custom_manual_override = True
+        if which == "from":
+            date_from_preview_var.set(dsel.isoformat())
+        else:
+            date_to_preview_var.set(dsel.isoformat())
+        _normalize_range_preview()
+        refresh_date_entry_states()
+        # Aggiorna subito le tendine Categoria/Conto in base al nuovo intervallo.
+        try:
+            refresh_category_account_dropdowns()
+        except Exception:
+            pass
+        # Uscita da modalità manuale dopo applicazione.
+        nonlocal manual_mode_from, manual_mode_to
+        if which == "from":
+            manual_mode_from = False
+        else:
+            manual_mode_to = False
+        try:
+            date_from_entry.configure(foreground="#111111")
+            date_to_entry.configure(foreground="#111111")
+        except Exception:
+            pass
+
+    def _on_from_enter(_e: tk.Event) -> str:
+        _validate_manual_date_and_apply("from")
+        return "break"
+
+    def _on_to_enter(_e: tk.Event) -> str:
+        _validate_manual_date_and_apply("to")
+        return "break"
+
+    def _mask_set_at(s: str, idx: int, ch: str) -> str:
+        return s[:idx] + ch + s[idx + 1 :]
+
+    def _mask_next_slot(s: str, start_pos: int) -> int | None:
+        for i in _DATE_MASK_POS:
+            if i >= start_pos and s[i] == "_":
+                return i
+        for i in _DATE_MASK_POS:
+            if s[i] == "_":
+                return i
+        return None
+
+    def _mask_prev_filled(s: str, start_pos: int) -> int | None:
+        for i in reversed(_DATE_MASK_POS):
+            if i < start_pos and s[i] != "_":
+                return i
+        for i in reversed(_DATE_MASK_POS):
+            if s[i] != "_":
+                return i
+        return None
+
+    def _masked_keypress(which: str, event: tk.Event) -> str | None:
+        if date_preset_preview_var.get() != "custom":
+            return None
+        if which == "from" and not manual_mode_from:
+            return None
+        if which == "to" and not manual_mode_to:
+            return None
+
+        entry = date_from_entry if which == "from" else date_to_entry
+        var = date_from_disp_var if which == "from" else date_to_disp_var
+        s = var.get() or ""
+        if len(s) != len(_DATE_MASK) or s[2] != "/" or s[5] != "/":
+            s = _DATE_MASK
+
+        keysym = getattr(event, "keysym", "")
+        ch = getattr(event, "char", "")
+
+        # Navigazione: permetti solo le frecce, ma evita di uscire dalla maschera.
+        if keysym in ("Left", "Right", "Home", "End", "Tab", "ISO_Left_Tab"):
+            return None
+
+        # Backspace: cancella la cifra precedente
+        if keysym == "BackSpace":
+            pos = entry.index(tk.INSERT)
+            prev_i = _mask_prev_filled(s, pos)
+            if prev_i is not None:
+                s2 = _mask_set_at(s, prev_i, "_")
+                var.set(s2)
+                entry.icursor(prev_i)
+            return "break"
+
+        # Solo cifre: riempi il prossimo slot disponibile
+        if ch.isdigit():
+            pos = entry.index(tk.INSERT)
+            # Se il cursore è fuori maschera, riparti da inizio.
+            if pos >= len(_DATE_MASK):
+                pos = 0
+            next_i = _mask_next_slot(s, pos)
+            if next_i is None:
+                return "break"
+            s2 = _mask_set_at(s, next_i, ch)
+
+            # Validazione immediata per evitare numeri impossibili.
+            def _digits_at(ix1: int, ix2: int) -> str:
+                return (s2[ix1] if ix1 < len(s2) else "_") + (s2[ix2] if ix2 < len(s2) else "_")
+
+            dd = _digits_at(0, 1)
+            mm = _digits_at(3, 4)
+            yyyy = "".join(s2[i] for i in (6, 7, 8, 9) if i < len(s2))
+
+            # Giorno: blocca subito valori fuori 01..31
+            if next_i in (0, 1):
+                # prima cifra giorno: 0..3
+                if next_i == 0 and ch not in ("0", "1", "2", "3"):
+                    return "break"
+                if dd[0] != "_" and dd[1] != "_":
+                    day = int(dd)
+                    if day < 1 or day > 31:
+                        return "break"
+                # seconda cifra: se prima è 3, seconda 0..1; se prima è 0, seconda 1..9
+                if next_i == 1 and dd[0] != "_":
+                    if dd[0] == "3" and ch not in ("0", "1"):
+                        return "break"
+                    if dd[0] == "0" and ch == "0":
+                        return "break"
+
+            # Mese: blocca subito valori fuori 01..12
+            if next_i in (3, 4):
+                if next_i == 3 and ch not in ("0", "1"):
+                    return "break"
+                if mm[0] != "_" and mm[1] != "_":
+                    month = int(mm)
+                    if month < 1 or month > 12:
+                        return "break"
+                if next_i == 4 and mm[0] != "_":
+                    if mm[0] == "1" and ch not in ("0", "1", "2"):
+                        return "break"
+                    if mm[0] == "0" and ch == "0":
+                        return "break"
+
+            # Anno: appena completo, deve stare dentro il range anni del DB (min..max).
+            if next_i in (6, 7, 8, 9):
+                if all(s2[i].isdigit() for i in (6, 7, 8, 9)):
+                    y = int(s2[6:10])
+                    if _dataset_years_with_records:
+                        y_min = min(_dataset_years_with_records)
+                        y_max = max(_dataset_years_with_records)
+                    else:
+                        y_min = (_dataset_min_date or date.today()).year
+                        y_max = (_dataset_max_date or date.today()).year
+                    if y < y_min or y > y_max:
+                        return "break"
+
+            # Se la data è completa, verifica subito coerenza calendario (mesi, bisestili, ecc.).
+            if all(s2[i].isdigit() for i in (0, 1, 3, 4, 6, 7, 8, 9)):
+                try:
+                    _ = date(int(s2[6:10]), int(s2[3:5]), int(s2[0:2]))
+                except Exception:
+                    return "break"
+
+            var.set(s2)
+            # sposta cursore al prossimo slot (o fine)
+            after = next_i + 1
+            # salta gli slash
+            if after in (2, 5):
+                after += 1
+            entry.icursor(after)
+            return "break"
+
+        # Blocca qualunque altro carattere
+        if ch:
+            return "break"
+        return None
+
+    def _ensure_mask_cursor(which: str) -> None:
+        if date_preset_preview_var.get() != "custom":
+            return
+        if which == "from" and not manual_mode_from:
+            return
+        if which == "to" and not manual_mode_to:
+            return
+        entry = date_from_entry if which == "from" else date_to_entry
+        var = date_from_disp_var if which == "from" else date_to_disp_var
+        s = var.get() or ""
+        if s != _DATE_MASK and "_" not in s:
+            return
+        # se il cursore è dopo la maschera o sugli slash, portalo al primo slot
+        try:
+            pos = entry.index(tk.INSERT)
+        except Exception:
+            pos = 0
+        if pos >= len(_DATE_MASK) or pos in (2, 5):
+            try:
+                entry.icursor(0)
+            except Exception:
+                pass
+
+    date_from_entry.bind("<Return>", _on_from_enter)
+    date_to_entry.bind("<Return>", _on_to_enter)
+    # Usa add=True per non interferire con binding interni ttk; ritorno "break" blocca l'inserimento.
+    date_from_entry.bind("<KeyPress>", lambda e: _masked_keypress("from", e), add=True)
+    date_to_entry.bind("<KeyPress>", lambda e: _masked_keypress("to", e), add=True)
+    date_from_entry.bind("<FocusIn>", lambda _e: _ensure_mask_cursor("from"), add=True)
+    date_to_entry.bind("<FocusIn>", lambda _e: _ensure_mask_cursor("to"), add=True)
+
+    date_from_preview_var.trace_add("write", lambda *_: _sync_date_displays_from_iso())
+    date_to_preview_var.trace_add("write", lambda *_: _sync_date_displays_from_iso())
+
+    _sync_date_displays_from_iso()
+
+    refresh_date_preset_button_styles()
+    refresh_date_preview_from_modes()
+    # Alla prima apertura, la griglia deve riflettere i default preset.
+    date_preset_applied_var.set(date_preset_preview_var.get())
+    date_from_applied_var.set(date_from_preview_var.get())
+    date_to_applied_var.set(date_to_preview_var.get())
+    refresh_movement_date_controls_visibility()
+
     cerca_wrap = tk.Frame(filters_search_row, highlightthickness=0)
-    cerca_wrap.pack(side=tk.RIGHT)
     _CERCA_GREEN = "#2e7d32"
     _CERCA_GREEN_ACTIVE = "#1b5e20"
     lbl_cerca = tk.Label(
@@ -807,6 +2528,7 @@ def build_ui(db: dict) -> None:
         text="Cerca",
         cursor="hand2",
         highlightthickness=0,
+        font=filter_ui_font,
         padx=18,
         pady=6,
         bg=_CERCA_GREEN,
@@ -826,41 +2548,97 @@ def build_ui(db: dict) -> None:
     lbl_cerca.bind("<Enter>", _cerca_enter)
     lbl_cerca.bind("<Leave>", _cerca_leave)
 
+    def _position_cerca_over_note_column(_e: tk.Event | None = None) -> None:
+        """Posiziona Cerca in corrispondenza della colonna Nota (note_tree)."""
+        try:
+            # Coord x del note_tree in coordinate schermo.
+            note_x = note_tree.winfo_rootx()
+            note_w = note_tree.winfo_width()
+            row_x = filters_search_row.winfo_rootx()
+            # Assicura width calcolati.
+            root.update_idletasks()
+            btn_w = cerca_wrap.winfo_reqwidth()
+            # Allinea a destra dentro la colonna Nota.
+            x = max(0, (note_x + note_w - btn_w) - row_x)
+            cerca_wrap.place(x=x, y=0)
+        except Exception:
+            # Fallback: a destra ma con margine
+            try:
+                cerca_wrap.place(relx=1.0, x=-200, y=0, anchor="ne")
+            except Exception:
+                pass
+
+    # Riposiziona quando cambia layout/dimensioni.
+    filters_search_row.bind("<Configure>", _position_cerca_over_note_column, add=True)
+    records_frame.bind("<Configure>", _position_cerca_over_note_column, add=True)
+    root.after_idle(_position_cerca_over_note_column)
+
     refresh_movement_filter_button_styles()
 
     populate_movements_trees()
 
-    balance_footer = ttk.Frame(movimenti_frame, padding=(0, 10, 0, 0))
+    balance_footer = ttk.Frame(movimenti_frame, padding=(0, 6, 0, 0))
     balance_footer.pack(fill=tk.X)
     balance_footer_row = tk.Frame(balance_footer)
-    balance_footer_row.pack(fill=tk.X, anchor=tk.W)
+    balance_footer_row.pack(fill=tk.X, anchor=tk.CENTER)
 
-    saldo_footer_font = ("TkDefaultFont", 11)
+    saldo_footer_font = ("TkDefaultFont", 13)
 
     def refresh_balance_footer() -> None:
         for w in balance_footer_row.winfo_children():
             w.destroy()
-        ly, names, amts = compute_balances_from_2022(cur_db())
+        ly, names, amts_abs = compute_balances_from_2022(cur_db())
+        _, _, amts_today = compute_balances_from_2022_asof(cur_db(), cutoff_date_iso=date.today().isoformat())
         valuta = "E" if ly >= 2002 else "L"
-        total = sum(amts, Decimal("0"))
+        total_abs = sum(amts_abs, Decimal("0"))
+        total_today = sum(amts_today, Decimal("0"))
+        diffs = [a - b for a, b in zip(amts_abs, amts_today)]
+        total_diff = total_abs - total_today
 
-        def plain(text: str) -> None:
-            tk.Label(balance_footer_row, text=text, font=saldo_footer_font).pack(side=tk.LEFT)
+        # Layout a tabella: intestazione + 3 righe.
+        table = tk.Frame(balance_footer_row)
+        # Centra l'intera area saldi nel footer.
+        table.pack(anchor=tk.CENTER)
 
-        def colored_amount(amt: Decimal) -> None:
+        header_font = ("TkDefaultFont", 13, "bold")
+        amount_font = ("TkDefaultFont", 13, "bold")
+
+        def header_cell(col: int, text: str) -> None:
+            tk.Label(table, text=text, font=header_font).grid(row=0, column=col, sticky="w", padx=(0, 10), pady=0)
+
+        def label_cell(row: int, text: str) -> None:
+            tk.Label(table, text=text, font=saldo_footer_font).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=0)
+
+        def amount_cell(row: int, col: int, amt: Decimal) -> None:
             tk.Label(
-                balance_footer_row,
+                table,
                 text=format_saldo_cell(valuta, amt),
-                font=saldo_footer_font,
+                font=amount_font,
                 fg=balance_amount_fg(amt),
-            ).pack(side=tk.LEFT)
+                anchor=tk.E,
+            ).grid(row=row, column=col, sticky="e", padx=(0, 10), pady=0)
 
-        plain("Saldo totale: ")
-        colored_amount(total)
-        for name, amt in zip(names, amts):
-            plain("    ")
-            plain(f"{name.strip()}: ")
-            colored_amount(amt)
+        # Intestazione colonne (1 = totale, poi conti)
+        header_cell(0, "")
+        header_cell(1, "TOTALE")
+        for i, name in enumerate(names, start=2):
+            header_cell(i, name.strip())
+
+        # Righe
+        label_cell(1, "Saldi alla data di oggi")
+        amount_cell(1, 1, total_today)
+        for i, amt in enumerate(amts_today, start=2):
+            amount_cell(1, i, amt)
+
+        label_cell(2, "Differenze")
+        amount_cell(2, 1, total_diff)
+        for i, amt in enumerate(diffs, start=2):
+            amount_cell(2, i, amt)
+
+        label_cell(3, "Saldi assoluti")
+        amount_cell(3, 1, total_abs)
+        for i, amt in enumerate(amts_abs, start=2):
+            amount_cell(3, i, amt)
 
     refresh_balance_footer()
 
