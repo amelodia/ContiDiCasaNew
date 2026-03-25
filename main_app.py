@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import platform
+import sys
 import tkinter as tk
 from decimal import Decimal
 from pathlib import Path
@@ -22,6 +23,9 @@ DEFAULT_CDC_ROOT = Path("/Users/macand/Library/CloudStorage/Dropbox/CdC")
 DEFAULT_OUTPUT = Path("data/unified_legacy_import.json")
 DEFAULT_ENCRYPTED_DB = Path("data/conti_di_casa.enc")
 DEFAULT_KEY_FILE = Path("data/conti_di_casa.key")
+
+# Inserimento griglia a lotti: migliaia di righe × 3 Treeview bloccano il main thread (macOS: beach ball).
+MOVEMENTS_INSERT_BATCH = 400
 
 # Stessa regola della colonna Importo nella griglia movimenti.
 COLOR_AMOUNT_POS = "#006400"
@@ -213,6 +217,54 @@ def show_record_in_movements_grid(rec: dict) -> bool:
     return True
 
 
+def record_legacy_stable_key(rec: dict) -> str:
+    """Chiave univoca del record nel DB unificato (come in import legacy)."""
+    k = rec.get("legacy_registration_key")
+    if isinstance(k, str) and k.strip():
+        return k
+    return f"{rec.get('year', '')}:{rec.get('source_folder', '')}:{rec.get('source_file', '')}:{rec.get('source_index', '')}"
+
+
+def unified_registration_sequence_map(records_sorted: list[dict]) -> dict[str, int]:
+    """
+    Progressivo globale 1..N su tutti i record nell'ordine di merge:
+    anno → cartella → file → indice (stesso criterio della griglia).
+    `legacy_registration_number` nel file .dat è solo l'indice dentro l'anno e si ripete ogni anno.
+    """
+    return {record_legacy_stable_key(r): i for i, r in enumerate(records_sorted, start=1)}
+
+
+def filter_and_sort_movements_for_grid(
+    records_canonical: list[dict],
+    reg_seq_map: dict[str, int],
+    *,
+    order_by_date: bool,
+    exclude_future_dates: bool,
+    backward: bool,
+) -> list[dict]:
+    """
+    Applica filtro date future e ordinamento richiesto dalla pagina Movimenti.
+    - order_by_date: True = per data, False = per numero di registrazione globale.
+    - exclude_future_dates: True = nasconde registrazioni con data > oggi.
+    - backward: True = dalla più recente / numero più alto; False = dalla più lontana / più basso.
+    """
+    today = date.today().isoformat()
+    pool: list[dict] = []
+    for r in records_canonical:
+        if not show_record_in_movements_grid(r):
+            continue
+        if exclude_future_dates and str(r.get("date_iso", "")) > today:
+            continue
+        pool.append(r)
+
+    reg_key = lambda r: reg_seq_map[record_legacy_stable_key(r)]
+    if order_by_date:
+        pool.sort(key=lambda r: (str(r.get("date_iso", "")), reg_key(r)), reverse=backward)
+    else:
+        pool.sort(key=reg_key, reverse=backward)
+    return pool
+
+
 def get_or_create_key(key_path: Path) -> bytes:
     if Fernet is None:
         raise RuntimeError("Pacchetto 'cryptography' non disponibile. Installa con: pip install cryptography")
@@ -274,6 +326,20 @@ def build_ui(db: dict) -> None:
 
     pack_centered_page_title(movimenti_frame)
 
+    # Preselezione (sei controlli) vs valori applicati alla griglia (solo con «Cerca»).
+    filter_order_preview_var = tk.StringVar(value="date")
+    filter_future_preview_var = tk.StringVar(value="include")
+    filter_direction_preview_var = tk.StringVar(value="backward")
+    filter_order_applied_var = tk.StringVar(value="date")
+    filter_future_applied_var = tk.StringVar(value="include")
+    filter_direction_applied_var = tk.StringVar(value="backward")
+
+    filters_row = ttk.Frame(movimenti_frame)
+    filters_row.pack(fill=tk.X, pady=(0, 4))
+
+    filters_search_row = ttk.Frame(movimenti_frame)
+    filters_search_row.pack(fill=tk.X, pady=(0, 8))
+
     records_frame = ttk.Frame(movimenti_frame, padding=8)
     records_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -295,8 +361,11 @@ def build_ui(db: dict) -> None:
         font=("TkDefaultFont", 10, "bold"),
     )
 
+    # Prima colonna `mov_pad` vuota (1px): su macOS la prima colonna dati ha bug/troncamenti; Reg è la seconda.
+    # Solo `show=headings` (no colonna albero #0): così `anchor=e` su Reg allinea a destra correttamente.
     mov_cols = (
-        "legacy_registration_number",
+        "mov_pad",
+        "reg_display",
         "date_it",
         "category_name",
         "account_primary_name",
@@ -312,7 +381,10 @@ def build_ui(db: dict) -> None:
         selectmode="browse",
         style="MovGrid.Treeview",
     )
-    mov_tree.heading("legacy_registration_number", text="Reg.")
+    mov_tree.heading("mov_pad", text="")
+    mov_tree.column("mov_pad", width=1, minwidth=1, stretch=False, anchor=tk.CENTER)
+    mov_tree.heading("reg_display", text="Reg.", anchor=tk.E)
+    mov_tree.column("reg_display", width=62, anchor=tk.E, stretch=False, minwidth=50)
     mov_tree.heading("date_it", text="Data")
     mov_tree.heading("category_name", text="Categoria")
     mov_tree.heading("account_primary_name", text="Conto 1")
@@ -320,7 +392,6 @@ def build_ui(db: dict) -> None:
     mov_tree.heading("account_secondary_name", text="Conto 2")
     mov_tree.heading("cheque", text="Assegno")
     mov_tree.heading("account_secondary_flags", text="")
-    mov_tree.column("legacy_registration_number", width=56, anchor=tk.E, stretch=False, minwidth=40)
     mov_tree.column("date_it", width=100, anchor=tk.CENTER, stretch=False, minwidth=80)
     mov_tree.column("category_name", width=160, stretch=True, minwidth=80)
     mov_tree.column("account_primary_name", width=130, stretch=True, minwidth=70)
@@ -358,6 +429,9 @@ def build_ui(db: dict) -> None:
     note_tree.column("note", width=280, stretch=True, minwidth=120)
     note_tree.tag_configure("stripe0", background="#f7f7f7")
     note_tree.tag_configure("stripe1", background="#ffffff")
+
+    amt_tree.column("#0", width=0, minwidth=0, stretch=False)
+    note_tree.column("#0", width=0, minwidth=0, stretch=False)
 
     yscroll = ttk.Scrollbar(records_frame, orient=tk.VERTICAL, command=mov_tree.yview)
 
@@ -412,6 +486,9 @@ def build_ui(db: dict) -> None:
         for iid in tree.selection():
             tree.selection_remove(iid)
 
+    def _selection_tuple(tree: ttk.Treeview) -> tuple[str, ...]:
+        return tuple(tree.selection())
+
     def sync_selection_mov(_event: tk.Event | None = None) -> None:
         nonlocal _sel_sync
         if _sel_sync:
@@ -420,12 +497,15 @@ def build_ui(db: dict) -> None:
         try:
             sel = mov_tree.selection()
             if sel:
-                amt_tree.selection_set(sel)
-                note_tree.selection_set(sel)
-                amt_tree.focus(sel[0])
+                if _selection_tuple(amt_tree) != sel:
+                    amt_tree.selection_set(*sel)
+                if _selection_tuple(note_tree) != sel:
+                    note_tree.selection_set(*sel)
             else:
-                _clear_selection(amt_tree)
-                _clear_selection(note_tree)
+                if amt_tree.selection():
+                    _clear_selection(amt_tree)
+                if note_tree.selection():
+                    _clear_selection(note_tree)
         finally:
             _sel_sync = False
 
@@ -437,12 +517,15 @@ def build_ui(db: dict) -> None:
         try:
             sel = amt_tree.selection()
             if sel:
-                mov_tree.selection_set(sel)
-                note_tree.selection_set(sel)
-                mov_tree.focus(sel[0])
+                if _selection_tuple(mov_tree) != sel:
+                    mov_tree.selection_set(*sel)
+                if _selection_tuple(note_tree) != sel:
+                    note_tree.selection_set(*sel)
             else:
-                _clear_selection(mov_tree)
-                _clear_selection(note_tree)
+                if mov_tree.selection():
+                    _clear_selection(mov_tree)
+                if note_tree.selection():
+                    _clear_selection(note_tree)
         finally:
             _sel_sync = False
 
@@ -454,18 +537,26 @@ def build_ui(db: dict) -> None:
         try:
             sel = note_tree.selection()
             if sel:
-                mov_tree.selection_set(sel)
-                amt_tree.selection_set(sel)
-                mov_tree.focus(sel[0])
+                if _selection_tuple(mov_tree) != sel:
+                    mov_tree.selection_set(*sel)
+                if _selection_tuple(amt_tree) != sel:
+                    amt_tree.selection_set(*sel)
             else:
-                _clear_selection(mov_tree)
-                _clear_selection(amt_tree)
+                if mov_tree.selection():
+                    _clear_selection(mov_tree)
+                if amt_tree.selection():
+                    _clear_selection(amt_tree)
         finally:
             _sel_sync = False
 
     mov_tree.bind("<<TreeviewSelect>>", sync_selection_mov)
     amt_tree.bind("<<TreeviewSelect>>", sync_selection_amt)
     note_tree.bind("<<TreeviewSelect>>", sync_selection_note)
+
+    def scroll_movements_grid_to_top() -> None:
+        """Dopo filtro/ordinamento o ricarica dati, la prima riga deve restare in cima (scroll sincronizzato)."""
+        root.update_idletasks()
+        mov_tree.yview_moveto(0)
 
     def on_mousewheel(event: tk.Event) -> str:
         delta = 0
@@ -497,22 +588,37 @@ def build_ui(db: dict) -> None:
     note_tree.grid(row=0, column=2, sticky="nsew")
     yscroll.grid(row=0, column=3, sticky="ns", padx=(2, 0))
 
+    pending_movement_rows: list[
+        tuple[str, str, tuple[object, ...], str, str, str, str]
+    ] = []
+
     def populate_movements_trees() -> None:
+        _clear_selection(mov_tree)
+        _clear_selection(amt_tree)
+        _clear_selection(note_tree)
         for iid in mov_tree.get_children():
             mov_tree.delete(iid)
         for iid in amt_tree.get_children():
             amt_tree.delete(iid)
         for iid in note_tree.get_children():
             note_tree.delete(iid)
+        scroll_movements_grid_to_top()
         d = cur_db()
         accounts_by_year = year_accounts_map(d)
         categories_by_year = year_categories_map(d)
         records = [r for y in d["years"] for r in y["records"]]
         records.sort(key=lambda r: (r["year"], r["source_folder"], r["source_file"], r["source_index"]))
+        reg_seq_map = unified_registration_sequence_map(records)
+        pool = filter_and_sort_movements_for_grid(
+            records,
+            reg_seq_map,
+            order_by_date=filter_order_applied_var.get() == "date",
+            exclude_future_dates=filter_future_applied_var.get() == "exclude",
+            backward=filter_direction_applied_var.get() == "backward",
+        )
+        pending_movement_rows.clear()
         row_i = 0
-        for r in records:
-            if not show_record_in_movements_grid(r):
-                continue
+        for r in pool:
             year = r.get("year")
             year_accounts = accounts_by_year.get(year, [])
             year_categories = categories_by_year.get(year, [])
@@ -524,25 +630,203 @@ def build_ui(db: dict) -> None:
             amount_text, amount_tag = format_amount_for_output(r)
             stripe = f"stripe{row_i % 2}"
             rid = str(row_i)
-            mov_tree.insert(
-                "",
-                tk.END,
-                iid=rid,
-                values=(
-                    r.get("legacy_registration_number", r.get("source_index", "")),
-                    to_italian_date(r["date_iso"]),
-                    category_name,
-                    account_1_name,
-                    stars_1,
-                    account_2_name,
-                    r.get("cheque") or "",
-                    stars_2,
-                ),
-                tags=(stripe,),
+            reg_text = str(reg_seq_map[record_legacy_stable_key(r)])
+            mov_vals = (
+                to_italian_date(r["date_iso"]),
+                category_name,
+                account_1_name,
+                stars_1,
+                account_2_name,
+                r.get("cheque") or "",
+                stars_2,
             )
-            amt_tree.insert("", tk.END, iid=rid, values=(amount_text,), tags=(amount_tag, stripe))
-            note_tree.insert("", tk.END, iid=rid, values=(r.get("note") or "",), tags=(stripe,))
+            pending_movement_rows.append(
+                (rid, reg_text, mov_vals, amount_text, amount_tag, r.get("note") or "", stripe)
+            )
             row_i += 1
+
+        def flush_movement_batch(start: int) -> None:
+            end = min(start + MOVEMENTS_INSERT_BATCH, len(pending_movement_rows))
+            for i in range(start, end):
+                rid, reg_text, mov_vals, amount_text, amount_tag, note_text, stripe = pending_movement_rows[i]
+                mov_tree.insert(
+                    "",
+                    tk.END,
+                    iid=rid,
+                    values=("", reg_text) + mov_vals,
+                    tags=(stripe,),
+                )
+                amt_tree.insert("", tk.END, iid=rid, values=(amount_text,), tags=(amount_tag, stripe))
+                note_tree.insert("", tk.END, iid=rid, values=(note_text,), tags=(stripe,))
+            if end < len(pending_movement_rows):
+                root.after(1, lambda s=end: flush_movement_batch(s))
+            else:
+                root.after_idle(scroll_movements_grid_to_top)
+
+        if pending_movement_rows:
+            root.after(0, lambda: flush_movement_batch(0))
+
+    # Coppie tipo pulsante: su macOS tk.Button ignora spesso bg; usiamo Label cliccabili (bg rispettato).
+    _FILTER_BG_OFF = "#ffffff"
+    _FILTER_BG_ON = "#fff176"
+
+    def _set_filter_toggle_style(w: tk.Label, selected: bool) -> None:
+        if selected:
+            w.configure(
+                bg=_FILTER_BG_ON,
+                fg="#1a1a1a",
+                relief=tk.SUNKEN,
+                bd=2,
+                highlightthickness=0,
+            )
+        else:
+            w.configure(
+                bg=_FILTER_BG_OFF,
+                fg="#1a1a1a",
+                relief=tk.RAISED,
+                bd=1,
+                highlightthickness=0,
+            )
+
+    g1 = ttk.Frame(filters_row)
+    g1.pack(side=tk.LEFT, anchor=tk.W)
+    btn_order_date = tk.Label(
+        g1,
+        text="Ricerca per data",
+        cursor="hand2",
+        highlightthickness=0,
+        padx=10,
+        pady=5,
+    )
+    btn_order_reg = tk.Label(
+        g1,
+        text="Ricerca per registrazione",
+        cursor="hand2",
+        highlightthickness=0,
+        padx=10,
+        pady=5,
+    )
+    btn_order_date.bind("<Button-1>", lambda _e: pick_order("date"))
+    btn_order_reg.bind("<Button-1>", lambda _e: pick_order("registration"))
+    btn_order_date.pack(side=tk.LEFT, padx=(0, 8))
+    btn_order_reg.pack(side=tk.LEFT)
+
+    g2 = ttk.Frame(filters_row)
+    g2.pack(side=tk.LEFT, padx=(28, 0), anchor=tk.W)
+    btn_future_include = tk.Label(
+        g2,
+        text="Comprese date future",
+        cursor="hand2",
+        highlightthickness=0,
+        padx=10,
+        pady=5,
+    )
+    btn_future_exclude = tk.Label(
+        g2,
+        text="Escluse date future",
+        cursor="hand2",
+        highlightthickness=0,
+        padx=10,
+        pady=5,
+    )
+    btn_future_include.bind("<Button-1>", lambda _e: pick_future("include"))
+    btn_future_exclude.bind("<Button-1>", lambda _e: pick_future("exclude"))
+    btn_future_include.pack(side=tk.LEFT, padx=(0, 8))
+    btn_future_exclude.pack(side=tk.LEFT)
+
+    g3 = ttk.Frame(filters_row)
+    g3.pack(side=tk.LEFT, padx=(28, 0), anchor=tk.W)
+    btn_dir_backward = tk.Label(
+        g3,
+        text="All'indietro, dalla più recente",
+        cursor="hand2",
+        highlightthickness=0,
+        padx=10,
+        pady=5,
+    )
+    btn_dir_forward = tk.Label(
+        g3,
+        text="In avanti, dalla più lontana",
+        cursor="hand2",
+        highlightthickness=0,
+        padx=10,
+        pady=5,
+    )
+    btn_dir_backward.bind("<Button-1>", lambda _e: pick_direction("backward"))
+    btn_dir_forward.bind("<Button-1>", lambda _e: pick_direction("forward"))
+    btn_dir_backward.pack(side=tk.LEFT, padx=(0, 8))
+    btn_dir_forward.pack(side=tk.LEFT)
+
+    def refresh_movement_filter_button_styles() -> None:
+        _set_filter_toggle_style(btn_order_date, filter_order_preview_var.get() == "date")
+        _set_filter_toggle_style(btn_order_reg, filter_order_preview_var.get() == "registration")
+        _set_filter_toggle_style(btn_future_include, filter_future_preview_var.get() == "include")
+        _set_filter_toggle_style(btn_future_exclude, filter_future_preview_var.get() == "exclude")
+        _set_filter_toggle_style(btn_dir_backward, filter_direction_preview_var.get() == "backward")
+        _set_filter_toggle_style(btn_dir_forward, filter_direction_preview_var.get() == "forward")
+
+    def pick_order(which: str) -> None:
+        if filter_order_preview_var.get() == which:
+            return
+        filter_order_preview_var.set(which)
+        refresh_movement_filter_button_styles()
+
+    def pick_future(which: str) -> None:
+        if filter_future_preview_var.get() == which:
+            return
+        filter_future_preview_var.set(which)
+        refresh_movement_filter_button_styles()
+
+    def pick_direction(which: str) -> None:
+        if filter_direction_preview_var.get() == which:
+            return
+        filter_direction_preview_var.set(which)
+        refresh_movement_filter_button_styles()
+
+    def apply_movement_search(_event: tk.Event | None = None) -> None:
+        o = filter_order_preview_var.get()
+        f = filter_future_preview_var.get()
+        d = filter_direction_preview_var.get()
+        if (
+            o == filter_order_applied_var.get()
+            and f == filter_future_applied_var.get()
+            and d == filter_direction_applied_var.get()
+        ):
+            return
+        filter_order_applied_var.set(o)
+        filter_future_applied_var.set(f)
+        filter_direction_applied_var.set(d)
+        populate_movements_trees()
+
+    cerca_wrap = tk.Frame(filters_search_row, highlightthickness=0)
+    cerca_wrap.pack(side=tk.RIGHT)
+    _CERCA_GREEN = "#2e7d32"
+    _CERCA_GREEN_ACTIVE = "#1b5e20"
+    lbl_cerca = tk.Label(
+        cerca_wrap,
+        text="Cerca",
+        cursor="hand2",
+        highlightthickness=0,
+        padx=18,
+        pady=6,
+        bg=_CERCA_GREEN,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    lbl_cerca.bind("<Button-1>", apply_movement_search)
+    lbl_cerca.pack()
+
+    def _cerca_enter(_e: tk.Event) -> None:
+        lbl_cerca.configure(bg=_CERCA_GREEN_ACTIVE)
+
+    def _cerca_leave(_e: tk.Event) -> None:
+        lbl_cerca.configure(bg=_CERCA_GREEN)
+
+    lbl_cerca.bind("<Enter>", _cerca_enter)
+    lbl_cerca.bind("<Leave>", _cerca_leave)
+
+    refresh_movement_filter_button_styles()
 
     populate_movements_trees()
 
@@ -695,6 +979,10 @@ def main() -> None:
     if encrypted_db is not None:
         db = encrypted_db
     else:
+        print(
+            "Primo avvio: import dell'archivio legacy in corso (può richiedere tempo; attendere).",
+            file=sys.stderr,
+        )
         run_import_legacy(DEFAULT_CDC_ROOT, DEFAULT_OUTPUT)
         db = json.loads(DEFAULT_OUTPUT.read_text(encoding="utf-8"))
         try:
