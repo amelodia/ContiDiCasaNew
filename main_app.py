@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import html as html_module
 import json
+import os
 import calendar
 import platform
+import subprocess
 import sys
+import time
+import tempfile
 import tkinter as tk
+import webbrowser
+from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -27,6 +34,9 @@ DEFAULT_KEY_FILE = Path("data/conti_di_casa.key")
 
 # Inserimento griglia a lotti: migliaia di righe × 3 Treeview bloccano il main thread (macOS: beach ball).
 MOVEMENTS_INSERT_BATCH = 400
+
+# TODO (aggiunta / gestione conti): definire e applicare un limite massimo di conti attivi
+# (coerente con DB, footer saldi, stampa, griglia). Oggi non c'è un tetto applicato nel codice.
 
 # Stessa regola della colonna Importo nella griglia movimenti.
 COLOR_AMOUNT_POS = "#006400"
@@ -252,6 +262,329 @@ def compute_balances_from_2022_asof(db: dict, *, cutoff_date_iso: str) -> tuple[
 def balance_amount_fg(value: Decimal) -> str:
     """Rosso / verde come colonna Importo (zero trattato come non negativo)."""
     return COLOR_AMOUNT_NEG if value < 0 else COLOR_AMOUNT_POS
+
+
+def _print_balances_native_macos(build_html: Callable[[float], str]) -> bool:
+    """Stampa con dialog nativo macOS (AppKit). Sempre A4 verticale; tabella lunga → pagine successive.
+
+    ``build_html(iw)`` riceve la larghezza in punti dell'area testo (``NSPrintInfo.imageablePageBounds``).
+
+    Nota documentazione Apple / pratica: ``NSAttributedString.initWithHTML`` non rende HTML come un browser;
+    larghezze tabella in % spesso falliscono. Usiamo ``colgroup`` e ``width`` della tabella in **punti** calcolati
+    da ``iw``, più ``clipsToBounds = NO`` sulla vista. Per layout tabellare completo l'API consigliata è
+    ``NSTextTable`` (non usata qui). Allineamento **verticale** del testo in cella: ``vertical-align: middle`` nel CSS.
+    Larghezza layout ``iw_layout < iw`` (area stampabile): stesso valore per ``build_html`` e per
+    ``NSTextContainer.setContainerSize_``, con ``textContainerInset`` orizzontale aumentato di metà differenza così
+    il blocco resta centrato nell’area immagine e non viene tagliato a destra. Sul wrapper HTML resta il padding
+    simmetrico (``margin-right`` sulle tabelle è inaffidabile).
+    """
+    try:
+        from AppKit import (
+            NSApplication,
+            NSAttributedString,
+            NSData,
+            NSMakeRect,
+            NSPrintInfo,
+            NSPrintOperation,
+            NSTextView,
+        )
+        from Foundation import NSSize
+    except ImportError:
+        return False
+    try:
+        app = NSApplication.sharedApplication()
+        try:
+            app.activateIgnoringOtherApps_(True)
+        except Exception:
+            pass
+
+        # A4 verticale + margini espliciti; calcolare iw *prima* dell'HTML per pt espliciti nel markup.
+        _mm_to_pt = 72.0 / 25.4
+        _margin_pt = 7.0 * _mm_to_pt
+        pinfo = NSPrintInfo.sharedPrintInfo().copy()
+        pinfo.setOrientation_(0)
+        try:
+            pinfo.setVerticallyCentered_(False)
+        except Exception:
+            pass
+        try:
+            pinfo.setHorizontallyCentered_(False)
+        except Exception:
+            pass
+        try:
+            pinfo.setPaperSize_(NSSize(595, 842))
+        except Exception:
+            pass
+        try:
+            pinfo.setLeftMargin_(_margin_pt)
+            pinfo.setRightMargin_(_margin_pt)
+            pinfo.setTopMargin_(_margin_pt)
+            pinfo.setBottomMargin_(_margin_pt)
+        except Exception:
+            pass
+        try:
+            ib = pinfo.imageablePageBounds()
+            ox = float(ib.origin.x)
+            oy = float(ib.origin.y)
+            iw = float(ib.size.width)
+            ih = float(ib.size.height)
+            ps = pinfo.paperSize()
+            paper_w = float(ps.width)
+            paper_h = float(ps.height)
+        except Exception:
+            ox, oy, iw, ih = 56.0, 56.0, 483.0, 728.0
+            paper_w, paper_h = 595.0, 842.0
+        iw = max(200.0, iw)
+        ih = max(200.0, ih)
+        paper_w = max(200.0, paper_w)
+        paper_h = max(200.0, paper_h)
+        # NSTextView è flipped: inset alto = distanza dal bordo superiore del foglio all'area stampabile.
+        # Ridurre la larghezza del container rispetto a ``iw`` e spostare leggermente l’inset a destra centra il
+        # contenuto nella fascia stampabile; altrimenti TextKit+HTML possono disegnare ~qualche pt oltre ``iw``.
+        # Banda vs area immagine (initWithHTML + bordo tabella): riduzione ampia per simmetria margini e linea verticale finale.
+        _iw_trim_pt = 84.0
+        iw_layout = max(200.0, iw - _iw_trim_pt)
+        inset_x_pad = (iw - iw_layout) / 2.0
+        left_inset = ox + inset_x_pad
+        top_inset = paper_h - oy - ih
+
+        html_utf8 = build_html(iw_layout)
+        raw = html_utf8.encode("utf-8")
+        nsdata = NSData.dataWithBytes_length_(raw, len(raw))
+        parsed = NSAttributedString.alloc().initWithHTML_documentAttributes_(nsdata, None)
+        if isinstance(parsed, tuple):
+            attr, _doc_attrs = parsed
+        else:
+            attr = parsed
+        if attr is None or attr.length() == 0:
+            return False
+
+        # Altezza iniziale ampia per il layout; poi stringiamo all'altezza reale del contenuto
+        # per evitare una seconda pagina vuota.
+        tv = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, paper_w, max(paper_h * 40.0, 4000.0)))
+        tv.setEditable_(False)
+        try:
+            tv.setTextContainerInset_((left_inset, top_inset))
+        except Exception:
+            pass
+        try:
+            tv.textContainer().setLineFragmentPadding_(0.0)
+        except Exception:
+            pass
+        try:
+            tv.textContainer().setWidthTracksTextView_(False)
+            tv.textContainer().setContainerSize_(NSSize(iw_layout, 1.0e7))
+        except Exception:
+            pass
+        try:
+            tv.setClipsToBounds_(False)
+        except Exception:
+            pass
+        tv.textStorage().setAttributedString_(attr)
+        try:
+            lm = tv.layoutManager()
+            tc = tv.textContainer()
+            lm.ensureLayoutForTextContainer_(tc)
+            used = lm.usedRectForTextContainer_(tc)
+            h_need = top_inset + float(used.origin.y + used.size.height) + 12.0
+            if h_need < 40.0:
+                h_need = top_inset + ih
+            tv.setFrame_(NSMakeRect(0, 0, paper_w, max(40.0, h_need)))
+        except Exception:
+            tv.setFrame_(NSMakeRect(0, 0, paper_w, top_inset + ih))
+
+        try:
+            op = NSPrintOperation.printOperationWithView_printInfo_(tv, pinfo)
+        except Exception:
+            op = NSPrintOperation.printOperationWithView_(tv)
+            if op is not None:
+                op.setPrintInfo_(pinfo)
+        if op is None:
+            return False
+        op.setShowsPrintPanel_(True)
+        op.setShowsProgressPanel_(True)
+        # runOperation() è NO se l'utente annulla: non aprire il fallback browser (HTML/PDF indesiderati).
+        op.runOperation()
+        return True
+    except Exception:
+        return False
+
+
+def _print_balances_native_windows(html_utf8: str) -> bool:
+    """
+    Dialog di stampa Windows via Internet Explorer COM (ExecWB), se disponibile.
+    Su Windows 11 IE può mancare: in quel caso ritorna False e si usa il fallback browser.
+    """
+    try:
+        import pythoncom
+        import win32com.client
+    except ImportError:
+        return False
+    tmp_path: str | None = None
+    coinit = False
+    ie = None
+    try:
+        try:
+            pythoncom.CoInitialize()
+            coinit = True
+        except pythoncom.com_error:
+            pass
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".html", encoding="utf-8") as f:
+            f.write(html_utf8)
+            tmp_path = str(Path(f.name).resolve())
+        url = Path(tmp_path).resolve().as_uri()
+        ie = win32com.client.DispatchEx("InternetExplorer.Application")
+        ie.Visible = 1
+        ie.Navigate2(url)
+
+        for _ in range(200):
+            if not ie.Busy and int(ie.ReadyState) == 4:
+                break
+            time.sleep(0.1)
+        else:
+            return False
+        # OLECMDID_PRINT = 6, OLECMDEXECOPT_PROMPTUSER = 1
+        ie.ExecWB(6, 1)
+        time.sleep(0.5)
+        return True
+    except Exception:
+        return False
+    finally:
+        if ie is not None:
+            try:
+                ie.Quit()
+            except Exception:
+                pass
+        if tmp_path:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        if coinit:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+
+def _print_balances_windows_pywebview(html_utf8: str) -> bool:
+    """
+    Windows 10/11: dialog stampa via Edge WebView2 (pacchetto pywebview), in sottoprocesso
+    separato per non bloccare Tk.
+    """
+    try:
+        import webview  # noqa: F401
+    except ImportError:
+        return False
+    worker = Path(__file__).resolve().parent / "webview_print_worker.py"
+    if not worker.is_file():
+        return False
+    try:
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".html", encoding="utf-8") as f:
+            f.write(html_utf8)
+            html_path = str(Path(f.name).resolve())
+        subprocess.Popen(
+            [sys.executable, str(worker), html_path],
+            close_fds=False,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _hex_to_rgb_triplet(hex_color: str) -> tuple[int, int, int]:
+    h = hex_color.lstrip("#").strip()
+    if len(h) != 6:
+        return (26, 26, 26)
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _print_balances_windows_fpdf(snap: dict) -> bool:
+    """Fallback Windows: PDF A4 verticale, tabella trasposta (4 colonne come HTML)."""
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        return False
+    names: list[str] = snap["names"]
+    valuta: str = snap["valuta"]
+    n = len(names)
+    try:
+        pdf = FPDF(orientation="P", unit="mm", format="A4")
+        pdf.set_margins(15, 15, 15)
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(0, 7, "Conti di casa", align="C", ln=1)
+        pdf.set_font("Helvetica", "", 8)
+        pdf.cell(0, 5, f"Data: {snap['date_it']}", align="C", ln=1)
+        # Spazio verticale data → tabella (~5 mm sotto la data + ~6 mm prima della tabella, come HTML).
+        pdf.ln(11)
+
+        epw = pdf.epw
+        _sh = 0.88
+        tw = epw * _sh
+        x_table = pdf.l_margin + (epw - tw) / 2.0
+        w_conti = tw * 0.16
+        w_amt = tw * 0.28
+        line_h = (6.5 if n > 12 else 7.0) * _sh
+        fs_head = round(7 * _sh, 2)
+        fs_body = round(7 * _sh, 2)
+
+        def amt_cell(amt: Decimal, w: float, *, bold: bool) -> None:
+            fg = balance_amount_fg(amt)
+            r, g, b = _hex_to_rgb_triplet(fg)
+            pdf.set_text_color(r, g, b)
+            pdf.set_font("Helvetica", "B" if bold else "", fs_body)
+            pdf.cell(w, line_h, format_saldo_cell(valuta, amt), border=1, align="R")
+
+        # Intestazione
+        pdf.set_x(x_table)
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("Helvetica", "B", fs_head)
+        pdf.cell(w_conti, line_h * 1.3, "Conti", border=1, align="L")
+        pdf.set_font("Helvetica", "B", fs_head)
+        pdf.cell(w_amt, line_h * 1.3, "Saldi oggi", border=1, align="C")
+        pdf.set_font("Helvetica", "", fs_head)
+        pdf.cell(w_amt, line_h * 1.3, "Differenze", border=1, align="C")
+        pdf.set_font("Helvetica", "B", fs_head)
+        pdf.cell(w_amt, line_h * 1.3, "Saldi assol.", border=1, align="C")
+        pdf.ln(line_h * 1.3)
+
+        for i, nm in enumerate(names):
+            pdf.set_x(x_table)
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_font("Helvetica", "B", fs_body)
+            show_nm = (nm or "").strip()[:10]
+            pdf.cell(w_conti, line_h, show_nm, border=1, align="L")
+            amt_cell(snap["amts_today"][i], w_amt, bold=True)
+            amt_cell(snap["diffs"][i], w_amt, bold=False)
+            amt_cell(snap["amts_abs"][i], w_amt, bold=True)
+            pdf.ln(line_h)
+
+        pdf.set_fill_color(240, 240, 240)
+        pdf.set_x(x_table)
+        pdf.set_font("Helvetica", "B", fs_body)
+        pdf.set_text_color(0, 0, 0)
+        pdf.cell(w_conti, line_h, "TOTALE", border=1, align="L", fill=True)
+        for amt, bold in (
+            (snap["total_today"], True),
+            (snap["total_diff"], False),
+            (snap["total_abs"], True),
+        ):
+            fg = balance_amount_fg(amt)
+            r, g, b = _hex_to_rgb_triplet(fg)
+            pdf.set_text_color(r, g, b)
+            pdf.set_font("Helvetica", "B" if bold else "", fs_body)
+            pdf.cell(w_amt, line_h, format_saldo_cell(valuta, amt), border=1, align="R", fill=True)
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(line_h)
+
+        fd, out_path = tempfile.mkstemp(suffix=".pdf", prefix="saldi_")
+        os.close(fd)
+        pdf.output(out_path)
+        os.startfile(out_path)  # type: ignore[attr-defined]
+        return True
+    except Exception:
+        return False
 
 
 def show_record_in_movements_grid(rec: dict) -> bool:
@@ -695,9 +1028,38 @@ def build_ui(db: dict) -> None:
     records_frame = ttk.Frame(movimenti_frame, padding=8)
     records_frame.pack(fill=tk.BOTH, expand=True)
 
+    search_title_var = tk.StringVar(value="")
+    _PRINT_RICERCA_RED = "#c62828"
+    _PRINT_RICERCA_RED_ACTIVE = "#8e0000"
+    search_title_row = tk.Frame(records_frame, bg="#ffffff")
+    btn_stampa_ricerca = tk.Label(
+        search_title_row,
+        text="Stampa ricerca",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=12,
+        pady=4,
+        bg=_PRINT_RICERCA_RED,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    btn_stampa_ricerca.pack(side=tk.LEFT, padx=(0, 10))
+    search_title_label = tk.Label(
+        search_title_row,
+        textvariable=search_title_var,
+        font=("TkDefaultFont", 12, "bold"),
+        fg="#1a1a1a",
+        bg="#ffffff",
+        anchor="w",
+        justify="left",
+    )
+    search_title_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
     no_results_label = tk.Label(
         records_frame,
-        text="Non ci sono registrazioni con questi filtri",
+        text="Nessuna registrazione con questi filtri",
         font=("TkDefaultFont", 16, "bold"),
         fg="#444444",
         bg="#ffffff",
@@ -772,6 +1134,50 @@ def build_ui(db: dict) -> None:
 
     mov_tree.tag_configure("stripe0", background="#f7f7f7")
     mov_tree.tag_configure("stripe1", background="#ffffff")
+
+    def refresh_search_title() -> None:
+        mode = filter_order_applied_var.get()
+        future_txt = "comprese date future" if filter_future_applied_var.get() == "include" else "escluse date future"
+        dir_txt = (
+            "all'indietro dalla più recente"
+            if filter_direction_applied_var.get() == "backward"
+            else "in avanti dalla più lontana"
+        )
+        if mode == "date":
+            s_from = to_italian_date(date_from_applied_var.get())
+            s_to = to_italian_date(date_to_applied_var.get())
+            date_txt = f"dalla data {s_from} alla data {s_to}"
+            mode_txt = "Ricerca per data"
+        else:
+            scope_from, scope_to = _scope_dates_for_registration(reg_preset_applied_var.get())
+            date_txt = f"dalla data {to_italian_date(scope_from)} alla data {to_italian_date(scope_to)}"
+            mode_txt = "Ricerca per registrazione"
+
+        parts: list[str] = [mode_txt, future_txt, dir_txt, date_txt]
+
+        if mode == "registration":
+            rf = (reg_from_applied_var.get() or "").strip()
+            rt = (reg_to_applied_var.get() or "").strip()
+            if rf and rt:
+                parts.append(f"dalla reg. # {rf} alla reg. # {rt}")
+
+        cat = (text_category_applied_var.get() or "").strip()
+        acc = (text_account_applied_var.get() or "").strip()
+        chq = (text_cheque_applied_var.get() or "").strip()
+        note = (text_note_applied_var.get() or "").strip()
+        if mode == "date" and cat and cat != _ALL_CATEGORIES_LABEL:
+            parts.append(f"per la categoria {cat}")
+        if acc and acc != _ALL_ACCOUNTS_LABEL:
+            parts.append(f"per il conto {acc}")
+        if mode == "date" and chq:
+            parts.append(f"per l'assegno {chq}")
+        if mode == "date" and note:
+            parts.append(f"per la nota {note}")
+
+        s = ", ".join(parts).strip()
+        if s and not s.endswith("."):
+            s += "."
+        search_title_var.set(s)
 
     # Separatori verticali nel primo Treeview (mov_tree).
     # ttk.Treeview non supporta vere gridline verticali; overlay con Frame 1px.
@@ -1085,8 +1491,10 @@ def build_ui(db: dict) -> None:
     records_frame.grid_columnconfigure(4, weight=1, minsize=100)
     records_frame.grid_columnconfigure(5, weight=0, minsize=20)
     records_frame.grid_rowconfigure(0, weight=0)
-    records_frame.grid_rowconfigure(1, weight=1)
-    header_row.grid(row=0, column=0, columnspan=5, sticky="ew", pady=(0, 2))
+    records_frame.grid_rowconfigure(1, weight=0)
+    records_frame.grid_rowconfigure(2, weight=1)
+    search_title_row.grid(row=0, column=0, columnspan=6, sticky="ew", pady=(0, 6))
+    header_row.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(0, 2))
     mov_hdr.grid(row=0, column=0, sticky="ew")
     hdr_sep_1.grid(row=0, column=1, sticky="nsw")
     amt_hdr.grid(row=0, column=2, sticky="ew")
@@ -1104,12 +1512,12 @@ def build_ui(db: dict) -> None:
     sep_2 = tk.Frame(records_frame, bg=header_bg, width=_SEP_CH_W)
     sep_1_line = tk.Frame(sep_1, bg="#c0c0c0", width=1)
     sep_2_line = tk.Frame(sep_2, bg="#c0c0c0", width=1)
-    mov_tree.grid(row=1, column=0, sticky="nsew")
-    sep_1.grid(row=1, column=1, sticky="nsw")
-    amt_tree.grid(row=1, column=2, sticky="nsew")
-    sep_2.grid(row=1, column=3, sticky="nsw")
-    note_tree.grid(row=1, column=4, sticky="nsew")
-    yscroll.grid(row=1, column=5, sticky="ns", padx=(2, 0))
+    mov_tree.grid(row=2, column=0, sticky="nsew")
+    sep_1.grid(row=2, column=1, sticky="nsw")
+    amt_tree.grid(row=2, column=2, sticky="nsew")
+    sep_2.grid(row=2, column=3, sticky="nsw")
+    note_tree.grid(row=2, column=4, sticky="nsew")
+    yscroll.grid(row=2, column=5, sticky="ns", padx=(2, 0))
 
     sep_1_line.place(x=-3, y=0, relheight=1.0)
     sep_2_line.place(x=-3, y=0, relheight=1.0)
@@ -1119,10 +1527,85 @@ def build_ui(db: dict) -> None:
     ] = []
     movements_population_seq = 0
 
+    def _movement_rows_from_pool(
+        pool: list[dict],
+        reg_seq_map: dict,
+        accounts_by_year: dict,
+        categories_by_year: dict,
+    ) -> list[tuple[str, str, tuple[object, ...], str, str, str, str]]:
+        """Stessa logica della griglia: (iid, reg#, mov_vals×7, importo, tag colore, nota, stripe)."""
+        q_cat_raw = text_category_applied_var.get().strip()
+        q_acc_raw = text_account_applied_var.get().strip()
+        q_cat = "" if q_cat_raw in ("", _ALL_CATEGORIES_LABEL) else q_cat_raw.lower()
+        q_acc = "" if q_acc_raw in ("", _ALL_ACCOUNTS_LABEL) else q_acc_raw.lower()
+        q_chq = text_cheque_applied_var.get().strip().lower()
+        q_note = text_note_applied_var.get().strip().lower()
+        row_i = 0
+        reg_from_n = None
+        reg_to_n = None
+        if filter_order_applied_var.get() == "registration":
+            try:
+                reg_from_n = int(str(reg_from_applied_var.get()).strip())
+                reg_to_n = int(str(reg_to_applied_var.get()).strip())
+            except Exception:
+                reg_from_n = None
+                reg_to_n = None
+        out: list[tuple[str, str, tuple[object, ...], str, str, str, str]] = []
+        for r in pool:
+            year = r.get("year")
+            year_accounts = accounts_by_year.get(year, [])
+            year_categories = categories_by_year.get(year, [])
+            account_1_name = account_name_for_record(r, year_accounts, "primary")
+            account_2_name = account_name_for_record(r, year_accounts, "secondary")
+            category_name = category_name_for_record(r, year_categories)
+            stars_1 = r.get("account_primary_flags", "")
+            stars_2 = r.get("account_secondary_flags", "")
+            if filter_order_applied_var.get() == "date":
+                if q_cat and q_cat != (category_name or "").lower():
+                    continue
+                if q_acc and q_acc not in (account_1_name or "").lower() and q_acc not in (account_2_name or "").lower():
+                    continue
+                if q_chq and q_chq not in str(r.get("cheque") or "").lower():
+                    continue
+                if q_note and q_note not in str(r.get("note") or "").lower():
+                    continue
+            elif filter_order_applied_var.get() == "registration":
+                nreg = reg_seq_map[record_legacy_stable_key(r)]
+                if reg_from_n is not None and reg_to_n is not None:
+                    if filter_direction_applied_var.get() == "backward":
+                        if nreg > reg_from_n or nreg < reg_to_n:
+                            continue
+                    else:
+                        if nreg < reg_from_n or nreg > reg_to_n:
+                            continue
+                if q_acc and q_acc not in (account_1_name or "").lower() and q_acc not in (account_2_name or "").lower():
+                    continue
+
+            amount_text, amount_tag = format_amount_for_output(r)
+            stripe = f"stripe{row_i % 2}"
+            rid = str(row_i)
+            reg_text = str(reg_seq_map[record_legacy_stable_key(r)])
+            mov_vals = (
+                to_italian_date(r["date_iso"]),
+                category_name,
+                account_1_name,
+                stars_1,
+                account_2_name,
+                stars_2,
+                r.get("cheque") or "",
+            )
+            out.append((rid, reg_text, mov_vals, amount_text, amount_tag, r.get("note") or "", stripe))
+            row_i += 1
+        return out
+
     def populate_movements_trees() -> None:
         nonlocal movements_population_seq
         movements_population_seq += 1
         token_local = movements_population_seq
+        try:
+            refresh_search_title()
+        except Exception:
+            pass
         # Nascondi eventuale messaggio "no risultati"
         try:
             no_results_label.place_forget()
@@ -1189,72 +1672,9 @@ def build_ui(db: dict) -> None:
             ),
         )
         pending_movement_rows.clear()
-        q_cat_raw = text_category_applied_var.get().strip()
-        q_acc_raw = text_account_applied_var.get().strip()
-        q_cat = "" if q_cat_raw in ("", _ALL_CATEGORIES_LABEL) else q_cat_raw.lower()
-        q_acc = "" if q_acc_raw in ("", _ALL_ACCOUNTS_LABEL) else q_acc_raw.lower()
-        q_chq = text_cheque_applied_var.get().strip().lower()
-        q_note = text_note_applied_var.get().strip().lower()
-        row_i = 0
-        # Range registrazione (solo se Ricerca per registrazione)
-        reg_from_n = None
-        reg_to_n = None
-        if filter_order_applied_var.get() == "registration":
-            try:
-                reg_from_n = int(str(reg_from_applied_var.get()).strip())
-                reg_to_n = int(str(reg_to_applied_var.get()).strip())
-            except Exception:
-                reg_from_n = None
-                reg_to_n = None
-        for r in pool:
-            year = r.get("year")
-            year_accounts = accounts_by_year.get(year, [])
-            year_categories = categories_by_year.get(year, [])
-            account_1_name = account_name_for_record(r, year_accounts, "primary")
-            account_2_name = account_name_for_record(r, year_accounts, "secondary")
-            category_name = category_name_for_record(r, year_categories)
-            stars_1 = r.get("account_primary_flags", "")
-            stars_2 = r.get("account_secondary_flags", "")
-            # Filtri testuali (solo se Ricerca per data).
-            if filter_order_applied_var.get() == "date":
-                if q_cat and q_cat != (category_name or "").lower():
-                    continue
-                if q_acc and q_acc not in (account_1_name or "").lower() and q_acc not in (account_2_name or "").lower():
-                    continue
-                if q_chq and q_chq not in str(r.get("cheque") or "").lower():
-                    continue
-                if q_note and q_note not in str(r.get("note") or "").lower():
-                    continue
-            elif filter_order_applied_var.get() == "registration":
-                # Filtro per range reg + (opzionale) conto nello scope
-                nreg = reg_seq_map[record_legacy_stable_key(r)]
-                if reg_from_n is not None and reg_to_n is not None:
-                    if filter_direction_applied_var.get() == "backward":
-                        if nreg > reg_from_n or nreg < reg_to_n:
-                            continue
-                    else:
-                        if nreg < reg_from_n or nreg > reg_to_n:
-                            continue
-                if q_acc and q_acc not in (account_1_name or "").lower() and q_acc not in (account_2_name or "").lower():
-                    continue
-
-            amount_text, amount_tag = format_amount_for_output(r)
-            stripe = f"stripe{row_i % 2}"
-            rid = str(row_i)
-            reg_text = str(reg_seq_map[record_legacy_stable_key(r)])
-            mov_vals = (
-                to_italian_date(r["date_iso"]),
-                category_name,
-                account_1_name,
-                stars_1,
-                account_2_name,
-                stars_2,
-                r.get("cheque") or "",
-            )
-            pending_movement_rows.append(
-                (rid, reg_text, mov_vals, amount_text, amount_tag, r.get("note") or "", stripe)
-            )
-            row_i += 1
+        pending_movement_rows.extend(
+            _movement_rows_from_pool(pool, reg_seq_map, accounts_by_year, categories_by_year)
+        )
 
         def flush_movement_batch(start: int) -> None:
             # Evita race condition: se nel frattempo viene lanciato un nuovo populate,
@@ -1276,12 +1696,44 @@ def build_ui(db: dict) -> None:
             if end < len(pending_movement_rows):
                 root.after(1, lambda s=end: flush_movement_batch(s))
             else:
+                # Risultati presenti: assicurati che intestazione e griglia siano visibili.
+                try:
+                    header_row.grid()
+                    mov_tree.grid()
+                    sep_1.grid()
+                    amt_tree.grid()
+                    sep_2.grid()
+                    note_tree.grid()
+                    yscroll.grid()
+                except Exception:
+                    pass
                 root.after_idle(scroll_movements_grid_to_top)
 
         if pending_movement_rows:
+            # Mostra griglia/intestazione (se erano state nascoste per "nessun risultato").
+            try:
+                header_row.grid()
+                mov_tree.grid()
+                sep_1.grid()
+                amt_tree.grid()
+                sep_2.grid()
+                note_tree.grid()
+                yscroll.grid()
+            except Exception:
+                pass
             root.after(0, lambda: flush_movement_batch(0))
         else:
             # Nessun risultato: mostra testo centrato.
+            try:
+                header_row.grid_remove()
+                mov_tree.grid_remove()
+                sep_1.grid_remove()
+                amt_tree.grid_remove()
+                sep_2.grid_remove()
+                note_tree.grid_remove()
+                yscroll.grid_remove()
+            except Exception:
+                pass
             no_results_label.place(relx=0.5, rely=0.5, anchor="center")
 
     # Coppie tipo pulsante: su macOS tk.Button ignora spesso bg; usiamo Label cliccabili (bg rispettato).
@@ -1481,14 +1933,27 @@ def build_ui(db: dict) -> None:
                     "Fuori intervallo",
                     f"I numeri di registrazione devono essere tra {mn_allowed} e {mx_allowed} per il periodo scelto.",
                 )
+                # Dopo l'avviso, ripristina subito i valori coerenti nelle caselle.
+                try:
+                    refresh_registration_scope_and_controls()
+                except Exception:
+                    pass
                 return
 
             # Coerenza con direzione: backward -> dalla >= alla ; forward -> dalla <= alla
             if d == "backward" and rf < rt:
                 messagebox.showerror("Ordine non coerente", "Con All'indietro, Dalla reg. # deve essere >= Alla reg. #.")
+                try:
+                    refresh_registration_scope_and_controls()
+                except Exception:
+                    pass
                 return
             if d == "forward" and rf > rt:
                 messagebox.showerror("Ordine non coerente", "Con In avanti, Dalla reg. # deve essere <= Alla reg. #.")
+                try:
+                    refresh_registration_scope_and_controls()
+                except Exception:
+                    pass
                 return
 
         if (
@@ -2581,22 +3046,644 @@ def build_ui(db: dict) -> None:
     balance_footer.pack(fill=tk.X)
     balance_footer_row = tk.Frame(balance_footer)
     balance_footer_row.pack(fill=tk.X, anchor=tk.CENTER)
+    balance_left = tk.Frame(balance_footer_row)
+    balance_left.pack(side=tk.LEFT, anchor="w")
+    balance_center = tk.Frame(balance_footer_row)
+    balance_center.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     saldo_footer_font = ("TkDefaultFont", 13)
 
-    def refresh_balance_footer() -> None:
-        for w in balance_footer_row.winfo_children():
-            w.destroy()
-        ly, names, amts_abs = compute_balances_from_2022(cur_db())
+    def _saldi_snapshot_for_print() -> dict:
+        _, names, amts_abs = compute_balances_from_2022(cur_db())
         _, _, amts_today = compute_balances_from_2022_asof(cur_db(), cutoff_date_iso=date.today().isoformat())
-        valuta = "E" if ly >= 2002 else "L"
+        total_abs = sum(amts_abs, Decimal("0"))
+        total_today = sum(amts_today, Decimal("0"))
+        diffs = [a - b for a, b in zip(amts_abs, amts_today)]
+        total_diff = total_abs - total_today
+        return {
+            "valuta": "E",
+            "names": [n.strip() for n in names],
+            "amts_abs": amts_abs,
+            "amts_today": amts_today,
+            "diffs": diffs,
+            "total_abs": total_abs,
+            "total_today": total_today,
+            "total_diff": total_diff,
+            "date_it": to_italian_date(date.today().isoformat()),
+        }
+
+    def _build_saldi_print_html(
+        snap: dict,
+        *,
+        for_native: bool = False,
+        native_text_width_pt: float | None = None,
+    ) -> str:
+        """Stampa A4: tabella trasposta — righe = conti, colonne = tre tipi di saldo + TOTALE in chiusura.
+
+        Con ``native_text_width_pt=iw`` (solo macOS) colgroup e larghezza tabella sono in **punti** (proporzioni 16/28/28/28).
+        """
+        valuta = snap["valuta"]
+        names: list[str] = snap["names"]
+        n_acc = len(names)
+        # Sempre A4 verticale: molte righe → continuazione su pagine successive (non orizzontale:
+        # in landscape l'altezza utile per le righe diminuisce).
+        page_size = "A4"
+        # Stampa nativa macOS: margini solo da NSPrintInfo + textContainerInset (evita doppio margine HTML).
+        page_margin = "0" if for_native else "7mm"
+        body_pad_v, body_pad_h = "1mm", "2mm"
+        h1_pt = 10.0
+        meta_pt = 7.0
+        table_pt = 5.8 if n_acc <= 10 else 5.2
+        hdr_pt = round(table_pt * 0.88, 2)
+        # Stampa nativa: tabella −12% (0,88) per margine sicuro sull’ultima colonna; font tabella in scala.
+        _saldi_shrink = 0.88 if native_text_width_pt is not None else 1.0
+        _tbl_pt = round(table_pt * _saldi_shrink, 3)
+        _hdr_tbl_pt = round(_tbl_pt * 0.88, 2)
+        cell_pad = "1px 2px"
+        line_h = 1.05
+        body_pad_css = "0" if for_native else f"{body_pad_v} {body_pad_h}"
+        # Larghezze colonne: 16% Conti, 28% ciascuna colonna importo (100% totale).
+        pct_conti = 16
+        pct_amt = 28
+        native_root_style = ""
+        native_wrap_style = ""
+        native_table_style = ""
+        if native_text_width_pt is not None:
+            _iw = float(native_text_width_pt)
+            # Slack orizzontale simmetrico: riduce la larghezza tabella e la centra con padding sul wrap,
+            # così bordi/rounding TextKit non tagliano l'ultima colonna (initWithHTML non è un motore browser).
+            _slack = 8.0
+            _tw_base = max(120.0, _iw - _slack)
+            _tw = _tw_base * _saldi_shrink
+            _side = max(0.0, (_iw - _tw) / 2.0)
+            # Gutter uguale sinistra/destra dentro il wrap: lascia ~1px bordo tabella senza taglio a destra (percezione margine asimmetrico).
+            _edge_gutter_pt = 5.0
+            _inner_tw = max(100.0, _tw - 2.0 * _edge_gutter_pt)
+            _pad_h = _side + _edge_gutter_pt
+            w_c = _inner_tw * pct_conti / 100.0
+            w_a = _inner_tw * pct_amt / 100.0
+            colgroup_html = (
+                "<colgroup>"
+                f'<col class="col-conti" style="width:{w_c:.2f}pt" />'
+                f'<col style="width:{w_a:.2f}pt" />'
+                f'<col style="width:{w_a:.2f}pt" />'
+                f'<col style="width:{w_a:.2f}pt" />'
+                "</colgroup>"
+            )
+            native_root_style = (
+                f' style="width:{_iw:.2f}pt;max-width:{_iw:.2f}pt;margin:0;padding:0;box-sizing:border-box;"'
+            )
+            # border-box + padding orizzontale _side: area interna = iw - 2*_side = _tw (centra senza margin sulla table;
+            # margin-right su <table> è spesso ignorato da initWithHTML e spinge il taglio a destra).
+            native_wrap_style = (
+                f' style="width:{_iw:.2f}pt;max-width:{_iw:.2f}pt;margin:0;'
+                f'padding:6mm {_pad_h:.2f}pt 0 {_pad_h:.2f}pt;box-sizing:border-box;text-align:left;"'
+            )
+            native_table_style = (
+                f' style="width:{_inner_tw:.2f}pt;max-width:{_inner_tw:.2f}pt;margin:0;padding:0;'
+                f'table-layout:fixed;border-collapse:collapse;border-spacing:0;"'
+            )
+        else:
+            colgroup_html = (
+                "<colgroup>"
+                f'<col class="col-conti" style="width:{pct_conti}%" />'
+                f'<col style="width:{pct_amt}%" />'
+                f'<col style="width:{pct_amt}%" />'
+                f'<col style="width:{pct_amt}%" />'
+                "</colgroup>"
+            )
+        _table_width_css_block = (
+            f"""  table.saldi {{
+    width: 88%;
+    max-width: 100%;
+    margin: 0 auto;
+    table-layout: fixed;
+    border-collapse: collapse;
+    border-spacing: 0;
+    font-size: {_tbl_pt}pt;
+    line-height: {line_h};
+  }}"""
+            if native_text_width_pt is None
+            else f"""  table.saldi {{
+    table-layout: fixed;
+    border-collapse: collapse;
+    border-spacing: 0;
+    font-size: {_tbl_pt}pt;
+    line-height: {line_h};
+  }}"""
+        )
+
+        def conti_cell(label: str) -> str:
+            s = (label or "").strip()[:10]
+            return f'<td class="row-label">{html_module.escape(s)}</td>'
+
+        def td_num(amt: Decimal, *, bold: bool) -> str:
+            fg = balance_amount_fg(amt)
+            t = html_module.escape(format_saldo_cell(valuta, amt))
+            cls = "num amt-b" if bold else "num amt-n"
+            inner = f"<strong>{t}</strong>" if bold else t
+            return f'<td class="{cls}" style="color:{html_module.escape(fg)}">{inner}</td>'
+
+        header_cells = (
+            '<th class="hdr-name">Conti</th>'
+            '<th class="col-hdr col-hdr-b"><strong>Saldi alla data<br/>di oggi</strong></th>'
+            '<th class="col-hdr col-hdr-n">Differenze</th>'
+            '<th class="col-hdr col-hdr-b"><strong>Saldi assoluti</strong></th>'
+        )
+
+        body_lines: list[str] = []
+        for i, nm in enumerate(names):
+            body_lines.append(
+                "<tr>"
+                + conti_cell(nm)
+                + td_num(snap["amts_today"][i], bold=True)
+                + td_num(snap["diffs"][i], bold=False)
+                + td_num(snap["amts_abs"][i], bold=True)
+                + "</tr>"
+            )
+        body_lines.append(
+            '<tr class="totale">'
+            + conti_cell("TOTALE")
+            + td_num(snap["total_today"], bold=True)
+            + td_num(snap["total_diff"], bold=False)
+            + td_num(snap["total_abs"], bold=True)
+            + "</tr>"
+        )
+        tbody_html = "\n".join(body_lines)
+
+        return f"""<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8"/>
+<title>Conti di casa — Saldi</title>
+<style>
+  @page {{ size: {page_size}; margin: {page_margin}; }}
+  * {{ box-sizing: border-box; }}
+  html, body {{ margin: 0; padding: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }}
+  body {{ padding: {body_pad_css}; color: #1a1a1a; text-align: left; }}
+  .print-root {{ width: 100%; max-width: 100%; margin: 0; padding: 0; text-align: left; }}
+  .print-head {{ width: 100%; max-width: 100%; margin: 0; padding: 0; text-align: center; box-sizing: border-box; }}
+  h1 {{ font-size: {h1_pt}pt; text-align: center; margin: 0 0 1mm 0; padding: 0; font-weight: 700; line-height: 1.1; width: 100%; }}
+  .meta {{ text-align: center; margin: 0; padding: 0 0 5mm 0; font-size: {meta_pt}pt; line-height: 1.1; width: 100%; }}
+  .saldi-table-wrap {{ width: 100%; margin: 0; padding: 6mm 0 0 0; text-align: left; box-sizing: border-box; }}
+{_table_width_css_block}
+  thead {{ display: table-header-group; }}
+  .saldi tbody tr {{ page-break-inside: avoid; }}
+  .saldi th, .saldi td {{
+    border: 1px solid #333;
+    padding: {cell_pad};
+    vertical-align: middle;
+    white-space: nowrap;
+  }}
+  .saldi th {{
+    background: #ebebeb;
+    vertical-align: middle;
+  }}
+  .saldi th.hdr-name {{
+    text-align: left;
+    font-size: {_tbl_pt}pt;
+    font-weight: 700;
+    overflow: hidden;
+    text-overflow: clip;
+  }}
+  .saldi th.col-hdr {{
+    text-align: center;
+    font-size: {_hdr_tbl_pt}pt;
+    line-height: 1.12;
+    white-space: normal;
+    overflow: visible;
+  }}
+  .saldi th.col-hdr-b {{ font-weight: 700; }}
+  .saldi th.col-hdr-n {{ font-weight: 400; }}
+  .saldi td.row-label {{
+    font-weight: 600;
+    text-align: left;
+    background: #fafafa;
+    overflow: hidden;
+    text-overflow: clip;
+  }}
+  .saldi tr.totale td.row-label {{ font-weight: 700; }}
+  .saldi tr.totale td {{ background: #f0f0f0; }}
+  .saldi td.num {{
+    text-align: right;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: visible;
+    letter-spacing: -0.04em;
+  }}
+  .saldi td.amt-b strong {{ font-weight: 700; }}
+  .saldi td.amt-n {{ font-weight: 400; }}
+  @media print {{
+    body {{ padding: 0; margin: 0; }}
+    .print-root {{ margin: 0; padding: 0; }}
+    .print-head {{ text-align: center; }}
+    h1 {{ margin-top: 0; text-align: center; }}
+    .saldi-table-wrap {{ padding-top: 6mm; }}
+    .noprint {{ display: none !important; }}
+  }}
+</style>
+</head>
+<body>
+<div class="print-root"{native_root_style}>
+<div class="print-head">
+<h1 style="margin:0 0 1mm 0;padding:0;text-align:center;width:100%;font-weight:700;">Conti di casa</h1>
+<div class="meta" style="margin:0;padding:0 0 5mm 0;text-align:center;width:100%;">Data: {html_module.escape(snap["date_it"])}</div>
+</div>
+<div class="saldi-table-wrap"{native_wrap_style}>
+<table class="saldi" role="table"{native_table_style}>
+{colgroup_html}
+<thead><tr>{header_cells}</tr></thead>
+<tbody>
+{tbody_html}
+</tbody>
+</table>
+</div>
+</div>
+{(
+            '<p class="noprint" style="margin-top:8mm;font-size:9pt;color:#555;text-align:center;">'
+            "Se la finestra di stampa non si apre, usa il comando Stampa del browser (es. Cmd+P / Ctrl+P)."
+            "</p>"
+            "<script>"
+            'window.addEventListener("load", function () {'
+            "setTimeout(function () { window.print(); }, 400);"
+            "});"
+            "</script>"
+            if not for_native
+            else ""
+        )}
+</body>
+</html>
+"""
+
+    def _print_saldi_via_browser(html_doc: str) -> None:
+        try:
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".html", encoding="utf-8") as f:
+                f.write(html_doc)
+                tmp_path = Path(f.name).resolve()
+            uri = tmp_path.as_uri()
+            webbrowser.open(uri)
+        except Exception as exc:
+            picked = filedialog.asksaveasfilename(
+                defaultextension=".html",
+                filetypes=[("HTML", "*.html"), ("Tutti i file", "*.*")],
+                initialfile=f"saldi_{date.today().isoformat()}.html",
+            )
+            if picked:
+                Path(picked).write_text(html_doc, encoding="utf-8")
+                try:
+                    webbrowser.open(Path(picked).resolve().as_uri())
+                except Exception:
+                    messagebox.showerror("Stampa saldi", str(exc))
+            else:
+                messagebox.showerror("Stampa saldi", str(exc))
+
+    def _print_ricerca_via_browser(html_doc: str) -> None:
+        try:
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".html", encoding="utf-8") as f:
+                f.write(html_doc)
+                tmp_path = Path(f.name).resolve()
+            uri = tmp_path.as_uri()
+            webbrowser.open(uri)
+        except Exception as exc:
+            picked = filedialog.asksaveasfilename(
+                defaultextension=".html",
+                filetypes=[("HTML", "*.html"), ("Tutti i file", "*.*")],
+                initialfile=f"ricerca_{date.today().isoformat()}.html",
+            )
+            if picked:
+                Path(picked).write_text(html_doc, encoding="utf-8")
+                try:
+                    webbrowser.open(Path(picked).resolve().as_uri())
+                except Exception:
+                    messagebox.showerror("Stampa ricerca", str(exc))
+            else:
+                messagebox.showerror("Stampa ricerca", str(exc))
+
+    def _build_ricerca_print_html(
+        rows: list[tuple[str, str, tuple[object, ...], str, str, str, str]],
+        search_desc: str,
+        *,
+        for_native: bool = False,
+        native_text_width_pt: float | None = None,
+    ) -> str:
+        """HTML stampa elenco movimenti filtrati: titolo/data come saldi, descrizione ricerca, tabella 2 righe/reg."""
+        page_size = "A4"
+        page_margin = "0" if for_native else "7mm"
+        body_pad_css = "0" if for_native else "2mm 3mm"
+        h1_pt = 10.0
+        meta_pt = 7.0
+        tbl_pt = 5.4 if for_native else 6.2
+        desc_pt = 7.8
+        date_it = to_italian_date(date.today().isoformat())
+        desc_esc = html_module.escape(search_desc or "(nessuna descrizione)")
+        native_root_style = ""
+        if native_text_width_pt is not None:
+            _iw = float(native_text_width_pt)
+            native_root_style = (
+                f' style="width:{_iw:.2f}pt;max-width:{_iw:.2f}pt;margin:0;padding:0;box-sizing:border-box;"'
+            )
+        # Data/asterischi: altro +10% sui pesi attuali; compensato su Assegno; normalizzazione a 100%.
+        _w_base = [6.0, 10.56, 21.0, 14.0, 0.968, 14.0, 0.968, 5.104, 24.0]
+        _w_sum = sum(_w_base)
+        _col_pct = [round(100.0 * x / _w_sum, 3) for x in _w_base]
+        colgroup_html = "".join(f'<col style="width:{p:.3f}%" />' for p in _col_pct)
+        body_lines: list[str] = []
+        for _rid, reg_text, mov_vals, amount_text, amount_tag, note_text, _stripe in rows:
+            dt, cat, a1, s1, a2, s2, chq = mov_vals
+            fg = COLOR_AMOUNT_NEG if amount_tag == "neg" else COLOR_AMOUNT_POS
+            reg_e = html_module.escape(str(reg_text))
+            dt_e = html_module.escape(str(dt))
+            cat_e = html_module.escape((str(cat or "")).strip()[:14])
+            a1_e = html_module.escape((str(a1 or "")).strip()[:10])
+            s1_e = html_module.escape(str(s1 or ""))
+            a2_e = html_module.escape((str(a2 or "")).strip()[:10])
+            s2_e = html_module.escape(str(s2 or ""))
+            chq_e = html_module.escape(str(chq or ""))
+            amt_e = html_module.escape(str(amount_text))
+            note_e = html_module.escape(str(note_text or "")).replace("\n", "<br/>")
+            body_lines.append(
+                '<tr class="r-main">'
+                f'<td class="r-num">{reg_e}</td>'
+                f'<td class="r-dt">{dt_e}</td>'
+                f'<td class="r-cat">{cat_e}</td>'
+                f'<td class="r-a1">{a1_e}</td>'
+                f'<td class="r-f1">{s1_e}</td>'
+                f'<td class="r-a2">{a2_e}</td>'
+                f'<td class="r-f2">{s2_e}</td>'
+                f'<td class="r-chq">{chq_e}</td>'
+                f'<td class="r-amt" style="color:{html_module.escape(fg)};font-weight:700;">{amt_e}</td>'
+                "</tr>"
+                f'<tr class="r-note"><td colspan="9"><div class="note-wrap">{note_e}</div></td></tr>'
+            )
+        tbody_html = "\n".join(body_lines) if body_lines else (
+            '<tr><td colspan="9" style="text-align:center;">Nessuna registrazione</td></tr>'
+        )
+        return f"""<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8"/>
+<title>Conti di casa — Stampa ricerca</title>
+<style>
+  @page {{ size: {page_size}; margin: {page_margin}; }}
+  * {{ box-sizing: border-box; }}
+  html, body {{ margin: 0; padding: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }}
+  body {{ padding: {body_pad_css}; color: #1a1a1a; }}
+  .print-root {{ width: 100%; max-width: 100%; margin: 0; padding: 0; overflow-x: hidden; }}
+  h1 {{ font-size: {h1_pt}pt; text-align: center; margin: 0 0 1mm 0; padding: 0; font-weight: 700; line-height: 1.1; width: 100%; }}
+  .meta {{ text-align: center; margin: 0; padding: 0 0 4mm 0; font-size: {meta_pt}pt; line-height: 1.1; width: 100%; }}
+  .search-desc {{ font-size: {desc_pt}pt; font-weight: 700; margin: 0 0 4mm 0; padding: 0; line-height: 1.25; }}
+  table.ricerca {{
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    border-collapse: collapse;
+    border-spacing: 0;
+    font-size: {tbl_pt}pt;
+    line-height: 1.15;
+    table-layout: fixed;
+  }}
+  table.ricerca th, table.ricerca td {{
+    padding: 1px 3px;
+    vertical-align: top;
+    word-wrap: break-word;
+    overflow-wrap: anywhere;
+  }}
+  /* Data e asterischi: una sola riga (no a capo); overflow nascosto. */
+  table.ricerca td.r-dt,
+  table.ricerca td.r-f1,
+  table.ricerca td.r-f2 {{
+    white-space: nowrap !important;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    word-wrap: normal;
+    overflow-wrap: normal;
+  }}
+  table.ricerca thead th:nth-child(2),
+  table.ricerca thead th:nth-child(5),
+  table.ricerca thead th:nth-child(7) {{
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }}
+  .ricerca-shell {{
+    width: 100%;
+    max-width: 100%;
+    overflow: hidden;
+    box-sizing: border-box;
+  }}
+  /* Bordi leggeri tra celle; contorno “blocco registrazione” più scuro su r-main + r-note */
+  table.ricerca thead th {{
+    background: #ebebeb;
+    font-weight: 700;
+    text-align: center;
+    border: 1px solid #2a2a2a;
+  }}
+  table.ricerca tr.r-main td {{
+    border: 1px solid #c8c8c8;
+    border-top: 1.5px solid #2a2a2a;
+    border-bottom: 1px solid #c8c8c8;
+  }}
+  table.ricerca tr.r-main td:first-child {{ border-left: 1.5px solid #2a2a2a; }}
+  table.ricerca tr.r-main td:last-child {{ border-right: 1.5px solid #2a2a2a; }}
+  table.ricerca tr.r-note td {{
+    font-size: {tbl_pt * 0.95:.2f}pt;
+    font-weight: 400;
+    background: #fafafa;
+    white-space: normal;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    width: 100%;
+    max-width: 100%;
+    border-left: 1.5px solid #2a2a2a;
+    border-right: 1.5px solid #2a2a2a;
+    border-bottom: 1.5px solid #2a2a2a;
+    border-top: 1px solid #c8c8c8;
+    overflow: hidden;
+    box-sizing: border-box;
+  }}
+  table.ricerca tr.r-note .note-wrap {{
+    display: block;
+    min-width: 0;
+    max-width: 100%;
+    width: 100%;
+    box-sizing: border-box;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    overflow: hidden;
+  }}
+  table.ricerca td.r-num {{ text-align: right; white-space: nowrap; }}
+  table.ricerca td.r-dt {{ text-align: right; }}
+  table.ricerca td.r-cat {{ text-align: left; }}
+  table.ricerca td.r-a1 {{ text-align: left; }}
+  table.ricerca td.r-f1 {{ text-align: center; }}
+  table.ricerca td.r-a2 {{ text-align: left; }}
+  table.ricerca td.r-f2 {{ text-align: center; }}
+  table.ricerca td.r-chq {{ text-align: center; }}
+  table.ricerca td.r-amt {{ text-align: right; white-space: nowrap; font-family: ui-monospace, Menlo, monospace; }}
+  @media print {{
+    body {{ padding: 0; margin: 0; }}
+    .noprint {{ display: none !important; }}
+  }}
+</style>
+</head>
+<body>
+<div class="print-root"{native_root_style}>
+<h1 style="margin:0 0 1mm 0;padding:0;text-align:center;width:100%;font-weight:700;">Conti di casa</h1>
+<div class="meta" style="margin:0;padding:0 0 4mm 0;text-align:center;width:100%;">Data: {html_module.escape(date_it)}</div>
+<p class="search-desc">{desc_esc}</p>
+<div class="ricerca-shell">
+<table class="ricerca" role="table">
+<colgroup>
+{colgroup_html}
+</colgroup>
+<thead><tr>
+<th>Reg #</th><th>Data</th><th>Categoria</th><th>Dal conto</th><th></th><th>al conto</th><th></th><th>Assegno</th><th>Importo</th>
+</tr></thead>
+<tbody>
+{tbody_html}
+</tbody>
+</table>
+</div>
+</div>
+{(
+            '<p class="noprint" style="margin-top:8mm;font-size:9pt;color:#555;text-align:center;">'
+            "Apri Stampa dal browser (Cmd+P / Ctrl+P) se necessario."
+            "</p>"
+            "<script>"
+            'window.addEventListener("load", function () {'
+            "setTimeout(function () { window.print(); }, 400);"
+            "});"
+            "</script>"
+            if not for_native
+            else ""
+        )}
+</body>
+</html>
+"""
+
+    def _print_ricerca_direct() -> None:
+        try:
+            refresh_search_title()
+        except Exception:
+            pass
+        desc = (search_title_var.get() or "").strip()
+        d = cur_db()
+        accounts_by_year = year_accounts_map(d)
+        categories_by_year = year_categories_map(d)
+        records = [r for y in d["years"] for r in y["records"]]
+        records.sort(key=lambda r: (r["year"], r["source_folder"], r["source_file"], r["source_index"]))
+        reg_seq_map = unified_registration_sequence_map(records)
+        pool = filter_and_sort_movements_for_grid(
+            records,
+            reg_seq_map,
+            order_by_date=filter_order_applied_var.get() == "date",
+            exclude_future_dates=filter_future_applied_var.get() == "exclude",
+            backward=filter_direction_applied_var.get() == "backward",
+            date_from_iso=(
+                date_from_applied_var.get()
+                if filter_order_applied_var.get() == "date"
+                else (
+                    _scope_dates_for_registration(reg_preset_applied_var.get())[0]
+                    if filter_order_applied_var.get() == "registration"
+                    else None
+                )
+            ),
+            date_to_iso=(
+                date_to_applied_var.get()
+                if filter_order_applied_var.get() == "date"
+                else (
+                    _scope_dates_for_registration(reg_preset_applied_var.get())[1]
+                    if filter_order_applied_var.get() == "registration"
+                    else None
+                )
+            ),
+        )
+        rows = _movement_rows_from_pool(pool, reg_seq_map, accounts_by_year, categories_by_year)
+        n = len(rows)
+        if n == 0:
+            messagebox.showinfo("Stampa ricerca", "Nessuna registrazione da stampare con i filtri attuali.")
+            return
+        if not messagebox.askokcancel(
+            "Stampa ricerca",
+            f"Verranno comprese nella stampa {n} registrazioni.\n\n"
+            "Puoi annullare se l’elenco è troppo lungo.",
+        ):
+            return
+        sysname = platform.system()
+        if sysname == "Darwin":
+
+            def _mk_r(iw: float) -> str:
+                return _build_ricerca_print_html(
+                    rows, desc, for_native=True, native_text_width_pt=iw
+                )
+
+            if _print_balances_native_macos(_mk_r):
+                return
+        elif sysname == "Windows":
+            html_native = _build_ricerca_print_html(rows, desc, for_native=True)
+            if _print_balances_native_windows(html_native):
+                return
+            if _print_balances_windows_pywebview(html_native):
+                return
+        _print_ricerca_via_browser(_build_ricerca_print_html(rows, desc, for_native=False))
+
+    btn_stampa_ricerca.bind("<Button-1>", lambda _e: _print_ricerca_direct())
+    btn_stampa_ricerca.bind("<Enter>", lambda _e: btn_stampa_ricerca.configure(bg=_PRINT_RICERCA_RED_ACTIVE))
+    btn_stampa_ricerca.bind("<Leave>", lambda _e: btn_stampa_ricerca.configure(bg=_PRINT_RICERCA_RED))
+
+    def _print_saldi_direct() -> None:
+        snap = _saldi_snapshot_for_print()
+        sysname = platform.system()
+        if sysname == "Darwin":
+
+            def _mac_html(iw: float) -> str:
+                return _build_saldi_print_html(snap, for_native=True, native_text_width_pt=iw)
+
+            if _print_balances_native_macos(_mac_html):
+                return
+        elif sysname == "Windows":
+            html_native = _build_saldi_print_html(snap, for_native=True)
+            if _print_balances_native_windows(html_native):
+                return
+            if _print_balances_windows_pywebview(html_native):
+                return
+            if _print_balances_windows_fpdf(snap):
+                return
+        _print_saldi_via_browser(_build_saldi_print_html(snap, for_native=False))
+
+    _PRINT_RED = "#c62828"
+    _PRINT_RED_ACTIVE = "#8e0000"
+    btn_stampa_saldi = tk.Label(
+        balance_left,
+        text="Stampa saldi",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=12,
+        pady=6,
+        bg=_PRINT_RED,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    btn_stampa_saldi.pack(anchor="w")
+    btn_stampa_saldi.bind("<Button-1>", lambda _e: _print_saldi_direct())
+    btn_stampa_saldi.bind("<Enter>", lambda _e: btn_stampa_saldi.configure(bg=_PRINT_RED_ACTIVE))
+    btn_stampa_saldi.bind("<Leave>", lambda _e: btn_stampa_saldi.configure(bg=_PRINT_RED))
+
+    def refresh_balance_footer() -> None:
+        for w in balance_center.winfo_children():
+            w.destroy()
+        _, names, amts_abs = compute_balances_from_2022(cur_db())
+        _, _, amts_today = compute_balances_from_2022_asof(cur_db(), cutoff_date_iso=date.today().isoformat())
         total_abs = sum(amts_abs, Decimal("0"))
         total_today = sum(amts_today, Decimal("0"))
         diffs = [a - b for a, b in zip(amts_abs, amts_today)]
         total_diff = total_abs - total_today
 
         # Layout a tabella: intestazione + 3 righe.
-        table = tk.Frame(balance_footer_row)
+        table = tk.Frame(balance_center)
         # Centra l'intera area saldi nel footer.
         table.pack(anchor=tk.CENTER)
 
@@ -2612,7 +3699,7 @@ def build_ui(db: dict) -> None:
         def amount_cell(row: int, col: int, amt: Decimal) -> None:
             tk.Label(
                 table,
-                text=format_saldo_cell(valuta, amt),
+                text=format_saldo_cell("E", amt),
                 font=amount_font,
                 fg=balance_amount_fg(amt),
                 anchor=tk.E,

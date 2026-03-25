@@ -1,6 +1,9 @@
 __pycache__/
 *.py[cod]
 
+# Ambiente virtuale Python (non versionare; ogni clone ricrea venv + pip install)
+.venv/
+
 # Generated data artifacts
 data/*.json
 data/*.enc

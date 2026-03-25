@@ -1,0 +1,22 @@
+# Installazione MANUALE prima di avviare l'app (l'app NON esegue pip da sola):
+#   python3 -m venv .venv
+#   source .venv/bin/activate   # Windows: .venv\Scripts\activate
+#   python3 -m pip install -r requirements.txt
+# pip installa solo le righe compatibili con il sistema (marker sys_platform).
+
+# Dipendenze comuni
+cryptography>=42.0.0
+
+# Stampa / dialog nativi (solo dove servono; pip ignora le righe non compatibili col sistema)
+# macOS: Cocoa (AppKit) per Quartz/NSPrintPanel ecc.
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
+
+# Windows: API Win32 (stampa, DC, ecc.)
+# Dopo l'install, se serve: python Scripts/pywin32_postinstall.py -install
+pywin32>=306; sys_platform == "win32"
+
+# Windows: dialog stampa stile browser (Edge WebView2) se IE/COM non c'è
+pywebview>=5.0; sys_platform == "win32"
+
+# Windows: PDF A4 di fallback (tabella saldi) se anche pywebview non basta
+fpdf2>=2.7.0; sys_platform == "win32"
