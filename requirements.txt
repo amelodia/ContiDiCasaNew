@@ -6,6 +6,11 @@
 
 # Dipendenze comuni
 cryptography>=42.0.0
+# Obbligatorio: finestra di accesso (JPEG incorporato in euro_login_asset via ImageTk).
+# Build eseguibile: assicurarsi che Pillow sia nel bundle (PyInstaller: --collect-all PIL o hiddenimports PIL._imaging).
+Pillow>=10.0.0
+# CA bundle per TLS email (SMTP/IMAP) su macOS / Python senza certificati di sistema
+certifi>=2024.0.0
 
 # Stampa / dialog nativi (solo dove servono; pip ignora le righe non compatibili col sistema)
 # macOS: Cocoa (AppKit) per Quartz/NSPrintPanel ecc.

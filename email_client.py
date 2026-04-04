@@ -8,11 +8,16 @@ import imaplib
 import re
 import smtplib
 import ssl
+import tkinter as tk
+from collections.abc import Callable
 from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.parser import BytesParser
 from email.policy import default as email_policy
+from tkinter import messagebox, ttk
 from typing import Any
+
+SaveMailFn = Callable[[], None]
 
 DEFAULT_EMAIL_SETTINGS: dict[str, Any] = {
     "smtp_host": "",
@@ -25,7 +30,64 @@ DEFAULT_EMAIL_SETTINGS: dict[str, Any] = {
     "username": "",
     "password": "",
     "from_address": "",
+    # False = non verificare il certificato del server (meno sicuro; solo se CERTIFICATE_VERIFY_FAILED persiste).
+    "ssl_verify_certificates": True,
 }
+
+
+def _ssl_context_for_settings(s: dict[str, Any]) -> ssl.SSLContext:
+    """
+    Contesto TLS per SMTP/IMAP. Su macOS Python spesso manca il bundle CA di sistema:
+    si usa il file CA di certifi se installato (pip install certifi).
+    """
+    if not bool(s.get("ssl_verify_certificates", True)):
+        return ssl._create_unverified_context()
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+def _smtp_imap_credentials_rejected(blob_lower: str) -> bool:
+    return any(
+        token in blob_lower
+        for token in (
+            "535",
+            "5.7.8",
+            "badcredentials",
+            "username and password not accepted",
+            "authenticationfailed",
+            "invalid credentials",
+            "auth plain failed",
+        )
+    )
+
+
+def _mail_password_help_text(s: dict[str, Any]) -> str:
+    """Suggerimenti se SMTP/IMAP rispondono credenziali non valide."""
+    user_l = (s.get("username") or "").lower()
+    hosts = f"{s.get('smtp_host', '')} {s.get('imap_host', '')}".lower()
+    is_gmail = "gmail" in user_l or "googlemail" in user_l or "gmail" in hosts
+    base = (
+        "\n\n— Credenziali rifiutate dal server —\n"
+        "• Controlla utente e password (nessuno spazio in più copiato/incollato).\n"
+        "• L'utente è di solito l'indirizzo email completo dell'account di posta.\n"
+    )
+    if is_gmail:
+        base += (
+            "\n— Account Gmail / Google —\n"
+            "Google non accetta la password normale dell'account per le app esterne.\n"
+            "1) Attiva la verifica in due passaggi sull'account Google.\n"
+            "2) Vai su https://myaccount.google.com/apppasswords e crea una «Password per le app» "
+            "(es. nome «Conti di casa»).\n"
+            "3) Incolla quella password di 16 caratteri nel campo password dell'app (non la password di login).\n"
+            "4) In Gmail web: Impostazioni → Inoltro e POP/IMAP → abilita «Accesso IMAP».\n"
+            "5) SMTP: smtp.gmail.com, porta 587, STARTTLS sì, SSL implicito (465) no.\n"
+            "   IMAP: imap.gmail.com, porta 993, SSL sì.\n"
+        )
+    return base
 
 
 def ensure_email_settings(db: dict) -> None:
@@ -35,6 +97,102 @@ def ensure_email_settings(db: dict) -> None:
     for k, v in DEFAULT_EMAIL_SETTINGS.items():
         if k not in db["email_settings"]:
             db["email_settings"][k] = v
+
+
+def is_app_mail_configured(db: dict) -> bool:
+    """True se SMTP, IMAP, credenziali e email amministratore sono impostati (notifiche / IMAP)."""
+    ensure_email_settings(db)
+    s = _settings_dict(db)
+    sc = db.get("security_config")
+    if not isinstance(sc, dict):
+        sc = {}
+    admin = (sc.get("admin_notify_email") or "").strip()
+    return bool(
+        admin
+        and (s.get("smtp_host") or "").strip()
+        and (s.get("imap_host") or "").strip()
+        and (s.get("username") or "").strip()
+        and (s.get("password") or "").strip()
+    )
+
+
+def test_email_configuration(db: dict) -> tuple[bool, str]:
+    """
+    Verifica connessione SMTP (login) e IMAP (login + INBOX).
+    Ritorna (ok, messaggio utente).
+    """
+    ensure_email_settings(db)
+    s = _settings_dict(db)
+    sc = db.get("security_config")
+    if not isinstance(sc, dict):
+        sc = {}
+    errs: list[str] = []
+
+    host = (s.get("smtp_host") or "").strip()
+    user = (s.get("username") or "").strip()
+    password = s.get("password") or ""
+    if not host or not user or not password:
+        errs.append("SMTP: host, utente e password sono obbligatori.")
+    else:
+        port = int(s.get("smtp_port") or 587)
+        implicit_ssl = bool(s.get("smtp_implicit_ssl"))
+        use_starttls = bool(s.get("smtp_use_starttls")) and not implicit_ssl
+        try:
+            tls_ctx = _ssl_context_for_settings(s)
+            if implicit_ssl:
+                with smtplib.SMTP_SSL(host, port, context=tls_ctx, timeout=60) as smtp:
+                    smtp.login(user, password)
+            else:
+                with smtplib.SMTP(host, port, timeout=60) as smtp:
+                    smtp.ehlo()
+                    if use_starttls:
+                        smtp.starttls(context=tls_ctx)
+                        smtp.ehlo()
+                    smtp.login(user, password)
+        except Exception as exc:
+            errs.append(f"SMTP: {exc}")
+
+    host_i = (s.get("imap_host") or "").strip()
+    if not host_i or not user or not password:
+        errs.append("IMAP: host, utente e password sono obbligatori.")
+    else:
+        port_i = int(s.get("imap_port") or 993)
+        use_ssl = bool(s.get("imap_use_ssl", True))
+        try:
+            if use_ssl:
+                mail = imaplib.IMAP4_SSL(
+                    host_i, port_i, ssl_context=_ssl_context_for_settings(s), timeout=60
+                )
+            else:
+                mail = imaplib.IMAP4(host_i, port_i, timeout=60)
+            try:
+                mail.login(user, password)
+                mail.select("INBOX", readonly=True)
+            finally:
+                try:
+                    mail.logout()
+                except Exception:
+                    pass
+        except Exception as exc:
+            errs.append(f"IMAP: {exc}")
+
+    admin = (sc.get("admin_notify_email") or "").strip()
+    if not admin:
+        errs.append("Indirizzo email amministratore (notifiche) mancante.")
+
+    if errs:
+        cert_hint = (
+            "\n\nSuggerimenti (certificati): «pip install certifi» e riavvio; "
+            "oppure disattiva «Verifica certificati SSL» in Opzioni solo se necessario."
+        )
+        blob = "\n".join(errs)
+        low = blob.lower()
+        if "certificate_verify_failed" in low or "certificate verify failed" in low:
+            blob += cert_hint
+        if _smtp_imap_credentials_rejected(low):
+            blob += _mail_password_help_text(s)
+        return False, blob
+    return True, "Connessione SMTP e IMAP riuscita. Le impostazioni possono essere salvate."
 
 
 def _settings_dict(db: dict) -> dict[str, Any]:
@@ -124,17 +282,16 @@ def send_email(
     msg["To"] = to_addr
     msg.set_content(body)
 
+    tls_ctx = _ssl_context_for_settings(s)
     if implicit_ssl:
-        context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(host, port, context=context, timeout=60) as smtp:
+        with smtplib.SMTP_SSL(host, port, context=tls_ctx, timeout=60) as smtp:
             smtp.login(user, password)
             smtp.send_message(msg)
     else:
         with smtplib.SMTP(host, port, timeout=60) as smtp:
             smtp.ehlo()
             if use_starttls:
-                context = ssl.create_default_context()
-                smtp.starttls(context=context)
+                smtp.starttls(context=tls_ctx)
                 smtp.ehlo()
             smtp.login(user, password)
             smtp.send_message(msg)
@@ -157,7 +314,7 @@ def list_inbox_messages(db: dict, *, limit: int = 80) -> list[dict[str, Any]]:
     use_ssl = bool(s.get("imap_use_ssl", True))
 
     if use_ssl:
-        mail = imaplib.IMAP4_SSL(host, port, ssl_context=ssl.create_default_context(), timeout=60)
+        mail = imaplib.IMAP4_SSL(host, port, ssl_context=_ssl_context_for_settings(s), timeout=60)
     else:
         mail = imaplib.IMAP4(host, port, timeout=60)
     try:
@@ -213,7 +370,7 @@ def fetch_message_body(db: dict, imap_id: str) -> str:
     num = imap_id.encode("ascii") if isinstance(imap_id, str) else imap_id
 
     if use_ssl:
-        mail = imaplib.IMAP4_SSL(host, port, ssl_context=ssl.create_default_context(), timeout=90)
+        mail = imaplib.IMAP4_SSL(host, port, ssl_context=_ssl_context_for_settings(s), timeout=90)
     else:
         mail = imaplib.IMAP4(host, port, timeout=90)
     try:
@@ -237,32 +394,79 @@ def fetch_message_body(db: dict, imap_id: str) -> str:
             pass
 
 
-_REG_APPROVAL_RE = re.compile(r"REGISTRA\s*:\s*(\S+@\S+)", re.IGNORECASE)
+# Accetta REGISTRA: o REGISTRATO: (oggetto o corpo), case-insensitive.
+_REG_APPROVAL_RE = re.compile(r"(?:REGISTRA|REGISTRATO)\s*:\s*(\S+@\S+)", re.IGNORECASE)
 
 
 def send_registration_signup_notification(db: dict, *, display_suffix: str, user_email: str) -> None:
-    """Invia all'amministratore i dati del primo accesso (SMTP da email_settings)."""
+    """
+    Notifica il primo accesso:
+    - all'email amministratore (se impostata in sicurezza), con istruzioni REGISTRA:/REGISTRATO:…
+    - sempre una copia di conferma all'indirizzo immesso nel wizard (così ricevi mail anche su Gmail).
+
+    Richiede SMTP configurato e funzionante (con Gmail usa password per le app, non la password normale).
+    """
     ensure_email_settings(db)
     sc = db.get("security_config")
     if not isinstance(sc, dict):
         sc = {}
-    to_addr = str(sc.get("admin_notify_email") or "").strip()
-    if not to_addr:
-        return
-    ue = user_email.strip().lower()
-    body = (
+    admin = str(sc.get("admin_notify_email") or "").strip()
+    ue = (user_email or "").strip().lower()
+    if not ue or "@" not in ue:
+        raise ValueError("Email utente non valida.")
+
+    admin_body = (
         "Nuovo primo accesso — Conti di casa\n\n"
         f"Nome schermata: Conti di casa {display_suffix}\n"
         f"Email utente: {ue}\n\n"
         "Stato account: non ancora registrato (in attesa di conferma amministratore).\n\n"
-        "Per confermare la registrazione, includere in una email (oggetto o corpo) la riga esatta:\n\n"
+        "Per confermare la registrazione, includere in una email (oggetto o corpo) una di queste righe esatte:\n\n"
         f"REGISTRA:{ue}\n"
+        f"oppure\nREGISTRATO:{ue}\n"
     )
-    send_email(db, to_addr=to_addr, subject=f"[Conti di casa] Nuovo accesso: {ue}", body=body)
+    user_body = (
+        "Conti di casa — primo accesso effettuato\n\n"
+        f"Hai completato la registrazione iniziale con l'indirizzo {ue}.\n"
+        f"Nome nell'app: Conti di casa {display_suffix}\n\n"
+        "Per risultare «registrato» nell'applicazione, l'amministratore deve far sì che nella casella "
+        "IMAP configurata in Opzioni compaia un messaggio (oggetto o testo) che contenga una di queste righe:\n\n"
+        f"REGISTRA:{ue}\n"
+        f"oppure\nREGISTRATO:{ue}\n\n"
+        "Se non vedi altre email di sistema, controlla in Opzioni SMTP/IMAP e la cartella Spam."
+    )
+
+    if not admin:
+        send_email(
+            db,
+            to_addr=ue,
+            subject="[Conti di casa] Primo accesso — conferma",
+            body=user_body
+            + "\n\n---\nNota: non è impostata l'email amministratore nelle Opzioni; "
+            "solo tu ricevi questa conferma.",
+        )
+        return
+
+    admin_l = admin.strip().lower()
+    if admin_l == ue:
+        send_email(
+            db,
+            to_addr=admin,
+            subject=f"[Conti di casa] Nuovo accesso (account {ue})",
+            body=admin_body + "\n\n---\nMessaggio unico: amministratore e utente coincidono.",
+        )
+        return
+
+    send_email(db, to_addr=admin, subject=f"[Conti di casa] Nuovo accesso: {ue}", body=admin_body)
+    send_email(
+        db,
+        to_addr=ue,
+        subject="[Conti di casa] Conferma del tuo primo accesso",
+        body=user_body,
+    )
 
 
 def scan_inbox_for_registration_approval(db: dict, *, target_email: str) -> bool:
-    """True se in INBOX compare REGISTRA:<email> (oggetto o testo)."""
+    """True se in INBOX compare REGISTRA:<email> o REGISTRATO:<email> (oggetto o testo)."""
     target_email = target_email.strip().lower()
     if not target_email:
         return False
@@ -276,7 +480,7 @@ def scan_inbox_for_registration_approval(db: dict, *, target_email: str) -> bool
     use_ssl = bool(s.get("imap_use_ssl", True))
 
     if use_ssl:
-        mail = imaplib.IMAP4_SSL(host, port, ssl_context=ssl.create_default_context(), timeout=90)
+        mail = imaplib.IMAP4_SSL(host, port, ssl_context=_ssl_context_for_settings(s), timeout=90)
     else:
         mail = imaplib.IMAP4(host, port, timeout=90)
     try:

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
 import html as html_module
 import json
 import os
+import re
+import shutil
 import calendar
 import platform
 import subprocess
@@ -24,7 +27,10 @@ except Exception:  # pragma: no cover - runtime optional dependency check
     Fernet = None
     InvalidToken = Exception
 
+import cloud_sync_wait
 import email_client
+import os_boot_time
+import mail_gate
 import periodiche
 import security_auth
 
@@ -53,6 +59,9 @@ DEBUG_SESSION_ID = "8c5304"
 # Inserimento griglia a lotti: migliaia di righe × 3 Treeview bloccano il main thread (macOS: beach ball).
 MOVEMENTS_INSERT_BATCH = 400
 
+# Dopo un boot recente, chiedere conferma Dropbox prima di aprire il database cifrato.
+_BOOT_DROPBOX_CONFIRM_WITHIN_SECONDS = 5 * 60
+
 # TODO (aggiunta / gestione conti): definire e applicare un limite massimo di conti attivi
 # (coerente con DB, footer saldi, stampa, griglia). Oggi non c'è un tetto applicato nel codice.
 
@@ -65,20 +74,26 @@ def app_title_text() -> str:
     return f"Conti di casa - {date.today().strftime('%d/%m/%Y')}"
 
 
-def window_title_for_session(db: dict, session: security_auth.AppSession) -> str:
-    """Titolo finestra principale in base al profilo e alla sessione."""
+def window_title_for_session(db: dict, _session: security_auth.AppSession) -> str:
+    """Titolo finestra principale in base al profilo (lo stato account non è indicato a parte: è nel nome utente)."""
     security_auth.ensure_security(db)
     up = db.get("user_profile") or {}
     suf = (up.get("display_name_suffix") or "").strip()
     d = date.today().strftime("%d/%m/%Y")
-    base = f"Conti di casa {suf} — {d}" if suf else f"Conti di casa — {d}"
-    if session.entered_via_guest:
-        return f"{base} · [non registrato]"
-    if session.entered_via_backdoor:
-        return f"{base} · [registrato · accesso tecnico]"
-    if session.is_registered:
-        return f"{base} · [registrato]"
-    return f"{base} · [non registrato]"
+    return f"Conti di casa {suf} — {d}" if suf else f"Conti di casa — {d}"
+
+
+def print_user_header_text(db: dict) -> str:
+    """Riga intestazione stampa saldi/ricerca: stesso identificativo del titolo finestra (suffisso o email)."""
+    security_auth.ensure_security(db)
+    up = db.get("user_profile") or {}
+    suf = (up.get("display_name_suffix") or "").strip()
+    if suf:
+        return f"Conti di casa {suf}"
+    email = (up.get("email") or "").strip()
+    if email:
+        return f"Conti di casa · {email}"
+    return "Conti di casa"
 
 
 def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: dict) -> None:
@@ -176,6 +191,116 @@ def bind_entry_first_char_uppercase(var: tk.StringVar, entry: tk.Misc) -> None:
             lock[0] = False
 
     var.trace_add("write", _on_write)
+
+
+def bind_euro_amount_entry_validation(
+    entry: tk.Misc, var: tk.StringVar, *, allow_leading_sign: bool = True
+) -> None:
+    """
+    Limita immissione e incolla a importi euro: cifre e separatori . e ,; + e − solo come primo carattere
+    (sostituisce il segno esistente). Con allow_leading_sign=False (es. saldo cassa) non ammette segno.
+    """
+
+    def _keypress(event: tk.Event) -> str | None:
+        keysym = getattr(event, "keysym", "")
+        if keysym in (
+            "BackSpace",
+            "Delete",
+            "Left",
+            "Right",
+            "Up",
+            "Down",
+            "Home",
+            "End",
+            "Tab",
+            "ISO_Left_Tab",
+            "Return",
+            "KP_Enter",
+            "Escape",
+            "Prior",
+            "Next",
+        ):
+            return None
+        ch = event.char or ""
+        if not ch:
+            return None
+        st = int(getattr(event, "state", 0) or 0)
+        if st & (0x0004 | 0x0008 | 0x20000 | 0x100000):
+            return None
+        if ord(ch) < 32:
+            return None
+
+        w = event.widget
+        try:
+            pos = int(w.index(tk.INSERT))
+        except (tk.TclError, ValueError, TypeError):
+            pos = 0
+        s = var.get() or ""
+
+        if ch in "+-":
+            if not allow_leading_sign:
+                return "break"
+            if pos != 0:
+                return "break"
+            try:
+                if w.selection_present():
+                    if int(w.index("sel.first")) != 0:
+                        return "break"
+                elif s[:1] in "+-" and s:
+                    if ch != s[0]:
+                        var.set(ch + s[1:])
+                    return "break"
+            except tk.TclError:
+                pass
+            return None
+
+        if ch.isdigit():
+            return None
+        if ch in ",.":
+            return None
+        return "break"
+
+    def _paste(event: tk.Event) -> str:
+        try:
+            clip = event.widget.clipboard_get()
+        except tk.TclError:
+            return "break"
+        t = clip.strip().replace(" ", "")
+        if not t:
+            return "break"
+        pat = r"[+-]?[0-9.,]*" if allow_leading_sign else r"[0-9.,]*"
+        if not re.fullmatch(pat, t):
+            return "break"
+        try:
+            normalize_euro_input(t)
+        except Exception:
+            return "break"
+        w = event.widget
+        s = var.get() or ""
+        try:
+            a = int(w.index("sel.first"))
+            b = int(w.index("sel.last"))
+        except tk.TclError:
+            try:
+                p = int(w.index(tk.INSERT))
+            except tk.TclError:
+                return "break"
+            a = b = p
+        merged = s[:a] + t + s[b:]
+        if merged.strip():
+            try:
+                normalize_euro_input(merged.replace(" ", ""))
+            except Exception:
+                return "break"
+        var.set(merged)
+        try:
+            w.icursor(min(a + len(t), len(merged)))
+        except tk.TclError:
+            pass
+        return "break"
+
+    entry.bind("<KeyPress>", _keypress, add="+")
+    entry.bind("<<Paste>>", _paste, add="+")
 
 
 def to_italian_date(date_iso: str) -> str:
@@ -782,6 +907,8 @@ def _print_balances_fpdf(snap: dict) -> bool:
         pdf.set_margins(15, 15, 15)
         pdf.add_page()
         pdf.set_font("Helvetica", "B", 11)
+        uh = _pdf_safe_text(str(snap.get("user_header") or "Conti di casa"))
+        pdf.cell(0, 6, uh, align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.cell(
             0,
             6,
@@ -871,6 +998,7 @@ def _print_balances_fpdf(snap: dict) -> bool:
 def _print_ricerca_fpdf(
     rows: list[tuple[str, str, tuple[object, ...], str, str, str, str]],
     search_desc: str,
+    user_header: str,
 ) -> bool:
     run_id = f"ricerca_{int(time.time() * 1000)}"
     # #region agent log
@@ -893,6 +1021,14 @@ def _print_ricerca_fpdf(
         pdf.add_page()
 
         pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(
+            0,
+            7,
+            _pdf_safe_text(user_header or "Conti di casa"),
+            align="C",
+            new_x=XPos.LMARGIN,
+            new_y=YPos.NEXT,
+        )
         pdf.cell(
             0,
             7,
@@ -1134,7 +1270,92 @@ def load_encrypted_db(output_path: Path, key_path: Path) -> dict | None:
     return json.loads(raw.decode("utf-8"))
 
 
-def build_ui(db: dict, root: tk.Tk, session: security_auth.AppSession) -> None:
+def per_user_encrypted_db_path(email: str) -> Path:
+    """File dati cifrato dedicato all'account registrato (email normalizzata)."""
+    h = hashlib.sha256(email.strip().lower().encode("utf-8")).hexdigest()[:20]
+    return Path("data") / f"conti_utente_{h}.enc"
+
+
+def load_database_at_startup(*, sync_ui_parent: tk.Misc | None = None) -> tuple[dict, Path]:
+    cloud_sync_wait.wait_for_paths_stable_if_cloud(
+        [DEFAULT_ENCRYPTED_DB, DEFAULT_KEY_FILE],
+        ui_parent=sync_ui_parent,
+    )
+    try:
+        db = load_encrypted_db(DEFAULT_ENCRYPTED_DB, DEFAULT_KEY_FILE)
+    except (InvalidToken, OSError, json.JSONDecodeError, ValueError):
+        db = None
+    if db is None:
+        print(
+            "Primo avvio: import dell'archivio legacy in corso (può richiedere tempo; attendere).",
+            file=sys.stderr,
+        )
+        run_import_legacy(DEFAULT_CDC_ROOT, DEFAULT_OUTPUT)
+        db = json.loads(DEFAULT_OUTPUT.read_text(encoding="utf-8"))
+        periodiche.ensure_periodic_registrations(db)
+        email_client.ensure_email_settings(db)
+        security_auth.ensure_security(db)
+        try:
+            save_encrypted_db(db, DEFAULT_ENCRYPTED_DB, DEFAULT_KEY_FILE)
+        except Exception:
+            pass
+        return db, DEFAULT_ENCRYPTED_DB
+
+    periodiche.ensure_periodic_registrations(db)
+    email_client.ensure_email_settings(db)
+    security_auth.ensure_security(db)
+    up = db.get("user_profile") or {}
+    em = (up.get("email") or "").strip().lower()
+    ph = (up.get("password_hash") or "").strip()
+    if em and ph:
+        target = per_user_encrypted_db_path(em)
+        if target.exists():
+            cloud_sync_wait.wait_for_paths_stable_if_cloud(
+                [target],
+                ui_parent=sync_ui_parent,
+            )
+            try:
+                db2 = load_encrypted_db(target, DEFAULT_KEY_FILE)
+            except (InvalidToken, OSError, json.JSONDecodeError, ValueError):
+                db2 = None
+            if db2:
+                periodiche.ensure_periodic_registrations(db2)
+                email_client.ensure_email_settings(db2)
+                security_auth.ensure_security(db2)
+                return db2, target
+    return db, DEFAULT_ENCRYPTED_DB
+
+
+def migrate_data_path_after_login(
+    db: dict,
+    session: security_auth.AppSession,
+    current_path: Path,
+) -> Path:
+    """Dopo login con account registrato, usa un file .enc dedicato per quell'email."""
+    if session.entered_via_guest or session.entered_via_backdoor:
+        return current_path
+    em = (session.user_email or "").strip().lower()
+    if not em:
+        return current_path
+    target = per_user_encrypted_db_path(em)
+    if target.resolve() == current_path.resolve():
+        return current_path
+    if not target.exists():
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(current_path, target)
+        except Exception:
+            shutil.copyfile(current_path, target)
+    return target
+
+
+def build_ui(
+    db: dict,
+    root: tk.Tk,
+    session: security_auth.AppSession,
+    *,
+    primary_data_path: Path | None = None,
+) -> None:
     # Riferimento mutabile: dopo import legacy da Opzioni, griglia e saldi devono usare il nuovo DB.
     db_holder: list[dict] = [db]
     session_holder: list[security_auth.AppSession] = [session]
@@ -1151,7 +1372,8 @@ def build_ui(db: dict, root: tk.Tk, session: security_auth.AppSession) -> None:
     def _page_banner_title() -> str:
         return window_title_for_session(cur_db(), session_holder[0])
 
-    data_file_var = tk.StringVar(value=str(DEFAULT_ENCRYPTED_DB.resolve()))
+    _primary = primary_data_path if primary_data_path is not None else DEFAULT_ENCRYPTED_DB
+    data_file_var = tk.StringVar(value=str(_primary.resolve()))
     key_file_var = tk.StringVar(value=str(DEFAULT_KEY_FILE))
     try:
         root.deiconify()
@@ -1405,6 +1627,7 @@ def build_ui(db: dict, root: tk.Tk, session: security_auth.AppSession) -> None:
     btn_amt_f_plus.bind("<Button-1>", lambda _e: _apply_amount_filter_sign("+"))
     btn_amt_f_minus.bind("<Button-1>", lambda _e: _apply_amount_filter_sign("-"))
     amount_filter_entry.bind("<FocusOut>", _format_movement_amount_filter_entry)
+    bind_euro_amount_entry_validation(amount_filter_entry, text_amount_preview_var)
 
     ttk.Label(filters_text_inner, text="Assegno", style="Filters.TLabel").pack(side=tk.LEFT, padx=(0, 6))
     cheque_entry = ttk.Entry(
@@ -2449,7 +2672,10 @@ def build_ui(db: dict, root: tk.Tk, session: security_auth.AppSession) -> None:
         else:
             ttk.Label(frm, text="Importo (€, usa . o , come decimale):").grid(row=0, column=0, sticky="w")
             v = tk.StringVar(value=format_euro_it(to_decimal(rec["amount_eur"])))
-        ttk.Entry(frm, textvariable=v, width=18).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ent_edit_amt = ttk.Entry(frm, textvariable=v, width=18)
+        ent_edit_amt.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        if not use_lire:
+            bind_euro_amount_entry_validation(ent_edit_amt, v)
 
         def on_ok() -> None:
             try:
@@ -2694,15 +2920,18 @@ def build_ui(db: dict, root: tk.Tk, session: security_auth.AppSession) -> None:
             )
             _d, _cat, a1, f1, a2, f2, chq = mov_vals
             note_e = html_module.escape(str(rec.get("note") or "")).replace("\n", "<br/>")
+            uh_e = html_module.escape(print_user_header_text(d))
             html_doc = f"""<!DOCTYPE html>
 <html lang="it"><head><meta charset="utf-8"/><title>Promemoria verifica</title>
 <style>
 body {{ font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color:#1a1a1a; padding:8mm; }}
 p {{ margin:0 0 3mm 0; }}
+.user-hdr {{ text-align:center; font-weight:700; font-size:12pt; margin:0 0 4mm 0; }}
 table {{ width:100%; border-collapse:collapse; font-size:10pt; }}
 th, td {{ border:1px solid #999; padding:4px 6px; vertical-align:top; }}
 th {{ background:#efefef; text-align:left; }}
 </style></head><body>
+<p class="user-hdr">{uh_e}</p>
 <p>Data: {html_module.escape(date_it)}</p>
 <p><b>E' stata tolta la spunta di verifica alla registrazione {selected_reg_n}</b></p>
 <table>
@@ -3428,6 +3657,15 @@ th {{ background:#efefef; text-align:left; }}
         mx = _dataset_max_date or date.today()
         return mn, mx
 
+    def _preset_rolling_start_date(months: int, *, allowed_min: date, allowed_max: date) -> date:
+        """Inizio intervallo «Ultimi N mesi»: con future escluse ancorato a oggi (= allowed_max); con future comprese ancorato a oggi ma il massimo resta allowed_max (es. ultima data futura nel dataset)."""
+        anchor = allowed_max if filter_future_preview_var.get() == "exclude" else date.today()
+        start = _add_months(anchor, -months)
+        start = max(allowed_min, start)
+        if start > allowed_max:
+            start = allowed_max
+        return start
+
     def _compute_preset_range(preset_id: str) -> tuple[date, date]:
         mn, mx = _dataset_minmax_safe()
         allowed_min = mn
@@ -3436,8 +3674,8 @@ th {{ background:#efefef; text-align:left; }}
         if preset_id == "all_time":
             return allowed_min, allowed_max
 
-        # I preset "Ultimi X mesi" sono sempre agganciati alla data massima consentita,
-        # così "In avanti, dalla più lontana" non sposta la finestra (solo l'ordine grid).
+        # Tutti gli intervalli «Ultimi N mesi» (1…12) usano la stessa regola: con future
+        # comprese l’inizio è oggi − N mesi; con future escluse è allowed_max (= oggi) − N mesi.
         months = 12
         if preset_id == "last_6":
             months = 6
@@ -3453,9 +3691,7 @@ th {{ background:#efefef; text-align:left; }}
             months = 12
 
         ref_end = allowed_max
-        start = _add_months(ref_end, -months)
-        # clamp start
-        start = max(allowed_min, min(start, allowed_max))
+        start = _preset_rolling_start_date(months, allowed_min=allowed_min, allowed_max=allowed_max)
         return start, ref_end
 
     def refresh_date_fields_from_current_preset() -> None:
@@ -3492,8 +3728,7 @@ th {{ background:#efefef; text-align:left; }}
         else:
             if not date_custom_manual_override:
                 # Preimpostazione comodità: ultimi 12 mesi, ma i vincoli di scelta restano globali.
-                start_12 = _add_months(max_allowed, -12)
-                start_12 = max(min_allowed, min(start_12, max_allowed))
+                start_12 = _preset_rolling_start_date(12, allowed_min=min_allowed, allowed_max=max_allowed)
                 if filter_direction_preview_var.get() == "backward":
                     date_from_preview_var.set(max_allowed.isoformat())
                     date_to_preview_var.set(start_12.isoformat())
@@ -3524,9 +3759,8 @@ th {{ background:#efefef; text-align:left; }}
         min_allowed = mn
         if preset_id == "all_time":
             return min_allowed.isoformat(), max_allowed.isoformat()
-        # last_12
-        start_12 = _add_months(max_allowed, -12)
-        start_12 = max(min_allowed, min(start_12, max_allowed))
+        # last_12 (stessa ancora «ultimi 12 mesi» dei preset data: oggi se future comprese)
+        start_12 = _preset_rolling_start_date(12, allowed_min=min_allowed, allowed_max=max_allowed)
         return start_12.isoformat(), max_allowed.isoformat()
 
     def refresh_registration_scope_and_controls() -> None:
@@ -3944,8 +4178,7 @@ th {{ background:#efefef; text-align:left; }}
             global_max = date.today() if filter_future_preview_var.get() == "exclude" else mx
             global_min = mn
             # Preimpostazione comodità: ultimi 12 mesi (poi la scelta resta possibile su tutto il periodo).
-            start_12 = _add_months(global_max, -12)
-            start_12 = max(global_min, min(start_12, global_max))
+            start_12 = _preset_rolling_start_date(12, allowed_min=global_min, allowed_max=global_max)
             if filter_direction_preview_var.get() == "backward":
                 date_from_preview_var.set(global_max.isoformat())
                 date_to_preview_var.set(start_12.isoformat())
@@ -4441,6 +4674,7 @@ th {{ background:#efefef; text-align:left; }}
             "total_today": total_today,
             "total_diff": total_diff,
             "date_it": to_italian_date(date.today().isoformat()),
+            "user_header": print_user_header_text(cur_db()),
         }
 
     def _build_saldi_print_html(
@@ -4658,6 +4892,7 @@ th {{ background:#efefef; text-align:left; }}
 <body>
 <div class="print-root"{native_root_style}>
 <div class="print-head">
+<div class="user-hdr" style="margin:0;padding:0 0 1mm 0;text-align:center;width:100%;font-size:{h1_pt}pt;font-weight:700;line-height:1.1;">{html_module.escape(str(snap.get("user_header") or "Conti di casa"))}</div>
 <div class="meta" style="margin:0;padding:0 0 5mm 0;text-align:center;width:100%;">Data: {html_module.escape(snap["date_it"])}</div>
 </div>
 <div class="saldi-table-wrap"{native_wrap_style}>
@@ -4734,6 +4969,7 @@ th {{ background:#efefef; text-align:left; }}
         rows: list[tuple[str, str, tuple[object, ...], str, str, str, str]],
         search_desc: str,
         *,
+        user_header: str,
         for_native: bool = False,
         native_text_width_pt: float | None = None,
     ) -> str:
@@ -4899,6 +5135,7 @@ th {{ background:#efefef; text-align:left; }}
 </head>
 <body>
 <div class="print-root"{native_root_style}>
+<div class="user-hdr" style="margin:0;padding:0 0 1mm 0;text-align:center;width:100%;font-size:{h1_pt}pt;font-weight:700;line-height:1.1;">{html_module.escape(user_header or "Conti di casa")}</div>
 <div class="meta" style="margin:0;padding:0 0 4mm 0;text-align:center;width:100%;">Data: {html_module.escape(date_it)}</div>
 <p class="search-desc">{desc_esc}</p>
 <div class="ricerca-shell">
@@ -4983,7 +5220,8 @@ th {{ background:#efefef; text-align:left; }}
             "Puoi annullare se l’elenco è troppo lungo.",
         ):
             return
-        fpdf_ok = _print_ricerca_fpdf(rows, desc)
+        uh = print_user_header_text(d)
+        fpdf_ok = _print_ricerca_fpdf(rows, desc, uh)
         # #region agent log
         _debug_log(run_id, "H2", "main_app.py:_print_ricerca_direct", "ricerca_fpdf_result", {"fpdf_ok": fpdf_ok, "rows": n})
         # #endregion
@@ -4994,7 +5232,7 @@ th {{ background:#efefef; text-align:left; }}
 
             def _mk_r(iw: float) -> str:
                 return _build_ricerca_print_html(
-                    rows, desc, for_native=True, native_text_width_pt=iw
+                    rows, desc, user_header=uh, for_native=True, native_text_width_pt=iw
                 )
 
             if _print_balances_native_macos(_mk_r):
@@ -5003,12 +5241,12 @@ th {{ background:#efefef; text-align:left; }}
                 # #endregion
                 return
         elif sysname == "Windows":
-            html_native = _build_ricerca_print_html(rows, desc, for_native=True)
+            html_native = _build_ricerca_print_html(rows, desc, user_header=uh, for_native=True)
             if _print_balances_native_windows(html_native):
                 return
             if _print_balances_windows_pywebview(html_native):
                 return
-        _print_ricerca_via_browser(_build_ricerca_print_html(rows, desc, for_native=False))
+        _print_ricerca_via_browser(_build_ricerca_print_html(rows, desc, user_header=uh, for_native=False))
         # #region agent log
         _debug_log(run_id, "H3", "main_app.py:_print_ricerca_direct", "fallback_browser_used", {})
         # #endregion
@@ -5537,6 +5775,7 @@ th {{ background:#efefef; text-align:left; }}
         if not iso:
             return
         newreg_date_var.set(to_italian_date(iso))
+        _apply_giro_default_note()
 
     def _newreg_date_keypress(event: tk.Event) -> str | None:
         entry = ent_date
@@ -5620,6 +5859,8 @@ th {{ background:#efefef; text-align:left; }}
                 if dsel < dmin or dsel > dmax:
                     return "break"
             var.set(s2)
+            if all(s2[i].isdigit() for i in _NEWREG_DATE_POS):
+                _apply_giro_default_note()
             after = next_i + 1
             if after in (2, 5):
                 after += 1
@@ -5634,6 +5875,76 @@ th {{ background:#efefef; text-align:left; }}
 
     def _is_second_account_cassa() -> bool:
         return (newreg_acc2_var.get() or "").strip().lower() == "cassa"
+
+    _AUT_NOTE_RE = re.compile(r"^Aut \d{2}/\d{2}$")
+
+    def _note_is_aut_replaceable(cur: str) -> bool:
+        t = (cur or "").strip()
+        if not t or t == "-":
+            return True
+        if t == "Giroconto":
+            return True
+        return bool(_AUT_NOTE_RE.fullmatch(t))
+
+    def _build_aut_note_girata_seconda_cassa_senza_memoria() -> str | None:
+        """«Aut » + gg/mm + spazio (cursore dopo la data per testo aggiuntivo)."""
+        if not _is_giro_label(newreg_cat_var.get()):
+            return None
+        if not _is_second_account_cassa():
+            return None
+        if memoria_cassa_euro[0] > Decimal("0"):
+            return None
+        if pending_immetti_memoria[0]:
+            return None
+        iso = parse_italian_ddmmyyyy_to_iso(newreg_date_var.get())
+        if not iso:
+            return None
+        d = date.fromisoformat(iso)
+        return f"Aut {d.day:02d}/{d.month:02d} "
+
+    def _position_newreg_note_cursor_after_aut() -> None:
+        """Se la nota è «Aut gg/mm», garantisce uno spazio finale e cursore subito dopo."""
+        s = newreg_note_var.get() or ""
+        core = s.rstrip()
+        if not _AUT_NOTE_RE.fullmatch(core):
+            return
+        want = core + " "
+        if s != want:
+            newreg_note_var.set(want)
+
+        def _place() -> None:
+            try:
+                ent_note.icursor(len(newreg_note_var.get() or ""))
+            except Exception:
+                pass
+
+        try:
+            root.after_idle(_place)
+        except Exception:
+            _place()
+
+    def _on_newreg_note_focus_in(_e: tk.Event | None = None) -> None:
+        _position_newreg_note_cursor_after_aut()
+
+    ent_note.bind("<FocusIn>", _on_newreg_note_focus_in, add="+")
+
+    def _apply_giro_default_note() -> None:
+        if not _is_giro_label(newreg_cat_var.get()):
+            return
+        cur = (newreg_note_var.get() or "").strip()
+        aut = _build_aut_note_girata_seconda_cassa_senza_memoria()
+        if aut is not None:
+            if _note_is_aut_replaceable(cur):
+                newreg_note_var.set(aut)
+                try:
+                    root.after_idle(_position_newreg_note_cursor_after_aut)
+                except Exception:
+                    _position_newreg_note_cursor_after_aut()
+            return
+        if not cur or cur == "-" or cur == "Giroconto":
+            newreg_note_var.set("Giroconto")
+        elif _AUT_NOTE_RE.fullmatch(cur):
+            newreg_note_var.set("Giroconto")
 
     def _memoria_cassa_must_discharge() -> bool:
         return memoria_cassa_euro[0] > Decimal("0")
@@ -5764,8 +6075,6 @@ th {{ background:#efefef; text-align:left; }}
                     pick = names[0]
                 newreg_acc2_var.set(pick)
                 newreg_last_account_touched[0] = "acc2"
-            if not (newreg_note_var.get() or "").strip() or (newreg_note_var.get() or "").strip() == "-":
-                newreg_note_var.set("Giroconto")
             # Controllo immediato: i due conti non possono coincidere. Si modifica l'altro conto rispetto a quello appena scelto.
             if newreg_acc1_var.get().strip() and newreg_acc1_var.get().strip() == newreg_acc2_var.get().strip():
                 if acc_opts_cache:
@@ -5778,6 +6087,7 @@ th {{ background:#efefef; text-align:left; }}
                             break
                 if newreg_acc1_var.get().strip() == newreg_acc2_var.get().strip():
                     nuovi_status_var.set("Attenzione: i due conti del giroconto devono essere diversi.")
+            _apply_giro_default_note()
         elif _memoria_cassa_must_discharge():
             # Memoria attiva senza giroconto: mostra solo la barra memoria (secondo conto non serve).
             lbl_acc2.grid_remove()
@@ -5998,6 +6308,7 @@ th {{ background:#efefef; text-align:left; }}
 
         def _pick(dsel: date) -> None:
             newreg_date_var.set(to_italian_date(dsel.isoformat()))
+            _apply_giro_default_note()
             top.destroy()
 
         def _jump(delta: int) -> None:
@@ -6244,10 +6555,11 @@ th {{ background:#efefef; text-align:left; }}
         last_acc1_code = str(rec["account_primary_code"])
         last_acc2_code = str(rec.get("account_secondary_code", ""))
         nuovi_status_var.set("Registrazione inserita.")
+        # Sempre ripulire il modulo (inclusa la Nota) per la registrazione successiva,
+        # anche se si passa subito a Movimenti con «Concludi immissione».
+        _populate_form_defaults(keep_last=True)
         if finish:
             notebook.select(movimenti_frame)
-        else:
-            _populate_form_defaults(keep_last=True)
 
     def _clear_values() -> None:
         if not messagebox.askyesno("Cancella valori", "Confermi cancellazione valori immessi?"):
@@ -6824,6 +7136,7 @@ th {{ background:#efefef; text-align:left; }}
     cb_per_acc1.bind("<<ComboboxSelected>>", lambda _e: _per_sync_cat_and_second())
     cb_per_acc2.bind("<<ComboboxSelected>>", lambda _e: _per_sync_cat_and_second())
     ent_per_amt.bind("<FocusOut>", lambda _e: _per_format_amount_entry())
+    bind_euro_amount_entry_validation(ent_per_amt, per_amount_var)
 
     def _per_plus_click(_e: tk.Event) -> str:
         _per_apply_sign("+")
@@ -6870,8 +7183,6 @@ th {{ background:#efefef; text-align:left; }}
         code = _selected_category_code()
         newreg_cat_code_var.set(code)
         _clear_pending_memoria_if_needed()
-        if _is_giro_label(newreg_cat_var.get() or ""):
-            newreg_note_var.set("Giroconto")
         _sync_cat_note_and_second_account()
 
     def _on_acc1_combo(_e: tk.Event | None = None) -> None:
@@ -6891,6 +7202,7 @@ th {{ background:#efefef; text-align:left; }}
     ent_date.bind("<Button-1>", lambda _e: (_open_newreg_calendar(), "break")[1])
     def _on_oggi_click() -> None:
         newreg_date_var.set(to_italian_date(date.today().isoformat()))
+        _apply_giro_default_note()
         try:
             ent_date.focus_set()
             ent_date.icursor(len(newreg_date_var.get() or ""))
@@ -6985,6 +7297,7 @@ th {{ background:#efefef; text-align:left; }}
         return "break"
 
     bind_return_and_kp_enter(ent_amt, _on_amt_enter)
+    bind_euro_amount_entry_validation(ent_amt, newreg_amount_var)
     bind_return_and_kp_enter(ent_chq, _on_chq_enter)
     bind_return_and_kp_enter(ent_note, _on_note_enter)
     btn_plus.bind("<Button-1>", lambda _e: _apply_sign("+"))
@@ -7025,6 +7338,7 @@ th {{ background:#efefef; text-align:left; }}
 
     bind_return_and_kp_enter(ent_saldo, _on_saldo_cassa_enter)
     ent_saldo.bind("<FocusOut>", lambda _e: _format_ent_saldo_cassa())
+    bind_euro_amount_entry_validation(ent_saldo, newreg_saldo_cassa_var, allow_leading_sign=False)
     _show_mode("new")
 
     pack_centered_page_title(verifica_frame, title=_page_banner_title())
@@ -7039,6 +7353,342 @@ th {{ background:#efefef; text-align:left; }}
 
     # Opzioni page
     pack_centered_page_title(opzioni_frame, title=_page_banner_title())
+
+    mail_outer = ttk.LabelFrame(opzioni_frame, text="Posta e sicurezza", padding=10)
+    mail_outer.pack(fill=tk.X, pady=(0, 14))
+
+    mail_setup_frame = ttk.Frame(mail_outer)
+    mail_verified_frame = ttk.Frame(mail_outer)
+
+    admin_notify_var = tk.StringVar()
+    smtp_host_var = tk.StringVar()
+    smtp_port_var = tk.StringVar(value="587")
+    smtp_implicit_ssl_var = tk.BooleanVar(value=False)
+    smtp_starttls_var = tk.BooleanVar(value=True)
+    imap_host_var = tk.StringVar()
+    imap_port_var = tk.StringVar(value="993")
+    imap_ssl_var = tk.BooleanVar(value=True)
+    ssl_verify_var = tk.BooleanVar(value=True)
+    mail_user_var = tk.StringVar()
+    mail_password_var = tk.StringVar()
+    mail_from_var = tk.StringVar()
+    mail_status_var = tk.StringVar(value="")
+
+    def _load_mail_vars_from_db() -> None:
+        d = cur_db()
+        email_client.ensure_email_settings(d)
+        security_auth.ensure_security(d)
+        s = d["email_settings"]
+        sc = d.get("security_config") or {}
+        if not isinstance(sc, dict):
+            sc = {}
+        admin_notify_var.set((sc.get("admin_notify_email") or "").strip())
+        smtp_host_var.set((s.get("smtp_host") or "").strip())
+        smtp_port_var.set(str(int(s.get("smtp_port") or 587)))
+        smtp_implicit_ssl_var.set(bool(s.get("smtp_implicit_ssl")))
+        smtp_starttls_var.set(bool(s.get("smtp_use_starttls", True)))
+        imap_host_var.set((s.get("imap_host") or "").strip())
+        imap_port_var.set(str(int(s.get("imap_port") or 993)))
+        imap_ssl_var.set(bool(s.get("imap_use_ssl", True)))
+        ssl_verify_var.set(bool(s.get("ssl_verify_certificates", True)))
+        mail_user_var.set((s.get("username") or "").strip())
+        mail_password_var.set(s.get("password") or "")
+        mail_from_var.set((s.get("from_address") or "").strip())
+
+    def _apply_mail_vars_to_db() -> None:
+        d = cur_db()
+        email_client.ensure_email_settings(d)
+        security_auth.ensure_security(d)
+        sc = d.setdefault("security_config", {})
+        if not isinstance(sc, dict):
+            sc = {}
+            d["security_config"] = sc
+        s = d["email_settings"]
+        sc["admin_notify_email"] = (admin_notify_var.get() or "").strip()
+        s["smtp_host"] = (smtp_host_var.get() or "").strip()
+        try:
+            s["smtp_port"] = int((smtp_port_var.get() or "587").strip())
+        except ValueError:
+            s["smtp_port"] = 587
+        s["smtp_implicit_ssl"] = bool(smtp_implicit_ssl_var.get())
+        s["smtp_use_starttls"] = bool(smtp_starttls_var.get())
+        s["imap_host"] = (imap_host_var.get() or "").strip()
+        try:
+            s["imap_port"] = int((imap_port_var.get() or "993").strip())
+        except ValueError:
+            s["imap_port"] = 993
+        s["imap_use_ssl"] = bool(imap_ssl_var.get())
+        s["ssl_verify_certificates"] = bool(ssl_verify_var.get())
+        s["username"] = (mail_user_var.get() or "").strip()
+        s["password"] = mail_password_var.get() or ""
+        s["from_address"] = (mail_from_var.get() or "").strip()
+
+    def refresh_mail_security_visibility() -> None:
+        d = cur_db()
+        security_auth.ensure_security(d)
+        sc = d.get("security_config") or {}
+        ok = bool(sc.get("email_verified_ok")) if isinstance(sc, dict) else False
+        if ok:
+            mail_setup_frame.pack_forget()
+            mail_verified_frame.pack(fill=tk.X)
+        else:
+            mail_verified_frame.pack_forget()
+            mail_setup_frame.pack(fill=tk.X)
+
+    def _save_mail_settings() -> None:
+        _apply_mail_vars_to_db()
+        security_auth.ensure_security(cur_db())
+        cur_db()["security_config"]["email_verified_ok"] = False
+        try:
+            save_encrypted_db_dual(
+                cur_db(),
+                Path(data_file_var.get()),
+                Path(key_file_var.get()),
+                backup_output_path=DEFAULT_BACKUP_ENCRYPTED_DB,
+            )
+            mail_status_var.set("Impostazioni posta salvate. Esegui il test per confermare.")
+            refresh_mail_security_visibility()
+        except Exception as exc:
+            messagebox.showerror("Posta", str(exc))
+            mail_status_var.set(f"Errore salvataggio: {exc}")
+
+    def _test_mail_settings() -> None:
+        _apply_mail_vars_to_db()
+        ok, msg = email_client.test_email_configuration(cur_db())
+        if ok:
+            security_auth.ensure_security(cur_db())
+            cur_db()["security_config"]["email_verified_ok"] = True
+            try:
+                save_encrypted_db_dual(
+                    cur_db(),
+                    Path(data_file_var.get()),
+                    Path(key_file_var.get()),
+                    backup_output_path=DEFAULT_BACKUP_ENCRYPTED_DB,
+                )
+                refresh_mail_security_visibility()
+                mail_status_var.set("Test superato.")
+                messagebox.showinfo("Test posta", msg)
+            except Exception as exc:
+                messagebox.showerror("Posta", str(exc))
+        else:
+            security_auth.ensure_security(cur_db())
+            cur_db()["security_config"]["email_verified_ok"] = False
+            mail_status_var.set("Test non superato.")
+            messagebox.showerror("Test posta", msg)
+
+    def _repeat_first_access_registration() -> None:
+        if not messagebox.askyesno(
+            "Ripeti primo accesso",
+            "Verranno cancellati profilo, password e stato di registrazione locale.\n"
+            "Potrai ripetere il primo accesso al prossimo avvio.\n\n"
+            "Procedere?",
+        ):
+            return
+        _apply_mail_vars_to_db()
+        security_auth.reset_user_profile_for_registration_restart(cur_db())
+        security_auth.ensure_security(cur_db())
+        cur_db()["security_config"]["email_verified_ok"] = False
+        try:
+            save_encrypted_db_dual(
+                cur_db(),
+                Path(data_file_var.get()),
+                Path(key_file_var.get()),
+                backup_output_path=DEFAULT_BACKUP_ENCRYPTED_DB,
+            )
+        except Exception as exc:
+            messagebox.showerror("Posta", str(exc))
+            return
+        messagebox.showinfo(
+            "Riavvio necessario",
+            "Chiudi e riapri l'applicazione per completare di nuovo il primo accesso.",
+        )
+        try:
+            root.destroy()
+        finally:
+            sys.exit(0)
+
+    def _factory_reset_security_and_data() -> None:
+        if not messagebox.askyesno(
+            "Reset completo",
+            "Verranno reimportati i dati dall'archivio legacy predefinito, "
+            "cancellati account utente, impostazioni posta e sicurezza.\n\n"
+            "L'applicazione si chiuderà: al riavvio andrà rifatto il primo accesso.\n\n"
+            "Confermi?",
+        ):
+            return
+        try:
+            run_import_legacy(DEFAULT_CDC_ROOT, DEFAULT_OUTPUT)
+            new_db = json.loads(DEFAULT_OUTPUT.read_text(encoding="utf-8"))
+            periodiche.ensure_periodic_registrations(new_db)
+            email_client.ensure_email_settings(new_db)
+            security_auth.ensure_security(new_db)
+            security_auth.reset_user_profile_for_registration_restart(new_db)
+            new_db["security_config"] = dict(security_auth.DEFAULT_SECURITY_CONFIG)
+            new_db["email_settings"] = dict(email_client.DEFAULT_EMAIL_SETTINGS)
+            save_encrypted_db_dual(
+                new_db,
+                Path(data_file_var.get()),
+                Path(key_file_var.get()),
+                backup_output_path=DEFAULT_BACKUP_ENCRYPTED_DB,
+            )
+        except Exception as exc:
+            messagebox.showerror("Reset", str(exc))
+            return
+        messagebox.showinfo(
+            "Reset eseguito",
+            "Operazione completata. Riapri l'applicazione per configurare di nuovo account e posta.",
+        )
+        try:
+            root.destroy()
+        finally:
+            sys.exit(0)
+
+    def _send_registration_notification_now() -> None:
+        _apply_mail_vars_to_db()
+        security_auth.ensure_security(cur_db())
+        up = cur_db().get("user_profile") or {}
+        em = (up.get("email") or "").strip().lower()
+        suf = (up.get("display_name_suffix") or "").strip()
+        if not em:
+            messagebox.showwarning(
+                "Registrazione",
+                "Nessun profilo con email: completa prima il primo accesso.",
+                parent=root,
+            )
+            return
+        if not email_client.is_app_mail_configured(cur_db()):
+            messagebox.showwarning(
+                "Registrazione",
+                "Configura e verifica la posta prima di inviare la notifica.",
+                parent=root,
+            )
+            return
+        try:
+            email_client.send_registration_signup_notification(
+                cur_db(), display_suffix=suf or "—", user_email=em
+            )
+        except Exception as exc:
+            messagebox.showerror("Registrazione", str(exc), parent=root)
+            return
+        try:
+            save_encrypted_db_dual(
+                cur_db(),
+                Path(data_file_var.get()),
+                Path(key_file_var.get()),
+                backup_output_path=DEFAULT_BACKUP_ENCRYPTED_DB,
+            )
+        except Exception as exc:
+            messagebox.showerror("Salvataggio", str(exc), parent=root)
+            return
+        messagebox.showinfo(
+            "Registrazione",
+            "Notifica inviata. Controlla la posta (e lo spam).\n\n"
+            "Per risultare «registrato», nella casella IMAP configurata deve comparire un messaggio "
+            "(oggetto o corpo) che contenga una di queste righe:\n\n"
+            f"REGISTRA:{em}\noppure\nREGISTRATO:{em}",
+            parent=root,
+        )
+
+    r_ = 0
+    ttk.Label(mail_setup_frame, text="Email amministratore (notifiche nuovi accessi)", font=("TkDefaultFont", 11, "bold")).grid(
+        row=r_, column=0, columnspan=4, sticky="w", pady=(0, 4)
+    )
+    r_ += 1
+    ttk.Entry(mail_setup_frame, textvariable=admin_notify_var, width=72).grid(row=r_, column=0, columnspan=4, sticky="we", pady=(0, 10))
+    r_ += 1
+    ttk.Label(mail_setup_frame, text="SMTP", font=("TkDefaultFont", 11, "bold")).grid(row=r_, column=0, columnspan=4, sticky="w")
+    r_ += 1
+    ttk.Label(mail_setup_frame, text="Server").grid(row=r_, column=0, sticky="w")
+    ttk.Entry(mail_setup_frame, textvariable=smtp_host_var, width=36).grid(row=r_, column=1, sticky="we", padx=(6, 8))
+    ttk.Label(mail_setup_frame, text="Porta").grid(row=r_, column=2, sticky="w")
+    ttk.Entry(mail_setup_frame, textvariable=smtp_port_var, width=8).grid(row=r_, column=3, sticky="w")
+    r_ += 1
+    ttk.Checkbutton(mail_setup_frame, text="SMTP SSL implicito (465)", variable=smtp_implicit_ssl_var).grid(
+        row=r_, column=0, columnspan=2, sticky="w"
+    )
+    ttk.Checkbutton(mail_setup_frame, text="STARTTLS", variable=smtp_starttls_var).grid(row=r_, column=2, columnspan=2, sticky="w")
+    r_ += 1
+    ttk.Label(mail_setup_frame, text="IMAP", font=("TkDefaultFont", 11, "bold")).grid(row=r_, column=0, columnspan=4, sticky="w", pady=(8, 0))
+    r_ += 1
+    ttk.Label(mail_setup_frame, text="Server").grid(row=r_, column=0, sticky="w")
+    ttk.Entry(mail_setup_frame, textvariable=imap_host_var, width=36).grid(row=r_, column=1, sticky="we", padx=(6, 8))
+    ttk.Label(mail_setup_frame, text="Porta").grid(row=r_, column=2, sticky="w")
+    ttk.Entry(mail_setup_frame, textvariable=imap_port_var, width=8).grid(row=r_, column=3, sticky="w")
+    r_ += 1
+    ttk.Checkbutton(mail_setup_frame, text="IMAP SSL", variable=imap_ssl_var).grid(row=r_, column=0, columnspan=2, sticky="w")
+    ttk.Checkbutton(
+        mail_setup_frame,
+        text="Verifica certificati SSL (lasciare attivo; disattivare solo se errore certificati)",
+        variable=ssl_verify_var,
+    ).grid(row=r_, column=2, columnspan=2, sticky="w")
+    r_ += 1
+    ttk.Label(mail_setup_frame, text="Utente (account posta)", font=("TkDefaultFont", 11, "bold")).grid(row=r_, column=0, columnspan=4, sticky="w", pady=(8, 0))
+    r_ += 1
+    ttk.Entry(mail_setup_frame, textvariable=mail_user_var, width=72).grid(row=r_, column=0, columnspan=4, sticky="we")
+    r_ += 1
+    ttk.Label(mail_setup_frame, text="Password app / account").grid(row=r_, column=0, sticky="nw", pady=(4, 0))
+    ttk.Entry(mail_setup_frame, textvariable=mail_password_var, width=40, show="•").grid(row=r_, column=1, columnspan=3, sticky="w", pady=(4, 0))
+    r_ += 1
+    tk.Label(
+        mail_setup_frame,
+        text=(
+            "Gmail: usa l’indirizzo completo come utente e una «Password per le app» "
+            "(myaccount.google.com/apppasswords), non la password di accesso a Google. "
+            "Abilita IMAP in Gmail (Impostazioni → Inoltro e POP/IMAP)."
+        ),
+        font=("TkDefaultFont", 10),
+        fg="#444444",
+        justify=tk.LEFT,
+        wraplength=720,
+    ).grid(row=r_, column=0, columnspan=4, sticky="w", pady=(2, 6))
+    r_ += 1
+    ttk.Label(mail_setup_frame, text="Da (mittente, opzionale)").grid(row=r_, column=0, sticky="w", pady=(6, 0))
+    ttk.Entry(mail_setup_frame, textvariable=mail_from_var, width=50).grid(row=r_, column=1, columnspan=3, sticky="w", pady=(6, 0))
+    r_ += 1
+    mail_btns = ttk.Frame(mail_setup_frame)
+    mail_btns.grid(row=r_, column=0, columnspan=4, sticky="w", pady=(12, 4))
+    ttk.Button(mail_btns, text="Salva impostazioni posta", command=_save_mail_settings).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Button(mail_btns, text="Test connessione (SMTP + IMAP)", command=_test_mail_settings).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Button(mail_btns, text="Ripeti primo accesso / registrazione", command=_repeat_first_access_registration).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Button(
+        mail_btns,
+        text="Invia notifica registrazione (amministratore + copia a te)",
+        command=_send_registration_notification_now,
+    ).pack(side=tk.LEFT, padx=(0, 8))
+    r_ += 1
+    ttk.Label(mail_setup_frame, textvariable=mail_status_var, foreground="#333").grid(row=r_, column=0, columnspan=4, sticky="w")
+
+    for c in range(4):
+        mail_setup_frame.columnconfigure(c, weight=1 if c == 1 else 0)
+
+    ttk.Label(
+        mail_verified_frame,
+        text="La configurazione della posta è stata verificata con successo.",
+        font=("TkDefaultFont", 12),
+    ).pack(anchor=tk.W)
+    ttk.Button(
+        mail_verified_frame,
+        text="Resettare account, posta e impostazioni di sicurezza…",
+        command=_factory_reset_security_and_data,
+    ).pack(anchor=tk.W, pady=(10, 0))
+    ttk.Button(
+        mail_verified_frame,
+        text="Invia di nuovo notifica registrazione (primo accesso)",
+        command=_send_registration_notification_now,
+    ).pack(anchor=tk.W, pady=(12, 0))
+    ttk.Label(
+        mail_verified_frame,
+        text=(
+            "Per confermare l'utente come «registrato», una email in INBOX deve contenere "
+            "REGISTRA: oppure REGISTRATO: seguiti dall'email utente (come nella notifica inviata)."
+        ),
+        wraplength=520,
+        font=("TkDefaultFont", 10),
+    ).pack(anchor=tk.W, pady=(8, 0))
+
+    _load_mail_vars_from_db()
+    refresh_mail_security_visibility()
+
     opzioni_inner = ttk.Frame(opzioni_frame)
     opzioni_inner.pack(fill=tk.BOTH, expand=True)
 
@@ -7174,36 +7824,136 @@ th {{ background:#efefef; text-align:left; }}
             pass
         messagebox.showinfo("Registrazioni periodiche", f"Operazione completata. Registrazioni create: {n}.")
 
+    def _open_opzioni_if_mail_incomplete() -> None:
+        try:
+            if not email_client.is_app_mail_configured(cur_db()):
+                notebook.select(opzioni_frame)
+        except Exception:
+            pass
+
+    root.after(200, _open_opzioni_if_mail_incomplete)
+
+    def _poll_registration_once() -> None:
+        try:
+            if security_auth.poll_registration_emails(cur_db()):
+                save_encrypted_db_dual(
+                    cur_db(),
+                    Path(data_file_var.get()),
+                    Path(key_file_var.get()),
+                    backup_output_path=DEFAULT_BACKUP_ENCRYPTED_DB,
+                )
+                refresh_window_title()
+        except Exception:
+            pass
+
+    root.after(900, _poll_registration_once)
+
     root.after(350, _startup_periodic_due_check)
     root.mainloop()
 
 
 def main() -> None:
-    encrypted_db = None
-    try:
-        encrypted_db = load_encrypted_db(DEFAULT_ENCRYPTED_DB, DEFAULT_KEY_FILE)
-    except InvalidToken:
-        encrypted_db = None
+    if Fernet is None:
+        print("Installa cryptography: pip install cryptography", file=sys.stderr)
+        sys.exit(1)
 
-    if encrypted_db is not None:
-        db = encrypted_db
-        periodiche.ensure_periodic_registrations(db)
-        email_client.ensure_email_settings(db)
-    else:
-        print(
-            "Primo avvio: import dell'archivio legacy in corso (può richiedere tempo; attendere).",
-            file=sys.stderr,
-        )
-        run_import_legacy(DEFAULT_CDC_ROOT, DEFAULT_OUTPUT)
-        db = json.loads(DEFAULT_OUTPUT.read_text(encoding="utf-8"))
-        periodiche.ensure_periodic_registrations(db)
-        email_client.ensure_email_settings(db)
+    root = tk.Tk()
+    root.title("Conti di casa")
+    # Finestra principale nascosta durante posta/login: niente seconda finestra "tk".
+    # I dialoghi di avvio non usano transient(root) così restano visibili anche con withdraw.
+    try:
+        root.withdraw()
+    except Exception:
+        pass
+
+    if not security_auth.verify_pillow_for_login_ui(parent=root):
         try:
-            save_encrypted_db(db, DEFAULT_ENCRYPTED_DB, DEFAULT_KEY_FILE)
+            root.destroy()
         except Exception:
-            # UI still starts even if encryption backend is unavailable.
             pass
-    build_ui(db)
+        return
+
+    up = os_boot_time.seconds_since_os_boot()
+    if up is not None and up < _BOOT_DROPBOX_CONFIRM_WITHIN_SECONDS:
+        if not messagebox.askokcancel(
+            "Conti di casa",
+            "Hai controllato che Dropbox sia aggiornato?\n\n"
+            "Se Dropbox non ha ancora finito di sincronizzare i file in questa cartella, attendere "
+            "prima di continuare.\n\n"
+            "OK = continua e carica il database\n"
+            "Annulla = esci dall'applicazione",
+            parent=root,
+        ):
+            try:
+                root.destroy()
+            except Exception:
+                pass
+            return
+
+    db, resolved_path = load_database_at_startup(sync_ui_parent=root)
+
+    db_holder: list[dict] = [db]
+    path_holder: list[Path] = [resolved_path]
+
+    def save_db() -> None:
+        periodiche.ensure_periodic_registrations(db_holder[0])
+        email_client.ensure_email_settings(db_holder[0])
+        security_auth.ensure_security(db_holder[0])
+        save_encrypted_db_dual(
+            db_holder[0],
+            path_holder[0],
+            DEFAULT_KEY_FILE,
+            backup_output_path=DEFAULT_BACKUP_ENCRYPTED_DB,
+        )
+
+    security_auth.ensure_security(db_holder[0])
+    if not mail_gate.run_startup_mail_gate(root, db_holder[0], save_db):
+        try:
+            messagebox.showwarning(
+                "Conti di casa",
+                "Configurazione posta non completata.\nL'applicazione verrà chiusa.",
+                parent=root,
+            )
+        except Exception:
+            print("Configurazione posta annullata.", file=sys.stderr)
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        return
+    if not security_auth.run_first_access_wizard_if_needed(root, db_holder[0], save_db):
+        try:
+            messagebox.showwarning(
+                "Conti di casa",
+                "Primo accesso non completato.\nL'applicazione verrà chiusa.",
+                parent=root,
+            )
+        except Exception:
+            print("Primo accesso non completato o annullato.", file=sys.stderr)
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        return
+    ok, session = security_auth.run_login_dialog(root, db_holder[0], save_db)
+    if not ok or session is None:
+        try:
+            messagebox.showinfo(
+                "Conti di casa",
+                "Accesso annullato.\nPer usare il programma avvia di nuovo l'applicazione.",
+                parent=root,
+            )
+        except Exception:
+            print("Accesso annullato.", file=sys.stderr)
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        return
+    assert session is not None
+
+    path_holder[0] = migrate_data_path_after_login(db_holder[0], session, path_holder[0])
+    build_ui(db_holder[0], root, session, primary_data_path=path_holder[0])
 
 
 if __name__ == "__main__":

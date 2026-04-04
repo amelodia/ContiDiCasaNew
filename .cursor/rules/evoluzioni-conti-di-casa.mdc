@@ -1,0 +1,35 @@
+---
+description: Disposizioni e convenzioni Conti di casa (UX, dati, sicurezza) da rispettare nelle evoluzioni
+alwaysApply: true
+---
+
+# Conti di casa — linee guida per evoluzioni
+
+## Nuova registrazione — campo Importo (€)
+
+- In immissione manuale: **solo cifre**; **`+` e `−` solo come primo carattere** (se c’è già un segno, sostituiscono il primo carattere, non si inseriscono in mezzo).
+- Restano ammessi **`.` e `,`** per il formato euro italiano (es. `1.234,56`), coerente con `normalize_euro_input` / `format_euro_it`.
+- **Incolla**: stesso alfabeto; il testo incollato e il risultato unito al campo devono passare `normalize_euro_input` dove ha senso.
+- Scorciatoie da tastiera (Ctrl/Cmd/Alt) non devono essere bloccate dal filtro `KeyPress`.
+
+Implementazione: `bind_euro_amount_entry_validation` in `main_app.py` su `ent_amt`, `amount_filter_entry` (Movimenti), `ent_per_amt`, `ent_edit_amt` (dialog Modifica importo €), `ent_saldo` con `allow_leading_sign=False` (solo importi non negativi).
+
+## Nuova registrazione — Nota (Girata conto/conto, 2° conto Cassa, senza memoria cassa)
+
+- Preimpostazione: **`Aut ` + `gg/mm` + uno spazio finale** (es. `Aut 15/03 `) per continuare a digitare dopo la data.
+- Al **focus** sul campo Nota, se il contenuto è quello modello, cursore **dopo lo spazio** finale.
+- La nota **non deve riproporre** il testo della registrazione precedente: dopo ogni inserimento riuscito eseguire sempre `_populate_form_defaults(keep_last=True)`, **anche** se l’utente sceglie «Concludi immissione» (prima di passare a Movimenti).
+
+## Dropbox e avvio
+
+- Prima di caricare il DB cifrato: attesa **stabilità** file sotto Dropbox (`cloud_sync_wait.py`).
+- Se il **boot** è avvenuto da meno di **5 minuti**, chiedere conferma su Dropbox aggiornato (`os_boot_time.py` + dialog in `main()`).
+
+## Accesso / Pillow
+
+- Immagine login: **solo** JPEG incorporato (`euro_login_asset.py`); **Pillow obbligatorio** all’avvio (`verify_pillow_for_login_ui`).
+- Rigenerare asset: `python3 regen_euro_login_asset.py` (neutro) o `--from-assets` da `assets/euro.jpg`.
+
+## Ricerca Movimenti — preset «Ultimi N mesi» con date future comprese
+
+- L’intervallo si ancora alla **data odierna** (inizio = oggi − N mesi), non all’ultima data futura del dataset (`_preset_rolling_start_date` in `main_app.py`).
