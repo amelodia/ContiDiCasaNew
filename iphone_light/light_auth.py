@@ -50,6 +50,5 @@ def try_login(db: dict, email: str, password: str) -> AppSession | None:
     return AppSession(
         is_registered=verified,
         entered_via_backdoor=False,
-        entered_via_guest=False,
         user_email=em,
     )

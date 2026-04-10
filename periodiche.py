@@ -14,7 +14,6 @@ from import_legacy import MAX_CHEQUE_LEN, MAX_RECORD_NOTE_LEN, format_money
 CADENCE_CHOICES: list[tuple[str, str]] = [
     ("daily", "Quotidiana"),
     ("weekly", "Settimanale"),
-    ("biweekly", "Bisettimanale"),
     ("monthly", "Mensile"),
     ("bimonthly", "Bimensile"),
     ("quarterly", "Trimestrale"),
@@ -34,6 +33,11 @@ def cadence_label(cid: str) -> str:
 def ensure_periodic_registrations(db: dict) -> None:
     if "periodic_registrations" not in db or not isinstance(db["periodic_registrations"], list):
         db["periodic_registrations"] = []
+    for rule in db["periodic_registrations"]:
+        if not isinstance(rule, dict):
+            continue
+        if str(rule.get("cadence") or "") == "biweekly":
+            rule["cadence"] = "weekly"
 
 
 def _add_months(d: date, months: int) -> date:
@@ -48,8 +52,6 @@ def advance_by_cadence(d: date, cadence: str) -> date:
         return d + timedelta(days=1)
     if cadence == "weekly":
         return d + timedelta(days=7)
-    if cadence == "biweekly":
-        return d + timedelta(days=14)
     if cadence == "monthly":
         return _add_months(d, 1)
     if cadence == "bimonthly":
@@ -63,6 +65,27 @@ def advance_by_cadence(d: date, cadence: str) -> date:
     if cadence == "annual":
         return _add_months(d, 12)
     return d + timedelta(days=1)
+
+
+def previous_by_cadence(d: date, cadence: str) -> date:
+    """Inverso di advance_by_cadence: data L tale che advance(L, cadence) == d (stessa logica di calendario)."""
+    if cadence == "daily":
+        return d - timedelta(days=1)
+    if cadence == "weekly":
+        return d - timedelta(days=7)
+    if cadence == "monthly":
+        return _add_months(d, -1)
+    if cadence == "bimonthly":
+        return _add_months(d, -2)
+    if cadence == "quarterly":
+        return _add_months(d, -3)
+    if cadence == "quadrimestral":
+        return _add_months(d, -4)
+    if cadence == "semiannual":
+        return _add_months(d, -6)
+    if cadence == "annual":
+        return _add_months(d, -12)
+    return d - timedelta(days=1)
 
 
 def _parse_iso(s: str | None) -> date | None:
@@ -124,6 +147,10 @@ def build_periodic_record(
     acc2_flags = str(tpl.get("account_secondary_flags") or "")
     chq = _sanitize_line(str(tpl.get("cheque") or ""), max_len=MAX_CHEQUE_LEN) or "-"
     note = _sanitize_line(str(tpl.get("note") or ""), max_len=MAX_RECORD_NOTE_LEN) or "-"
+    cadence = str(rule.get("cadence") or "")
+    if cadence in {"monthly", "bimonthly"}:
+        # Mensile/Bimensile: nota preimpostata anno/mese della singola istanza creata.
+        note = f"{y:04d}/{int(movement_date_iso[5:7]):02d}"
     amt_eur = str(tpl.get("amount_eur") or "0.00")
     amt_dec = Decimal(str(amt_eur.replace(",", ".")))
     return {
@@ -162,17 +189,45 @@ def build_periodic_record(
     }
 
 
+_PLAN_REF_YEAR = 2026
+
+
+def _chart_clone_template_for_periodiche(db: dict) -> dict | None:
+    for y in db.get("years", []) or []:
+        if int(y.get("year", 0)) == _PLAN_REF_YEAR:
+            return y
+    ys = db.get("years", []) or []
+    if not ys:
+        return None
+    return max(ys, key=lambda yy: int(yy["year"]))
+
+
 def ensure_year_bucket(db: dict, target_year: int) -> dict:
     import json
 
     for y in db.get("years", []):
         if int(y.get("year", 0)) == int(target_year):
             return y
-    latest = max(db["years"], key=lambda yy: int(yy["year"]))
+    if not db.get("years"):
+        new_y = {
+            "year": int(target_year),
+            "folder": "",
+            "source_files": {},
+            "legacy_saldi": None,
+            "categories": [{"code": "1", "name": "+Nuova", "note": None}],
+            "accounts": [{"code": "1", "name": ""}],
+            "records": [],
+        }
+        db.setdefault("years", []).append(new_y)
+        db["years"].sort(key=lambda yy: int(yy["year"]))
+        return new_y
+    template = _chart_clone_template_for_periodiche(db)
+    if not template:
+        template = max(db["years"], key=lambda yy: int(yy["year"]))
     new_y = {
         "year": int(target_year),
-        "accounts": json.loads(json.dumps(latest.get("accounts", []))),
-        "categories": json.loads(json.dumps(latest.get("categories", []))),
+        "accounts": json.loads(json.dumps(template.get("accounts", []))),
+        "categories": json.loads(json.dumps(template.get("categories", []))),
         "records": [],
     }
     db["years"].append(new_y)

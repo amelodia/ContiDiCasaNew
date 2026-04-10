@@ -28,8 +28,11 @@ MAX_AMOUNT_EUR = Decimal("999999999.99")
 MAX_CATEGORY_NAME_LEN = 20
 MAX_CATEGORY_NOTE_LEN = 100
 MAX_ACCOUNT_NAME_LEN = 16
+# Limite pratico sul numero di voci (nuova app / scheda Categorie e conti).
+MAX_CATEGORIES_COUNT = 100
+MAX_ACCOUNTS_COUNT = 20
 MAX_RECORD_NOTE_LEN = 100
-MAX_CHEQUE_LEN = 8
+MAX_CHEQUE_LEN = 12  # es. «Periodica» nelle registrazioni periodiche
 
 _AMOUNT_RE = re.compile(r"[+-]?\d[\d\.]*([,\.]\d+)?")
 
@@ -142,18 +145,23 @@ def format_date_yyyymmdd(raw: str) -> str:
     return f"{d[0:4]}-{d[4:6]}-{d[6:8]}"
 
 
-def parse_dat_records(path: Path, year: int, categories: list[str], accounts: list[str]) -> list[LegacyRecord]:
+def parse_dat_records(
+    path: Path,
+    year: int,
+    categories: list[str],
+    accounts: list[str],
+    category_notes_from_2026: list[str],
+) -> list[LegacyRecord]:
     content = path.read_text(encoding="latin-1", errors="ignore")
     total = len(content) // RECORD_LEN
     out: list[LegacyRecord] = []
-    category_notes = parse_category_notes(path.parent)
     for idx in range(total):
         record = content[idx * RECORD_LEN : (idx + 1) * RECORD_LEN]
         if len(record) < RECORD_LEN:
             continue
 
         raw_date = record[0:8]
-        importo_lire_raw = record[8:23]
+        _lire_slot = record[8:23]  # non importato: solo euro
         importo_euro_raw = record[23:37]
         categoria_raw = record[37:39]
         conto1_raw = record[39:40]
@@ -171,21 +179,54 @@ def parse_dat_records(path: Path, year: int, categories: list[str], accounts: li
         primary_flags = f"{ver1}{ver2}".replace(" ", "")
         secondary_flags = f"{ver3}{ver4}".replace(" ", "")
 
-        # Some legacy slots are placeholders for cancelled records.
-        if not raw_date.strip() or not raw_date.strip().isdigit():
+        cat_code_raw = categoria_raw.strip()
+        # Conti90: le prime 8 registrazioni del dat sono dotazioni; il campo categoria in quegli slot può essere errato.
+        if year == 1990 and idx < 8:
+            cat_int = 0
+        elif not cat_code_raw.isdigit():
             continue
-        date_iso = format_date_yyyymmdd(raw_date)
-        amount_eur = parse_amount(importo_euro_raw)
-        amount_lire = parse_amount(importo_lire_raw.replace("E", "").replace("L", ""))
+        else:
+            cat_int = int(cat_code_raw)
+        if cat_int == 0 and year != 1990:
+            continue
+        cat_idx = cat_int
+        if cat_idx < 0 or cat_idx >= len(categories):
+            continue
 
-        cat_code = categoria_raw.strip()
-        cat_idx = int(cat_code) if cat_code.isdigit() else -1
-        category_name = clip_text(categories[cat_idx], MAX_CATEGORY_NAME_LEN) if 0 <= cat_idx < len(categories) else None
-        category_note = (
-            clip_text(category_notes[cat_idx], MAX_CATEGORY_NOTE_LEN)
-            if 0 <= cat_idx < len(category_notes)
-            else None
-        )
+        # In Conti90 le prime dotazioni possono avere data/importo euro non conformi al resto del dat.
+        rs = raw_date.strip()
+        if not rs or not rs.isdigit() or len(rs) != 8:
+            if year == 1990 and cat_int == 0:
+                date_iso = "1990-01-01"
+            else:
+                continue
+        else:
+            try:
+                date_iso = format_date_yyyymmdd(raw_date)
+            except ValueError:
+                if year == 1990 and cat_int == 0:
+                    date_iso = "1990-01-01"
+                else:
+                    continue
+
+        try:
+            amount_eur = parse_amount(importo_euro_raw)
+        except ValueError:
+            if year == 1990 and cat_int == 0:
+                amount_eur = Decimal("0")
+            else:
+                continue
+
+        category_name = clip_text(categories[cat_idx], MAX_CATEGORY_NAME_LEN)
+        cat_code = str(cat_int)
+        # Note *not.aco: slot 0 = Dotazione (non abbinato); codice categoria k>=1 usa slot k.
+        category_note = None
+        if (
+            cat_idx > 0
+            and cat_idx < len(category_notes_from_2026)
+            and str(category_notes_from_2026[cat_idx] or "").strip()
+        ):
+            category_note = clip_text(str(category_notes_from_2026[cat_idx]), MAX_CATEGORY_NOTE_LEN)
 
         acc1_code = conto1_raw.strip()
         acc1_idx = int(acc1_code) if acc1_code.isdigit() else 0
@@ -199,13 +240,9 @@ def parse_dat_records(path: Path, year: int, categories: list[str], accounts: li
             clip_text(accounts[acc2_idx - 1], MAX_ACCOUNT_NAME_LEN) if 1 <= acc2_idx <= len(accounts) else None
         )
 
-        source_currency = "LIRE" if year <= 2001 else "EUR"
-        if source_currency == "LIRE":
-            display_currency = "LIRE"
-            display_amount = format_money(amount_lire)
-        else:
-            display_currency = "EUR"
-            display_amount = format_money(amount_eur)
+        source_currency = "EUR"
+        display_currency = "EUR"
+        display_amount = format_money(amount_eur)
 
         out.append(
             LegacyRecord(
@@ -228,7 +265,7 @@ def parse_dat_records(path: Path, year: int, categories: list[str], accounts: li
                 account_secondary_with_flags=f"{acc2_code}{secondary_flags}" if acc2_code else "",
                 account_secondary_name=account_secondary_name,
                 amount_eur=format_money(amount_eur),
-                amount_lire_original=format_money(amount_lire) if year <= 2001 else None,
+                amount_lire_original=None,
                 note=clip_text(note, MAX_RECORD_NOTE_LEN),
                 cheque=clip_text(assegno_raw.strip(), MAX_CHEQUE_LEN),
                 raw_flags=flags,
@@ -243,11 +280,20 @@ def parse_dat_records(path: Path, year: int, categories: list[str], accounts: li
 
 
 def guess_year_from_folder(folder_name: str) -> int:
-    suffix = folder_name[-2:]
-    if not suffix.isdigit():
-        raise ValueError(f"Impossibile dedurre l'anno da: {folder_name}")
-    yy = int(suffix)
-    return 1900 + yy if yy >= 90 else 2000 + yy
+    """
+    Conti90 → 1990, Conti26 → 2026. Accetta anche cartelle tipo Conti1990 / Conti2026 (4 cifre).
+    """
+    fn = folder_name.strip()
+    m4 = re.fullmatch(r"Conti(\d{4})", fn, flags=re.IGNORECASE)
+    if m4:
+        y = int(m4.group(1))
+        if 1900 <= y <= 2100:
+            return y
+    m2 = re.fullmatch(r"Conti(\d{2})", fn, flags=re.IGNORECASE)
+    if m2:
+        yy = int(m2.group(1))
+        return 1900 + yy if yy >= 90 else 2000 + yy
+    raise ValueError(f"Impossibile dedurre l'anno da: {folder_name!r}")
 
 
 def find_single_file(folder: Path, pattern: str) -> Path:
@@ -257,10 +303,15 @@ def find_single_file(folder: Path, pattern: str) -> Path:
     return candidates[0]
 
 
+# *sld.aco (es. Conti26): prima riga = indicatore valuta (E/L), da ignorare per i numeri;
+# a seguire esattamente 8 saldi assoluti in euro, conto 1 = Cassa … conto 8.
+SLD_LEGACY_ACCOUNT_SLOTS = 8
+
+
 def parse_sld_balances(folder: Path, n_accounts: int) -> dict[str, object] | None:
     """
-    Legge *sld.aco come fa il programma legacy: prima riga valuta (L/E), poi N saldi.
-    Autoritativo per i saldi di chiusura anno (include effetto Dotazione iniziale).
+    Legge *sld.aco: prima riga valuta (E/L) da trascurare come dato numerico, poi 8 saldi
+    assoluti per i primi 8 conti (Cassa = primo). Estende con zeri se il piano ha più conti.
     """
     candidates = sorted(folder.glob("*sld.aco"))
     if len(candidates) != 1:
@@ -268,18 +319,46 @@ def parse_sld_balances(folder: Path, n_accounts: int) -> dict[str, object] | Non
     lines = [ln.strip().strip('"') for ln in candidates[0].read_text(encoding="latin-1", errors="ignore").splitlines() if ln.strip()]
     if len(lines) < 2:
         return None
-    valuta = lines[0].upper()[:1]
-    raw_amounts = lines[1 : 1 + n_accounts]
-    if len(raw_amounts) < n_accounts:
-        return None
-    amounts: list[str] = []
-    for raw in raw_amounts:
-        clean = raw.replace(".", "").replace(",", ".") if "," in raw else raw
+    first_parts = lines[0].split()
+    valuta = (first_parts[0].upper()[:1] if first_parts else "E")
+    if valuta not in ("E", "L"):
+        valuta = "E"
+    nums: list[Decimal] = []
+
+    def _push_token(t: str) -> None:
+        nonlocal nums
+        if len(nums) >= SLD_LEGACY_ACCOUNT_SLOTS:
+            return
+        t = t.strip()
+        if not t:
+            return
+        clean = t.replace(".", "").replace(",", ".") if "," in t else t
         try:
-            dec = Decimal(clean)
+            nums.append(Decimal(clean))
         except InvalidOperation:
-            dec = Decimal("0")
-        amounts.append(str(dec))
+            nums.append(Decimal("0"))
+
+    if first_parts and first_parts[0].upper() in ("E", "L"):
+        for part in first_parts[1:]:
+            if len(nums) >= SLD_LEGACY_ACCOUNT_SLOTS:
+                break
+            _push_token(part)
+    for line in lines[1:]:
+        if len(nums) >= SLD_LEGACY_ACCOUNT_SLOTS:
+            break
+        for part in line.split():
+            if len(nums) >= SLD_LEGACY_ACCOUNT_SLOTS:
+                break
+            _push_token(part)
+    while len(nums) < SLD_LEGACY_ACCOUNT_SLOTS:
+        nums.append(Decimal("0"))
+    nums = nums[:SLD_LEGACY_ACCOUNT_SLOTS]
+    amounts: list[str] = []
+    for i in range(max(n_accounts, 1)):
+        if i < len(nums):
+            amounts.append(str(nums[i]))
+        else:
+            amounts.append("0")
     return {
         "source_file": candidates[0].name,
         "valuta": valuta,
@@ -287,20 +366,49 @@ def parse_sld_balances(folder: Path, n_accounts: int) -> dict[str, object] | Non
     }
 
 
-def parse_category_notes(folder: Path) -> list[str]:
+def _clean_not_aco_line(line: str) -> str:
+    return line.strip().strip('"').replace("\x1a", "").strip()
+
+
+def parse_category_notes_for_n_categories(folder: Path, n_categories: int) -> list[str]:
+    """
+    *not.aco: di solito **nessun titolo**; **non** c’è riga per la Dotazione (codice 0).
+
+    La **prima riga** del file va sulla **Girata** (codice 1), la seconda sul codice 2, ecc.
+    Tipico: 51 categorie in *cat.aco (0…50) e **50 righe** in *not.aco → out[1]=riga0, …, out[50]=riga49.
+
+    Opzionale: una sola riga titolo in più (come *cat.aco) se len(file) == n_categories + 1.
+    """
     notes_files = sorted(folder.glob("*not.aco"))
-    if not notes_files:
+    if not notes_files or n_categories <= 0:
         return []
-    lines = notes_files[0].read_text(encoding="latin-1", errors="ignore").splitlines()
-    notes: list[str] = []
-    for line in lines:
-        clean = line.strip().strip('"').replace("\x1a", "").strip()
-        if clean:
-            notes.append(clean)
-    return notes
+    raw_lines = notes_files[0].read_text(encoding="latin-1", errors="ignore").splitlines()
+    slots = [_clean_not_aco_line(ln) for ln in raw_lines]
+    if not slots:
+        return [""] * n_categories
+    if len(slots) == n_categories + 1:
+        slots = slots[1:]
+    # Al massimo (n_categories - 1) righe utili (codici 1…N-1)
+    n_note_lines = max(0, n_categories - 1)
+    if len(slots) > n_note_lines:
+        slots = slots[:n_note_lines]
+
+    out = [""] * n_categories
+    out[0] = ""
+    for k in range(1, n_categories):
+        fi = k - 1
+        if fi < len(slots) and str(slots[fi] or "").strip():
+            out[k] = clip_text(str(slots[fi]), MAX_CATEGORY_NOTE_LEN)
+    return out
 
 
-def load_year(folder: Path) -> dict:
+def load_year(
+    folder: Path,
+    *,
+    category_notes_2026: list[str],
+    legacy_saldi_for_year: dict | None,
+    category_notes_source_filename: str | None,
+) -> dict:
     year = guess_year_from_folder(folder.name)
     cat_file = find_single_file(folder, "*cat.aco")
     coc_file = find_single_file(folder, "*coc.aco")
@@ -309,9 +417,9 @@ def load_year(folder: Path) -> dict:
 
     categories = parse_aco_list(cat_file)
     accounts = parse_aco_list(coc_file)
-    records = parse_dat_records(dat_file, year, categories, accounts)
-    category_notes = parse_category_notes(folder)
-    legacy_saldi = parse_sld_balances(folder, len(accounts))
+    records = parse_dat_records(
+        dat_file, year, categories, accounts, category_notes_2026
+    )
 
     return {
         "year": year,
@@ -320,17 +428,27 @@ def load_year(folder: Path) -> dict:
             "dat": dat_file.name,
             "cat": cat_file.name,
             "coc": coc_file.name,
-            "not": not_candidates[0].name if not_candidates else None,
-            "sld": legacy_saldi["source_file"] if legacy_saldi else None,
+            "not": category_notes_source_filename
+            or (not_candidates[0].name if not_candidates else None),
+            "sld": (legacy_saldi_for_year or {}).get("source_file")
+            if isinstance(legacy_saldi_for_year, dict)
+            else None,
         },
-        "legacy_saldi": legacy_saldi,
+        "legacy_saldi": legacy_saldi_for_year,
         "categories": [
             {
                 "code": str(i - 1),
                 "name": clip_text(name, MAX_CATEGORY_NAME_LEN),
-                "note": clip_text(category_notes[i - 1], MAX_CATEGORY_NOTE_LEN)
-                if i - 1 < len(category_notes)
-                else None,
+                "note": (
+                    None
+                    if (i - 1) == 0
+                    else (
+                        clip_text(category_notes_2026[i - 1], MAX_CATEGORY_NOTE_LEN)
+                        if (i - 1) < len(category_notes_2026)
+                        and str(category_notes_2026[i - 1] or "").strip()
+                        else None
+                    )
+                ),
             }
             for i, name in enumerate(categories, start=1)
         ],
@@ -343,24 +461,82 @@ def load_year(folder: Path) -> dict:
 
 
 def iter_year_folders(root: Path) -> Iterable[Path]:
-    for path in sorted(root.glob("Conti??")):
-        if path.is_dir():
+    """Cartelle annuali: Conti90, Conti26, oppure Conti1990, Conti2026, …"""
+    seen: set[Path] = set()
+    for pattern in ("Conti????", "Conti??"):
+        for path in sorted(root.glob(pattern)):
+            if not path.is_dir():
+                continue
+            key = path.resolve()
+            if key in seen:
+                continue
+            try:
+                guess_year_from_folder(path.name)
+            except ValueError:
+                continue
+            seen.add(key)
             yield path
 
 
 def build_unified_database(cdc_root: Path) -> dict:
+    def _folder_year_key(p: Path) -> tuple[int, str]:
+        try:
+            return (guess_year_from_folder(p.name), p.name)
+        except ValueError:
+            return (99999, p.name)
+
+    folders = sorted(iter_year_folders(cdc_root), key=_folder_year_key)
+    folder_2026: Path | None = None
+    for folder in folders:
+        try:
+            if guess_year_from_folder(folder.name) == 2026:
+                folder_2026 = folder
+                break
+        except ValueError:
+            continue
+
+    category_notes_2026: list[str] = []
+    not_name_2026: str | None = None
+    legacy_saldi_2026: dict | None = None
+    if folder_2026 is not None:
+        nn = sorted(folder_2026.glob("*not.aco"))
+        not_name_2026 = nn[0].name if nn else None
+        try:
+            cat_26 = find_single_file(folder_2026, "*cat.aco")
+            n_cat_26 = len(parse_aco_list(cat_26))
+            category_notes_2026 = parse_category_notes_for_n_categories(folder_2026, n_cat_26)
+        except FileNotFoundError:
+            category_notes_2026 = []
+        try:
+            coc_26 = find_single_file(folder_2026, "*coc.aco")
+            accounts_26 = parse_aco_list(coc_26)
+            legacy_saldi_2026 = parse_sld_balances(folder_2026, len(accounts_26))
+        except FileNotFoundError:
+            legacy_saldi_2026 = None
+
     years_data: list[dict] = []
     skipped_years: list[dict[str, str]] = []
-    for folder in iter_year_folders(cdc_root):
+    for folder in folders:
         try:
-            years_data.append(load_year(folder))
-        except FileNotFoundError as exc:
+            y = guess_year_from_folder(folder.name)
+            saldi = legacy_saldi_2026 if y == 2026 else None
+            years_data.append(
+                load_year(
+                    folder,
+                    category_notes_2026=category_notes_2026,
+                    legacy_saldi_for_year=saldi,
+                    category_notes_source_filename=not_name_2026,
+                )
+            )
+        except (FileNotFoundError, ValueError) as exc:
             skipped_years.append({"folder": folder.name, "reason": str(exc)})
     all_records = [record for year_data in years_data for record in year_data["records"]]
     girata_missing_second: list[dict[str, str | int]] = []
     for rec in all_records:
-        cat_name = (rec.get("category_name") or "").upper()
-        if "GIRATA.CONTO/CONTO" in cat_name or "GIRATA CONTO/CONTO" in cat_name:
+        cat_code = str(rec.get("category_code", "")).strip()
+        cat_name_u = (rec.get("category_name") or "").upper()
+        is_girata = cat_code == "1" or "GIRATA.CONTO/CONTO" in cat_name_u or "GIRATA CONTO/CONTO" in cat_name_u
+        if is_girata:
             if not (rec.get("account_primary_code") and rec.get("account_secondary_code")):
                 girata_missing_second.append(
                     {
@@ -386,7 +562,8 @@ def build_unified_database(cdc_root: Path) -> dict:
             "total_girata_records": sum(
                 1
                 for r in all_records
-                if "GIRATA.CONTO/CONTO" in (r.get("category_name") or "").upper()
+                if str(r.get("category_code", "")).strip() == "1"
+                or "GIRATA.CONTO/CONTO" in (r.get("category_name") or "").upper()
                 or "GIRATA CONTO/CONTO" in (r.get("category_name") or "").upper()
             ),
             "missing_second_account_count": len(girata_missing_second),
@@ -428,7 +605,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("data/unified_legacy_import.json"),
+        default=Path("legacy_import/unified_legacy_import.json"),
         help="Percorso file JSON di output",
     )
     args = parser.parse_args()

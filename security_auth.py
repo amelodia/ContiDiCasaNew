@@ -1,17 +1,19 @@
 """
 Accesso al programma: primo avvio, login, backdoor, stato registrato / non registrato,
-notifica email e conferma registrazione via IMAP.
+notifica email e conferma registrazione via IMAP, percorso «Nuova utenza» (wizard senza perdere posta/sicurezza).
 """
 from __future__ import annotations
 
 import base64
 import hashlib
 import io
+import os
 import platform
 import re
 import secrets
 import sys
 import time
+from datetime import datetime, timezone
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,10 +25,22 @@ SaveFn = Callable[[], None]
 # Versione mostrata nella finestra di accesso (allineare al rilascio).
 APP_VERSION = "1.0.0"
 
-# Colori finestra di accesso.
-_LOGIN_IMG_CANVAS_BG = "#d8ecf5"
-_LOGIN_BTN_FG = "#000000"
-_LOGIN_BTN_ACTIVE_BG = "#c9e4ef"  # azzurro leggermente più scuro al click
+# Sfondo azzurro chiaro (login, pagina Movimenti e altre UI allineate).
+CDC_AZZURRO_CHIARO_BG = "#d8ecf5"
+# Finestra di accesso: stesso azzurro.
+_LOGIN_IMG_CANVAS_BG = CDC_AZZURRO_CHIARO_BG
+
+# Palette «tipo tasti» (ocra chiaro, testo nero): unica fonte per riuso in altre schermate.
+CDC_TIPO_TASTI_BTN_BG = "#efe4b8"
+CDC_TIPO_TASTI_BTN_ACTIVE_BG = "#e2d696"
+CDC_TIPO_TASTI_BTN_FG = "#1a1a1a"
+
+# Login: stessi colori del tipo tasti (`tk.Label`, colori fedeli su macOS).
+_LOGIN_BTN_FG = CDC_TIPO_TASTI_BTN_FG
+_LOGIN_BTN_BG = CDC_TIPO_TASTI_BTN_BG
+_LOGIN_BTN_ACTIVE_BG = CDC_TIPO_TASTI_BTN_ACTIVE_BG
+# Larghezza in caratteri allineata ad «Accedi» per tasti corti (es. «Esci»).
+_LOGIN_BTN_WIDTH_ACCEDI_CHARS = len("Accedi")
 
 # Area immagine euro (compatta).
 _LOGIN_BANNER_AREA_HEIGHT = 128
@@ -36,6 +50,9 @@ _LOGIN_EURO_DISPLAY_MAX = 118
 # Finestra login: larghezza minima modesta; altezza segue il contenuto (niente “vuoto” sotto i tasti).
 _LOGIN_WIN_MIN_W = 400
 _LOGIN_WIN_MIN_H = 1
+# Primo accesso (wizard): dimensioni minime esplicite — su macOS senza ``WxH`` la finestra può risultare troppo bassa e nascondere «Continua» / «Annulla».
+_FIRST_ACCESS_WIN_MIN_W = 480
+_FIRST_ACCESS_WIN_MIN_H = 360
 # ~0,5 cm di margine in più sotto il contenuto (padding inferiore del riquadro principale).
 _LOGIN_OUTER_PAD_BOTTOM_PX = 22
 
@@ -150,6 +167,10 @@ DEFAULT_USER_PROFILE: dict[str, Any] = {
     "password_hash": "",
     "salt": "",
     "registration_verified": False,
+    # Istante UTC (ISO) dopo cui la scan IMAP accetta REGISTRA:/REGISTRATO: (evita match su mail vecchie).
+    "registration_poll_not_before_iso": "",
+    # True dopo «Nuova utenza» + DB contabile vuoto: aprire scheda Categorie e conti quando la posta è configurata.
+    "plan_conti_wizard_pending": False,
 }
 
 DEFAULT_SECURITY_CONFIG: dict[str, Any] = {
@@ -157,6 +178,26 @@ DEFAULT_SECURITY_CONFIG: dict[str, Any] = {
     # True dopo test SMTP+IMAP riuscito in Opzioni (UI compatta).
     "email_verified_ok": False,
 }
+
+
+def _login_prefill_email(up: dict) -> str:
+    """Email nel campo accesso: ultima usata (persistente), poi profilo DB, poi env."""
+    try:
+        import data_workspace
+
+        le = data_workspace.load_last_login_email()
+        if le:
+            return le
+    except Exception:
+        pass
+    prof = (up.get("email") or "").strip()
+    if prof:
+        return prof
+    for key in ("CONTI_LOGIN_EMAIL", "CONTI_DEFAULT_LOGIN_EMAIL", "CONTI_LOGIN_USERID"):
+        v = (os.environ.get(key) or "").strip()
+        if v:
+            return v
+    return ""
 
 
 def ensure_security(db: dict) -> None:
@@ -188,6 +229,21 @@ def reset_user_profile_for_registration_restart(db: dict) -> None:
     db["user_profile"] = dict(DEFAULT_USER_PROFILE)
 
 
+def prepare_database_for_nuova_utenza(db: dict) -> None:
+    """Nuova utenza: profilo e opzioni applicative ripartono da zero (l’utenza precedente va sul suo file .enc)."""
+    import email_client
+    import periodiche
+
+    ensure_security(db)
+    db["user_profile"] = dict(DEFAULT_USER_PROFILE)
+    db["email_settings"] = dict(email_client.DEFAULT_EMAIL_SETTINGS)
+    db["security_config"] = dict(DEFAULT_SECURITY_CONFIG)
+    db["periodic_registrations"] = []
+    ensure_security(db)
+    email_client.ensure_email_settings(db)
+    periodiche.ensure_periodic_registrations(db)
+
+
 def _hash_password(password: str, salt_hex: str) -> str:
     salt = bytes.fromhex(salt_hex)
     dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000)
@@ -217,7 +273,6 @@ class AppSession:
 
     is_registered: bool
     entered_via_backdoor: bool
-    entered_via_guest: bool
     user_email: str | None
 
 
@@ -233,6 +288,10 @@ def run_first_access_wizard_if_needed(
     win = tk.Toplevel(parent)
     win.title("Primo accesso — Conti di casa")
     win.resizable(True, False)
+    try:
+        win.transient(parent)
+    except Exception:
+        pass
     win.grab_set()
     frm = ttk.Frame(win, padding=16)
     frm.pack(fill=tk.BOTH, expand=True)
@@ -310,6 +369,17 @@ def run_first_access_wizard_if_needed(
                 "Se è impostata l'email amministratore, riceve anche la notifica con REGISTRA:… o REGISTRATO:…\n\n"
                 "Puoi entrare come utente non registrato dal login, oppure con email e password.",
             )
+        up["registration_poll_not_before_iso"] = datetime.now(timezone.utc).isoformat()
+        try:
+            save()
+        except Exception as exc:
+            messagebox.showerror(
+                "Primo accesso",
+                "Salvataggio della soglia per la verifica email non riuscito:\n"
+                f"{exc}\n\n"
+                "Ripeti il primo accesso o controlla il file del database.",
+            )
+            return
         result[0] = True
         win.destroy()
 
@@ -326,24 +396,38 @@ def run_first_access_wizard_if_needed(
     win.protocol("WM_DELETE_WINDOW", on_cancel)
     try:
         win.update_idletasks()
-        w = win.winfo_reqwidth()
-        h = win.winfo_reqheight()
         sw = win.winfo_screenwidth()
         sh = win.winfo_screenheight()
-        win.geometry(f"+{(sw - w) // 2}+{(sh - h) // 3}")
+        rw = max(win.winfo_reqwidth(), _FIRST_ACCESS_WIN_MIN_W)
+        rh = max(win.winfo_reqheight(), _FIRST_ACCESS_WIN_MIN_H)
+        ww = min(rw, int(sw * 0.92))
+        wh = min(rh, int(sh * 0.88))
+        win.geometry(f"{ww}x{wh}+{(sw - ww) // 2}+{(sh - wh) // 3}")
+        win.minsize(_FIRST_ACCESS_WIN_MIN_W, _FIRST_ACCESS_WIN_MIN_H)
     except Exception:
-        pass
+        try:
+            win.geometry(
+                f"{_FIRST_ACCESS_WIN_MIN_W}x{_FIRST_ACCESS_WIN_MIN_H}+100+100"
+            )
+        except Exception:
+            pass
 
     _present_modal_dialog(win, parent)
     parent.wait_window(win)
     return result[0] is True
 
 
-def run_login_dialog(parent: tk.Tk, db: dict, save: SaveFn) -> tuple[bool, AppSession | None]:
+def run_login_dialog(
+    parent: tk.Tk,
+    db: dict,
+    save: SaveFn,
+    *,
+    before_nuova_utenza: Callable[[], None] | None = None,
+    after_prepare_nuova_utenza: Callable[[dict], None] | None = None,
+) -> tuple[bool, AppSession | None]:
     """Finestra login. Ritorna (True, session) o (False, None)."""
     ensure_security(db)
     up = db["user_profile"]
-    has_password = bool((up.get("password_hash") or "").strip())
 
     win = tk.Toplevel(parent)
     win.title(f"Accesso — Conti di casa {APP_VERSION}")
@@ -408,7 +492,7 @@ def run_login_dialog(parent: tk.Tk, db: dict, save: SaveFn) -> tuple[bool, AppSe
     ttk.Label(frm, text="Email", font=("TkDefaultFont", 12), style="CdcLogin.TLabel").grid(
         row=email_row, column=0, sticky="w"
     )
-    email_var = tk.StringVar(value=(up.get("email") or ""))
+    email_var = tk.StringVar(value=_login_prefill_email(up))
     ent_email = ttk.Entry(frm, textvariable=email_var, width=38)
     ent_email.grid(row=email_row + 1, column=0, columnspan=2, sticky="we", pady=(2, 8))
 
@@ -424,7 +508,9 @@ def run_login_dialog(parent: tk.Tk, db: dict, save: SaveFn) -> tuple[bool, AppSe
     backdoor = _BackdoorState()
 
     def do_login() -> None:
-        if not has_password:
+        ensure_security(db)
+        up_now = db["user_profile"]
+        if not (up_now.get("password_hash") or "").strip():
             messagebox.showerror("Accesso", "Profilo non inizializzato.")
             return
         em = (email_var.get() or "").strip().lower()
@@ -432,38 +518,100 @@ def run_login_dialog(parent: tk.Tk, db: dict, save: SaveFn) -> tuple[bool, AppSe
         if not em or not pw:
             messagebox.showerror("Accesso", "Inserisci email e password.")
             return
-        if em != (up.get("email") or "").strip().lower():
+        if em != (up_now.get("email") or "").strip().lower():
             messagebox.showerror("Accesso", "Email non riconosciuta.")
             return
-        if not verify_password(up, pw):
+        if not verify_password(up_now, pw):
             messagebox.showerror("Accesso", "Password non corretta.")
             return
-        verified = bool(up.get("registration_verified"))
+        verified = bool(up_now.get("registration_verified"))
         sess = AppSession(
             is_registered=verified,
             entered_via_backdoor=False,
-            entered_via_guest=False,
             user_email=em,
         )
         out[0] = (True, sess)
         win.destroy()
 
-    def do_guest() -> None:
-        sess = AppSession(
-            is_registered=False,
-            entered_via_backdoor=False,
-            entered_via_guest=True,
-            user_email=None,
+    def do_nuova_utenza() -> None:
+        if not messagebox.askyesno(
+            "Nuova utenza",
+            "Si crea un nuovo profilo di accesso (nome visualizzato, email e password, come al primo accesso).\n\n"
+            "L’utenza che stai lasciando resta nei suoi file: le sue impostazioni (posta, sicurezza, "
+            "registrazioni periodiche) restano legate a quell’account nel file .enc dedicato.\n"
+            "Per la nuova utenza le opzioni ripartono vuote o predefinite e vanno configurate di nuovo in Opzioni.\n"
+            "I dati contabili (anni, registrazioni, piano conti) vengono azzerati; si ripopolano solo "
+            "con «Ricarica importi legacy» in Opzioni se lo attivi.\n\n"
+            "Continuare?",
+            parent=win,
+        ):
+            return
+        if before_nuova_utenza is not None:
+            try:
+                before_nuova_utenza()
+            except Exception as exc:
+                messagebox.showerror(
+                    "Nuova utenza",
+                    f"Salvataggio dell’utenza precedente sul suo file dati non riuscito:\n{exc}",
+                    parent=win,
+                )
+                return
+        prepare_database_for_nuova_utenza(db)
+        if after_prepare_nuova_utenza is not None:
+            after_prepare_nuova_utenza(db)
+        try:
+            save()
+        except Exception as exc:
+            messagebox.showerror("Nuova utenza", f"Salvataggio non riuscito:\n{exc}", parent=win)
+            return
+        if not run_first_access_wizard_if_needed(parent, db, save):
+            messagebox.showwarning(
+                "Nuova utenza",
+                "Primo accesso non completato.\n"
+                "Alla prossima apertura potrai completare il profilo o usare «Nuova utenza» di nuovo.",
+                parent=win,
+            )
+            return
+        ensure_security(db)
+        try:
+            email_var.set(_login_prefill_email(db["user_profile"]))
+        except Exception:
+            email_var.set((db.get("user_profile") or {}).get("email") or "")
+        try:
+            pw_var.set("")
+        except Exception:
+            pass
+        messagebox.showinfo(
+            "Nuova utenza",
+            "Profilo di accesso aggiornato: accedi con la nuova email e password.\n\n"
+            "Le impostazioni dell’account precedente restano sul relativo file dati (quell’utenza). "
+            "Per questa nuova utenza configura in Opzioni posta, sicurezza e le altre opzioni.\n"
+            "I dati contabili sono vuoti finché non usi «Ricarica importi legacy» in Opzioni.",
+            parent=win,
         )
-        out[0] = (True, sess)
-        win.destroy()
 
     def do_backdoor() -> None:
+        """Ctrl+Z poi Ctrl+X: sessione legata all’email nel campo userid; ``is_registered`` dal profilo dopo migrazione."""
+        ensure_security(db)
+        em_field = (email_var.get() or "").strip().lower()
+        if not em_field or "@" not in em_field:
+            messagebox.showerror(
+                "Accesso tecnico",
+                "Inserisci nel campo email (userid) l’utenza con cui entrare.",
+                parent=win,
+            )
+            return
+        up_now = db["user_profile"]
+        prof_em = (up_now.get("email") or "").strip().lower()
+        if prof_em == em_field:
+            verified = bool(up_now.get("registration_verified"))
+        else:
+            # DB in RAM è di un altro account: la sessione userà ``user_email`` per ricaricare il .enc giusto.
+            verified = False
         sess = AppSession(
-            is_registered=True,
+            is_registered=verified,
             entered_via_backdoor=True,
-            entered_via_guest=False,
-            user_email=(up.get("email") or None),
+            user_email=em_field,
         )
         out[0] = (True, sess)
         win.destroy()
@@ -479,24 +627,57 @@ def run_login_dialog(parent: tk.Tk, db: dict, save: SaveFn) -> tuple[bool, AppSe
 
     rowb = tk.Frame(frm, bg=_LOGIN_IMG_CANVAS_BG)
     rowb.grid(row=email_row + 4, column=0, columnspan=2, sticky="we", pady=(2, 0))
-    _btn_kw: dict[str, Any] = {
-        "bg": _LOGIN_IMG_CANVAS_BG,
-        "fg": _LOGIN_BTN_FG,
-        "font": ("TkDefaultFont", 11, "bold"),
-        "activebackground": _LOGIN_BTN_ACTIVE_BG,
-        "activeforeground": _LOGIN_BTN_FG,
-        "relief": tk.RAISED,
-        "borderwidth": 1,
-        "highlightbackground": _LOGIN_IMG_CANVAS_BG,
-        "highlightcolor": _LOGIN_IMG_CANVAS_BG,
-        "padx": 8,
-        "pady": 4,
-        "highlightthickness": 0,
-        "cursor": "hand2",
-    }
-    tk.Button(rowb, text="Accedi", command=do_login, **_btn_kw).pack(side=tk.LEFT, padx=(0, 8))
-    tk.Button(rowb, text="Accesso non registrato", command=do_guest, **_btn_kw).pack(side=tk.LEFT, padx=(0, 8))
-    tk.Button(rowb, text="Esci", command=lambda: win.destroy(), **_btn_kw).pack(side=tk.LEFT)
+    rowb.columnconfigure(0, weight=1)
+    rowb.columnconfigure(2, weight=1)
+    btn_bar = tk.Frame(rowb, bg=_LOGIN_IMG_CANVAS_BG)
+    btn_bar.grid(row=0, column=1, sticky="")
+
+    def _login_action_label(
+        parent: tk.Misc,
+        text: str,
+        command: Callable[[], None],
+        *,
+        width_chars: int | None = None,
+    ) -> tk.Label:
+        kw: dict[str, Any] = {
+            "master": parent,
+            "text": text,
+            "font": ("TkDefaultFont", 11, "bold"),
+            "bg": _LOGIN_BTN_BG,
+            "fg": _LOGIN_BTN_FG,
+            "padx": 8,
+            "pady": 4,
+            "cursor": "hand2",
+            "relief": tk.RAISED,
+            "bd": 1,
+            "highlightthickness": 0,
+        }
+        if width_chars is not None:
+            kw["width"] = width_chars
+        lb = tk.Label(**kw)
+
+        def _enter(_e: tk.Event | None = None) -> None:
+            lb.configure(bg=_LOGIN_BTN_ACTIVE_BG)
+
+        def _leave(_e: tk.Event | None = None) -> None:
+            lb.configure(bg=_LOGIN_BTN_BG)
+
+        def _click(_e: tk.Event) -> None:
+            command()
+
+        lb.bind("<Enter>", _enter)
+        lb.bind("<Leave>", _leave)
+        lb.bind("<Button-1>", _click)
+        return lb
+
+    _btn_pad_between = (0, 8)
+    _login_action_label(btn_bar, "Accedi", do_login, width_chars=_LOGIN_BTN_WIDTH_ACCEDI_CHARS).pack(
+        side=tk.LEFT, padx=_btn_pad_between
+    )
+    _login_action_label(btn_bar, "Nuova utenza", do_nuova_utenza).pack(side=tk.LEFT, padx=_btn_pad_between)
+    _login_action_label(btn_bar, "Esci", lambda: win.destroy(), width_chars=_LOGIN_BTN_WIDTH_ACCEDI_CHARS).pack(
+        side=tk.LEFT
+    )
 
     win.bind("<Control-z>", on_ctrl_z)
     win.bind("<Control-Z>", on_ctrl_z)

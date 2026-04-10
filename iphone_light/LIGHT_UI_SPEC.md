@@ -21,6 +21,7 @@ Non va implementato in `main_app.py`: l’app **desktop** resta quella completa.
 - **Nessun** filtro su importo, assegno o nota testuale.
 - Filtri previsti: **Categoria** e **Conto** (con azioni tipo Cerca / Pulisci coerenti).
 - **Saldi**: sempre disponibili; opzionale pulsante **Mostra / Nascondi saldi**.
+- I saldi in app provengono **solo** dal blocco JSON **`light_saldi`** nel `*_light.enc` (file **nella stessa cartella** del `.enc` completo sul desktop, senza sottocartelle; desktop: `compute_balances_from_2022` / `compute_balances_from_2022_asof` sul DB completo). Se manca, l’app mostra «Dati mancanti» e non calcola saldi dai movimenti nel light. Dopo ogni salvataggio desktop il sidecar si rigenera. Al salvataggio iOS (futuro), aggiornare `light_saldi` con `ContiDatabase.applyNewRecordToLightSaldi` prima di ricifrare.
 - **Nessuna stampa** (né ricerca né saldi).
 
 ## Pagina nuove registrazioni (light)

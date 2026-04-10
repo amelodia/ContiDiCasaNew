@@ -5,31 +5,53 @@ alwaysApply: true
 
 # Conti di casa — linee guida per evoluzioni
 
-## Nuova registrazione — campo Importo (€)
+## Piano conti — voci obbligatorie
 
-- In immissione manuale: **solo cifre**; **`+` e `−` solo come primo carattere** (se c’è già un segno, sostituiscono il primo carattere, non si inseriscono in mezzo).
-- Restano ammessi **`.` e `,`** per il formato euro italiano (es. `1.234,56`), coerente con `normalize_euro_input` / `format_euro_it`.
-- **Incolla**: stesso alfabeto; il testo incollato e il risultato unito al campo devono passare `normalize_euro_input` dove ha senso.
-- Scorciatoie da tastiera (Ctrl/Cmd/Alt) non devono essere bloccate dal filtro `KeyPress`.
+- Nel piano conti devono **sempre** esistere la categoria **Girata conto/conto**, la categoria **Consumi ordinari**, il conto **Cassa** e il conto **VIRTUALE** (non eliminabili / garantiti a livello dati e nelle opzioni).
 
-Implementazione: `bind_euro_amount_entry_validation` in `main_app.py` su `ent_amt`, `amount_filter_entry` (Movimenti), `ent_per_amt`, `ent_edit_amt` (dialog Modifica importo €), `ent_saldo` con `allow_leading_sign=False` (solo importi non negativi).
+## Campo Importo (€) — tutte le caselle con `bind_euro_amount_entry_validation`
 
-## Nuova registrazione — Nota (Girata conto/conto, 2° conto Cassa, senza memoria cassa)
+- **Cifre** e separatori **`.` e `,`** (formato italiano); **`+` e `−` da tastiera in qualsiasi momento** aggiornano **solo il segno iniziale** (il corpo numerico resta uguale); dopo l'azione il **cursore va in fondo** al testo immesso.
+- **Incolla**: pattern coerente; `normalize_euro_input` su frammento e testo unito dove ha senso.
+- Scorciatoie (Ctrl/Cmd/Alt) non bloccate dal filtro `KeyPress`.
+- **`allow_leading_sign=False`** (es. saldo cassa): nessun segno, `+`/`-` ignorati.
+
+Punti collegati: `ent_amt`, filtri Movimenti, `ent_per_amt`, dialog **Modifica importo** (€) con tasti +/− come in nuova registrazione, `ent_saldo` senza segno.
+
+## Correzione registrazioni (Modifica registrazione)
+
+- **Data**: click sul campo data apre `open_bounded_date_calendar_popup` con gli stessi vincoli della validazione al salvataggio (anno contabile, 5 anni, intervallo ricerca se filtro per data).
+- **Dal conto / al conto**: il menu usa l'elenco **ordinato** dei nomi ma la preselezione deve basarsi sul **nome del conto** della registrazione (`accounts[indice_codice]`), non sull'indice nella lista ordinata.
+
+## Nuova registrazione — Nota (Girata conto/conto, 2° conto Cassa)
 
 - Preimpostazione: **`Aut ` + `gg/mm` + uno spazio finale** (es. `Aut 15/03 `) per continuare a digitare dopo la data.
 - Al **focus** sul campo Nota, se il contenuto è quello modello, cursore **dopo lo spazio** finale.
-- La nota **non deve riproporre** il testo della registrazione precedente: dopo ogni inserimento riuscito eseguire sempre `_populate_form_defaults(keep_last=True)`, **anche** se l’utente sceglie «Concludi immissione» (prima di passare a Movimenti).
+- La nota **non deve riproporre** il testo della registrazione precedente: dopo ogni inserimento riuscito eseguire sempre `_populate_form_defaults(keep_last=True)`, **anche** se l'utente sceglie «Concludi immissione» (prima di passare a Movimenti).
+
+## Memoria virtuale (conto Virtuale)
+
+- Il conto **VIRTUALE** compare nel combo conti **solo** quando la categoria è **Girata conto/conto**, in ultima posizione.
+- **Mutua esclusione**: se entrambi i conti della Girata sono impostati su VIRTUALE, l'altro viene cambiato in Cassa.
+- La **prima Girata** con VIRTUALE ha effetto sul conto non-virtuale coinvolto; le registrazioni successive (fase scarico) hanno effetto **solo sul saldo virtuale** e contano solo per le categorie.
+- **Fase scarico**: l'utente è bloccato sulla pagina immissione dati; categorie: tutte esclusa Girata; conto: solo VIRTUALE; saldo virtuale sempre visibile; tasto «Scarica saldo virtuale» disponibile. Il blocco termina quando il saldo virtuale è **zero**.
+- Le registrazioni di scarico (`is_virtuale_discharge=True`) **non modificano i saldi reali** dei conti, ma sono visibili nei Movimenti e misurabili per categoria.
+- Registrazioni con conto VIRTUALE: **non modificabili** e **non eliminabili**. Doppia conferma all'inserimento.
+- Il saldo virtuale **non compare** nella pagina Saldi.
+- Girata con VIRTUALE: la nota **non** viene preimpostata a "Giroconto".
 
 ## Dropbox e avvio
 
 - Prima di caricare il DB cifrato: attesa **stabilità** file sotto Dropbox (`cloud_sync_wait.py`).
 - Se il **boot** è avvenuto da meno di **5 minuti**, chiedere conferma su Dropbox aggiornato (`os_boot_time.py` + dialog in `main()`).
+- Cartella dati sincronizzata: **`.key`**, **`.enc` completo** (`conti_utente_<hash>.enc`) e **`*_light.enc`** nella **stessa cartella** (nessuna sottocartella dedicata al light); output import legacy in `legacy_import/` (non in `data/`).
+- Dopo spostamento cartella Dropbox: aggiornare i path in **Opzioni**; `cloud_sync_wait` non deve bloccare minuti su file assenti (attesa breve per «comparsa», poi stabilità solo se il file esiste).
 
 ## Accesso / Pillow
 
-- Immagine login: **solo** JPEG incorporato (`euro_login_asset.py`); **Pillow obbligatorio** all’avvio (`verify_pillow_for_login_ui`).
+- Immagine login: **solo** JPEG incorporato (`euro_login_asset.py`); **Pillow obbligatorio** all'avvio (`verify_pillow_for_login_ui`).
 - Rigenerare asset: `python3 regen_euro_login_asset.py` (neutro) o `--from-assets` da `assets/euro.jpg`.
 
 ## Ricerca Movimenti — preset «Ultimi N mesi» con date future comprese
 
-- L’intervallo si ancora alla **data odierna** (inizio = oggi − N mesi), non all’ultima data futura del dataset (`_preset_rolling_start_date` in `main_app.py`).
+- L'intervallo si ancora alla **data odierna** (inizio = oggi − N mesi), non all'ultima data futura del dataset (`_preset_rolling_start_date` in `main_app.py`).

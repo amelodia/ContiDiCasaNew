@@ -49,9 +49,8 @@ def save_encrypted_db_single(db: dict, output_path: Path, key_path: Path) -> Non
 
 def resolve_per_user_enc_path_if_present(db: dict, *, primary_enc_path: Path) -> Path | None:
     """
-    Stesso schema del desktop: il file dedicato all'utente sta nella **stessa cartella**
-    del file .enc principale (es. ``.../data/conti_utente_<hash>.enc`` accanto a
-    ``.../data/conti_di_casa.enc``).
+    Stesso schema del desktop: il file dedicato all'utente è ``conti_utente_<hash>.enc`` nella **stessa cartella**
+    del file .enc principale indicato (stesso nome file che usa ``per_user_encrypted_db_path``).
     """
     from security_auth import ensure_security
 

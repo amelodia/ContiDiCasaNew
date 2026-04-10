@@ -3,8 +3,8 @@
 CLI di prova (macOS/Linux): verifica caricamento DB + login light senza Tk/Pillow.
 Non è l'app iPhone; serve a validare percorsi Dropbox e credenziali.
 
-Esempio dalla root del repo:
-  python3 -m iphone_light.probe_cli --enc data/conti_di_casa.enc --key data/conti_di_casa.key
+Esempio dalla root del repo (usa i path reali del tuo `.enc` completo e della `.key`):
+  python3 -m iphone_light.probe_cli --enc data/conti_utente_<hash>.enc --key data/conti_di_casa.key
 """
 from __future__ import annotations
 

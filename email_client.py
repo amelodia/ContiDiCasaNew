@@ -10,10 +10,12 @@ import smtplib
 import ssl
 import tkinter as tk
 from collections.abc import Callable
+from datetime import datetime, timezone
 from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.parser import BytesParser
 from email.policy import default as email_policy
+from email.utils import parsedate_to_datetime
 from tkinter import messagebox, ttk
 from typing import Any
 
@@ -38,7 +40,7 @@ DEFAULT_EMAIL_SETTINGS: dict[str, Any] = {
 def _ssl_context_for_settings(s: dict[str, Any]) -> ssl.SSLContext:
     """
     Contesto TLS per SMTP/IMAP. Su macOS Python spesso manca il bundle CA di sistema:
-    si usa il file CA di certifi se installato (pip install certifi).
+    si usa il file CA di certifi se installato (python3 -m pip install certifi).
     """
     if not bool(s.get("ssl_verify_certificates", True)):
         return ssl._create_unverified_context()
@@ -182,7 +184,7 @@ def test_email_configuration(db: dict) -> tuple[bool, str]:
 
     if errs:
         cert_hint = (
-            "\n\nSuggerimenti (certificati): «pip install certifi» e riavvio; "
+            "\n\nSuggerimenti (certificati): «python3 -m pip install certifi» e riavvio; "
             "oppure disattiva «Verifica certificati SSL» in Opzioni solo se necessario."
         )
         blob = "\n".join(errs)
@@ -398,6 +400,54 @@ def fetch_message_body(db: dict, imap_id: str) -> str:
 _REG_APPROVAL_RE = re.compile(r"(?:REGISTRA|REGISTRATO)\s*:\s*(\S+@\S+)", re.IGNORECASE)
 
 
+def _utc_aware(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_registration_not_before_iso(s: str) -> datetime | None:
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    return _utc_aware(dt)
+
+
+def _internaldate_utc_from_fetch_blob(blob: bytes) -> datetime | None:
+    m = re.search(rb'INTERNALDATE\s+"([^"]+)"', blob)
+    if not m:
+        return None
+    try:
+        ds = m.group(1).decode("ascii", errors="replace")
+        dt = parsedate_to_datetime(ds)
+        return _utc_aware(dt)
+    except Exception:
+        return None
+
+
+def _message_received_utc_from_msg(
+    msg: Any, mail: imaplib.IMAP4_SSL | imaplib.IMAP4, num: bytes
+) -> datetime | None:
+    ds = msg.get("Date")
+    if ds:
+        try:
+            return _utc_aware(parsedate_to_datetime(ds))
+        except Exception:
+            pass
+    try:
+        typ, chunk = mail.fetch(num, "(INTERNALDATE)")
+        if typ != "OK" or not chunk:
+            return None
+        blob = b"".join(p for p in chunk if isinstance(p, (bytes, bytearray)))
+        return _internaldate_utc_from_fetch_blob(blob)
+    except Exception:
+        return None
+
+
 def send_registration_signup_notification(db: dict, *, display_suffix: str, user_email: str) -> None:
     """
     Notifica il primo accesso:
@@ -466,10 +516,23 @@ def send_registration_signup_notification(db: dict, *, display_suffix: str, user
 
 
 def scan_inbox_for_registration_approval(db: dict, *, target_email: str) -> bool:
-    """True se in INBOX compare REGISTRA:<email> o REGISTRATO:<email> (oggetto o testo)."""
+    """
+    True se in INBOX compare REGISTRA:<email> o REGISTRATO:<email> (oggetto o testo).
+
+    Se il profilo ha `registration_poll_not_before_iso` (ISO UTC impostato al termine del primo accesso),
+    viene ignorato ogni messaggio la cui data (header Date o INTERNALDATE IMAP) non è **successiva**
+    a quell'istante — così non si conferma la registrazione con risposte rimaste in casella da cicli
+    precedenti.
+    """
     target_email = target_email.strip().lower()
     if not target_email:
         return False
+    up = db.get("user_profile")
+    if not isinstance(up, dict):
+        up = {}
+    not_before_utc = _parse_registration_not_before_iso(
+        str(up.get("registration_poll_not_before_iso") or "")
+    )
     s = _settings_dict(db)
     host = (s.get("imap_host") or "").strip()
     user = (s.get("username") or "").strip()
@@ -503,6 +566,10 @@ def scan_inbox_for_registration_approval(db: dict, *, target_email: str) -> bool
             if raw is None:
                 continue
             msg = BytesParser(policy=email_policy).parsebytes(raw)
+            if not_before_utc is not None:
+                msg_dt = _message_received_utc_from_msg(msg, mail, num)
+                if msg_dt is None or msg_dt <= not_before_utc:
+                    continue
             subj = _decode_header_value(msg.get("Subject"))
             text = _message_text_from_bytes(raw)
             blob = f"{subj}\n{text}"

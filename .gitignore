@@ -1,10 +1,27 @@
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
 
-# Ambiente virtuale Python (non versionare; ogni clone ricrea venv + pip install)
+# Ambiente virtuale (ogni clone ricrea venv + pip install)
 .venv/
+venv/
+.env
+.env.*
 
-# Generated data artifacts
-data/*.json
-data/*.enc
-data/*.key
+# Dati sensibili e generati — cartella sincronizzata (Dropbox): non versionare mai chiavi né DB cifrati
+data/**/*.enc
+data/**/*.key
+data/**/*.json
+
+# Import legacy e sessione pre-login (fuori da `data/`, vedi `main_app` / `import_legacy`)
+legacy_import/*.json
+legacy_import/*.enc
+
+# macOS / Finder
+.DS_Store
+**/.DS_Store
+
+# Cursor / log di debug locale
+.cursor/debug*.log

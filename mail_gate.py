@@ -23,9 +23,12 @@ def _security_config(db: dict) -> dict[str, Any]:
 
 
 def is_mail_ready_for_notifications(db: dict) -> bool:
-    if not email_client.is_app_mail_configured(db):
-        return False
-    return bool(_security_config(db).get("email_verified_ok"))
+    """True se la posta è utilizzabile senza aprire il wizard all'avvio.
+
+    Basta che SMTP/IMAP e credenziali siano impostati nel DB; non si richiede a ogni avvio
+    di aver ripetuto «Verifica connessione» (``email_verified_ok`` resta utile in Opzioni come promemoria).
+    """
+    return email_client.is_app_mail_configured(db)
 
 
 def run_startup_mail_gate(parent: tk.Misc, db: dict, save: SaveFn) -> bool:
@@ -141,10 +144,13 @@ def run_startup_mail_gate(parent: tk.Misc, db: dict, save: SaveFn) -> bool:
     ttk.Label(frm, textvariable=status, wraplength=520).grid(row=r, column=0, columnspan=4, sticky="w", pady=(10, 6))
     r += 1
 
+    rowb = ttk.Frame(frm)
+    rowb.grid(row=r, column=0, columnspan=4, sticky="we", pady=(4, 0))
+
     test_passed: list[bool] = [False]
     outcome: list[bool | None] = [None]
 
-    btn_continue = ttk.Button(frm, text="Continua", state="disabled")
+    btn_continue = ttk.Button(rowb, text="Continua", state="disabled")
 
     def do_verify() -> None:
         _apply_to_db()
@@ -208,8 +214,6 @@ def run_startup_mail_gate(parent: tk.Misc, db: dict, save: SaveFn) -> bool:
             outcome[0] = False
             win.destroy()
 
-    rowb = ttk.Frame(frm)
-    rowb.grid(row=r, column=0, columnspan=4, sticky="we", pady=(4, 0))
     ttk.Button(rowb, text="Verifica connessione", command=do_verify).pack(side=tk.LEFT, padx=(0, 8))
     btn_continue.configure(command=do_continue)
     btn_continue.pack(side=tk.LEFT, padx=(0, 8))
