@@ -11365,6 +11365,10 @@ th {{ background:#efefef; text-align:left; }}
                 return
             if _ver_widget_or_ancestor_is(fg, ver_input_actions):
                 return
+            if _ver_widget_or_ancestor_is(fg, ver_btn_immetti):
+                return
+            if _ver_widget_or_ancestor_is(fg, ver_btn_cancel_immissione):
+                return
             if _ver_widget_or_ancestor_is(fg, ver_pending_btns):
                 return
             if _ver_widget_or_ancestor_is(fg, ver_pending_host) and not _ver_widget_or_ancestor_is(
@@ -11461,7 +11465,8 @@ th {{ background:#efefef; text-align:left; }}
     bind_return_and_kp_enter(ver_ent_note, _ver_on_note_enter)
 
     ver_input_actions = tk.Frame(ver_input_frame, bg=_VER_BG, highlightthickness=0)
-    ver_input_actions.grid(row=0, column=8, columnspan=3, sticky="w", padx=(8, 0), pady=2)
+    # Seconda riga: su pagina risultati / finestra stretta i tasti in coda alla riga 0 restavano tagliati (col. 8+).
+    ver_input_actions.grid(row=1, column=0, columnspan=12, sticky="w", padx=0, pady=(6, 2))
 
     ver_btn_end = tk.Label(
         ver_input_actions,
@@ -11513,7 +11518,7 @@ th {{ background:#efefef; text-align:left; }}
 
     ver_btn_cancel_immissione = tk.Label(
         ver_input_actions,
-        text="Chiudi",
+        text="Annulla immissione",
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
