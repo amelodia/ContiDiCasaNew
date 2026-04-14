@@ -36,6 +36,11 @@ import data_workspace
 import mail_gate
 import periodiche
 import security_auth
+from estratto_conto_pdf import extract_estratto_conto_movements_from_pdf
+
+# Verifica — estratto PDF: se True, non si escludono movimenti con data operazione oltre la data di chiusura.
+# Equiv.: ``VER_PDF_SKIP_CUTOFF_FILTER=1`` nell'ambiente.
+VER_PDF_DISABLE_CUTOFF_DATE_FILTER = False
 
 # Sfondo pagina Movimenti (allineato al login).
 MOVIMENTI_PAGE_BG = security_auth.CDC_AZZURRO_CHIARO_BG
@@ -280,23 +285,23 @@ def bind_euro_amount_entry_validation(
         if ch in "+-":
             if not allow_leading_sign:
                 return "break"
-            if pos != 0:
-                return "break"
+            body = s.lstrip("+-")
+            if not body:
+                var.set(ch)
+            elif s[:1] != ch:
+                var.set(ch + body)
             try:
-                if w.selection_present():
-                    if int(w.index("sel.first")) != 0:
-                        return "break"
-                elif s[:1] in "+-" and s:
-                    if ch != s[0]:
-                        var.set(ch + s[1:])
-                    return "break"
-            except tk.TclError:
+                w.icursor(tk.END)
+            except Exception:
                 pass
-            return None
+            return "break"
 
-        if ch.isdigit():
-            return None
-        if ch in ",.":
+        if ch.isdigit() or ch in ",.":
+            if allow_leading_sign and pos == 0 and s and s[0] in "+-":
+                try:
+                    w.icursor(1)
+                except Exception:
+                    pass
             return None
         return "break"
 
@@ -352,7 +357,7 @@ def to_italian_date(date_iso: str) -> str:
 
 
 def parse_italian_ddmmyyyy_to_iso(s: str) -> str | None:
-    """Come i campi data in Movimenti: gg/mm/aaaa o ISO YYYY-MM-DD."""
+    """Come i campi data in Movimenti: gg/mm/aaaa o gg/mm/aa (anno a 2 cifre → 2000–2099) o ISO YYYY-MM-DD."""
     s = (s or "").strip()
     if not s:
         return None
@@ -366,9 +371,18 @@ def parse_italian_ddmmyyyy_to_iso(s: str) -> str | None:
     parts = s.split("/")
     if len(parts) != 3:
         return None
-    dd, mm, yyyy = parts
+    dd, mm, y_raw = parts
+    if not (dd.isdigit() and mm.isdigit() and y_raw.isdigit()):
+        return None
+    if len(y_raw) == 2:
+        yi = int(y_raw)
+        yyyy = 2000 + yi if yi <= 99 else yi
+    elif len(y_raw) == 4:
+        yyyy = int(y_raw)
+    else:
+        return None
     try:
-        return date(int(yyyy), int(mm), int(dd)).isoformat()
+        return date(yyyy, int(mm), int(dd)).isoformat()
     except Exception:
         return None
 
@@ -692,9 +706,44 @@ def record_contains_any_asterisk(rec: dict) -> bool:
     return False
 
 
+def normalize_category_leading_sign_in_stored(raw: str) -> str:
+    """Normalizza spazi iniziali/finali del nome categoria memorizzato (segno + o - esplicito)."""
+    return (raw or "").strip()
+
+
 def category_display_name(raw: str) -> str:
-    base = (raw or "").strip()
-    return base[1:].strip() if base[:1] in {"+", "-", "="} else base
+    base = normalize_category_leading_sign_in_stored((raw or "").strip())
+    return base[1:].strip() if base[:1] in {"+", "-"} else base
+
+
+def format_category_chart_name_stored(raw: str) -> str:
+    """Nome categoria nel piano: segno + o -, corpo maiuscolo, lunghezza massima."""
+    t = normalize_category_leading_sign_in_stored((raw or "").strip())
+    if not t:
+        return clip_text("+", MAX_CATEGORY_NAME_LEN)
+    sign = t[0] if t[0] in "+-" else "+"
+    body = (t[1:] if t[0] in "+-" else t).strip().upper()
+    return clip_text(sign + body, MAX_CATEGORY_NAME_LEN)
+
+
+def format_category_note_stored(note: str) -> str:
+    t = clip_text((note or "").strip(), MAX_CATEGORY_NOTE_LEN)
+    if not t:
+        return t
+    return t[0].upper() + t[1:]
+
+
+def sync_record_category_names_if_identical_old(db: dict, code: str, old_name: str, new_canonical: str) -> None:
+    """Aggiorna solo le registrazioni con `category_name` identico al nome precedente."""
+    sc = str(code).strip()
+    old_s = (old_name or "").strip()
+    for yb in db.get("years", []) or []:
+        for r in yb.get("records", []) or []:
+            if str(r.get("category_code", "")).strip() != sc:
+                continue
+            if (r.get("category_name") or "").strip() != old_s:
+                continue
+            r["category_name"] = new_canonical
 
 
 def is_hidden_dotazione_category_name(raw: str) -> bool:
@@ -781,11 +830,13 @@ def plan_conti_account_is_cassa(name_raw: str) -> bool:
 
 
 def plan_conti_names_have_attinenza(old_raw: str, new_raw: str) -> bool:
-    """True se nome nuovo è «vicino» al vecchio (SequenceMatcher >= 0.55 oppure inclusione >= 4 char)."""
+    """True se nome nuovo è «vicino» al vecchio (SequenceMatcher >= 0.55, inclusione >= 4 char, o stessa etichetta con testo memorizzato diverso)."""
     na = category_display_name(old_raw).strip().lower()
     nb = category_display_name(new_raw).strip().lower()
-    if not na or not nb or na == nb:
+    if not na or not nb:
         return False
+    if na == nb:
+        return (old_raw or "").strip() != (new_raw or "").strip()
     if SequenceMatcher(None, na, nb).ratio() >= 0.55:
         return True
     if len(nb) >= 4 and (nb in na or na in nb):
@@ -823,6 +874,209 @@ def propagate_account_chart_by_code(db: dict, code: str, name: str) -> None:
                 break
         if not found:
             yb.setdefault("accounts", []).append({"code": sc, "name": name})
+
+
+MAX_ESTRATTI_PDF_STEM_LEN = 120
+
+
+def estratti_pdf_settings_from_db(db: dict) -> dict:
+    """Cartella radice estratti PDF e metadati per la verifica conto (persistiti nel DB cifrato)."""
+    ep = db.get("estratti_pdf")
+    if not isinstance(ep, dict):
+        ep = {}
+        db["estratti_pdf"] = ep
+    ep.setdefault("root_folder", "")
+    return ep
+
+
+def propagate_account_estratti_pdf_stem_by_code(db: dict, code: str, stem: str) -> None:
+    """Nome base file estratto PDF (parte prima di spazio + mese + .pdf) su tutti gli anni, per il codice conto."""
+    sc = str(code).strip()
+    v = clip_text((stem or "").strip(), MAX_ESTRATTI_PDF_STEM_LEN)
+    for yb in db.get("years", []) or []:
+        for a in yb.get("accounts", []) or []:
+            if str(a.get("code", "")).strip() != sc:
+                continue
+            if v:
+                a["estratti_pdf_stem"] = v
+            else:
+                a.pop("estratti_pdf_stem", None)
+            break
+
+
+def account_estratti_pdf_stem_for_code(db: dict, acc_code: str) -> str:
+    """
+    Nome base file estratto PDF per il codice conto, senza suffisso mese/trimestre.
+    Usa l’anno di riferimento del piano; se lì manca, cerca lo stesso codice negli altri anni (dati fuori sync).
+    """
+    sc = str(acc_code).strip()
+    yb = year_bucket_for_calendar_year(db, PLAN_REFERENCE_YEAR) or chart_clone_source_bucket(db)
+    if yb:
+        acc = next((a for a in (yb.get("accounts") or []) if str(a.get("code", "")).strip() == sc), None)
+        if acc:
+            v = str(acc.get("estratti_pdf_stem") or "").strip()
+            if v:
+                return v
+    for yb2 in db.get("years") or []:
+        acc = next((a for a in (yb2.get("accounts") or []) if str(a.get("code", "")).strip() == sc), None)
+        if acc:
+            v = str(acc.get("estratti_pdf_stem") or "").strip()
+            if v:
+                return v
+    return ""
+
+
+def _estr_pdf_normalize_name_fragment(s: str) -> str:
+    """Spazi Unicode tipo NBSP → spazio normale; solo trim iniziale/finale (non altera spazi centrali)."""
+    t = (s or "").replace("\u00a0", " ").replace("\u202f", " ").replace("\u2007", " ")
+    return t.strip()
+
+
+def parse_estratto_pdf_suffix_for_stem(pdf_filename: str, stem: str) -> tuple[str, int] | None:
+    """
+    Se ``pdf_filename`` è ``<stem>`` + spazi (anche Unicode) + suffisso + ``.pdf``, restituisce (``'M'``, mese 1–12)
+    oppure (``'T'``, trimestre 1–4). Il confronto con ``stem`` ignora maiuscole/minuscole (file system macOS).
+    """
+    if not pdf_filename.lower().endswith(".pdf"):
+        return None
+    stem_n = _estr_pdf_normalize_name_fragment(stem)
+    if not stem_n:
+        return None
+    base_n = _estr_pdf_normalize_name_fragment(pdf_filename[:-4])
+    try:
+        m = re.fullmatch(
+            re.escape(stem_n) + r"\s*(\d{2}|[tT][1-4])",
+            base_n,
+            flags=re.IGNORECASE,
+        )
+    except re.error:
+        return None
+    if not m:
+        return None
+    suf = m.group(1)
+    if len(suf) == 2 and suf.isdigit():
+        v = int(suf)
+        if 1 <= v <= 12:
+            return ("M", v)
+        return None
+    if len(suf) == 2 and suf[0].upper() == "T" and suf[1] in "1234":
+        return ("T", int(suf[1]))
+    return None
+
+
+def pick_estratto_pdf_in_folder(folder: Path, stem: str, dco: date) -> Path | None:
+    """
+    Tra i PDF **direttamente** nella cartella ``folder`` che rispettano il nome base ``stem``, sceglie quello con **suffisso più alto**
+    tra quelli ancora compatibili con la data di chiusura: mese ``MM`` con ``MM <= mese(chiusura)``, oppure — se non
+    ce n’è nessuno — trimestre ``Tn`` con ``n <= trimestre(chiusura)``. Stessa logica di lettura del file scelto.
+    """
+    cut_m = dco.month
+    cut_q = (dco.month - 1) // 3 + 1
+    monthly: list[tuple[int, Path]] = []
+    quarterly: list[tuple[int, Path]] = []
+    try:
+        for p in folder.iterdir():
+            if not p.is_file():
+                continue
+            if p.suffix.lower() != ".pdf":
+                continue
+            parsed = parse_estratto_pdf_suffix_for_stem(p.name, stem)
+            if parsed is None:
+                continue
+            kind, val = parsed
+            if kind == "M":
+                monthly.append((val, p))
+            else:
+                quarterly.append((val, p))
+    except OSError:
+        return None
+    eligible_m = [(m, path) for m, path in monthly if m <= cut_m]
+    if eligible_m:
+        return max(eligible_m, key=lambda t: t[0])[1]
+    eligible_t = [(q, path) for q, path in quarterly if q <= cut_q]
+    if eligible_t:
+        return max(eligible_t, key=lambda t: t[0])[1]
+    return None
+
+
+def resolve_estratto_pdf_for_account(
+    db: dict, acc_code: str, cutoff_raw_ggmmyyyy: str
+) -> tuple[Path | None, str]:
+    """
+    Cerca il PDF nella **sola** cartella radice impostata in Opzioni (nessuna sottocartella anno): file
+    ``<nomebase> <MM>.pdf`` / ``<nomebase><MM>.pdf`` o trimestre ``Tn``, con il **suffisso più alto** tra quelli
+    presenti e ancora compatibili con la data di chiusura. Restituisce ``(percorso, testo_diagnostica)``.
+    """
+    lines: list[str] = []
+
+    def ln(s: str) -> None:
+        lines.append(s)
+
+    root_raw = (estratti_pdf_settings_from_db(db).get("root_folder") or "").strip()
+    ln(f"Cartella radice (Opzioni), valore in database: {root_raw or '(vuoto)'}")
+    if not root_raw:
+        ln("Errore: impostare la cartella in Opzioni e premere «Salva cartella».")
+        return None, "\n".join(lines)
+
+    root = Path(root_raw).expanduser()
+    try:
+        ln(f"Percorso assoluto usato per la ricerca: {root.resolve()}")
+    except Exception:
+        ln(f"Percorso usato per la ricerca: {root}")
+
+    if not root.is_dir():
+        ln("Errore: non è una cartella accessibile.")
+        return None, "\n".join(lines)
+
+    stem = account_estratti_pdf_stem_for_code(db, acc_code)
+    ln(f"Nome base file (Conti): «{stem}»" if stem else "Nome base file (Conti): (mancante)")
+    if not stem:
+        ln("Errore: compilare il nome base nella pagina Conti per questo conto.")
+        return None, "\n".join(lines)
+
+    try:
+        iso = parse_italian_ddmmyyyy_to_iso((cutoff_raw_ggmmyyyy or "").strip())
+        if not iso:
+            ln("Errore: data di chiusura non valida.")
+            return None, "\n".join(lines)
+        dco = date.fromisoformat(iso)
+    except Exception:
+        ln("Errore: data di chiusura non interpretabile.")
+        return None, "\n".join(lines)
+
+    ln(
+        f"Criterio: tra i .pdf con nome «{stem}» + spazio opzionale + (01…12 o T1…T4), suffisso massimo "
+        f"con mese ≤ {dco.month} (oppure trimestre ≤ {(dco.month - 1) // 3 + 1})."
+    )
+    picked = pick_estratto_pdf_in_folder(root, stem, dco)
+    if picked is not None and picked.is_file():
+        try:
+            ln(f"File selezionato: {picked.resolve()}")
+        except Exception:
+            ln(f"File selezionato: {picked}")
+        return picked, "\n".join(lines)
+
+    ln("Esito: nessun PDF idoneo trovato con nome base e suffisso compatibile.")
+    try:
+        pdf_names = sorted(
+            p.name for p in root.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"
+        )
+        if pdf_names:
+            head = pdf_names[:30]
+            tail = " …" if len(pdf_names) > 30 else ""
+            ln(f".pdf presenti in cartella ({len(pdf_names)}): {', '.join(head)}{tail}")
+        else:
+            ln("Nessun file .pdf in questa cartella.")
+    except OSError as exc:
+        ln(f"Impossibile elencare i file: {exc}")
+    return None, "\n".join(lines)
+
+
+def _ver_account_expects_auto_estratto_pdf(db: dict, acc_code: str) -> bool:
+    """True se in Conti è impostato il nome base PDF e in Opzioni la cartella radice (ricerca automatica prevista)."""
+    if not (account_estratti_pdf_stem_for_code(db, acc_code) or "").strip():
+        return False
+    return bool((estratti_pdf_settings_from_db(db).get("root_folder") or "").strip())
 
 
 def sync_record_category_names_for_code(db: dict, code: str, canonical_name: str) -> None:
@@ -864,7 +1118,7 @@ def account_code_used_any_year(db: dict, code: str) -> bool:
 
 
 def account_balance_for_code_latest_chart(db: dict, account_code: str) -> Decimal | None:
-    """Saldo footer: priorità a *sld.aco dell’anno di riferimento (2026) se importato; altrimenti calcolo da movimenti."""
+    """Saldo footer: dopo import legacy = *sld* (2026) + variazioni in app; senza *sld* calcolo da movimenti."""
     if not db.get("years"):
         return Decimal("0")
     y_ref = year_bucket_for_calendar_year(db, PLAN_REFERENCE_YEAR)
@@ -884,8 +1138,13 @@ def account_balance_for_code_latest_chart(db: dict, account_code: str) -> Decima
                     legacy_val = None
                 if legacy_val is not None:
                     new_fx = compute_new_records_effect(db)
-                    return legacy_val + (new_fx[idx] if idx < len(new_fx) else Decimal("0"))
-    _ly, _names, bals = compute_balances_from_2022(db)
+                    canc = compute_cancelled_imported_records_balance_adjustment(
+                        db, cutoff_date_iso="9999-12-31"
+                    )
+                    return legacy_val + (new_fx[idx] if idx < len(new_fx) else Decimal("0")) + (
+                        canc[idx] if idx < len(canc) else Decimal("0")
+                    )
+    _ly, _names, bals = compute_balances_from_2022_asof(db, cutoff_date_iso="9999-12-31")
     yb = latest_year_bucket(db)
     if not yb:
         return None
@@ -988,7 +1247,7 @@ def apply_amount_to_record(rec: dict, amount: Decimal) -> None:
     if year <= 2001 and rec.get("amount_lire_original") is not None:
         li = int(amount.quantize(Decimal("1")))
         rec["amount_lire_original"] = format_money(Decimal(li))
-        rec["amount_eur"] = format_money((Decimal(li) / EURO_CONVERSION_RATE).quantize(Decimal("0.001")))
+        rec["amount_eur"] = format_money((Decimal(li) / EURO_CONVERSION_RATE).quantize(Decimal("0.01")))
     else:
         rec["amount_eur"] = format_money(amount.quantize(Decimal("0.01")))
 
@@ -1050,8 +1309,8 @@ def category_name_for_record(rec: dict, categories_for_year: list[dict[str, str]
             base = str(categories_for_year[idx].get("name", "") or "")
         else:
             base = str(rec.get("category_name") or "")
-    # Output-only: hide leading control sign (+, -, =)
-    out = base[1:].strip() if base[:1] in {"+", "-", "="} else base.strip()
+    base = normalize_category_leading_sign_in_stored(base)
+    out = base[1:].strip() if base[:1] in {"+", "-"} else base.strip()
     if is_hidden_dotazione_category_name(out) and not _allow_dotazione_visible():
         return ""
     return out
@@ -1113,54 +1372,72 @@ def is_dotazione_record(rec: dict) -> bool:
     return _category_code_int(rec) == 0
 
 
-def compute_balances_from_2022(db: dict) -> tuple[int, list[str], list[Decimal]]:
-    """
-    Saldi da tutte le annate presenti fino all’ultimo anno; dotazione (cat. 0) solo nel 1990.
-    Piano conti = ultimo anno. + sul conto 1; giroconto: − sul conto 2.
-    """
-    if not db.get("years"):
-        return (date.today().year, [], [])
-    latest_year = max(y["year"] for y in db["years"])
-    year_data = next(y for y in db["years"] if y["year"] == latest_year)
-    accounts = year_data["accounts"]
-    n_accounts = len(accounts)
+def format_amount_for_verification_account(rec: dict, *, side: str) -> tuple[str, str]:
+    """Importo mostrato dal punto di vista del conto in verifica (girata sul conto 2: stesso segno usato nei totali)."""
+    flip = side == "secondary" and is_giroconto_record(rec)
+    year = int(rec.get("year", 0))
+    if year <= 2001 and rec.get("amount_lire_original") is not None:
+        value = to_decimal(rec["amount_lire_original"])
+        if flip:
+            value = -value
+        currency = "L"
+        prefix = "+" if value >= 0 else ""
+        rounded_lire = int(abs(value).quantize(Decimal("1")))
+        grouped_lire = f"{rounded_lire:,}".replace(",", ".")
+        amount_text = f"{prefix}{'-' if value < 0 else ''}{grouped_lire} {currency}"
+        return amount_text, ("neg" if value < 0 else "pos")
+    value = to_decimal(rec["amount_eur"])
+    if flip:
+        value = -value
+    prefix = "+" if value >= 0 else ""
+    formatted = format_euro_it(value)
+    return f"{prefix}{formatted} €", ("neg" if value < 0 else "pos")
 
-    pool: list[dict] = []
-    for yd in db["years"]:
-        y = int(yd["year"])
-        if y > latest_year:
-            continue
-        pool.extend(yd["records"])
-    pool.sort(key=record_merge_sort_key)
 
-    balances = [Decimal("0") for _ in accounts]
-    for rec in pool:
-        if rec.get("is_cancelled"):
-            continue
-        y = int(rec["year"])
-        if is_dotazione_record(rec) and y != LEGACY_DOTAZIONE_YEAR:
-            continue
+def _ver_summary_signed_eur(v: Decimal) -> str:
+    """Importo nel riepilogo verifica (schermo e stampa HTML): segno + e suffisso €."""
+    s = format_euro_it(v)
+    if v > 0 and not s.startswith("+"):
+        s = "+" + s
+    elif v == 0 and not s.startswith("+") and not s.startswith("-"):
+        s = "+" + s
+    return s + " €"
 
-        amount = to_decimal(rec["amount_eur"])
-        c1 = rec.get("account_primary_code", "")
-        c2 = rec.get("account_secondary_code", "")
 
-        c1_idx = int(c1) - 1 if str(c1).isdigit() else -1
-        c2_idx = int(c2) - 1 if str(c2).isdigit() else -1
+def _ver_summary_amount_line_color(v: Decimal) -> str:
+    return "#2e7d32" if v >= 0 else "#c62828"
 
-        if 0 <= c1_idx < n_accounts:
-            balances[c1_idx] += amount
-        if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts:
-            balances[c2_idx] -= amount
 
-    names = [a["name"] for a in accounts]
-    return latest_year, names, balances
+def _ver_summary_diff_line_color(match_ok: bool) -> str:
+    return "#2e7d32" if match_ok else "#c62828"
+
+
+def _ver_summary_row_definitions(
+    *,
+    current_balance: Decimal,
+    count_unverified: int,
+    sum_unverified: Decimal,
+    projected: Decimal,
+    stmt_balance: Decimal,
+    diff: Decimal,
+) -> tuple[tuple[str, Decimal], ...]:
+    """Stesse voci testuali del rapporto di stampa verifica (tabella Riepilogo)."""
+    return (
+        ("Saldo assoluto di Conti di casa", current_balance),
+        (f"N. {count_unverified} registrazioni non verificate, con valore", sum_unverified),
+        ("Proiezione del saldo assoluto di Conti di casa", projected),
+        ("Saldo dell'estratto conto", stmt_balance),
+        ("Differenza", diff),
+    )
 
 
 def compute_balances_from_2022_asof(db: dict, *, cutoff_date_iso: str) -> tuple[int, list[str], list[Decimal]]:
     """
-    Come `compute_balances_from_2022`, ma considera solo registrazioni con `date_iso <= cutoff_date_iso`
-    (saldo cumulato alla data indicata, inclusiva). Es.: saldo cassa in nuova registrazione.
+    Ricalcolo saldi da tutte le registrazioni (fallback senza *sld*). Non coincide col file *sld* salvo
+    replicare esattamente le regole legacy (finestra anni, dotazioni solo 2022, ecc.): per DB post-import
+    si usano *sld* + ``compute_new_records_effect`` + eventuale ``compute_cancelled_imported_records_balance_adjustment``.
+    Esclude annullate e scarichi virtuali. Dotazione (cat. 0) solo nel 1990. Piano conti = ultimo anno.
+    Per saldo totale senza limiti di data usare cutoff_date_iso="9999-12-31".
     """
     if not db.get("years"):
         return (date.today().year, [], [])
@@ -1180,6 +1457,8 @@ def compute_balances_from_2022_asof(db: dict, *, cutoff_date_iso: str) -> tuple[
     balances = [Decimal("0") for _ in accounts]
     for rec in pool:
         if rec.get("is_cancelled"):
+            continue
+        if rec.get("is_virtuale_discharge"):
             continue
         y = int(rec["year"])
         if is_dotazione_record(rec) and y != LEGACY_DOTAZIONE_YEAR:
@@ -1237,6 +1516,55 @@ def compute_new_records_effect(db: dict) -> list[Decimal]:
             if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts:
                 balances[c2_idx] -= amount
     return balances
+
+
+def compute_cancelled_imported_records_balance_adjustment(
+    db: dict, *, cutoff_date_iso: str
+) -> list[Decimal]:
+    """Correzione ai saldi basati su *sld*: movimenti importati ancora contati in *sld* ma annullati in app.
+
+    ``compute_new_records_effect`` ignora le righe con ``raw_record`` pieno; qui si compensa l'effetto
+    contabile opposto (stessi vincoli di data/dotazione/giroconto/scarico virtuale di ``compute_balances_from_2022_asof``).
+    """
+    if not db.get("years"):
+        return []
+    latest_year = max(y["year"] for y in db["years"])
+    year_data = next(y for y in db["years"] if y["year"] == latest_year)
+    accounts = year_data["accounts"]
+    n_accounts = len(accounts)
+
+    pool: list[dict] = []
+    for yd in db["years"]:
+        y = int(yd["year"])
+        if y > latest_year:
+            continue
+        pool.extend(yd.get("records", []))
+
+    adj = [Decimal("0") for _ in range(n_accounts)]
+    for rec in pool:
+        if not rec.get("is_cancelled"):
+            continue
+        if not (rec.get("raw_record") or "").strip():
+            continue
+        if rec.get("is_virtuale_discharge"):
+            continue
+        y = int(rec["year"])
+        if is_dotazione_record(rec) and y != LEGACY_DOTAZIONE_YEAR:
+            continue
+        r_date = str(rec.get("date_iso", ""))
+        if r_date and r_date > cutoff_date_iso:
+            continue
+
+        amount = -to_decimal(rec["amount_eur"])
+        c1 = rec.get("account_primary_code", "")
+        c2 = rec.get("account_secondary_code", "")
+        c1_idx = int(c1) - 1 if str(c1).isdigit() else -1
+        c2_idx = int(c2) - 1 if str(c2).isdigit() else -1
+        if 0 <= c1_idx < n_accounts:
+            adj[c1_idx] += amount
+        if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts:
+            adj[c2_idx] -= amount
+    return adj
 
 
 def compute_balances_future_dated_only(db: dict, *, today_iso: str) -> tuple[int, list[str], list[Decimal]]:
@@ -2218,6 +2546,47 @@ def reset_contabili_for_nuova_utenza(db: dict) -> None:
     db["user_profile"]["plan_conti_wizard_pending"] = True
 
 
+def _merge_account_estratti_pdf_stems_from_previous_db(imported_db: dict, previous_db: dict | None) -> None:
+    """Dopo import legacy: conserva su ogni conto (per anno) il nome base PDF impostato in pagina Conti."""
+    if not previous_db:
+        return
+    prev_by_year: dict[int, dict[str, dict]] = {}
+    for yd in previous_db.get("years") or []:
+        if not isinstance(yd, dict):
+            continue
+        try:
+            y = int(yd.get("year", 0))
+        except (TypeError, ValueError):
+            continue
+        prev_by_year[y] = {
+            str(a.get("code", "")).strip(): a
+            for a in (yd.get("accounts") or [])
+            if isinstance(a, dict) and str(a.get("code", "")).strip().isdigit()
+        }
+    for yd in imported_db.get("years") or []:
+        if not isinstance(yd, dict):
+            continue
+        try:
+            y = int(yd.get("year", 0))
+        except (TypeError, ValueError):
+            continue
+        prev_map = prev_by_year.get(y)
+        if not prev_map:
+            continue
+        for a in yd.get("accounts") or []:
+            if not isinstance(a, dict):
+                continue
+            code = str(a.get("code", "")).strip()
+            if not code.isdigit():
+                continue
+            pa = prev_map.get(code)
+            if not isinstance(pa, dict):
+                continue
+            stem_old = str(pa.get("estratti_pdf_stem") or "").strip()
+            if stem_old:
+                a["estratti_pdf_stem"] = stem_old
+
+
 def _merge_preserved_app_sections_from_previous_db(imported_db: dict, previous_db: dict | None) -> None:
     """
     Il JSON prodotto da ImportLegacy contiene solo anni/registrazioni e metadati import.
@@ -2225,13 +2594,14 @@ def _merge_preserved_app_sections_from_previous_db(imported_db: dict, previous_d
     """
     if not previous_db:
         return
-    for key in ("user_profile", "security_config", "email_settings"):
+    for key in ("user_profile", "security_config", "email_settings", "estratti_pdf"):
         if key not in previous_db:
             continue
         val = previous_db[key]
         if isinstance(val, dict):
             imported_db[key] = copy.deepcopy(val)
     imported_db["periodic_registrations"] = []
+    _merge_account_estratti_pdf_stems_from_previous_db(imported_db, previous_db)
 
 
 def load_encrypted_db(output_path: Path, key_path: Path) -> dict | None:
@@ -2468,6 +2838,8 @@ def build_ui(
 
     data_file_var = tk.StringVar(value=str(path_holder[0].resolve()))
     key_file_var = tk.StringVar(value=str(key_path_holder[0].resolve()))
+    # Se aperta la pagina risultati verifica, dopo ogni salvataggio DB si ricalcolano griglie/riepilogo.
+    ver_results_after_persist_cb: list[Callable[[], None] | None] = [None]
 
     def _sync_path_holders_from_vars(*_args: object) -> None:
         try:
@@ -2533,6 +2905,7 @@ def build_ui(
     statistiche_frame = ttk.Frame(cdc_content, padding=8, style="MovCdc.TFrame")
     budget_frame = ttk.Frame(cdc_content, padding=8, style="MovCdc.TFrame")
     opzioni_frame = ttk.Frame(cdc_content, padding=8, style="MovCdc.TFrame")
+    plan_categorie_frame = ttk.Frame(cdc_content, padding=8, style="MovCdc.TFrame")
     plan_conti_frame = ttk.Frame(cdc_content, padding=8, style="MovCdc.TFrame")
     aiuto_frame = ttk.Frame(cdc_content, padding=8, style="MovCdc.TFrame")
 
@@ -2543,6 +2916,7 @@ def build_ui(
         statistiche_frame,
         budget_frame,
         opzioni_frame,
+        plan_categorie_frame,
         plan_conti_frame,
         aiuto_frame,
     ]
@@ -2556,6 +2930,8 @@ def build_ui(
     _cdc_current: list[tk.Widget | None] = [None]
     _plan_conti_visible: list[bool] = [False]
     _frame_to_tab_label: dict[tk.Widget, tk.Label] = {}
+    # Sessione Verifica (manuale/automatica): definito qui per uso in _cdc_select (blocco uscita pagina).
+    ver_session_active: list[bool] = [False]
 
     def _cdc_ordered_tabs() -> list[tk.Widget]:
         o: list[tk.Widget] = [
@@ -2567,6 +2943,7 @@ def build_ui(
             opzioni_frame,
         ]
         if _plan_conti_visible[0]:
+            o.append(plan_categorie_frame)
             o.append(plan_conti_frame)
         o.append(aiuto_frame)
         return o
@@ -2583,10 +2960,13 @@ def build_ui(
         if not _plan_conti_visible[0]:
             return
         _plan_conti_visible[0] = False
-        try:
-            lbl_plan_conti.pack_forget()
-        except tk.TclError:
-            pass
+        for _lbl in (lbl_plan_categorie, lbl_plan_conti):
+            try:
+                _lbl.pack_forget()
+            except tk.TclError:
+                pass
+
+    _ver_on_tab_enter_fn: list[Callable[[], None] | None] = [None]
 
     def _cdc_on_tab_side_effects(_new: tk.Widget) -> None:
         if _new is movimenti_frame:
@@ -2602,8 +2982,25 @@ def build_ui(
                     refresh_balance_footer()
                 except NameError:
                     pass
+        elif _new is verifica_frame:
+            fn = _ver_on_tab_enter_fn[0]
+            if fn is not None:
+                fn()
 
     def _cdc_select(f: tk.Widget) -> None:
+        if _cdc_current[0] is verifica_frame and f is not verifica_frame and ver_session_active[0]:
+            try:
+                messagebox.showwarning(
+                    "Verifica in corso",
+                    "È in corso una sessione di verifica.\n\n"
+                    "Uscire dalla pagina Verifica solo dopo «Chiudi verifica» (o fine sessione equivalente).\n\n"
+                    "È comunque possibile aprire e consultare il PDF generato da Stampa/anteprima.",
+                    parent=root,
+                )
+            except Exception:
+                pass
+            _cdc_sync_tab_style()
+            return
         for pf in _pages_all:
             try:
                 pf.grid_remove()
@@ -2615,7 +3012,7 @@ def build_ui(
             f.grid(row=0, column=0, sticky="nsew")
         _cdc_current[0] = f
         _cdc_sync_tab_style()
-        if f is not plan_conti_frame and _plan_conti_visible[0]:
+        if f not in (plan_categorie_frame, plan_conti_frame) and _plan_conti_visible[0]:
             _cdc_forget_plan_conti_bar()
         _cdc_on_tab_side_effects(f)
         try:
@@ -2660,7 +3057,8 @@ def build_ui(
     _mk_cdc_tab("Statistiche", statistiche_frame).pack(side=tk.LEFT, padx=(0, 6))
     _mk_cdc_tab("Budget", budget_frame).pack(side=tk.LEFT, padx=(0, 6))
     _mk_cdc_tab("Opzioni", opzioni_frame).pack(side=tk.LEFT, padx=(0, 6))
-    lbl_plan_conti = _mk_cdc_tab("Categorie e conti", plan_conti_frame)
+    lbl_plan_categorie = _mk_cdc_tab("Categorie", plan_categorie_frame)
+    lbl_plan_conti = _mk_cdc_tab("Conti", plan_conti_frame)
     lbl_aiuto = _mk_cdc_tab("Aiuto", aiuto_frame)
     lbl_aiuto.pack(side=tk.LEFT, padx=(0, 6))
 
@@ -2680,29 +3078,31 @@ def build_ui(
                 raise tk.TclError("tab id not found")
 
         def forget(self, widget: tk.Widget) -> None:
-            if widget is not plan_conti_frame:
-                raise tk.TclError("forget only supported for Categorie e conti")
+            if widget not in (plan_categorie_frame, plan_conti_frame):
+                raise tk.TclError("forget only supported for le schede Categorie e Conti")
             _cdc_forget_plan_conti_bar()
             try:
+                plan_categorie_frame.grid_remove()
                 plan_conti_frame.grid_remove()
             except tk.TclError:
                 pass
 
         def insert(self, _pos: int, widget: tk.Widget, text: str | None = None) -> None:
-            if widget is not plan_conti_frame:
-                raise tk.TclError("insert only supported for Categorie e conti")
+            if widget not in (plan_categorie_frame, plan_conti_frame):
+                raise tk.TclError("insert only supported per le schede Categorie e Conti")
             _ensure_plan_conti_tab()
 
         def add(self, widget: tk.Widget, text: str | None = None) -> None:
-            if widget is not plan_conti_frame:
-                raise tk.TclError("add only supported for Categorie e conti")
+            if widget not in (plan_categorie_frame, plan_conti_frame):
+                raise tk.TclError("add only supported per le schede Categorie e Conti")
             _ensure_plan_conti_tab()
 
     def _ensure_plan_conti_tab() -> None:
-        """Mostra il tasto «Categorie e conti» (come il vecchio reinserimento nel Notebook)."""
+        """Mostra i tasti «Categorie» e «Conti» nella barra (come il vecchio reinserimento nel Notebook)."""
         if _plan_conti_visible[0]:
             return
         _plan_conti_visible[0] = True
+        lbl_plan_categorie.pack(side=tk.LEFT, padx=(0, 6), before=lbl_aiuto)
         lbl_plan_conti.pack(side=tk.LEFT, padx=(0, 6), before=lbl_aiuto)
         _cdc_sync_tab_style()
 
@@ -3701,6 +4101,12 @@ def build_ui(
             return
         populate_movements_trees(reselect_stable_key=reselect_key)
         refresh_balance_footer()
+        vrf = ver_results_after_persist_cb[0]
+        if vrf is not None:
+            try:
+                vrf()
+            except Exception:
+                pass
 
     def open_edit_date(stable_key: str) -> None:
         pair = find_record_year_and_ref(cur_db(), stable_key)
@@ -4032,21 +4438,27 @@ def build_ui(
         s = str(rec.get("account_secondary_name") or rec.get("account_secondary_code") or "")
         return _is_virtuale_account(p) or _is_virtuale_account(s)
 
-    def on_modifica_reg_click(event: tk.Event) -> None:
-        cur = _correzione_current_key_and_rec()
+    def on_modifica_reg_click_generic(
+        event: tk.Event,
+        *,
+        get_cur: Callable[[], tuple[str, dict] | None],
+        refresh_bar: Callable[[], None],
+        forza_revealed_cell: list[bool],
+        menu_parent: tk.Misc,
+    ) -> None:
+        cur = get_cur()
         if not cur:
             return
         _key0, rec0 = cur
         is_virtuale_rec = _record_has_virtuale(rec0)
-        correzione_forza_revealed[0] = True
-        refresh_correction_bar()
-        _key0, rec0 = cur
+        forza_revealed_cell[0] = True
+        refresh_bar()
         has_star = record_has_account_verification_flags(rec0)
         giro = is_giroconto_record(rec0)
-        m = tk.Menu(correzione_row, tearoff=0)
+        m = tk.Menu(menu_parent, tearoff=0)
 
         def run_edit(fn: Callable[[str], None]) -> None:
-            cur2 = _correzione_current_key_and_rec()
+            cur2 = get_cur()
             if cur2:
                 fn(cur2[0])
 
@@ -4071,6 +4483,15 @@ def build_ui(
             except Exception:
                 pass
 
+    def on_modifica_reg_click(event: tk.Event) -> None:
+        on_modifica_reg_click_generic(
+            event,
+            get_cur=_correzione_current_key_and_rec,
+            refresh_bar=refresh_correction_bar,
+            forza_revealed_cell=correzione_forza_revealed,
+            menu_parent=correzione_row,
+        )
+
     def _flags_star_count(flags: str) -> int:
         return str(flags or "").count("*")
 
@@ -4094,8 +4515,11 @@ def build_ui(
         reg_map = unified_registration_sequence_map(all_records)
         return all_records, reg_map
 
-    def on_forza_verifica_click(_event: tk.Event | None = None) -> None:
-        cur = _correzione_current_key_and_rec()
+    def on_forza_verifica_click_generic(
+        _event: tk.Event | None,
+        get_cur: Callable[[], tuple[str, dict] | None],
+    ) -> None:
+        cur = get_cur()
         if not cur:
             return
         stable_key, rec = cur
@@ -4141,6 +4565,13 @@ def build_ui(
 
         if not target_account_name:
             messagebox.showerror("Forza cancellazione verifica", "Conto non identificabile per la registrazione selezionata.")
+            return
+
+        if not messagebox.askyesno(
+            "Forza cancellazione verifica",
+            f"Confermi la cancellazione della verifica per il conto {target_account_name}\n"
+            f"sulla registrazione n. {selected_reg_n}?",
+        ):
             return
 
         selected_stars = st_a if side == "primary" else st_b
@@ -4253,8 +4684,14 @@ th {{ background:#efefef; text-align:left; }}
         except Exception as exc:
             messagebox.showerror("Stampa promemoria", str(exc))
 
-    def on_elimina_reg_click(_event: tk.Event | None = None) -> None:
-        cur = _correzione_current_key_and_rec()
+    def on_forza_verifica_click(_event: tk.Event | None = None) -> None:
+        on_forza_verifica_click_generic(_event, _correzione_current_key_and_rec)
+
+    def on_elimina_reg_click_generic(
+        _event: tk.Event | None,
+        get_cur: Callable[[], tuple[str, dict] | None],
+    ) -> None:
+        cur = get_cur()
         if not cur:
             return
         stable_key, rec = cur
@@ -4291,6 +4728,9 @@ th {{ background:#efefef; text-align:left; }}
         persist_db_after_edit(None)
         if reg_n is not None:
             messagebox.showinfo("Registrazione eliminata", f"Registrazione {reg_n} annullata.")
+
+    def on_elimina_reg_click(_event: tk.Event | None = None) -> None:
+        on_elimina_reg_click_generic(_event, _correzione_current_key_and_rec)
 
     btn_modifica_reg.bind("<Button-1>", on_modifica_reg_click)
     btn_forza_verifica.bind("<Button-1>", on_forza_verifica_click)
@@ -6109,6 +6549,50 @@ th {{ background:#efefef; text-align:left; }}
     balance_center_canvas.configure(xscrollcommand=balance_center_hscroll.set)
     balance_center_canvas.pack(fill=tk.X, expand=True)
     balance_center_hscroll.pack(fill=tk.X, pady=(6, 0))
+    # Scroll orizzontale touchpad: su macOS Tk 8.6 deltaX è un MouseWheel con Shift nel modifier state.
+    balance_center_canvas.configure(xscrollincrement=36)
+
+    def _balance_saldi_hscroll_steps(event: tk.Event) -> int:
+        d = int(getattr(event, "delta", 0) or 0)
+        if not d:
+            return 0
+        if platform.system() == "Darwin":
+            n = -d
+            return max(-10, min(10, n))
+        n = int(-d / 120)
+        if n == 0:
+            n = -1 if d > 0 else 1
+        return max(-8, min(8, n))
+
+    def _balance_saldi_on_shift_wheel(event: tk.Event) -> str | None:
+        n = _balance_saldi_hscroll_steps(event)
+        if n:
+            balance_center_canvas.xview_scroll(n, "units")
+        return "break"
+
+    def _balance_saldi_on_btn67(event: tk.Event) -> str | None:
+        num = int(getattr(event, "num", 0) or 0)
+        if num == 6:
+            balance_center_canvas.xview_scroll(-1, "units")
+        elif num == 7:
+            balance_center_canvas.xview_scroll(1, "units")
+        return "break"
+
+    def _bind_balance_saldi_horizontal_scroll(w: tk.Misc) -> None:
+        w.bind("<Shift-MouseWheel>", _balance_saldi_on_shift_wheel, add="+")
+        for seq in ("<Button-6>", "<Button-7>"):
+            try:
+                w.bind(seq, _balance_saldi_on_btn67, add="+")
+            except tk.TclError:
+                pass
+
+    def _bind_balance_saldi_horizontal_scroll_recursive(w: tk.Misc) -> None:
+        _bind_balance_saldi_horizontal_scroll(w)
+        for ch in w.winfo_children():
+            _bind_balance_saldi_horizontal_scroll_recursive(ch)
+
+    for _bs_w in (balance_center_canvas, balance_scroll_block, balance_center, balance_center_hscroll):
+        _bind_balance_saldi_horizontal_scroll(_bs_w)
 
     def _saldi_snapshot_for_print() -> dict:
         today_iso = date.today().isoformat()
@@ -6116,7 +6600,15 @@ th {{ background:#efefef; text-align:left; }}
         la = legacy_absolute_account_amounts(cur_db(), len(names))
         if la is not None:
             new_fx = compute_new_records_effect(cur_db())
-            saldo_assoluti = [la[i] + (new_fx[i] if i < len(new_fx) else Decimal("0")) for i in range(len(names))]
+            canc = compute_cancelled_imported_records_balance_adjustment(
+                cur_db(), cutoff_date_iso=today_iso
+            )
+            saldo_assoluti = [
+                la[i]
+                + (new_fx[i] if i < len(new_fx) else Decimal("0"))
+                + (canc[i] if i < len(canc) else Decimal("0"))
+                for i in range(len(names))
+            ]
         else:
             _, _, saldo_assoluti = compute_balances_from_2022_asof(cur_db(), cutoff_date_iso=today_iso)
         saldo_oggi = [saldo_assoluti[i] - amts_future[i] for i in range(len(names))]
@@ -6800,7 +7292,15 @@ th {{ background:#efefef; text-align:left; }}
         la = legacy_absolute_account_amounts(cur_db(), len(names))
         if la is not None:
             new_fx = compute_new_records_effect(cur_db())
-            saldo_assoluti = [la[i] + (new_fx[i] if i < len(new_fx) else Decimal("0")) for i in range(len(names))]
+            canc = compute_cancelled_imported_records_balance_adjustment(
+                cur_db(), cutoff_date_iso=today_iso
+            )
+            saldo_assoluti = [
+                la[i]
+                + (new_fx[i] if i < len(new_fx) else Decimal("0"))
+                + (canc[i] if i < len(canc) else Decimal("0"))
+                for i in range(len(names))
+            ]
         else:
             _, _, saldo_assoluti = compute_balances_from_2022_asof(cur_db(), cutoff_date_iso=today_iso)
         saldo_oggi = [saldo_assoluti[i] - amts_future[i] for i in range(len(names))]
@@ -6809,7 +7309,7 @@ th {{ background:#efefef; text-align:left; }}
         diffs = [a - b for a, b in zip(saldo_assoluti, saldo_oggi)]
         total_diff = total_assoluti - total_oggi
 
-        # Riga 1 = legacy *sld* (o fallback); riga 2 = assoluti − effetto registrazioni con data > oggi.
+        # Riga 1 = *sld* + variazioni in app (o fallback da movimenti); riga 2 = assoluti − data > oggi.
         table = tk.Frame(balance_center_canvas, highlightthickness=0, bd=0)
         balance_center_canvas.create_window((0, 0), window=table, anchor="nw")
 
@@ -6871,6 +7371,7 @@ th {{ background:#efefef; text-align:left; }}
         if bbox is not None:
             balance_center_canvas.configure(scrollregion=bbox)
         balance_center_canvas.update_idletasks()
+        _bind_balance_saldi_horizontal_scroll_recursive(table)
         root.after_idle(_align_stampa_saldi_to_middle_row)
 
     refresh_balance_footer()
@@ -7071,7 +7572,8 @@ th {{ background:#efefef; text-align:left; }}
                 continue
             raw_name = str(c.get("name", "")).strip()
             cat_raw_name_by_code[code] = raw_name
-            sign = raw_name[:1] if raw_name[:1] in {"+", "-", "="} else ""
+            rn = normalize_category_leading_sign_in_stored(raw_name)
+            sign = rn[:1] if rn[:1] in {"+", "-"} else ""
             cat_sign_by_code[code] = sign
             n0 = category_row_merged_note(c)
             if n0:
@@ -7275,7 +7777,15 @@ th {{ background:#efefef; text-align:left; }}
         la = legacy_absolute_account_amounts(cur_db(), len(names))
         if la is not None:
             new_fx = compute_new_records_effect(cur_db())
-            combined = [la[i] + (new_fx[i] if i < len(new_fx) else Decimal("0")) for i in range(len(names))]
+            canc = compute_cancelled_imported_records_balance_adjustment(
+                cur_db(), cutoff_date_iso=d_iso
+            )
+            combined = [
+                la[i]
+                + (new_fx[i] if i < len(new_fx) else Decimal("0"))
+                + (canc[i] if i < len(canc) else Decimal("0"))
+                for i in range(len(names))
+            ]
             for i, n in enumerate(names):
                 if n.strip().lower() == "cassa":
                     return combined[i]
@@ -7784,7 +8294,7 @@ th {{ background:#efefef; text-align:left; }}
             sign = cat_sign_by_code_cache.get(code, "")
             if sign == "+":
                 _apply_sign("+")
-            elif sign in ("-", "="):
+            elif sign == "-":
                 _apply_sign("-")
         if is_giro and not virtuale_discharge_active[0]:
             lbl_acc2.grid(row=4, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
@@ -7903,7 +8413,7 @@ th {{ background:#efefef; text-align:left; }}
             raw = raw[1:]
         newreg_amount_var.set((("-" if sign == "-" else "+") + raw).strip())
 
-    def _format_amount_entry() -> None:
+    def _format_amount_entry(*, omit_plus_for_positive_unless_typed: bool = False) -> None:
         raw = (newreg_amount_var.get() or "").strip()
         if not raw:
             return
@@ -7916,7 +8426,12 @@ th {{ background:#efefef; text-align:left; }}
             else:
                 amt = abs(amt)
             txt = format_euro_it(abs(amt))
-            newreg_amount_var.set(("-" if amt < 0 else "+") + txt)
+            if amt < 0:
+                newreg_amount_var.set("-" + txt)
+            elif omit_plus_for_positive_unless_typed and not raw.startswith("+"):
+                newreg_amount_var.set(txt)
+            else:
+                newreg_amount_var.set("+" + txt)
             if _is_giro_label(newreg_cat_var.get()):
                 newreg_sign_var.set("-")
         except Exception:
@@ -8956,7 +9471,7 @@ th {{ background:#efefef; text-align:left; }}
             sign = cat_sign_by_code_cache.get(code, "")
             if sign == "+":
                 _per_apply_sign("+")
-            elif sign in ("-", "="):
+            elif sign == "-":
                 _per_apply_sign("-")
         if is_giro:
             lbl_per_acc2.grid(row=5, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
@@ -9767,6 +10282,7 @@ th {{ background:#efefef; text-align:left; }}
             try:
                 v = normalize_euro_input(raw)
                 if v != Decimal("0"):
+                    _format_amount_entry(omit_plus_for_positive_unless_typed=True)
                     _hide_aggiorna_saldo_btn()
             except Exception:
                 pass
@@ -9834,7 +10350,4897 @@ th {{ background:#efefef; text-align:left; }}
     pack_centered_page_title(
         verifica_frame, title=_page_banner_title(), banner_style="MovCdc.TFrame", title_bg=MOVIMENTI_PAGE_BG
     )
-    ttk.Label(verifica_frame, text="Pagina in preparazione").pack(anchor=tk.W)
+
+    # ========================  PAGINA VERIFICA  ========================
+    _VER_BG = MOVIMENTI_PAGE_BG
+    _ver_ui_font = ("TkDefaultFont", 11)
+    _ver_ui_font_b = ("TkDefaultFont", 11, "bold")
+    _ver_cand_promo_font = ("TkDefaultFont", 14, "bold")
+    _VER_GRID_AMT_POS_FG = "#156716"
+    _VER_GRID_AMT_NEG_FG = "#b71c1c"
+    _VER_GRID_AMT_ZERO_FG = "#424242"
+    # Tasti azioni sospesi: stessi colori/dimensioni della barra «registrazioni non verificate».
+    _VER_PENDING_BTN_EDIT_BG = "#1565c0"
+    _VER_PENDING_BTN_DEL_BG = "#b71c1c"
+    _VER_PENDING_BTN_NEW_BG = "#2e7d32"
+    _VER_PENDING_BTN_CLEARSEL_BG = "#616161"
+    _VER_FOOT_PRINT_BG = "#546e7a"
+    _VER_FOOT_CYCLE_BG = "#ef6c00"
+    _VER_FOOT_CLOSE_BG = "#c62828"
+    _VER_ACTION_BTN_FONT = ("TkDefaultFont", 15, "bold")
+
+    _ver_res_style = ttk.Style()
+    _ver_res_style.configure(
+        "VerRes.Treeview",
+        borderwidth=1,
+        relief="solid",
+        rowheight=24,
+        background=CDC_GRID_STRIPE1_BG,
+        fieldbackground=CDC_GRID_STRIPE1_BG,
+        font=("TkDefaultFont", 12, "bold"),
+    )
+    _ver_res_style.configure(
+        "VerRes.Treeview.Heading",
+        borderwidth=1,
+        relief="flat",
+        background=CDC_GRID_HEADING_BG,
+        foreground="#1a1a1a",
+        font=("TkDefaultFont", 11, "bold"),
+    )
+
+    def _ver_grid_amount_from_decimal(d: Decimal) -> tuple[str, str]:
+        """Testo importo griglia verifica (+/− sempre) e tag Treeview per colore riga."""
+        t = format_euro_it(d)
+        if d > 0:
+            s = "+" + t if not t.startswith("+") else t
+            return s, "ver_amt_pos"
+        if d < 0:
+            return t, "ver_amt_neg"
+        s = "+" + t if not t.startswith("+") else t
+        return s, "ver_amt_zero"
+
+    def _ver_grid_amount_from_amount_str(raw: object) -> tuple[str, str]:
+        s = str(raw or "").strip().replace(" ", "").replace(",", ".")
+        if not s:
+            return "+0,00", "ver_amt_zero"
+        try:
+            return _ver_grid_amount_from_decimal(Decimal(s))
+        except Exception:
+            return "+0,00", "ver_amt_zero"
+
+    def _ver_amount_storage_str(d: Decimal) -> str:
+        """Importo in memoria/sessione: sempre due decimali (punto), per griglia e salvataggio."""
+        return format(d.quantize(Decimal("0.01")), "f")
+
+    def _ver_configure_ver_tree_amount_tags(tv: ttk.Treeview) -> None:
+        try:
+            tv.tag_configure("ver_amt_pos", foreground=_VER_GRID_AMT_POS_FG)
+            tv.tag_configure("ver_amt_neg", foreground=_VER_GRID_AMT_NEG_FG)
+            tv.tag_configure("ver_amt_zero", foreground=_VER_GRID_AMT_ZERO_FG)
+        except tk.TclError:
+            pass
+
+    ver_body = tk.Frame(verifica_frame, bg=_VER_BG, highlightthickness=0)
+    ver_body.pack(fill=tk.BOTH, expand=True)
+
+    # --- stato sessione ---
+    ver_account_code_var = tk.StringVar(value="")
+    ver_account_name_var = tk.StringVar(value="")
+    ver_cutoff_date_var = tk.StringVar(value="")
+    ver_stmt_balance_var = tk.StringVar(value="")
+    # Verifica manuale: True dopo almeno un invio con importo valido (o avvio con coda PDF); evita Termina «a vuoto» = reset conto/data.
+    ver_manual_any_amount_submitted: list[bool] = [False]
+    # Sessione avviata con coda PDF (nuovo PDF o ripresa salvata): in pagina risultati non si modificano le non verificate.
+    ver_verifica_used_pdf_coda: list[bool] = [False]
+    # Durante la sessione: cronologia di tutte le immissioni (``verified`` True/False), tutte visibili in griglia.
+    # Solo quando tutti risultano verificati (es. dopo «Riavvia ricerca» con successo completo) si possono togliere
+    # dalla lista le righe già verificate.
+    ver_pending_items: list[list[dict]] = [[]]
+    # Conto con PDF automatico: nasconde percorso/Sfoglia finché «Ricerca automatica PDF» non fallisce.
+    ver_setup_pdf_path_after_auto_fail: list[bool] = [False]
+    # Codici conto per cui l'utente ha risposto «Annulla» alla ripresa memoria ma «No» alla cancellazione:
+    # blocca nuova verifica (manuale, PDF automatico, PDF da percorso) finché la memoria non è ripresa o cancellata dal dialogo.
+    ver_accounts_declined_memory_keep: list[set[str]] = [set()]
+    # Coalescing trace su data/PDF nella schermata setup verifica (evita raffiche di callback).
+    ver_setup_buttons_trace_after: list[str | None] = [None]
+    # Ritardo post-«Ricerca automatica PDF»: annullabile se l'utente cambia conto prima dell'avvio.
+    ver_auto_start_defer_after: list[str | None] = [None]
+    # Dialogo ripresa memoria senza tasti intermedi: schedulato dopo selezione conto / ingresso tab.
+    ver_memory_resume_prompt_after: list[str | None] = [None]
+
+    def _ver_activate_ui_for_modal_dialog() -> tk.Misc:
+        """Porta in primo piano la finestra dell'app prima di dialoghi modali (evita finestre dietro il notebook, macOS)."""
+        try:
+            parent = verifica_frame.winfo_toplevel()
+        except Exception:
+            parent = root
+        for w in (parent, root):
+            try:
+                w.lift()
+                w.update_idletasks()
+            except Exception:
+                pass
+        return parent
+
+    def _ver_item_is_verified(it: dict) -> bool:
+        return bool(it.get("verified"))
+
+    def _ver_normalize_verification_items(items: list[dict] | None) -> None:
+        """Compatibilità con salvataggi senza campo ``verified`` (trattati come in sospeso)."""
+        if not items:
+            return
+        for it in items:
+            if isinstance(it, dict):
+                it.setdefault("verified", False)
+
+    def _ver_filter_session_to_pending_only() -> None:
+        ver_pending_items[0] = [x for x in ver_pending_items[0] if not _ver_item_is_verified(x)]
+
+    def _ver_count_pending_rows() -> int:
+        return sum(1 for x in ver_pending_items[0] if not _ver_item_is_verified(x))
+    ver_print_data: list[dict | None] = [None]
+    ver_bancoposta_pdf_var = tk.StringVar(value="")
+    ver_bancoposta_queue: list[list[dict]] = [[]]
+    ver_bancoposta_idx: list[int] = [-1]
+    ver_bancoposta_browse_enabled: list[bool] = [True]
+    # Punta a ``_ver_on_submit`` dopo la definizione (auto-verifica PDF senza tasto).
+    ver_on_submit_pdf: list[Callable[[], None] | None] = [None]
+    ver_bancoposta_closing: list[Decimal | None] = [None]
+    # Saldo finale PDF: resta disponibile per il popup anche dopo aver azzerato ``ver_bancoposta_closing`` a fine coda.
+    ver_pdf_closing_balance_hint: list[Decimal | None] = [None]
+    ver_pdf_auto_diag_var = tk.StringVar(value="")
+
+    # --- persistenza dati di verifica in sospeso ---
+    def _ver_saved_has_bancoposta(saved: dict | None) -> bool:
+        if not saved or not isinstance(saved, dict):
+            return False
+        m = saved.get("bancoposta_movements") or saved.get("bancoposta_queue")
+        if isinstance(m, (list, tuple)) and len(m) > 0:
+            return True
+        return bool(str(saved.get("bancoposta_pdf_path", "") or "").strip())
+
+    def _ver_saved_has_unverified_session_items(saved: dict | None) -> bool:
+        """True se tra gli ``items`` salvati c'è almeno un dato di verifica non ancora abbinato."""
+        if not saved or not isinstance(saved, dict):
+            return False
+        for x in saved.get("items") or []:
+            if isinstance(x, dict) and not _ver_item_is_verified(x):
+                return True
+        return False
+
+    def _ver_saved_has_verification_in_sospeso(saved: dict | None) -> bool:
+        """True se nel salvataggio su disco restano dati da riprendere (PDF e/o voci non verificate)."""
+        if not saved or not isinstance(saved, dict):
+            return False
+        return _ver_saved_has_bancoposta(saved) or _ver_saved_has_unverified_session_items(saved)
+
+    def _ver_other_accounts_verification_memory_labels(cur_acc_code: str) -> list[str]:
+        """Nomi conto (come salvati) con memoria di verifica attiva, escluso il codice conto ``cur_acc_code``."""
+        vp = cur_db().get("verification_pending") or {}
+        out: list[str] = []
+        seen_lower: set[str] = set()
+        cur = str(cur_acc_code).strip()
+        for k, v in vp.items():
+            if str(k).strip() == cur:
+                continue
+            if not isinstance(v, dict) or not _ver_saved_has_verification_in_sospeso(v):
+                continue
+            nm = str(v.get("account_name", "?")).strip() or "?"
+            key = nm.lower()
+            if key in seen_lower:
+                continue
+            seen_lower.add(key)
+            out.append(nm)
+        return out
+
+    def _ver_restore_coerce_saved_movement(r: object) -> dict | None:
+        """Normalizza una riga salvata (dict o sequenza legacy) in movimento interno."""
+        if isinstance(r, dict):
+            try:
+                amt = Decimal(str(r.get("amount", "0")))
+            except Exception:
+                amt = Decimal("0")
+            bd = str(r.get("booking_date") or r.get("booking", "") or "")
+            bk = str(r.get("booking", "") or bd)
+            return {
+                "booking": bk,
+                "booking_date": bd or bk,
+                "amount": amt,
+                "note": str(r.get("note", "")),
+            }
+        if isinstance(r, (list, tuple)):
+            seq = list(r)
+            if len(seq) >= 3:
+                booking, raw_amt, note = seq[0], seq[1], seq[2]
+            elif len(seq) == 2:
+                booking, raw_amt = seq[0], seq[1]
+                note = ""
+            else:
+                return None
+            try:
+                amt = Decimal(str(raw_amt))
+            except Exception:
+                amt = Decimal("0")
+            bk = str(booking or "")
+            return {
+                "booking": bk,
+                "booking_date": bk,
+                "amount": amt,
+                "note": str(note or ""),
+            }
+        return None
+
+    def _ver_filtered_bancoposta_rows_from_pdf(
+        pth: Path, cutoff_raw: str
+    ) -> tuple[list[dict], Decimal | None, int]:
+        """Estrae movimenti dal PDF; opz. esclude righe oltre la chiusura. Ritorna anche il n. movimenti grezzi dal parser."""
+        ext = extract_estratto_conto_movements_from_pdf(pth)
+        n_raw = len(ext.movements)
+        closing = ext.closing_balance
+        cutoff_iso = ""
+        cr = (cutoff_raw or "").strip()
+        if cr:
+            try:
+                cutoff_iso = parse_italian_ddmmyyyy_to_iso(cr)
+            except Exception:
+                cutoff_iso = ""
+        skip_cutoff = VER_PDF_DISABLE_CUTOFF_DATE_FILTER or os.environ.get(
+            "VER_PDF_SKIP_CUTOFF_FILTER", ""
+        ).strip().lower() in ("1", "true", "yes", "on", "si")
+        filtered: list[dict] = []
+        for row in ext.movements:
+            if cutoff_iso and not skip_cutoff:
+                try:
+                    biso = parse_italian_ddmmyyyy_to_iso(row.get("booking") or "")
+                except Exception:
+                    biso = ""
+                if biso and biso > cutoff_iso:
+                    continue
+            filtered.append(row)
+        return filtered, closing, n_raw
+
+    def _ver_reload_pdf_closing_only() -> Decimal | None:
+        """Ri-legge dal PDF il saldo finale (stesso file e data di chiusura della sessione)."""
+        pth_raw = ver_bancoposta_pdf_var.get().strip()
+        if not pth_raw:
+            return None
+        pth = Path(pth_raw)
+        if not pth.is_file():
+            return None
+        try:
+            _rows, closing, _nraw = _ver_filtered_bancoposta_rows_from_pdf(
+                pth, ver_cutoff_date_var.get().strip()
+            )
+            return closing
+        except Exception:
+            return None
+
+    def _ver_restore_bancoposta_from_saved(saved: dict) -> None:
+        mov = saved.get("bancoposta_movements") or saved.get("bancoposta_queue") or []
+        if isinstance(mov, tuple):
+            mov = list(mov)
+        if not isinstance(mov, list):
+            mov = []
+        rows: list[dict] = []
+        for r in mov:
+            coerced = _ver_restore_coerce_saved_movement(r)
+            if coerced is not None:
+                rows.append(coerced)
+        pdf_saved = str(saved.get("bancoposta_pdf_path", "") or "").strip()
+        closing_fallback_pdf: Decimal | None = None
+        if not rows and pdf_saved:
+            pth = Path(pdf_saved)
+            if pth.is_file():
+                try:
+                    rows, closing_fallback_pdf, _nraw = _ver_filtered_bancoposta_rows_from_pdf(
+                        pth, str(saved.get("cutoff_date", "") or "")
+                    )
+                except Exception:
+                    rows = []
+                    closing_fallback_pdf = None
+        ver_bancoposta_queue[0] = rows
+        try:
+            idx = int(saved.get("bancoposta_idx", 0))
+        except (TypeError, ValueError):
+            idx = 0
+        if rows:
+            ver_bancoposta_idx[0] = max(0, min(idx, len(rows) - 1))
+        else:
+            ver_bancoposta_idx[0] = -1
+        bc = saved.get("bancoposta_closing")
+        try:
+            ver_bancoposta_closing[0] = Decimal(str(bc)) if bc not in (None, "") else None
+        except Exception:
+            ver_bancoposta_closing[0] = None
+        if ver_bancoposta_closing[0] is None and closing_fallback_pdf is not None:
+            ver_bancoposta_closing[0] = closing_fallback_pdf
+        if ver_bancoposta_closing[0] is not None:
+            ver_pdf_closing_balance_hint[0] = ver_bancoposta_closing[0]
+        else:
+            ver_pdf_closing_balance_hint[0] = None
+        ver_bancoposta_pdf_var.set(pdf_saved)
+
+    def _ver_save_pending_to_db() -> None:
+        """Salva in ``verification_pending[codice_conto]`` la sessione del conto attivo (altri conti restano inalterati)."""
+        acc_code = ver_account_code_var.get()
+        if not acc_code:
+            return
+        d = cur_db()
+        vp = d.setdefault("verification_pending", {})
+        has_rows = bool(ver_pending_items[0])
+        has_pdf = bool(ver_bancoposta_queue[0])
+        if not has_rows and not has_pdf:
+            vp.pop(acc_code, None)
+        else:
+            entry: dict = {
+                "account_name": ver_account_name_var.get(),
+                "cutoff_date": ver_cutoff_date_var.get().strip(),
+                "stmt_balance": ver_stmt_balance_var.get().strip(),
+                "items": list(ver_pending_items[0]),
+            }
+            if has_pdf:
+                entry["bancoposta_pdf_path"] = ver_bancoposta_pdf_var.get().strip()
+                entry["bancoposta_movements"] = [
+                    {
+                        "booking": str(r.get("booking", "")),
+                        "booking_date": str(r.get("booking_date") or r.get("booking", "")),
+                        "amount": str(r.get("amount", "")),
+                        "note": str(r.get("note", "")),
+                    }
+                    for r in ver_bancoposta_queue[0]
+                ]
+                entry["bancoposta_idx"] = int(ver_bancoposta_idx[0])
+                if ver_bancoposta_closing[0] is not None:
+                    entry["bancoposta_closing"] = str(ver_bancoposta_closing[0])
+            vp[acc_code] = entry
+        try:
+            persist_db_after_edit(None)
+        except Exception:
+            pass
+
+    def _ver_load_pending_from_db(acc_code: str) -> dict | None:
+        """Ritorna i dati salvati per il conto, oppure None."""
+        vp = cur_db().get("verification_pending") or {}
+        return vp.get(acc_code) or None
+
+    def _ver_clear_pending_from_db(acc_code: str) -> None:
+        """Rimuove dalla mappa ``verification_pending`` solo la chiave del conto indicato (gli altri conti non vengono toccati)."""
+        vp = cur_db().get("verification_pending")
+        if vp and acc_code in vp:
+            del vp[acc_code]
+        try:
+            ver_accounts_declined_memory_keep[0].discard(str(acc_code).strip())
+        except Exception:
+            pass
+
+    def _ver_has_any_saved_pending() -> dict[str, dict]:
+        """Mappa ``codice_conto`` → dati salvati; ogni conto ha memoria indipendente dagli altri."""
+        return cur_db().get("verification_pending") or {}
+
+    # --- setup: scelta conto e data chiusura ---
+    ver_setup_frame = tk.Frame(ver_body, bg=_VER_BG, highlightthickness=0)
+    ver_setup_frame.pack(fill=tk.X, anchor=tk.W, pady=(0, 4))
+
+    ver_setup_inner = tk.Frame(ver_setup_frame, bg=_VER_BG, highlightthickness=0)
+    ver_setup_inner.pack(anchor=tk.CENTER)
+
+    tk.Label(ver_setup_inner, text="Conto da verificare", font=_ver_ui_font, bg=_VER_BG).grid(
+        row=0, column=0, sticky="w", padx=(0, 8), pady=2
+    )
+    ver_acc_combo = ttk.Combobox(ver_setup_inner, textvariable=ver_account_name_var, state="readonly", width=20,
+                                  style="NewReg.TCombobox")
+    ver_acc_combo.grid(row=0, column=1, sticky="w", pady=2, padx=(0, 16))
+
+    tk.Label(ver_setup_inner, text="Data chiusura estratto conto", font=_ver_ui_font, bg=_VER_BG).grid(
+        row=0, column=2, sticky="w", padx=(0, 8), pady=2
+    )
+    ver_cutoff_entry = ttk.Entry(ver_setup_inner, textvariable=ver_cutoff_date_var, width=12, style="NewReg.TEntry")
+    ver_cutoff_entry.grid(row=0, column=3, sticky="w", pady=2, padx=(0, 16))
+
+    ver_cutoff_calendar_popup: list[tk.Toplevel | None] = [None]
+    ver_cutoff_manual_mode: list[bool] = [False]
+    ver_cutoff_restore_iso: list[str | None] = [None]
+
+    def _ver_cutoff_date_bounds() -> tuple[date, date]:
+        today = date.today()
+        dmin = date(today.year - 1, 1, 1)
+        next_m = today.month + 1
+        next_y = today.year
+        if next_m > 12:
+            next_m = 1
+            next_y += 1
+        import calendar as cal_mod
+        last_day = cal_mod.monthrange(next_y, next_m)[1]
+        dmax = date(next_y, next_m, last_day)
+        return dmin, dmax
+
+    def _open_ver_cutoff_calendar() -> None:
+        dmin, dmax = _ver_cutoff_date_bounds()
+        today = date.today()
+        cur_iso = parse_italian_ddmmyyyy_to_iso(ver_cutoff_date_var.get()) or today.isoformat()
+        try:
+            cur = date.fromisoformat(cur_iso)
+        except Exception:
+            cur = today
+        cur = max(dmin, min(cur, dmax))
+
+        def _on_date_chosen(dsel: date) -> None:
+            ver_cutoff_date_var.set(to_italian_date(dsel.isoformat()))
+            ver_cutoff_manual_mode[0] = False
+            try:
+                _ver_setup_start_buttons_state()
+            except Exception:
+                pass
+
+        top = build_immissione_calendar_toplevel(
+            root, title="Data chiusura estratto conto", anchor=ver_cutoff_entry,
+            field_min=dmin, field_max=dmax, current=cur,
+            on_date_chosen=_on_date_chosen, ui_font=filter_ui_font,
+        )
+        ver_cutoff_calendar_popup[0] = top
+
+        def _on_destroy(_e: tk.Event | None = None) -> None:
+            ver_cutoff_calendar_popup[0] = None
+        top.bind("<Destroy>", _on_destroy)
+
+    def _toggle_ver_cutoff_calendar() -> None:
+        if ver_cutoff_manual_mode[0]:
+            ver_cutoff_manual_mode[0] = False
+            if ver_cutoff_restore_iso[0]:
+                try:
+                    ver_cutoff_date_var.set(to_italian_date(ver_cutoff_restore_iso[0]))
+                except Exception:
+                    pass
+                ver_cutoff_restore_iso[0] = None
+            _open_ver_cutoff_calendar()
+            return
+        if ver_cutoff_calendar_popup[0] is not None:
+            try:
+                ver_cutoff_calendar_popup[0].destroy()
+            except Exception:
+                pass
+            ver_cutoff_calendar_popup[0] = None
+            ver_cutoff_manual_mode[0] = True
+            iso = parse_italian_ddmmyyyy_to_iso(ver_cutoff_date_var.get())
+            ver_cutoff_restore_iso[0] = iso if iso else date.today().isoformat()
+            ver_cutoff_date_var.set("__/__/____")
+            try:
+                ver_cutoff_entry.focus_set()
+                ver_cutoff_entry.icursor(0)
+            except Exception:
+                pass
+            return
+        _open_ver_cutoff_calendar()
+
+    ver_cutoff_entry.bind("<Button-1>", lambda _e: _toggle_ver_cutoff_calendar())
+
+    def _ver_validate_cutoff_on_focusout(_e: tk.Event | None = None) -> None:
+        raw = ver_cutoff_date_var.get().strip()
+        if not raw or raw == "__/__/____":
+            return
+        try:
+            iso = parse_italian_ddmmyyyy_to_iso(raw)
+            d = date.fromisoformat(iso)
+        except Exception:
+            messagebox.showerror("Verifica", "Data non valida (formato gg/mm/aaaa).")
+            ver_cutoff_date_var.set("")
+            return
+        dmin, dmax = _ver_cutoff_date_bounds()
+        if d < dmin or d > dmax:
+            messagebox.showerror(
+                "Verifica",
+                f"Data fuori intervallo.\n"
+                f"Ammesse dal {to_italian_date(dmin.isoformat())} al {to_italian_date(dmax.isoformat())}.",
+            )
+            ver_cutoff_date_var.set("")
+            return
+        ver_cutoff_date_var.set(to_italian_date(iso))
+        ver_cutoff_manual_mode[0] = False
+        try:
+            _ver_setup_start_buttons_state()
+        except Exception:
+            pass
+
+    ver_cutoff_entry.bind("<FocusOut>", _ver_validate_cutoff_on_focusout)
+
+    ver_btn_start_auto = tk.Label(
+        ver_setup_inner,
+        text="Ricerca automatica PDF e avvio",
+        cursor="hand2",
+        highlightthickness=0,
+        font=_VER_ACTION_BTN_FONT,
+        padx=16,
+        pady=6,
+        bg=_VER_FOOT_PRINT_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    ver_btn_start_manual = tk.Label(
+        ver_setup_inner,
+        text="Immissione manuale dati…",
+        cursor="hand2",
+        highlightthickness=0,
+        font=_VER_ACTION_BTN_FONT,
+        padx=16,
+        pady=6,
+        bg=_VER_FOOT_CYCLE_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    ver_btn_start_with_pdf = tk.Label(
+        ver_setup_inner,
+        text="Avvia con PDF selezionato",
+        cursor="hand2",
+        highlightthickness=0,
+        font=_VER_ACTION_BTN_FONT,
+        padx=16,
+        pady=6,
+        bg=_VER_PENDING_BTN_EDIT_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    ver_btn_start_resume = tk.Label(
+        ver_setup_inner,
+        text="Avvia verifica",
+        cursor="hand2",
+        highlightthickness=0,
+        font=_VER_ACTION_BTN_FONT,
+        padx=16,
+        pady=6,
+        bg=_VER_PENDING_BTN_NEW_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+
+    ver_bancoposta_lbl = tk.Label(
+        ver_setup_inner, text="Estratto conto / carta (PDF, opz.)", font=_ver_ui_font, bg=_VER_BG
+    )
+    ver_bancoposta_lbl.grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(2, 4))
+    ver_bancoposta_entry = ttk.Entry(
+        ver_setup_inner, textvariable=ver_bancoposta_pdf_var, width=48, style="NewReg.TEntry"
+    )
+    ver_bancoposta_entry.grid(row=1, column=1, columnspan=3, sticky="we", padx=(0, 8), pady=(2, 4))
+
+    ver_btn_bancoposta_browse = tk.Label(
+        ver_setup_inner,
+        text="Sfoglia…",
+        cursor="hand2",
+        highlightthickness=0,
+        font=_VER_ACTION_BTN_FONT,
+        padx=12,
+        pady=6,
+        bg=_VER_FOOT_PRINT_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    ver_btn_bancoposta_browse.grid(row=1, column=4, sticky="w", pady=(2, 4))
+    ver_setup_inner.columnconfigure(1, weight=1)
+
+    tk.Label(
+        ver_setup_inner,
+        textvariable=ver_pdf_auto_diag_var,
+        font=("TkDefaultFont", 9),
+        bg=_VER_BG,
+        fg="#333333",
+        justify=tk.LEFT,
+        anchor="w",
+        wraplength=780,
+    ).grid(row=3, column=0, columnspan=5, sticky="we", padx=(0, 8), pady=(2, 4))
+
+    ver_setup_saved_var = tk.StringVar(value="")
+    ver_setup_saved_label = tk.Label(
+        ver_setup_frame, textvariable=ver_setup_saved_var, font=_ver_ui_font,
+        bg=_VER_BG, fg="#8B0000", anchor="w",
+    )
+    ver_setup_saved_label.pack(anchor=tk.CENTER, pady=(2, 0))
+
+    def _ver_has_saved_session_for_account(acc_code: str) -> bool:
+        """True se per il conto c'è memoria di verifica salvata (PDF e/o dati manuali in sospeso)."""
+        saved = _ver_load_pending_from_db(acc_code)
+        return _ver_saved_has_verification_in_sospeso(saved)
+
+    def _ver_declined_memory_blocks_new_verification_until_resolved(acc_code: str) -> bool:
+        """Dopo Annulla ripresa + No cancellazione: blocca ogni avvio «nuovo» (manuale o PDF) finché la memoria resta."""
+        dcl = ver_accounts_declined_memory_keep[0]
+        if acc_code not in dcl:
+            return False
+        saved_gate = _ver_load_pending_from_db(acc_code)
+        if not _ver_saved_has_verification_in_sospeso(saved_gate):
+            dcl.discard(acc_code)
+            return False
+        p_gate = _ver_activate_ui_for_modal_dialog()
+        messagebox.showwarning(
+            "Verifica",
+            "Per questo conto resta salvata in memoria una verifica non ripresa "
+            "(«Annulla» al dialogo di ripresa e «No» alla cancellazione).\n\n"
+            "Finché quella memoria c'è, non si può avviare una nuova verifica su altro percorso: né immissione manuale "
+            "da zero, né ricerca automatica del PDF, né avvio con un PDF scelto nel campo.\n\n"
+            "Bisogna prima riprendere o cancellare quella memoria dal dialogo di ripresa (riseleziona il conto nella lista, "
+            "oppure nel dialogo «Annulla» alla ripresa e poi «Sì» alla cancellazione).",
+            parent=p_gate,
+        )
+        return True
+
+    def _ver_on_start_auto() -> None:
+        ver_pdf_auto_diag_var.set("")
+        try:
+            aid0 = ver_auto_start_defer_after[0]
+            if aid0 is not None:
+                root.after_cancel(aid0)
+        except Exception:
+            pass
+        ver_auto_start_defer_after[0] = None
+        acc_name = ver_account_name_var.get().strip()
+        if not acc_name:
+            messagebox.showerror("Verifica", "Seleziona un conto da verificare.")
+            return
+        acc_code = _ver_account_code_for_name(acc_name)
+        if not acc_code:
+            messagebox.showerror("Verifica", f"Conto '{acc_name}' non trovato.")
+            return
+        if _ver_has_saved_session_for_account(acc_code):
+            ver_setup_pdf_path_after_auto_fail[0] = False
+            _ver_on_start()
+            return
+        if _ver_declined_memory_blocks_new_verification_until_resolved(acc_code):
+            return
+        cutoff_raw = ver_cutoff_date_var.get().strip()
+        if not cutoff_raw:
+            messagebox.showerror("Verifica", "Immetti la data di chiusura dell'estratto conto.")
+            ver_cutoff_entry.focus_set()
+            return
+        try:
+            parse_italian_ddmmyyyy_to_iso(cutoff_raw)
+        except Exception:
+            messagebox.showerror("Verifica", "Data non valida (formato gg/mm/aaaa).")
+            ver_cutoff_entry.focus_set()
+            return
+        ver_setup_pdf_path_after_auto_fail[0] = False
+        _ver_setup_start_buttons_state()
+        p, diag = resolve_estratto_pdf_for_account(cur_db(), acc_code, cutoff_raw)
+        try:
+            root.update_idletasks()
+        except Exception:
+            pass
+        if not p or not p.is_file():
+            ver_pdf_auto_diag_var.set("")
+            if _ver_account_expects_auto_estratto_pdf(cur_db(), acc_code):
+                ver_setup_pdf_path_after_auto_fail[0] = True
+                _ver_setup_start_buttons_state()
+            messagebox.showwarning(
+                "Verifica — ricerca automatica PDF",
+                diag + "\n\nIndicare il PDF nel campo sotto (o «Sfoglia…») e premere «Avvia con PDF selezionato».",
+                parent=root,
+            )
+            return
+        ver_pdf_auto_diag_var.set("")
+        try:
+            root.update_idletasks()
+        except Exception:
+            pass
+        picked_path = p
+        expected_acc_code = acc_code
+
+        def _defer_ver_start() -> None:
+            ver_auto_start_defer_after[0] = None
+            cur = _ver_account_code_for_name(ver_account_name_var.get().strip())
+            if cur != expected_acc_code:
+                return
+            ver_bancoposta_pdf_var.set(str(picked_path))
+            _ver_on_start()
+
+        ver_auto_start_defer_after[0] = root.after(350, _defer_ver_start)
+
+    def _ver_on_start_with_selected_pdf_path() -> None:
+        """Dopo ricerca automatica PDF fallita: avvio usando il percorso nel campo / scelto con Sfoglia."""
+        acc_name = ver_account_name_var.get().strip()
+        if not acc_name:
+            messagebox.showerror("Verifica", "Seleziona un conto da verificare.")
+            return
+        acc_code = _ver_account_code_for_name(acc_name)
+        if not acc_code:
+            messagebox.showerror("Verifica", f"Conto '{acc_name}' non trovato.")
+            return
+        if _ver_has_saved_session_for_account(acc_code):
+            ver_setup_pdf_path_after_auto_fail[0] = False
+            _ver_on_start()
+            return
+        if _ver_declined_memory_blocks_new_verification_until_resolved(acc_code):
+            return
+        cutoff_raw = ver_cutoff_date_var.get().strip()
+        if not cutoff_raw:
+            messagebox.showerror("Verifica", "Immetti la data di chiusura dell'estratto conto.")
+            ver_cutoff_entry.focus_set()
+            return
+        try:
+            parse_italian_ddmmyyyy_to_iso(cutoff_raw)
+        except Exception:
+            messagebox.showerror("Verifica", "Data non valida (formato gg/mm/aaaa).")
+            ver_cutoff_entry.focus_set()
+            return
+        pdf_raw = ver_bancoposta_pdf_var.get().strip()
+        if not pdf_raw:
+            messagebox.showinfo(
+                "Verifica",
+                "Indicare il percorso del file PDF nell'apposito campo oppure usare «Sfoglia…».",
+            )
+            return
+        pth = Path(pdf_raw)
+        if not pth.is_file():
+            messagebox.showerror(
+                "Verifica",
+                f"File PDF non trovato o non accessibile:\n{pth}",
+            )
+            return
+        _ver_on_start()
+
+    def _ver_on_start_resume() -> None:
+        """Avvio immissione manuale; se per il conto c'è memoria salvata (PDF e/o sospesi), passa a ``_ver_on_start()``."""
+        acc_name = ver_account_name_var.get().strip()
+        if not acc_name:
+            messagebox.showerror("Verifica", "Seleziona un conto da verificare.")
+            return
+        acc_code = _ver_account_code_for_name(acc_name)
+        if not acc_code:
+            messagebox.showerror("Verifica", f"Conto '{acc_name}' non trovato.")
+            return
+        if _ver_has_saved_session_for_account(acc_code):
+            ver_setup_pdf_path_after_auto_fail[0] = False
+            _ver_on_start()
+            return
+        if _ver_declined_memory_blocks_new_verification_until_resolved(acc_code):
+            return
+        cutoff_raw = ver_cutoff_date_var.get().strip()
+        if not cutoff_raw:
+            messagebox.showerror("Verifica", "Immetti la data di chiusura dell'estratto conto.")
+            ver_cutoff_entry.focus_set()
+            return
+        try:
+            parse_italian_ddmmyyyy_to_iso(cutoff_raw)
+        except Exception:
+            messagebox.showerror("Verifica", "Data non valida (formato gg/mm/aaaa).")
+            ver_cutoff_entry.focus_set()
+            return
+        ver_bancoposta_pdf_var.set("")
+        _ver_on_start()
+
+    ver_btn_start_auto.bind("<Button-1>", lambda _e: _ver_on_start_auto())
+    ver_btn_start_manual.bind("<Button-1>", lambda _e: _ver_on_start_resume())
+    ver_btn_start_with_pdf.bind("<Button-1>", lambda _e: _ver_on_start_with_selected_pdf_path())
+    ver_btn_start_resume.bind("<Button-1>", lambda _e: _ver_on_start_resume())
+
+    def _ver_update_reset_saved_button_visibility(_e: object = None) -> None:
+        """Riservato al layout verifica; la cancellazione memoria è solo dal dialogo di ripresa."""
+        pass
+
+    def _ver_on_account_combo_selected(_e: tk.Event | None = None) -> None:
+        try:
+            ver_pdf_auto_diag_var.set("")
+            try:
+                aid_d = ver_auto_start_defer_after[0]
+                if aid_d is not None:
+                    root.after_cancel(aid_d)
+            except Exception:
+                pass
+            ver_auto_start_defer_after[0] = None
+            _ver_cancel_memory_resume_prompt_after()
+            acc_name = ver_account_name_var.get().strip()
+            if not acc_name:
+                ver_setup_saved_var.set("")
+                return
+            acc_code = _ver_account_code_for_name(acc_name)
+            if not acc_code:
+                ver_setup_saved_var.set("")
+                return
+            saved = _ver_load_pending_from_db(acc_code)
+            # Il campo PDF non deve restare popolato con il file del conto precedente: senza memoria PDF
+            # per questo conto, reset (evita lettura PDF lunga o errata all'avvio su altro conto).
+            if not (saved and _ver_saved_has_bancoposta(saved)) and not _ver_bancoposta_pdf_ui_locked():
+                if ver_bancoposta_pdf_var.get().strip():
+                    try:
+                        ver_bancoposta_pdf_var.set("")
+                    except tk.TclError:
+                        pass
+            if saved and saved.get("items") and not _ver_saved_has_bancoposta(saved):
+                items_u = list(saved.get("items") or [])
+                _ver_normalize_verification_items(items_u)
+                n_sosp = sum(1 for x in items_u if isinstance(x, dict) and not _ver_item_is_verified(x))
+                if n_sosp > 0:
+                    ver_setup_saved_var.set(
+                        f"Dati di verifica in memoria per questo conto ({n_sosp} in sospeso). "
+                        "Si apre subito il dialogo per scegliere se riprendere o cancellare la memoria."
+                    )
+                else:
+                    ver_setup_saved_var.set(
+                        "Dati di verifica salvati in memoria per questo conto. "
+                        "Si apre subito il dialogo per scegliere se riprendere o cancellare la memoria."
+                    )
+            elif saved and _ver_saved_has_bancoposta(saved):
+                cutoff = saved.get("cutoff_date", "")
+                if cutoff:
+                    ver_cutoff_date_var.set(cutoff)
+                ver_setup_saved_var.set(
+                    "Sessione di verifica con estratto PDF salvato ma non completato. "
+                    "Si apre subito il dialogo per scegliere se riprendere o cancellare la memoria."
+                )
+            else:
+                ver_setup_saved_var.set("")
+            others_nm = _ver_other_accounts_verification_memory_labels(acc_code)
+            if others_nm:
+                cur_txt = (ver_setup_saved_var.get() or "").strip()
+                extra = "Altri conti con dati in memoria: " + ", ".join(others_nm) + "."
+                ver_setup_saved_var.set(f"{cur_txt}\n{extra}".strip() if cur_txt else extra)
+        finally:
+            try:
+                tid = ver_setup_buttons_trace_after[0]
+                if tid is not None:
+                    root.after_cancel(tid)
+            except Exception:
+                pass
+            ver_setup_buttons_trace_after[0] = None
+            ver_setup_pdf_path_after_auto_fail[0] = False
+            _ver_apply_bancoposta_pdf_lock_for_setup()
+            _ver_setup_start_buttons_state()
+            _ver_apply_bancoposta_pdf_lock_for_setup()
+            acc_nm_f = ver_account_name_var.get().strip()
+            if acc_nm_f:
+                ac_f = _ver_account_code_for_name(acc_nm_f)
+                sv_f = _ver_load_pending_from_db(ac_f) if ac_f else None
+                if ac_f and sv_f and _ver_saved_has_verification_in_sospeso(sv_f):
+                    _ver_schedule_memory_resume_prompt()
+
+    ver_acc_combo.bind("<<ComboboxSelected>>", _ver_on_account_combo_selected)
+
+    # --- area di lavoro (visibile solo a sessione attiva) ---
+    ver_work_frame = tk.Frame(ver_body, bg=_VER_BG, highlightthickness=0)
+    ver_results_frame = tk.Frame(ver_body, bg=_VER_BG, highlightthickness=0)
+    # Pagina risultati: riga superiore ~60% / ~40% (sospesi+griglia | Riepilogo), poi immissione, griglia non verificate, footer tasti.
+    ver_sospesi_split = tk.Frame(ver_results_frame, bg=_VER_BG, highlightthickness=0)
+    ver_sospesi_left = tk.Frame(ver_sospesi_split, bg=_VER_BG, highlightthickness=0)
+    ver_sospesi_right = tk.Frame(ver_sospesi_split, bg=_VER_BG, highlightthickness=0)
+    ver_sospesi_split.columnconfigure(0, weight=3, uniform="ver_sosp")
+    ver_sospesi_split.columnconfigure(1, weight=2, uniform="ver_sosp")
+    ver_sospesi_split.rowconfigure(0, weight=0)
+    ver_sospesi_left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+    ver_sospesi_right.grid(row=0, column=1, sticky="nsew")
+    ver_sospesi_right.rowconfigure(0, weight=1)
+    ver_sospesi_right.columnconfigure(0, weight=1)
+    ver_summary_outer = tk.Frame(ver_sospesi_right, bg=_VER_BG, highlightthickness=0)
+    ver_summary_outer.grid(row=0, column=0, sticky="nsew")
+    ver_summary_outer.rowconfigure(0, weight=1)
+    ver_summary_outer.rowconfigure(2, weight=1)
+    ver_summary_outer.columnconfigure(0, weight=1)
+    ver_results_footer_center = tk.Frame(ver_results_frame, bg=_VER_BG, highlightthickness=0)
+    ver_results_footer_inner = tk.Frame(ver_results_footer_center, bg=_VER_BG, highlightthickness=0)
+    ver_results_new_data_visible: list[bool] = [False]
+    # Griglia sessione (tutte le righe in immissione): master ver_body così pack -in ver_work_frame / ver_results_frame riparenta sempre.
+    ver_pending_host = tk.Frame(ver_body, bg=_VER_BG, highlightthickness=0)
+
+    # titolo sessione
+    ver_session_title_var = tk.StringVar(value="")
+    ver_session_title_lbl = tk.Label(
+        ver_work_frame,
+        textvariable=ver_session_title_var,
+        font=_ver_ui_font_b,
+        bg=_VER_BG,
+        fg="#1a1a1a",
+        anchor="w",
+    )
+    ver_session_title_lbl.pack(fill=tk.X, pady=(0, 4))
+
+    # form immissione dato di verifica (master ver_body: anche sulla pagina risultati per aggiungere sospesi)
+    ver_input_frame = tk.Frame(ver_body, bg=_VER_BG, highlightthickness=0)
+    ver_input_frame.pack(fill=tk.X, pady=(0, 4), in_=ver_work_frame, after=ver_session_title_lbl)
+
+    ver_inp_amt_var = tk.StringVar(value="-")
+    ver_inp_chq_var = tk.StringVar(value="")
+    ver_inp_note_var = tk.StringVar(value="")
+
+    tk.Label(ver_input_frame, text="Importo (€)", font=_ver_ui_font, bg=_VER_BG).grid(
+        row=0, column=0, sticky="w", padx=(0, 6), pady=2
+    )
+    ver_ent_amt = ttk.Entry(ver_input_frame, textvariable=ver_inp_amt_var, width=14, style="NewReg.TEntry")
+    ver_ent_amt.grid(row=0, column=1, sticky="w", padx=(0, 4), pady=2)
+    ver_btn_plus = tk.Label(ver_input_frame, text="+", cursor="hand2", font=_ver_ui_font, padx=6, pady=2,
+                            bg="#e0f2f1", relief=tk.RAISED, bd=1)
+    ver_btn_minus = tk.Label(ver_input_frame, text="-", cursor="hand2", font=_ver_ui_font, padx=6, pady=2,
+                             bg="#ffebee", relief=tk.RAISED, bd=1)
+    ver_btn_plus.grid(row=0, column=2, padx=(0, 2), pady=2)
+    ver_btn_minus.grid(row=0, column=3, padx=(0, 16), pady=2)
+    bind_euro_amount_entry_validation(ver_ent_amt, ver_inp_amt_var)
+
+    ver_amt_focusout_guard: list[bool] = [False]
+    ver_amt_focusout_suppress_once: list[bool] = [False]
+    _VER_AMT_FOCUS_MSG = (
+        "Indicare un importo valido in euro (cifre e separatore), con segno + o − iniziale."
+    )
+
+    def _ver_pdf_line_active_for_amt() -> bool:
+        q_bp = ver_bancoposta_queue[0]
+        i_bp = ver_bancoposta_idx[0]
+        return bool(q_bp) and 0 <= i_bp < len(q_bp)
+
+    def _ver_ver_amt_entry_raw_valid() -> bool:
+        """Importo pronto per uscire dal campo (Enter / focus): non vuoto, non solo segno, normalizzabile; in manuale anche +/− iniziale."""
+        raw = (ver_inp_amt_var.get() or "").strip()
+        if not raw or raw in ("+", "-"):
+            return False
+        if not _ver_pdf_line_active_for_amt():
+            if not raw.startswith(("+", "-")):
+                return False
+        try:
+            normalize_euro_input(raw)
+        except Exception:
+            return False
+        return True
+
+    def _ver_on_amt_enter(_e: object = None) -> str | None:
+        if _ver_candidate_pick_ui_active():
+            return "break"
+        raw = (ver_inp_amt_var.get() or "").strip()
+        if not _ver_ver_amt_entry_raw_valid():
+            messagebox.showwarning("Verifica", _VER_AMT_FOCUS_MSG, parent=verifica_frame)
+            try:
+                ver_ent_amt.focus_set()
+                ver_ent_amt.icursor(tk.END)
+            except tk.TclError:
+                pass
+            return "break"
+        try:
+            val = normalize_euro_input(raw)
+            formatted = format_euro_it(val)
+            if val >= 0 and not formatted.startswith("+"):
+                formatted = "+" + formatted
+            ver_inp_amt_var.set(formatted)
+        except InvalidOperation:
+            messagebox.showerror("Verifica", _VER_AMT_FOCUS_MSG, parent=verifica_frame)
+            try:
+                ver_ent_amt.focus_set()
+                ver_ent_amt.icursor(tk.END)
+            except tk.TclError:
+                pass
+            return "break"
+        except Exception:
+            messagebox.showerror("Verifica", "Importo non valido.", parent=verifica_frame)
+            try:
+                ver_ent_amt.focus_set()
+                ver_ent_amt.icursor(tk.END)
+            except tk.TclError:
+                pass
+            return "break"
+        ver_status_var.set("")
+        ver_ent_chq.focus_set()
+        _ver_update_submit_visibility()
+        return "break"
+
+    def _ver_widget_or_ancestor_is(w: tk.Misc | None, target: tk.Misc) -> bool:
+        p: tk.Misc | None = w
+        while p is not None:
+            if p is target:
+                return True
+            try:
+                p = p.master  # type: ignore[assignment]
+            except Exception:
+                break
+        return False
+
+    def _ver_on_amt_focusout(_e: tk.Event) -> None:
+        if ver_amt_focusout_guard[0]:
+            return
+        if _ver_candidate_pick_ui_active():
+            return
+        if not ver_session_active[0]:
+            return
+        if not (
+            bool(str(ver_work_frame.winfo_manager() or "").strip()) or _ver_ui_on_results_page()
+        ):
+            return
+
+        def _check() -> None:
+            if ver_amt_focusout_suppress_once[0]:
+                ver_amt_focusout_suppress_once[0] = False
+                return
+            if ver_amt_focusout_guard[0]:
+                return
+            if _ver_ver_amt_entry_raw_valid():
+                return
+            try:
+                fg = verifica_frame.focus_get()
+            except Exception:
+                fg = None
+            if fg is None or fg is ver_ent_amt:
+                return
+            if not _ver_widget_or_ancestor_is(fg, verifica_frame):
+                return
+            if fg in (ver_ent_chq, ver_ent_note):
+                return
+            if _ver_widget_or_ancestor_is(fg, ver_btn_end):
+                return
+            if _ver_widget_or_ancestor_is(fg, ver_btn_verifica):
+                return
+            if _ver_widget_or_ancestor_is(fg, ver_input_actions):
+                return
+            if _ver_widget_or_ancestor_is(fg, ver_pending_btns):
+                return
+            if _ver_widget_or_ancestor_is(fg, ver_pending_host) and not _ver_widget_or_ancestor_is(
+                fg, ver_input_frame
+            ):
+                return
+            if _ver_widget_or_ancestor_is(fg, ver_results_btns):
+                return
+            if _ver_widget_or_ancestor_is(fg, ver_unver_correzione_row):
+                return
+            ver_amt_focusout_guard[0] = True
+            try:
+                messagebox.showwarning("Verifica", _VER_AMT_FOCUS_MSG, parent=verifica_frame)
+            finally:
+                ver_amt_focusout_guard[0] = False
+            try:
+                ver_ent_amt.focus_set()
+                ver_ent_amt.icursor(tk.END)
+            except tk.TclError:
+                pass
+
+        try:
+            verifica_frame.after_idle(_check)
+        except tk.TclError:
+            pass
+
+    bind_return_and_kp_enter(ver_ent_amt, _ver_on_amt_enter)
+    ver_ent_amt.bind("<FocusOut>", _ver_on_amt_focusout, add="+")
+
+    def _ver_apply_sign(sign: str) -> None:
+        raw = (ver_inp_amt_var.get() or "").strip()
+        if not raw or raw in ("+", "-"):
+            ver_inp_amt_var.set(sign)
+        else:
+            if raw.startswith(("+", "-")):
+                raw = raw[1:]
+            ver_inp_amt_var.set(sign + raw)
+        try:
+            ver_ent_amt.icursor(tk.END)
+        except Exception:
+            pass
+
+    ver_btn_plus.bind("<Button-1>", lambda _e: _ver_apply_sign("+"))
+    ver_btn_minus.bind("<Button-1>", lambda _e: _ver_apply_sign("-"))
+
+    tk.Label(ver_input_frame, text="Assegno", font=_ver_ui_font, bg=_VER_BG).grid(
+        row=0, column=4, sticky="w", padx=(0, 6), pady=2
+    )
+    ver_ent_chq = ttk.Entry(ver_input_frame, textvariable=ver_inp_chq_var, width=12, style="NewReg.TEntry")
+    ver_ent_chq.grid(row=0, column=5, sticky="w", padx=(0, 16), pady=2)
+
+    tk.Label(ver_input_frame, text="Nota", font=_ver_ui_font, bg=_VER_BG).grid(
+        row=0, column=6, sticky="w", padx=(0, 6), pady=2
+    )
+    ver_ent_note = ttk.Entry(ver_input_frame, textvariable=ver_inp_note_var, width=28, style="NewReg.TEntry")
+    ver_ent_note.grid(row=0, column=7, sticky="w", padx=(0, 8), pady=2)
+
+    def _ver_on_chq_enter(_e: object = None) -> str | None:
+        if _ver_candidate_pick_ui_active():
+            return "break"
+        chq = ver_inp_chq_var.get().strip()
+        note = ver_inp_note_var.get().strip()
+        q_bp = ver_bancoposta_queue[0]
+        i_bp = ver_bancoposta_idx[0]
+        pdf_line = bool(q_bp) and 0 <= i_bp < len(q_bp)
+        if not chq:
+            ver_ent_note.focus_set()
+            return "break"
+        if note:
+            if pdf_line:
+                ver_inp_chq_var.set("")
+            else:
+                ver_inp_note_var.set("")
+        _ver_on_submit()
+        return "break"
+
+    def _ver_on_note_enter(_e: object = None) -> str | None:
+        if _ver_candidate_pick_ui_active():
+            return "break"
+        note = ver_inp_note_var.get().strip()
+        chq = ver_inp_chq_var.get().strip()
+        q_bp = ver_bancoposta_queue[0]
+        i_bp = ver_bancoposta_idx[0]
+        pdf_line = bool(q_bp) and 0 <= i_bp < len(q_bp)
+        if not note:
+            ver_ent_chq.focus_set()
+            return "break"
+        if chq:
+            ver_inp_chq_var.set("")
+        _ver_on_submit()
+        return "break"
+
+    bind_return_and_kp_enter(ver_ent_chq, _ver_on_chq_enter)
+    bind_return_and_kp_enter(ver_ent_note, _ver_on_note_enter)
+
+    ver_input_actions = tk.Frame(ver_input_frame, bg=_VER_BG, highlightthickness=0)
+    ver_input_actions.grid(row=0, column=8, columnspan=3, sticky="w", padx=(8, 0), pady=2)
+
+    ver_btn_end = tk.Label(
+        ver_input_actions,
+        text="Termina immissione",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=12,
+        pady=4,
+        bg="#c62828",
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+        takefocus=1,
+    )
+    ver_btn_end.pack(side=tk.RIGHT, padx=(12, 0))
+
+    # Pagina immissione (sessione): come prima, ma evidenziato in verde (stesso ingombro dei tasti griglia).
+    ver_btn_verifica = tk.Label(
+        ver_input_actions,
+        text="Verifica",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=12,
+        pady=4,
+        bg=_VER_PENDING_BTN_NEW_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+        takefocus=1,
+    )
+
+    # Pagina risultati (nuovo dato): dopo i campi, prima di «Chiudi».
+    ver_btn_immetti = tk.Label(
+        ver_input_actions,
+        text="Immetti dato di verifica",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=12,
+        pady=4,
+        bg="#fdd835",
+        fg="#1a1a1a",
+        relief=tk.RAISED,
+        bd=1,
+        takefocus=1,
+    )
+
+    ver_btn_cancel_immissione = tk.Label(
+        ver_input_actions,
+        text="Chiudi",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=12,
+        pady=4,
+        bg=_VER_PENDING_BTN_EDIT_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+        takefocus=1,
+    )
+
+    ver_btn_resume_immissione = ttk.Button(
+        ver_input_actions,
+        text="Riprendi immissione",
+        style="NewReg.TButton",
+    )
+    try:
+        ver_btn_resume_immissione.pack_forget()
+    except tk.TclError:
+        pass
+
+    def _ver_hide_resume_immissione_btn() -> None:
+        try:
+            ver_btn_resume_immissione.pack_forget()
+        except tk.TclError:
+            pass
+
+    def _ver_on_resume_immissione_click() -> None:
+        """Dopo annullamento saldo: chiude il messaggio guida e nasconde «Riprendi immissione» (i campi restano attivi)."""
+        ver_status_var.set("")
+        _ver_hide_resume_immissione_btn()
+        try:
+            ver_ent_amt.focus_set()
+        except tk.TclError:
+            pass
+
+    ver_btn_resume_immissione.configure(command=_ver_on_resume_immissione_click)
+
+    def _ver_chq_or_note_nonempty_for_submit() -> bool:
+        return bool(ver_inp_chq_var.get().strip()) or bool(ver_inp_note_var.get().strip())
+
+    def _ver_update_submit_visibility(_e: object = None) -> None:
+        q_bp = ver_bancoposta_queue[0]
+        i_bp = ver_bancoposta_idx[0]
+        if bool(q_bp) and 0 <= i_bp < len(q_bp):
+            try:
+                ver_btn_verifica.pack_forget()
+            except tk.TclError:
+                pass
+            try:
+                ver_btn_immetti.pack_forget()
+            except tk.TclError:
+                pass
+            try:
+                ver_btn_cancel_immissione.pack_forget()
+            except tk.TclError:
+                pass
+            return
+        on_res = _ver_ui_on_results_page()
+        try:
+            if on_res:
+                try:
+                    ver_btn_verifica.pack_forget()
+                except tk.TclError:
+                    pass
+                if ver_results_new_data_visible[0]:
+                    if _ver_ver_amt_entry_raw_valid() and _ver_chq_or_note_nonempty_for_submit():
+                        ver_btn_immetti.pack(side=tk.LEFT, padx=(0, 8))
+                    else:
+                        ver_btn_immetti.pack_forget()
+                    ver_btn_cancel_immissione.pack(side=tk.LEFT, padx=(0, 8))
+                else:
+                    ver_btn_immetti.pack_forget()
+                    ver_btn_cancel_immissione.pack_forget()
+            else:
+                ver_btn_immetti.pack_forget()
+                ver_btn_cancel_immissione.pack_forget()
+                ver_btn_verifica.pack(side=tk.LEFT, padx=(0, 8))
+        except tk.TclError:
+            pass
+        try:
+            ver_input_actions.update_idletasks()
+        except tk.TclError:
+            pass
+
+    def _ver_reset_ver_entry_form() -> None:
+        """Azzera importo / assegno / nota dopo una verifica (immissione manuale o fine riga PDF)."""
+        ver_inp_amt_var.set("-")
+        ver_inp_chq_var.set("")
+        ver_inp_note_var.set("")
+        _ver_update_submit_visibility()
+
+    ver_inp_amt_var.trace_add("write", lambda *_a: _ver_update_submit_visibility())
+    ver_inp_chq_var.trace_add("write", lambda *_a: _ver_update_submit_visibility())
+    ver_inp_note_var.trace_add("write", lambda *_a: _ver_update_submit_visibility())
+
+    ver_status_var = tk.StringVar(value="")
+    ver_status_lbl = tk.Label(
+        ver_work_frame,
+        textvariable=ver_status_var,
+        font=("TkDefaultFont", 13, "bold"),
+        bg=_VER_BG,
+        fg="#555555",
+        anchor="w",
+    )
+    ver_status_lbl.pack(fill=tk.X, pady=(0, 2))
+
+    def _ver_candidate_pick_ui_active() -> bool:
+        try:
+            return bool(ver_cand_frame.winfo_ismapped())
+        except tk.TclError:
+            return False
+
+    def _ver_set_ver_input_candidate_readonly(readonly: bool) -> None:
+        st = "readonly" if readonly else "normal"
+        for w in (ver_ent_amt, ver_ent_chq, ver_ent_note):
+            try:
+                w.configure(state=st)
+            except tk.TclError:
+                pass
+
+    # --- griglia candidati per verifica manuale ---
+    ver_cand_frame = tk.Frame(ver_work_frame, bg=_VER_BG, highlightthickness=0)
+    ver_cand_title_var = tk.StringVar(value="")
+    tk.Label(
+        ver_cand_frame,
+        textvariable=ver_cand_title_var,
+        font=_ver_cand_promo_font,
+        bg=_VER_BG,
+        fg="#111111",
+        anchor="w",
+    ).pack(fill=tk.X, pady=(0, 4))
+    ver_cand_dato_var = tk.StringVar(value="")
+    tk.Label(
+        ver_cand_frame,
+        textvariable=ver_cand_dato_var,
+        font=_ver_cand_promo_font,
+        bg=_VER_BG,
+        fg="#111111",
+        anchor="nw",
+        justify=tk.LEFT,
+        wraplength=0,
+    ).pack(fill=tk.X, pady=(0, 8))
+    ver_cand_tree_frame = tk.Frame(ver_cand_frame, bg=_VER_BG, highlightthickness=0)
+    ver_cand_tree_frame.pack(fill=tk.X, pady=(0, 4))
+    _ver_cand_cols = ("reg", "date", "category", "account", "amount", "cheque", "note")
+    ver_cand_tree = ttk.Treeview(
+        ver_cand_tree_frame, columns=_ver_cand_cols, show="headings", height=6,
+        style="MovGrid.Treeview", selectmode="browse",
+    )
+    ver_cand_tree.heading("reg", text="#", anchor="w")
+    ver_cand_tree.heading("date", text="Data", anchor="w")
+    ver_cand_tree.heading("category", text="Categoria", anchor="w")
+    ver_cand_tree.heading("account", text="Conto", anchor="w")
+    ver_cand_tree.heading("amount", text="Importo", anchor="e")
+    ver_cand_tree.heading("cheque", text="Assegno", anchor="w")
+    ver_cand_tree.heading("note", text="Nota", anchor="w")
+    ver_cand_tree.column("reg", width=50, anchor="w")
+    ver_cand_tree.column("date", width=80, anchor="w")
+    ver_cand_tree.column("category", width=140, anchor="w")
+    ver_cand_tree.column("account", width=110, anchor="w")
+    ver_cand_tree.column("amount", width=100, anchor="e")
+    ver_cand_tree.column("cheque", width=80, anchor="w")
+    ver_cand_tree.column("note", width=200, anchor="w")
+    ver_cand_scroll = ttk.Scrollbar(ver_cand_tree_frame, orient="vertical", command=ver_cand_tree.yview)
+    ver_cand_tree.configure(yscrollcommand=ver_cand_scroll.set)
+    ver_cand_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    ver_cand_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+    _ver_configure_ver_tree_amount_tags(ver_cand_tree)
+
+    ver_cand_btns = tk.Frame(ver_cand_frame, bg=_VER_BG, highlightthickness=0)
+    ver_cand_btns.pack(fill=tk.X, pady=(0, 4))
+    ver_btn_cand_confirm = ttk.Button(
+        ver_cand_btns,
+        text="Conferma verifica della registrazione selezionata",
+        style="NewReg.TButton",
+    )
+    ver_btn_cand_confirm.pack(side=tk.LEFT, padx=(0, 8))
+    ver_btn_cand_none = ttk.Button(ver_cand_btns, text="Nessuna corrispondenza", style="NewReg.TButton")
+    ver_btn_cand_none.pack(side=tk.LEFT)
+
+    ver_cand_candidates: list[list[tuple[int, dict]]] = [[]]
+    ver_cand_pending_item: list[dict | None] = [None]
+    # True solo se _ver_show_candidates ha nascosto ver_input_frame (evita pack errati in _ver_hide_candidates).
+    ver_input_hidden_for_candidate_pick: list[bool] = [False]
+
+    def _ver_cand_title_extra(chq_raw: str, note_raw: str) -> str:
+        parts: list[str] = []
+        for raw, label in ((chq_raw, "assegno"), (note_raw, "nota")):
+            t = " ".join((raw or "").strip().split())
+            if not t:
+                continue
+            if len(t) > 72:
+                t = t[:71] + "…"
+            parts.append(f"{label} «{t}»")
+        return (" — " + " — ".join(parts)) if parts else ""
+
+    def _ver_show_candidates(
+        amt: Decimal,
+        chq: str,
+        note: str,
+        candidates: list[tuple[int, dict]],
+        *,
+        pdf_booking_date: str = "",
+        pdf_note_full: str = "",
+    ) -> None:
+        ver_cand_candidates[0] = candidates
+        pend: dict = {"amount": _ver_amount_storage_str(amt), "cheque": chq, "note": note}
+        bd0 = (pdf_booking_date or "").strip()
+        if bd0:
+            pend["booking_date"] = bd0
+        ver_cand_pending_item[0] = pend
+        n_c = len(candidates)
+        reg_txt = "1 registrazione" if n_c == 1 else f"{n_c} registrazioni"
+        amt_txt = format_euro_it(amt)
+        if amt >= 0 and not amt_txt.startswith("+"):
+            amt_txt = "+" + amt_txt
+        ver_cand_title_var.set(
+            f"Importo da verificare di € {amt_txt}{_ver_cand_title_extra(chq, note)} trovato in {reg_txt}."
+        )
+        parts2: list[str] = []
+        bd = (pdf_booking_date or "").strip()
+        if bd:
+            parts2.append(f"Data: {bd}")
+        cq = (chq or "").strip()
+        if cq:
+            parts2.append(f"Assegno: {cq}")
+        nd_raw = (pdf_note_full or note or "").strip()
+        nd_one = " ".join(nd_raw.split()) if nd_raw else ""
+        if nd_one:
+            parts2.append(f"Nota: {nd_one}")
+        ver_cand_dato_var.set(" — ".join(parts2) if parts2 else "")
+        d = cur_db()
+        acc_by_year = year_accounts_map(d)
+        cat_by_year = year_categories_map(d)
+        ver_cand_tree.delete(*ver_cand_tree.get_children())
+        acc_code_c = ver_account_code_var.get().strip()
+        for i, (reg_n, rec) in enumerate(candidates[:20]):
+            y_acc = acc_by_year.get(rec.get("year"), [])
+            y_cat = cat_by_year.get(rec.get("year"), [])
+            cat_name = category_name_for_record(rec, y_cat)
+            _tc, side_c = _ver_record_touches_account(rec, acc_code_c)
+            side_disp = side_c if _tc else "primary"
+            acc_name = account_name_for_record(rec, y_acc, side_disp)
+            amount_text, tone = format_amount_for_verification_account(rec, side=side_disp)
+            amt_tag = "ver_amt_neg" if tone == "neg" else "ver_amt_pos"
+            ver_cand_tree.insert(
+                "",
+                "end",
+                iid=str(i),
+                values=(
+                    str(reg_n),
+                    to_italian_date(str(rec.get("date_iso", ""))),
+                    cat_name,
+                    acc_name,
+                    amount_text,
+                    str(rec.get("cheque") or ""),
+                    str(rec.get("note") or ""),
+                ),
+                tags=(amt_tag,),
+            )
+        try:
+            ver_btn_verifica.pack_forget()
+        except tk.TclError:
+            pass
+        try:
+            ver_btn_immetti.pack_forget()
+        except tk.TclError:
+            pass
+        try:
+            ver_btn_cancel_immissione.pack_forget()
+        except tk.TclError:
+            pass
+        try:
+            if str(ver_input_frame.winfo_manager() or "").strip():
+                ver_input_frame.pack_forget()
+                ver_input_hidden_for_candidate_pick[0] = True
+        except tk.TclError:
+            pass
+        ver_cand_frame.pack(fill=tk.X, pady=(4, 0), in_=ver_work_frame, after=ver_status_lbl)
+        _ver_place_pending_host()
+
+    def _ver_hide_candidates() -> None:
+        ver_cand_frame.pack_forget()
+        _ver_set_ver_input_candidate_readonly(False)
+        if ver_input_hidden_for_candidate_pick[0]:
+            ver_input_hidden_for_candidate_pick[0] = False
+            try:
+                if ver_session_active[0] and bool(str(ver_work_frame.winfo_manager() or "").strip()):
+                    ver_input_frame.pack(fill=tk.X, pady=(0, 4), in_=ver_work_frame, before=ver_status_lbl)
+            except tk.TclError:
+                pass
+        ver_cand_candidates[0] = []
+        ver_cand_pending_item[0] = None
+        ver_cand_title_var.set("")
+        ver_cand_dato_var.set("")
+        _ver_update_submit_visibility()
+        _ver_update_pending_action_buttons_visibility()
+        _ver_place_pending_host()
+
+    def _ver_on_cand_confirm() -> None:
+        sel = ver_cand_tree.selection()
+        if not sel:
+            ver_status_var.set("Seleziona una registrazione nella griglia candidati.")
+            return
+        try:
+            idx = int(sel[0])
+        except (ValueError, IndexError):
+            return
+        cands = ver_cand_candidates[0]
+        if idx < 0 or idx >= len(cands):
+            return
+        chosen_rec = cands[idx][1]
+        acc_code = ver_account_code_var.get()
+        _touches, side = _ver_record_touches_account(chosen_rec, acc_code)
+        _ver_mark_record_verified(chosen_rec, side)
+        persist_db_after_edit(None)
+        _movements_dirty[0] = True
+        pend = ver_cand_pending_item[0] or {}
+        log_row = {k: v for k, v in pend.items() if k != "verified"}
+        log_row["verified"] = True
+        ver_pending_items[0].append(log_row)
+        _ver_refresh_pending_tree()
+        try:
+            amt_ok = Decimal(str(pend.get("amount", "0")))
+        except Exception:
+            amt_ok = Decimal("0")
+        q_bp0 = ver_bancoposta_queue[0]
+        i_bp0 = ver_bancoposta_idx[0]
+        pdf_here = bool(q_bp0) and 0 <= i_bp0 < len(q_bp0)
+        if pdf_here:
+            ver_status_var.set(
+                f"Estratto PDF: registrazione n. {cands[idx][0]} verificata "
+                f"({_ver_amount_label_for_popup(amt_ok)})."
+            )
+        else:
+            ver_manual_any_amount_submitted[0] = True
+            ver_status_var.set(f"Registrazione verificata manualmente (reg. {cands[idx][0]}).")
+        _ver_hide_candidates()
+        _ver_bancoposta_advance_after_line_done(verified=True)
+        if not pdf_here:
+            _ver_reset_ver_entry_form()
+            ver_ent_amt.focus_set()
+
+    def _ver_on_cand_none() -> None:
+        q_bp0 = ver_bancoposta_queue[0]
+        i_bp0 = ver_bancoposta_idx[0]
+        pdf_here = bool(q_bp0) and 0 <= i_bp0 < len(q_bp0)
+        item = ver_cand_pending_item[0]
+        if item is not None:
+            row = dict(item)
+            row["verified"] = False
+            ver_pending_items[0].append(row)
+            _ver_refresh_pending_tree()
+            ver_status_var.set("Nessuna registrazione autorizzata. Dato aggiunto ai sospesi.")
+            try:
+                amt_bad = Decimal(str(item.get("amount", "0")))
+            except Exception:
+                amt_bad = Decimal("0")
+            if not pdf_here:
+                ver_status_var.set(
+                    f"Nessuna corrispondenza autorizzata per {_ver_amount_label_for_popup(amt_bad)} — dato in sospeso."
+                )
+            else:
+                ver_status_var.set(
+                    f"Estratto PDF: nessuna corrispondenza autorizzata — "
+                    f"{_ver_amount_label_for_popup(amt_bad)} in sospeso."
+                )
+        else:
+            ver_status_var.set("")
+        _ver_hide_candidates()
+        if bool(q_bp0) and 0 <= i_bp0 < len(q_bp0):
+            _ver_bancoposta_advance_after_line_done(verified=False)
+        else:
+            ver_ent_amt.focus_set()
+        if not pdf_here:
+            _ver_reset_ver_entry_form()
+            ver_ent_amt.focus_set()
+
+    ver_btn_cand_confirm.configure(command=_ver_on_cand_confirm)
+    ver_btn_cand_none.configure(command=_ver_on_cand_none)
+
+    # --- elenco dati di verifica di sessione (stesso blocco in lavorazione o in pagina risultati) ---
+    ver_pending_lbl = tk.Label(
+        ver_pending_host,
+        text="Dati di verifica in sospeso",
+        font=_ver_ui_font_b,
+        bg=_VER_BG,
+        fg="#1a1a1a",
+        anchor="w",
+    )
+    ver_pending_lbl.pack(fill=tk.X, pady=(4, 0))
+
+    ver_pending_tree_frame = tk.Frame(ver_pending_host, bg=_VER_BG, highlightthickness=0)
+    ver_pending_tree_frame.configure(height=242)
+    ver_pending_tree_frame.pack_propagate(False)
+    ver_pending_tree_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+    ver_pending_tree = ttk.Treeview(
+        ver_pending_tree_frame,
+        columns=("date", "amount", "cheque", "note", "stato"),
+        show="headings",
+        height=8,
+        style="VerRes.Treeview",
+    )
+    ver_pending_tree.heading("date", text="Data", anchor="w")
+    ver_pending_tree.heading("amount", text="Importo", anchor="e")
+    ver_pending_tree.heading("cheque", text="Assegno", anchor="w")
+    ver_pending_tree.heading("note", text="Nota", anchor="w")
+    ver_pending_tree.heading("stato", text="Stato", anchor="w")
+    ver_pending_tree.column("date", width=62, anchor="w", stretch=False, minwidth=52)
+    ver_pending_tree.column("amount", width=78, anchor="e", stretch=False, minwidth=64)
+    ver_pending_tree.column("cheque", width=56, anchor="w", stretch=False, minwidth=44)
+    ver_pending_tree.column("note", width=120, anchor="w", stretch=True, minwidth=72)
+    ver_pending_tree.column("stato", width=72, anchor="w", stretch=False, minwidth=56)
+    _ver_configure_ver_tree_amount_tags(ver_pending_tree)
+    try:
+        ver_pending_tree.tag_configure("ver_sess_ok", background="#e8f5e9")
+        ver_pending_tree.tag_configure("ver_sess_sosp", background=_VER_BG)
+        ver_pending_tree.tag_configure("ver_sess_pdf", background="#fff8e1")
+    except tk.TclError:
+        pass
+    ver_pend_scroll = ttk.Scrollbar(ver_pending_tree_frame, orient="vertical", command=ver_pending_tree.yview)
+    ver_pending_tree.configure(yscrollcommand=ver_pend_scroll.set)
+    ver_pending_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    ver_pend_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+    ver_pending_btns = tk.Frame(ver_pending_host, bg=_VER_BG, highlightthickness=0)
+    ver_pending_btns.pack(fill=tk.X, pady=(0, 4))
+    ver_btn_new_ver_data = tk.Label(
+        ver_pending_btns,
+        text="Nuovo dato di verifica",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=12,
+        pady=4,
+        bg=_VER_PENDING_BTN_NEW_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    ver_btn_edit_pending = tk.Label(
+        ver_pending_btns,
+        text="Modifica dato di verifica",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=12,
+        pady=4,
+        bg=_VER_PENDING_BTN_EDIT_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    ver_btn_del_pending = tk.Label(
+        ver_pending_btns,
+        text="Elimina dato di verifica",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=10,
+        pady=4,
+        bg=_VER_PENDING_BTN_DEL_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    ver_btn_annulla_sel_pending = tk.Label(
+        ver_pending_btns,
+        text="Annulla selezione",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=10,
+        pady=4,
+        bg=_VER_PENDING_BTN_CLEARSEL_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+
+    # --- risultati: registrazioni non verificate ---
+    ver_results_title = tk.Label(ver_results_frame, text="", font=_ver_ui_font_b, bg=_VER_BG, fg="#1a1a1a",
+                                  anchor="w")
+    ver_all_verified_lbl = tk.Label(
+        ver_results_frame,
+        text="",
+        font=_ver_ui_font_b,
+        bg=_VER_BG,
+        fg="#2e7d32",
+        anchor="w",
+        justify="left",
+    )
+    # Pagina risultati: messaggio al posto della griglia «dati in sospeso» quando non ce ne sono.
+    ver_results_pending_empty_lbl = tk.Label(
+        ver_results_frame,
+        text="",
+        font=_ver_ui_font,
+        bg=_VER_BG,
+        fg="#555555",
+        anchor="w",
+        justify=tk.LEFT,
+    )
+
+    ver_unver_tree_frame = tk.Frame(ver_results_frame, bg=_VER_BG, highlightthickness=0)
+    ver_unver_tree_frame.configure(height=254)
+    ver_unver_tree_frame.pack_propagate(False)
+    ver_unver_tree_frame.columnconfigure(0, weight=1)
+    ver_unver_tree_frame.columnconfigure(1, weight=0)
+    ver_unver_tree_frame.rowconfigure(0, weight=1)
+    # Due Treeview: i tag colore in ttk valgono per riga intera (come in Movimenti); l'importo è in colonna dedicata.
+    _ver_unv_main_cols = ("reg", "date", "category", "account", "cheque", "note", "period")
+    ver_unver_tree = ttk.Treeview(
+        ver_unver_tree_frame,
+        columns=_ver_unv_main_cols,
+        show="headings",
+        height=8,
+        style="VerRes.Treeview",
+    )
+    ver_unver_tree.heading("reg", text="#", anchor="w")
+    ver_unver_tree.heading("date", text="Data", anchor="w")
+    ver_unver_tree.heading("category", text="Categoria", anchor="w")
+    ver_unver_tree.heading("account", text="Conto", anchor="w")
+    ver_unver_tree.heading("cheque", text="Assegno", anchor="w")
+    ver_unver_tree.heading("note", text="Nota", anchor="w")
+    ver_unver_tree.heading("period", text="Entro il periodo", anchor="center")
+    ver_unver_tree.column("reg", width=48, anchor="w", stretch=False, minwidth=40)
+    ver_unver_tree.column("date", width=78, anchor="w", stretch=False, minwidth=64)
+    ver_unver_tree.column("category", width=88, anchor="w", stretch=False, minwidth=64)
+    ver_unver_tree.column("account", width=78, anchor="w", stretch=False, minwidth=56)
+    ver_unver_tree.column("cheque", width=48, anchor="w", stretch=False, minwidth=40)
+    ver_unver_tree.column("note", width=220, anchor="w", stretch=True, minwidth=100)
+    ver_unver_tree.column("period", width=120, anchor="center", stretch=False, minwidth=96)
+
+    ver_unver_amt_tree = ttk.Treeview(
+        ver_unver_tree_frame,
+        columns=("amount_eur",),
+        show="headings",
+        height=8,
+        style="VerRes.Treeview",
+    )
+    ver_unver_amt_tree.heading("amount_eur", text="Importo", anchor="e")
+    ver_unver_amt_tree.column("amount_eur", width=118, anchor="e", stretch=False, minwidth=92)
+
+    _ver_unv_yscroll_lock: list[bool] = [False]
+
+    def _ver_unv_scroll_command(*args: object) -> None:
+        ver_unver_tree.yview(*args)
+        ver_unver_amt_tree.yview(*args)
+
+    ver_unv_scroll = ttk.Scrollbar(ver_unver_tree_frame, orient="vertical", command=_ver_unv_scroll_command)
+
+    def _ver_unv_main_yscroll(first: str, last: str) -> None:
+        if _ver_unv_yscroll_lock[0]:
+            return
+        _ver_unv_yscroll_lock[0] = True
+        try:
+            ver_unv_scroll.set(first, last)
+            ver_unver_amt_tree.yview_moveto(float(first))
+        finally:
+            _ver_unv_yscroll_lock[0] = False
+
+    def _ver_unv_amt_yscroll(first: str, last: str) -> None:
+        if _ver_unv_yscroll_lock[0]:
+            return
+        _ver_unv_yscroll_lock[0] = True
+        try:
+            ver_unv_scroll.set(first, last)
+            ver_unver_tree.yview_moveto(float(first))
+        finally:
+            _ver_unv_yscroll_lock[0] = False
+
+    ver_unver_tree.configure(yscrollcommand=_ver_unv_main_yscroll)
+    ver_unver_amt_tree.configure(yscrollcommand=_ver_unv_amt_yscroll)
+
+    ver_unver_tree.grid(row=0, column=0, sticky="nsew")
+    ver_unver_amt_tree.grid(row=0, column=1, sticky="ns")
+    ver_unv_scroll.grid(row=0, column=2, sticky="ns")
+
+    _ver_configure_ver_tree_amount_tags(ver_unver_amt_tree)
+    try:
+        ver_unver_amt_tree.tag_configure("ver_amt_zero", foreground="#1a1a1a")
+    except tk.TclError:
+        pass
+    try:
+        ver_unver_tree.tag_configure("ver_uv_in_period", background="#fff8e1", foreground="#b71c1c")
+    except tk.TclError:
+        pass
+
+    _ver_unv_sel_lock: list[bool] = [False]
+
+    def _ver_unv_clear_sel(tv: ttk.Treeview) -> None:
+        for iid in tv.selection():
+            tv.selection_remove(iid)
+
+    def _ver_unv_sync_sel_from_main(_event: tk.Event | None = None) -> None:
+        if _ver_unv_sel_lock[0]:
+            return
+        _ver_unv_sel_lock[0] = True
+        try:
+            sel = ver_unver_tree.selection()
+            if sel:
+                if tuple(ver_unver_amt_tree.selection()) != sel:
+                    ver_unver_amt_tree.selection_set(*sel)
+            else:
+                if ver_unver_amt_tree.selection():
+                    _ver_unv_clear_sel(ver_unver_amt_tree)
+        finally:
+            _ver_unv_sel_lock[0] = False
+
+    def _ver_unv_sync_sel_from_amt(_event: tk.Event | None = None) -> None:
+        if _ver_unv_sel_lock[0]:
+            return
+        _ver_unv_sel_lock[0] = True
+        try:
+            sel = ver_unver_amt_tree.selection()
+            if sel:
+                if tuple(ver_unver_tree.selection()) != sel:
+                    ver_unver_tree.selection_set(*sel)
+            else:
+                if ver_unver_tree.selection():
+                    _ver_unv_clear_sel(ver_unver_tree)
+        finally:
+            _ver_unv_sel_lock[0] = False
+
+    def _ver_unv_on_mousewheel(event: tk.Event) -> str:
+        delta = 0
+        if hasattr(event, "delta") and event.delta:
+            delta = -1 if event.delta > 0 else 1
+        if delta:
+            ver_unver_tree.yview("scroll", str(delta), "units")
+        return "break"
+
+    for _ver_uv_tv in (ver_unver_tree, ver_unver_amt_tree):
+        _ver_uv_tv.bind("<MouseWheel>", _ver_unv_on_mousewheel)
+
+    def _ver_unver_autofit_key_columns() -> None:
+        """Larghezze #, Data, periodo, Importo in base a intestazioni e righe inserite."""
+        try:
+            f_txt = tkfont.Font(root, font=("TkDefaultFont", 10))
+        except Exception:
+            f_txt = None
+        if f_txt is None:
+            return
+        try:
+            period_hdr = str(ver_unver_tree.heading("period", "text") or "")
+        except Exception:
+            period_hdr = ""
+        if not period_hdr.strip():
+            period_hdr = "Entro il periodo"
+        reg_w = max(48, int(f_txt.measure("888888")) + 22)
+        date_w = max(78, int(f_txt.measure("88/88/8888")) + 22)
+        period_w = max(120, int(f_txt.measure(period_hdr)) + 32)
+        amt_w = max(118, int(f_txt.measure("+9.999.999,99 €")) + 24)
+        for iid in ver_unver_tree.get_children():
+            vals = ver_unver_tree.item(iid, "values")
+            if not vals or len(vals) < 2:
+                continue
+            reg_w = max(reg_w, int(f_txt.measure(str(vals[0]))) + 26)
+            date_w = max(date_w, int(f_txt.measure(str(vals[1]))) + 26)
+            if len(vals) > 6:
+                pcell = str(vals[6])
+                if pcell.strip():
+                    period_w = max(period_w, int(f_txt.measure(pcell)) + 28)
+        for iid in ver_unver_amt_tree.get_children():
+            av = ver_unver_amt_tree.item(iid, "values")
+            if av and av[0]:
+                amt_w = max(amt_w, int(f_txt.measure(str(av[0]))) + 28)
+        ver_unver_tree.column("reg", width=min(reg_w, 140), minwidth=40)
+        ver_unver_tree.column("date", width=min(date_w, 120), minwidth=64)
+        ver_unver_tree.column("period", width=min(period_w, 220), minwidth=96)
+        ver_unver_amt_tree.column("amount_eur", width=min(amt_w, 200), minwidth=92)
+
+    # Barra correzione registrazioni non verificate (stesse regole della pagina Movimenti).
+    _VER_CORR_BLUE = "#1565c0"
+    ver_unver_correzione_row = tk.Frame(ver_results_frame, bg=_VER_BG, highlightthickness=0)
+    ver_unver_btn_modifica_reg = tk.Label(
+        ver_unver_correzione_row,
+        text="Modifica registrazione",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=12,
+        pady=4,
+        bg=_VER_CORR_BLUE,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    ver_unver_lbl_correzione_msg = tk.Label(
+        ver_unver_correzione_row,
+        text="",
+        font=("TkDefaultFont", 11, "bold"),
+        fg="#b71c1c",
+        bg=_VER_BG,
+    )
+    ver_unver_btn_forza_verifica = tk.Label(
+        ver_unver_correzione_row,
+        text="Forzare la cancellazione della verifica",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=10,
+        pady=4,
+        bg="#ef6c00",
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    ver_unver_btn_elimina_reg = tk.Label(
+        ver_unver_correzione_row,
+        text="Elimina registrazione",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=10,
+        pady=4,
+        bg="#b71c1c",
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    ver_unver_correzione_forza_revealed: list[bool] = [False]
+    ver_unver_correzione_prev_key: list[str | None] = [None]
+
+    def _ver_unver_correzione_current_key_and_rec() -> tuple[str, dict] | None:
+        sel = ver_unver_tree.selection()
+        if not sel:
+            return None
+        pair = find_record_year_and_ref(cur_db(), sel[0])
+        if not pair:
+            return None
+        _yd, rec = pair
+        if not record_is_within_recent_mod_delete_window(rec):
+            return None
+        return (sel[0], rec)
+
+    def _ver_refresh_ver_unver_correction_bar(_event: tk.Event | None = None) -> None:
+        sel = ver_unver_tree.selection()
+        key = sel[0] if sel else None
+        if key != ver_unver_correzione_prev_key[0]:
+            ver_unver_correzione_forza_revealed[0] = False
+        ver_unver_correzione_prev_key[0] = key
+
+        want_forza = False
+        want_elimina = False
+        want_msg = False
+        want_modifica = False
+        has_verifica_flags = False
+        forza_ok_recency = False
+        cutoff_year = date.today().year - 1
+        msg_text = f"Registrazione non modificabile: data precedente al 01/01/{cutoff_year}."
+
+        if sel:
+            sk = sel[0]
+            pair = find_record_year_and_ref(cur_db(), sk)
+            if pair:
+                _yd, rec = pair
+                if record_has_account_verification_flags(rec):
+                    has_verifica_flags = True
+                forza_ok_recency = record_is_within_forza_verifica_recency(rec)
+                if not record_is_within_recent_mod_delete_window(rec):
+                    want_msg = True
+                else:
+                    want_modifica = True
+                    if record_contains_any_asterisk(rec):
+                        want_msg = True
+                        msg_text = "Registrazione verificata non cancellabile."
+
+        want_forza = (
+            has_verifica_flags
+            and want_modifica
+            and forza_ok_recency
+            and ver_unver_correzione_forza_revealed[0]
+        )
+        want_elimina = want_modifica and (not want_forza)
+        if sel:
+            pair = find_record_year_and_ref(cur_db(), sel[0])
+            if pair:
+                _yd, rec = pair
+                if record_contains_any_asterisk(rec):
+                    want_elimina = False
+
+        if (
+            sel
+            and ver_verifica_used_pdf_coda[0]
+            and _ver_ui_on_results_page()
+            and (want_modifica or want_forza or want_elimina)
+        ):
+            want_modifica = False
+            want_forza = False
+            want_elimina = False
+            want_msg = True
+            msg_text = (
+                "Con la verifica da estratto PDF (coda automatica), in questa schermata non è possibile modificare, "
+                "eliminare né forzare le registrazioni non verificate: usare la pagina immissione o terminare la sessione."
+            )
+
+        col = 1
+        if want_msg:
+            ver_unver_lbl_correzione_msg.configure(text=msg_text)
+            ver_unver_lbl_correzione_msg.grid(row=0, column=col, sticky="w", padx=(0, 12))
+            col += 1
+        else:
+            ver_unver_lbl_correzione_msg.grid_remove()
+
+        if want_modifica:
+            ver_unver_btn_modifica_reg.grid(row=0, column=col, sticky="w", padx=(0, 12))
+            col += 1
+        else:
+            ver_unver_btn_modifica_reg.grid_remove()
+
+        if want_forza:
+            ver_unver_btn_forza_verifica.grid(row=0, column=col, sticky="w", padx=(0, 12))
+            col += 1
+        else:
+            ver_unver_btn_forza_verifica.grid_remove()
+        if want_elimina:
+            ver_unver_btn_elimina_reg.grid(row=0, column=col, sticky="w", padx=(0, 12))
+        else:
+            ver_unver_btn_elimina_reg.grid_remove()
+
+    def _on_ver_unver_tree_select(_e: tk.Event | None = None) -> None:
+        _ver_unv_sync_sel_from_main()
+        _ver_refresh_ver_unver_correction_bar()
+
+    def _on_ver_unver_amt_select(_e: tk.Event | None = None) -> None:
+        _ver_unv_sync_sel_from_amt()
+        _ver_refresh_ver_unver_correction_bar()
+
+    ver_unver_tree.bind("<<TreeviewSelect>>", _on_ver_unver_tree_select)
+    ver_unver_amt_tree.bind("<<TreeviewSelect>>", _on_ver_unver_amt_select)
+
+    def _on_ver_unver_modifica_click(event: tk.Event) -> None:
+        on_modifica_reg_click_generic(
+            event,
+            get_cur=_ver_unver_correzione_current_key_and_rec,
+            refresh_bar=_ver_refresh_ver_unver_correction_bar,
+            forza_revealed_cell=ver_unver_correzione_forza_revealed,
+            menu_parent=ver_unver_correzione_row,
+        )
+
+    ver_unver_btn_modifica_reg.bind("<Button-1>", _on_ver_unver_modifica_click)
+    ver_unver_btn_forza_verifica.bind(
+        "<Button-1>",
+        lambda e: on_forza_verifica_click_generic(e, _ver_unver_correzione_current_key_and_rec),
+    )
+    ver_unver_btn_elimina_reg.bind(
+        "<Button-1>",
+        lambda e: on_elimina_reg_click_generic(e, _ver_unver_correzione_current_key_and_rec),
+    )
+
+    ver_summary_frame = tk.Frame(ver_summary_outer, bg=_VER_BG, highlightthickness=0)
+    _ver_sum_title_font = ("TkDefaultFont", 15, "bold")
+    _ver_sum_row_font = ("TkDefaultFont", 14)
+    _ver_sum_row_font_b = ("TkDefaultFont", 14, "bold")
+    _ver_sum_amt_font = ("TkFixedFont", 14)
+    _ver_sum_amt_font_b = ("TkFixedFont", 14, "bold")
+    _ver_sum_verdict_font = ("TkDefaultFont", 16, "bold")
+    _ver_sum_sess_ok_font = ("TkDefaultFont", 14)
+    ver_sess_all_matched_lbl = tk.Label(
+        ver_summary_frame,
+        text="",
+        font=_ver_sum_sess_ok_font,
+        bg=_VER_BG,
+        fg="#2e7d32",
+        anchor="w",
+        justify=tk.LEFT,
+    )
+    ver_summary_title_lbl = tk.Label(
+        ver_summary_frame,
+        text="Riepilogo",
+        font=_ver_sum_title_font,
+        bg=_VER_BG,
+        fg="#1a1a1a",
+        anchor="w",
+    )
+    ver_summary_title_lbl.pack(fill=tk.X, anchor="w", pady=(0, 1))
+    ver_summary_inner = tk.Frame(ver_summary_frame, bg=_VER_BG, highlightthickness=0)
+    ver_summary_inner.pack(fill=tk.X, anchor="w")
+    ver_verdict_lbl = tk.Label(
+        ver_summary_frame,
+        text="",
+        font=_ver_sum_verdict_font,
+        bg=_VER_BG,
+        anchor="w",
+        justify=tk.LEFT,
+    )
+    ver_verdict_lbl.pack(fill=tk.X, anchor="w", pady=(2, 1))
+    ver_summary_frame.grid(row=1, column=0, padx=2)
+
+    def _ver_fill_ver_results_summary() -> None:
+        for w in ver_summary_inner.winfo_children():
+            w.destroy()
+        n_sess_sosp = sum(1 for item in ver_pending_items[0] if not _ver_item_is_verified(item))
+        if n_sess_sosp == 0:
+            ver_sess_all_matched_lbl.configure(
+                text="Tutti i dati di verifica hanno trovato corrispondenza."
+            )
+            if not str(ver_sess_all_matched_lbl.winfo_manager() or "").strip():
+                ver_sess_all_matched_lbl.pack(
+                    fill=tk.X,
+                    anchor="w",
+                    pady=(0, 4),
+                    before=ver_summary_title_lbl,
+                )
+        else:
+            try:
+                ver_sess_all_matched_lbl.pack_forget()
+            except tk.TclError:
+                pass
+        pd = ver_print_data[0] or {}
+        current_balance = pd.get("current_balance", Decimal("0"))
+        count_unverified = int(pd.get("count_unverified", 0))
+        sum_unverified = pd.get("sum_unverified", Decimal("0"))
+        projected = pd.get("projected", Decimal("0"))
+        stmt_balance = pd.get("stmt_balance", Decimal("0"))
+        diff = pd.get("diff", Decimal("0"))
+        match_ok = bool(pd.get("match_ok", False))
+        rows = _ver_summary_row_definitions(
+            current_balance=current_balance,
+            count_unverified=count_unverified,
+            sum_unverified=sum_unverified,
+            projected=projected,
+            stmt_balance=stmt_balance,
+            diff=diff,
+        )
+        for i, (desc, val) in enumerate(rows):
+            is_diff = desc == "Differenza"
+            if is_diff:
+                amt_fg = _ver_summary_diff_line_color(match_ok)
+                df = _ver_sum_row_font_b
+                af = _ver_sum_amt_font_b
+                py = (1, 0)
+            else:
+                amt_fg = _ver_summary_amount_line_color(val)
+                df = _ver_sum_row_font
+                af = _ver_sum_amt_font
+                py = (0, 0)
+            tk.Label(
+                ver_summary_inner,
+                text=desc,
+                font=df,
+                bg=_VER_BG,
+                fg="#1a1a1a",
+                anchor="w",
+            ).grid(row=i, column=0, sticky="w", padx=(0, 6), pady=py)
+            tk.Label(
+                ver_summary_inner,
+                text=_ver_summary_signed_eur(val),
+                font=af,
+                bg=_VER_BG,
+                fg=amt_fg,
+                anchor="e",
+            ).grid(row=i, column=1, sticky="e", padx=(0, 0), pady=py)
+        ver_summary_inner.grid_columnconfigure(0, weight=0)
+        ver_summary_inner.grid_columnconfigure(1, weight=0)
+        if match_ok:
+            ver_verdict_lbl.configure(text="✓ Verifica coincidente", fg="#2e7d32")
+        else:
+            ver_verdict_lbl.configure(text="✗ Scostamento: sono necessari controlli", fg="#c62828")
+
+    def _ver_apply_edit_to_pending_item_index(idx: int) -> None:
+        if idx < 0 or idx >= len(ver_pending_items[0]):
+            return
+        item = ver_pending_items[0][idx]
+        from tkinter import simpledialog
+
+        changed_here = False
+        new_amt = simpledialog.askstring(
+            "Modifica importo",
+            f"Importo attuale: {item['amount']}\n"
+            "Usare + o − come in immissione verifica (es. −529,00 per uscita).",
+            initialvalue=item["amount"],
+            parent=verifica_frame,
+        )
+        if new_amt is not None:
+            try:
+                item["amount"] = _ver_amount_storage_str(normalize_euro_input(new_amt.strip()))
+                changed_here = True
+            except Exception:
+                messagebox.showerror("Verifica", "Importo non valido.", parent=verifica_frame)
+        new_chq = simpledialog.askstring(
+            "Modifica assegno",
+            f"Assegno attuale: {item.get('cheque', '')}",
+            initialvalue=item.get("cheque", ""),
+            parent=verifica_frame,
+        )
+        if new_chq is not None:
+            item["cheque"] = new_chq.strip()
+            changed_here = True
+        new_note = simpledialog.askstring(
+            "Modifica nota",
+            f"Nota attuale: {item.get('note', '')}",
+            initialvalue=item.get("note", ""),
+            parent=verifica_frame,
+        )
+        if new_note is not None:
+            item["note"] = new_note.strip()
+            changed_here = True
+        if changed_here:
+            item["verified"] = False
+        _ver_refresh_pending_tree()
+        try:
+            _ver_save_pending_to_db()
+        except Exception:
+            pass
+
+    ver_results_btns = tk.Frame(ver_results_footer_inner, bg=_VER_BG, highlightthickness=0)
+    ver_btn_print = tk.Label(
+        ver_results_btns,
+        text="Stampa risultati",
+        cursor="hand2",
+        highlightthickness=0,
+        font=_VER_ACTION_BTN_FONT,
+        padx=16,
+        pady=6,
+        bg=_VER_FOOT_PRINT_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    ver_btn_print.pack(side=tk.LEFT, padx=(0, 6))
+    ver_btn_new_cycle = tk.Label(
+        ver_results_btns,
+        text="Riavvia ricerca",
+        cursor="hand2",
+        highlightthickness=0,
+        font=_VER_ACTION_BTN_FONT,
+        padx=16,
+        pady=6,
+        bg=_VER_FOOT_CYCLE_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    ver_btn_close = tk.Label(
+        ver_results_btns,
+        text="Chiudi verifica",
+        cursor="hand2",
+        highlightthickness=0,
+        font=_VER_ACTION_BTN_FONT,
+        padx=16,
+        pady=6,
+        bg=_VER_FOOT_CLOSE_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    ver_btn_close.pack(side=tk.LEFT)
+
+    def _ver_suppress_next_amt_focusout_check(_e: object = None) -> None:
+        ver_amt_focusout_suppress_once[0] = True
+
+    def _ver_ui_on_results_page() -> bool:
+        """True se è attiva la pagina risultati (affidabile subito dopo pack, a differenza di winfo_ismapped)."""
+        try:
+            return bool(str(ver_results_frame.winfo_manager() or "").strip()) and not bool(
+                str(ver_work_frame.winfo_manager() or "").strip()
+            )
+        except tk.TclError:
+            return False
+
+    def _ver_pack_ver_results_footer() -> None:
+        """Deprecato: Riepilogo è a destra della griglia sospesi; tasti finali nel footer centrato (vedi _ver_show_results)."""
+        return
+
+    def _ver_pack_ver_input_in_work_frame() -> None:
+        """Riga importo/assegno/nota in immissione (con «Termina immissione»)."""
+        try:
+            ver_input_frame.pack_forget()
+        except tk.TclError:
+            pass
+        try:
+            ver_input_frame.pack(fill=tk.X, pady=(0, 4), in_=ver_work_frame, before=ver_status_lbl)
+        except tk.TclError:
+            pass
+        try:
+            ver_btn_end.pack(side=tk.RIGHT, padx=(12, 0))
+        except tk.TclError:
+            pass
+
+    def _ver_pack_ver_input_on_results_page() -> None:
+        """Risultati: dopo «Nuovo dato» la riga immissione sostituisce i tasti sotto la griglia sospesi (stesso spazio)."""
+        if not _ver_ui_on_results_page():
+            return
+        try:
+            ver_btn_end.pack_forget()
+        except tk.TclError:
+            pass
+        try:
+            ver_btn_resume_immissione.pack_forget()
+        except tk.TclError:
+            pass
+        try:
+            ver_input_frame.pack_forget()
+        except tk.TclError:
+            pass
+        if not ver_results_new_data_visible[0]:
+            try:
+                ver_pending_btns.pack(fill=tk.X, pady=(0, 4), in_=ver_pending_host, after=ver_pending_tree_frame)
+            except tk.TclError:
+                pass
+            _ver_update_submit_visibility()
+            _ver_update_pending_action_buttons_visibility()
+            return
+        try:
+            ver_pending_btns.pack_forget()
+        except tk.TclError:
+            pass
+        try:
+            ver_input_frame.pack(fill=tk.X, pady=(0, 4), in_=ver_pending_host, after=ver_pending_tree_frame)
+        except tk.TclError:
+            pass
+        _ver_update_submit_visibility()
+        _ver_update_pending_action_buttons_visibility()
+
+    def _ver_on_new_ver_data_click() -> None:
+        if not _ver_ui_on_results_page():
+            return
+        if ver_verifica_used_pdf_coda[0]:
+            return
+        ver_results_new_data_visible[0] = True
+        _ver_pack_ver_input_on_results_page()
+        try:
+            ver_ent_amt.focus_set()
+        except tk.TclError:
+            pass
+
+    ver_btn_new_ver_data.bind("<Button-1>", lambda _e: _ver_on_new_ver_data_click())
+
+    def _ver_on_cancel_results_input(_e: object = None) -> None:
+        if not _ver_ui_on_results_page():
+            return
+        ver_amt_focusout_suppress_once[0] = True
+        ver_results_new_data_visible[0] = False
+        ver_inp_amt_var.set("-")
+        ver_inp_chq_var.set("")
+        ver_inp_note_var.set("")
+        _ver_pack_ver_input_on_results_page()
+        try:
+            ver_btn_new_ver_data.focus_set()
+        except tk.TclError:
+            pass
+
+    def _ver_update_results_session_ui_visibility() -> None:
+        """«Riavvia ricerca» solo con dati di sessione in sospeso; griglia sessione in ver_pending_host."""
+        if not _ver_ui_on_results_page():
+            return
+        if _ver_count_pending_rows() == 0:
+            try:
+                ver_btn_new_cycle.pack_forget()
+            except tk.TclError:
+                pass
+            return
+        if not str(ver_btn_new_cycle.winfo_manager() or "").strip():
+            try:
+                ver_btn_new_cycle.pack(side=tk.LEFT, padx=(0, 8), before=ver_btn_close)
+            except tk.TclError:
+                pass
+
+    # Ordine verticale della pagina risultati: vedi _ver_show_results (compatto per schermi piccoli).
+    _ver_update_results_session_ui_visibility()
+
+    # ---- Helper: lista conti ammessi (no Cassa, no VIRTUALE) ----
+    def _ver_eligible_accounts() -> list[tuple[str, str]]:
+        d = cur_db()
+        if not d.get("years"):
+            return []
+        latest_year = max(y["year"] for y in d["years"])
+        year_data = next(y for y in d["years"] if y["year"] == latest_year)
+        out: list[tuple[str, str]] = []
+        for acc in year_data["accounts"]:
+            name = acc["name"].strip()
+            if name.lower() == "cassa" or _is_virtuale_account(name):
+                continue
+            out.append((name, str(acc.get("code", ""))))
+        return out
+
+    # ---- Helper: trova il codice numerico del conto dal nome ----
+    def _ver_account_code_for_name(name: str) -> str:
+        d = cur_db()
+        if not d.get("years"):
+            return ""
+        latest_year = max(y["year"] for y in d["years"])
+        year_data = next(y for y in d["years"] if y["year"] == latest_year)
+        for i, acc in enumerate(year_data["accounts"]):
+            if acc["name"].strip().lower() == name.strip().lower():
+                return str(i + 1)
+        return ""
+
+    def _ver_set_bancoposta_browse_enabled(en: bool) -> None:
+        ver_bancoposta_browse_enabled[0] = bool(en)
+        try:
+            if en:
+                ver_btn_bancoposta_browse.configure(
+                    cursor="hand2",
+                    bg=_VER_FOOT_PRINT_BG,
+                    fg="#ffffff",
+                )
+            else:
+                ver_btn_bancoposta_browse.configure(
+                    cursor="arrow",
+                    bg="#bdbdbd",
+                    fg="#e0e0e0",
+                )
+        except tk.TclError:
+            pass
+
+    def _ver_bancoposta_pdf_ui_locked() -> bool:
+        if ver_session_active[0] and ver_bancoposta_queue[0]:
+            return True
+        acc_name = ver_account_name_var.get().strip()
+        if not acc_name:
+            return False
+        acc_code = _ver_account_code_for_name(acc_name)
+        if not acc_code:
+            return False
+        saved = _ver_load_pending_from_db(acc_code)
+        return _ver_saved_has_bancoposta(saved)
+
+    def _ver_apply_bancoposta_pdf_lock_for_setup() -> None:
+        if _ver_bancoposta_pdf_ui_locked():
+            acc_name = ver_account_name_var.get().strip()
+            acc_code = _ver_account_code_for_name(acc_name) if acc_name else ""
+            saved = _ver_load_pending_from_db(acc_code) if acc_code else None
+            if saved and str(saved.get("bancoposta_pdf_path", "")).strip():
+                ps = str(saved.get("bancoposta_pdf_path", "")).strip()
+                if ver_bancoposta_pdf_var.get().strip() != ps:
+                    ver_bancoposta_pdf_var.set(ps)
+            try:
+                ver_bancoposta_entry.configure(state="readonly")
+            except tk.TclError:
+                pass
+            _ver_set_bancoposta_browse_enabled(False)
+        else:
+            try:
+                ver_bancoposta_entry.configure(state="normal")
+            except tk.TclError:
+                pass
+            _ver_set_bancoposta_browse_enabled(True)
+
+    def _ver_has_valid_cutoff_for_setup() -> bool:
+        raw = ver_cutoff_date_var.get().strip()
+        if not raw or raw == "__/__/____":
+            return False
+        try:
+            parse_italian_ddmmyyyy_to_iso(raw)
+            return True
+        except Exception:
+            return False
+
+    def _ver_setup_start_buttons_state(_e: object = None) -> None:
+        """Riga PDF e tasti coerenti con conto; i tasti di avvio solo con data di chiusura valida (salvo sessione salvata)."""
+        acc_name = ver_account_name_var.get().strip()
+        acc_code = _ver_account_code_for_name(acc_name) if acc_name else ""
+
+        def _hide_all_start_buttons() -> None:
+            for w in (
+                ver_btn_start_auto,
+                ver_btn_start_manual,
+                ver_btn_start_with_pdf,
+                ver_btn_start_resume,
+            ):
+                try:
+                    w.grid_remove()
+                except tk.TclError:
+                    pass
+
+        if not acc_code:
+            _hide_all_start_buttons()
+            for w in (ver_bancoposta_lbl, ver_bancoposta_entry, ver_btn_bancoposta_browse):
+                try:
+                    w.grid_remove()
+                except tk.TclError:
+                    pass
+            _ver_update_reset_saved_button_visibility()
+            return
+
+        _hide_all_start_buttons()
+
+        saved_pending = _ver_load_pending_from_db(acc_code)
+        has_saved_pdf_session = bool(saved_pending and _ver_saved_has_bancoposta(saved_pending))
+        has_saved_memory_for_start = _ver_saved_has_verification_in_sospeso(saved_pending)
+        has_stem = bool(account_estratti_pdf_stem_for_code(cur_db(), acc_code).strip())
+        expects_auto_pdf = _ver_account_expects_auto_estratto_pdf(cur_db(), acc_code)
+
+        show_pdf_row = False
+        if has_saved_pdf_session and saved_pending:
+            show_pdf_row = True
+        elif not has_saved_pdf_session and has_stem:
+            show_pdf_row = (not expects_auto_pdf) or ver_setup_pdf_path_after_auto_fail[0]
+
+        if show_pdf_row:
+            ver_bancoposta_lbl.grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(2, 4))
+            ver_bancoposta_entry.grid(row=1, column=1, columnspan=3, sticky="we", padx=(0, 8), pady=(2, 4))
+            ver_btn_bancoposta_browse.grid(row=1, column=4, sticky="w", pady=(2, 4))
+        else:
+            for w in (ver_bancoposta_lbl, ver_bancoposta_entry, ver_btn_bancoposta_browse):
+                try:
+                    w.grid_remove()
+                except tk.TclError:
+                    pass
+            if not has_saved_pdf_session and not has_stem and not _ver_bancoposta_pdf_ui_locked():
+                if ver_bancoposta_pdf_var.get().strip():
+                    ver_bancoposta_pdf_var.set("")
+
+        cutoff_ok = _ver_has_valid_cutoff_for_setup()
+
+        dcl_setup = ver_accounts_declined_memory_keep[0]
+        if acc_code in dcl_setup:
+            if not _ver_saved_has_verification_in_sospeso(saved_pending):
+                dcl_setup.discard(acc_code)
+            else:
+                _ver_update_reset_saved_button_visibility()
+                return
+
+        if not cutoff_ok and not has_saved_memory_for_start:
+            _ver_update_reset_saved_button_visibility()
+            return
+
+        # Memoria su questo conto: nessun tasto di avvio qui — il dialogo di ripresa è in ``_ver_schedule_memory_resume_prompt`` / ``_ver_on_start``.
+        if has_saved_memory_for_start:
+            _ver_update_reset_saved_button_visibility()
+            return
+
+        try:
+            ver_btn_start_resume.configure(text="Avvia verifica")
+        except tk.TclError:
+            pass
+
+        if not has_stem:
+            ver_btn_start_resume.grid(row=2, column=0, columnspan=2, sticky="w", padx=(0, 8), pady=(6, 2))
+        else:
+            try:
+                ver_btn_start_resume.grid_remove()
+            except tk.TclError:
+                pass
+            ver_btn_start_auto.grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 2))
+            ver_btn_start_manual.grid(row=2, column=1, sticky="w", padx=(0, 8), pady=(6, 2))
+            if ver_setup_pdf_path_after_auto_fail[0] and ver_bancoposta_pdf_var.get().strip():
+                ver_btn_start_with_pdf.grid(
+                    row=2, column=2, sticky="w", padx=(0, 8), pady=(6, 2)
+                )
+            else:
+                try:
+                    ver_btn_start_with_pdf.grid_remove()
+                except tk.TclError:
+                    pass
+
+        _ver_update_reset_saved_button_visibility()
+
+    def _ver_on_setup_cutoff_or_pdf_path_changed(*_a: object) -> None:
+        def _run_setup_buttons() -> None:
+            ver_setup_buttons_trace_after[0] = None
+            try:
+                _ver_setup_start_buttons_state()
+            except Exception:
+                pass
+
+        try:
+            tid = ver_setup_buttons_trace_after[0]
+            if tid is not None:
+                try:
+                    root.after_cancel(tid)
+                except Exception:
+                    pass
+                ver_setup_buttons_trace_after[0] = None
+        except Exception:
+            pass
+        try:
+            ver_setup_buttons_trace_after[0] = root.after(1, _run_setup_buttons)
+        except Exception:
+            try:
+                root.after_idle(_ver_setup_start_buttons_state)
+            except Exception:
+                pass
+
+    try:
+        ver_cutoff_date_var.trace_add("write", _ver_on_setup_cutoff_or_pdf_path_changed)
+        ver_bancoposta_pdf_var.trace_add("write", _ver_on_setup_cutoff_or_pdf_path_changed)
+    except tk.TclError:
+        pass
+
+    def _ver_lock_bancoposta_pdf_after_session_load() -> None:
+        if ver_bancoposta_queue[0]:
+            try:
+                ver_bancoposta_entry.configure(state="readonly")
+            except tk.TclError:
+                pass
+            _ver_set_bancoposta_browse_enabled(False)
+
+    def _ver_browse_bancoposta_pdf() -> None:
+        if not ver_bancoposta_browse_enabled[0]:
+            return
+        if _ver_bancoposta_pdf_ui_locked():
+            messagebox.showinfo(
+                "Verifica",
+                "È già presente un estratto PDF in corso (sessione attiva o salvata su disco).\n"
+                "Per usare un altro file, completa o chiudi la verifica e attendi il salvataggio.",
+            )
+            return
+        picked = filedialog.askopenfilename(
+            parent=verifica_frame,
+            title="Estratto conto / carta (PDF)",
+            filetypes=[("PDF", "*.pdf"), ("Tutti i file", "*.*")],
+        )
+        if picked:
+            ver_bancoposta_pdf_var.set(picked)
+
+    ver_btn_bancoposta_browse.bind("<Button-1>", lambda _e: _ver_browse_bancoposta_pdf())
+
+    def _ver_populate_account_combo() -> None:
+        eligible = _ver_eligible_accounts()
+        ver_acc_combo.configure(values=[n for n, _c in eligible])
+        if ver_account_name_var.get() and ver_account_name_var.get() not in [n for n, _c in eligible]:
+            ver_account_name_var.set("")
+        _ver_apply_bancoposta_pdf_lock_for_setup()
+        _ver_setup_start_buttons_state()
+        _ver_apply_bancoposta_pdf_lock_for_setup()
+
+    def _ver_refresh_setup_saved_banner_global() -> None:
+        """Messaggio sotto il setup: elenco memorie su altri conti (nessun conto selezionato o dopo reset)."""
+        saved_all = _ver_has_any_saved_pending()
+        if saved_all:
+            names_pdf: list[str] = []
+            names_manual: list[str] = []
+            for v in saved_all.values():
+                if not isinstance(v, dict) or not _ver_saved_has_verification_in_sospeso(v):
+                    continue
+                nm = str(v.get("account_name", "?"))
+                if _ver_saved_has_bancoposta(v):
+                    names_pdf.append(f"{nm} (PDF)")
+                else:
+                    n_sosp_tab = sum(
+                        1
+                        for x in (v.get("items") or [])
+                        if isinstance(x, dict) and not _ver_item_is_verified(x)
+                    )
+                    if n_sosp_tab > 0:
+                        names_manual.append(nm)
+            parts_detail: list[str] = []
+            if names_pdf:
+                parts_detail.append(f"Estratto PDF da completare per: {', '.join(names_pdf)}")
+            if names_manual:
+                parts_detail.append(
+                    f"Dati di verifica in memoria (sospesi) per: {', '.join(names_manual)}"
+                )
+            if parts_detail:
+                intro = (
+                    "Memoria separata per ogni conto: possono coesistere salvataggi su conti diversi."
+                )
+                ver_setup_saved_var.set(intro + "\n" + "\n".join(parts_detail))
+            else:
+                ver_setup_saved_var.set("")
+        else:
+            ver_setup_saved_var.set("")
+
+    def _ver_reset_verifica_after_cleared_saved_memory() -> None:
+        """Dopo cancellazione memoria dal dialogo: niente conto selezionato, niente testo persistenza per quel conto."""
+        _ver_cancel_memory_resume_prompt_after()
+        try:
+            ver_account_name_var.set("")
+            ver_account_code_var.set("")
+            ver_cutoff_date_var.set("")
+            ver_stmt_balance_var.set("")
+        except tk.TclError:
+            pass
+        ver_cutoff_manual_mode[0] = False
+        if not _ver_bancoposta_pdf_ui_locked():
+            try:
+                ver_bancoposta_pdf_var.set("")
+            except tk.TclError:
+                pass
+        _ver_populate_account_combo()
+        _ver_refresh_setup_saved_banner_global()
+
+    # ---- Ricerca registrazioni per verifica ----
+    def _ver_record_touches_account(rec: dict, acc_code: str) -> tuple[bool, str]:
+        """Restituisce (True, 'primary'|'secondary') se il record tocca il conto con codice acc_code."""
+        c1 = str(rec.get("account_primary_code", "")).strip()
+        c2 = str(rec.get("account_secondary_code", "")).strip()
+        if c1 == acc_code:
+            return True, "primary"
+        if c2 == acc_code:
+            return True, "secondary"
+        return False, ""
+
+    def _ver_account_stars(rec: dict, side: str) -> int:
+        fk = "account_primary_flags" if side == "primary" else "account_secondary_flags"
+        return str(rec.get(fk) or "").count("*")
+
+    def _ver_record_amount_for_account(rec: dict, side: str) -> Decimal:
+        """Importo con segno dal punto di vista del conto: + se primary, - se secondary (giroconto)."""
+        amt = to_decimal(rec.get("amount_eur", "0"))
+        if side == "secondary" and is_giroconto_record(rec):
+            return -amt
+        return amt
+
+    def _ver_norm(s: str) -> str:
+        """Normalizza testo per confronto verifica: Unicode NFC, spazi collassati, lowercase."""
+        import re
+        import unicodedata
+        t = unicodedata.normalize("NFC", s.strip())
+        t = re.sub(r"\s+", " ", t)
+        return t.lower()
+
+    def _ver_note_tokens_rank(s: str) -> frozenset[str]:
+        """Token della nota per confronto (parole ≥ 2 caratteri, Unicode)."""
+        import re
+
+        t = _ver_norm(s or "")
+        toks = re.findall(r"\w+", t, flags=re.UNICODE)
+        return frozenset(x for x in toks if len(x) >= 2)
+
+    def _ver_note_overlap_candidates(pdf_note: str, rec_note: str) -> int:
+        """Punteggio lessicale: parole comuni + piccolo bonus se una nota contiene l'altra (normalizzate)."""
+        sa = _ver_note_tokens_rank(pdf_note)
+        sb = _ver_note_tokens_rank(rec_note)
+        n = len(sa & sb)
+        a = _ver_norm(pdf_note or "")
+        b = _ver_norm(rec_note or "")
+        if len(a) >= 4 and len(b) >= 4 and (a in b or b in a):
+            n += 2
+        return n
+
+    def _ver_sort_candidates_for_verify(
+        candidates: list[tuple[int, dict]],
+        *,
+        pdf_booking_date: str | None,
+        verify_note: str,
+    ) -> list[tuple[int, dict]]:
+        """Ordina i candidati: punteggio = distanza in giorni − k×parole comuni nelle note (k ≈ giorni-equivalente)."""
+        if not candidates:
+            return list(candidates)
+        word_day_equiv = 18
+        pdf_d: date | None = None
+        raw = (pdf_booking_date or "").strip()
+        if raw:
+            try:
+                pdf_d = date.fromisoformat(parse_italian_ddmmyyyy_to_iso(raw))
+            except Exception:
+                pdf_d = None
+
+        def _dist_days(rec: dict) -> int:
+            if pdf_d is None:
+                return 0
+            try:
+                rd = date.fromisoformat(str(rec.get("date_iso") or "").strip())
+            except Exception:
+                return 10**6
+            return abs((rd - pdf_d).days)
+
+        def _key(item: tuple[int, dict]) -> tuple[float, float, int]:
+            reg_n, rec = item
+            d = float(_dist_days(rec))
+            ov = float(_ver_note_overlap_candidates(verify_note, str(rec.get("note") or "")))
+            score = d - word_day_equiv * ov
+            return (score, -ov, -int(reg_n))
+
+        return sorted(candidates, key=_key)
+
+    def _ver_pdf_booking_date_matches_rec_date(rec: dict, pdf_booking_date: str | None) -> bool:
+        """True se la data operazione del PDF (gg/mm/aaaa) coincide con ``date_iso`` della registrazione."""
+        pb = (pdf_booking_date or "").strip()
+        if not pb:
+            return False
+        try:
+            pdf_iso = parse_italian_ddmmyyyy_to_iso(pb)
+        except Exception:
+            return False
+        return str(rec.get("date_iso") or "").strip() == pdf_iso
+
+    def _ver_search_match(
+        acc_code: str,
+        target_amt: Decimal,
+        chq_text: str,
+        note_text: str,
+        *,
+        pdf_assisted: bool = False,
+        pdf_booking_date: str | None = None,
+    ) -> tuple[str, dict | None, list[tuple[int, dict]]]:
+        """
+        Cerca all'indietro per numero registrazione.
+        Restituisce:
+          ('exact', rec, [])  se trovato match importo e (assegno o nota **identici** carattere per
+            carattere dopo normalizzazione, con contenuto non vuoto su entrambi i lati), oppure
+            con ``pdf_assisted=True`` se tra i candidati con lo stesso importo **uno solo** ha la
+            data contabile uguale alla data operazione della riga PDF;
+          ('contains', rec, candidates)  se match parziale su assegno/nota (solo verifica manuale,
+            non con ``pdf_assisted``);
+          ('candidates', None, candidates)  se stesso importo ma senza altro campo identico
+            (sempre verifica manuale a scelta dalla lista);
+          ('none', None, [])  se nessun match
+
+        Non si considera mai ``exact`` solo per uguaglianza di importo in verifica manuale; con PDF,
+        l'auto-match per **importo + data** richiede un solo candidato con quella coppia. Senza
+        quello né assegno/nota identici serve la griglia candidati o i sospesi.
+        Con ``pdf_booking_date``, i candidati con lo stesso importo sono ordinati per
+        vicinanza temporale e sovrapposizione lessicale sulle note.
+        """
+        all_records, reg_map = _build_reg_index_maps()
+        ordered = sorted(
+            [(reg_map[record_legacy_stable_key(r)], r) for r in all_records],
+            key=lambda x: x[0],
+            reverse=True,
+        )
+
+        _Q = Decimal("0.01")
+        target_norm = target_amt.quantize(_Q)
+        chq_norm = _ver_norm(chq_text)
+        note_norm = _ver_norm(note_text)
+        candidates: list[tuple[int, dict]] = []
+        contains_hit: tuple[int, dict] | None = None
+
+        for reg_n, rec in ordered:
+            if rec.get("is_cancelled"):
+                continue
+            touches, side = _ver_record_touches_account(rec, acc_code)
+            if not touches:
+                continue
+            stars = _ver_account_stars(rec, side)
+            if stars >= 2:
+                break
+            if stars >= 1:
+                continue
+            rec_amt = _ver_record_amount_for_account(rec, side).quantize(_Q)
+            if rec_amt != target_norm:
+                continue
+            rec_chq = _ver_norm(str(rec.get("cheque") or ""))
+            rec_note = _ver_norm(str(rec.get("note") or ""))
+            # Mai considerare uguali due campi vuoti: serve contenuto su entrambi i lati.
+            chq_exact = bool(chq_norm) and bool(rec_chq) and rec_chq == chq_norm
+            note_exact = bool(note_norm) and bool(rec_note) and rec_note == note_norm
+            if chq_exact or note_exact:
+                return ("exact", rec, [])
+            # Da PDF: nessun match «simile» automatico o a un click — solo uguaglianza esatta sopra
+            # o scelta dalla griglia candidati.
+            if contains_hit is None and not pdf_assisted:
+                chq_contains = chq_norm and len(chq_norm) >= 3 and (chq_norm in rec_chq or rec_chq in chq_norm)
+                note_contains = note_norm and len(note_norm) >= 3 and (note_norm in rec_note or rec_note in note_norm)
+                if chq_contains or note_contains:
+                    contains_hit = (reg_n, rec)
+            candidates.append((reg_n, rec))
+
+        if candidates:
+            candidates = _ver_sort_candidates_for_verify(
+                candidates,
+                pdf_booking_date=pdf_booking_date,
+                verify_note=note_text,
+            )
+
+        if pdf_assisted:
+            same_amt_and_date = [
+                (rn, r)
+                for rn, r in candidates
+                if _ver_pdf_booking_date_matches_rec_date(r, pdf_booking_date)
+            ]
+            if len(same_amt_and_date) == 1:
+                return ("exact", same_amt_and_date[0][1], [])
+        if contains_hit is not None:
+            return ("contains", contains_hit[1], candidates)
+        if candidates:
+            return ("candidates", None, candidates)
+        return ("none", None, [])
+
+    def _ver_mark_record_verified(rec: dict, side: str) -> None:
+        _set_account_flags(rec, side, 1)
+
+    def _ver_all_verified(acc_code: str) -> bool:
+        """True se tutte le registrazioni del conto dopo il confine ** sono già verificate."""
+        all_records, reg_map = _build_reg_index_maps()
+        ordered = sorted(
+            [(reg_map[record_legacy_stable_key(r)], r) for r in all_records],
+            key=lambda x: x[0],
+        )
+        double_star_boundary = -1
+        for reg_n, rec in ordered:
+            if rec.get("is_cancelled"):
+                continue
+            touches, side = _ver_record_touches_account(rec, acc_code)
+            if not touches:
+                continue
+            if _ver_account_stars(rec, side) >= 2:
+                double_star_boundary = reg_n
+        for reg_n, rec in ordered:
+            if reg_n <= double_star_boundary:
+                continue
+            if rec.get("is_cancelled"):
+                continue
+            touches, side = _ver_record_touches_account(rec, acc_code)
+            if not touches:
+                continue
+            if _ver_account_stars(rec, side) < 1:
+                return False
+        return True
+
+    def _ver_try_pdf_auto_verify_line() -> None:
+        """Con coda PDF attiva, esegue la verifica appena importo e nota/assegno sono valorizzati (senza tasto Verifica)."""
+        if _ver_candidate_pick_ui_active():
+            return
+        fn = ver_on_submit_pdf[0]
+        if fn is None:
+            return
+        q_bp = ver_bancoposta_queue[0]
+        i_bp = ver_bancoposta_idx[0]
+        if not (bool(q_bp) and 0 <= i_bp < len(q_bp)):
+            return
+        raw_amt = (ver_inp_amt_var.get() or "").strip()
+        if raw_amt in ("", "+", "-"):
+            return
+        if not ver_inp_note_var.get().strip() and not ver_inp_chq_var.get().strip():
+            return
+        fn()
+
+    def _ver_bancoposta_fill_current() -> bool:
+        q = ver_bancoposta_queue[0]
+        i = ver_bancoposta_idx[0]
+        if i < 0 or i >= len(q):
+            return False
+        row = q[i]
+        ver_inp_chq_var.set("")
+        amt = row["amount"]
+        formatted = format_euro_it(amt)
+        if amt >= 0 and not formatted.startswith("+"):
+            formatted = "+" + formatted
+        ver_inp_amt_var.set(formatted)
+        ver_inp_note_var.set(str(row.get("note") or ""))
+        _ver_update_submit_visibility()
+        ver_ent_note.focus_set()
+        total = len(q)
+        ver_status_var.set(f"Estratto PDF: voce {i + 1} di {total} — verifica automatica.")
+        root.after(0, _ver_try_pdf_auto_verify_line)
+        return True
+
+    def _ver_bancoposta_advance_after_line_done(*, verified: bool = True) -> None:
+        """Passa alla voce successiva del PDF. Fine coda: svuota sempre la coda (successo o fallimento),
+        così un tentativo negativo sull'ultima riga non ripresenta la stessa voce né duplica i sospesi."""
+        q = ver_bancoposta_queue[0]
+        i = ver_bancoposta_idx[0]
+        if i < 0 or not q:
+            ver_ent_amt.focus_set()
+            return
+        next_i = i + 1
+        if next_i >= len(q):
+            n = len(q)
+            closing_mem = ver_bancoposta_closing[0]
+            if closing_mem is not None:
+                ver_pdf_closing_balance_hint[0] = closing_mem
+            closing_eff = (
+                closing_mem if closing_mem is not None else ver_pdf_closing_balance_hint[0]
+            )
+            if closing_eff is None:
+                closing_eff = _ver_reload_pdf_closing_only()
+                if closing_eff is not None:
+                    ver_pdf_closing_balance_hint[0] = closing_eff
+            ver_bancoposta_queue[0] = []
+            ver_bancoposta_idx[0] = -1
+            ver_bancoposta_closing[0] = None
+            ver_inp_amt_var.set("-")
+            ver_inp_chq_var.set("")
+            ver_inp_note_var.set("")
+            _ver_update_submit_visibility()
+            prev = ver_status_var.get().strip()
+            tail = (
+                f"Estratto PDF completato ({n} voci)."
+                if verified
+                else f"Ultima voce PDF senza corrispondenza; estratto completato ({n} voci)."
+            )
+            ver_status_var.set(f"{prev} {tail}".strip() if prev else tail)
+            # Fine coda PDF: apri sempre il popup saldo (precaricato se letto dall'estratto).
+            if n > 0:
+                if closing_eff is not None:
+                    ver_status_var.set(
+                        f"{ver_status_var.get().strip()} Saldo finale estratto: {format_euro_it(closing_eff)} €; "
+                        "conferma nel popup."
+                    )
+                else:
+                    ver_status_var.set(
+                        f"{ver_status_var.get().strip()} Immetti il saldo dell'estratto conto nel popup."
+                    )
+                try:
+                    ver_btn_end.pack_forget()
+                except tk.TclError:
+                    pass
+                try:
+                    verifica_frame.update_idletasks()
+                except tk.TclError:
+                    pass
+
+                def _run_pdf_stmt_popup(c: Decimal | None = closing_eff) -> None:
+                    _ver_prompt_stmt_balance_after_pdf_done(c)
+
+                # ``after`` sul ``root`` del build (non sul frame): su macOS è più affidabile dopo i messagebox.
+                root.after(0, _run_pdf_stmt_popup)
+            else:
+                ver_ent_amt.focus_set()
+            try:
+                ver_bancoposta_entry.configure(state="normal")
+            except tk.TclError:
+                pass
+            _ver_set_bancoposta_browse_enabled(True)
+            try:
+                _ver_save_pending_to_db()
+            except Exception:
+                pass
+        else:
+            ver_bancoposta_idx[0] = next_i
+            _ver_bancoposta_fill_current()
+            try:
+                _ver_save_pending_to_db()
+            except Exception:
+                pass
+        try:
+            _ver_refresh_pending_tree()
+        except Exception:
+            pass
+
+    def _ver_cancel_memory_resume_prompt_after() -> None:
+        try:
+            mid = ver_memory_resume_prompt_after[0]
+            if mid is not None:
+                root.after_cancel(mid)
+        except Exception:
+            pass
+        ver_memory_resume_prompt_after[0] = None
+
+    def _ver_schedule_memory_resume_prompt() -> None:
+        """Dopo selezione conto o ingresso tab: apre il dialogo ripresa memoria senza mostrare prima i tasti di avvio."""
+        if ver_session_active[0]:
+            return
+        acc_name = ver_account_name_var.get().strip()
+        acc_code = _ver_account_code_for_name(acc_name) if acc_name else ""
+        if not acc_code:
+            return
+        saved = _ver_load_pending_from_db(acc_code)
+        if not _ver_saved_has_verification_in_sospeso(saved):
+            return
+        _ver_cancel_memory_resume_prompt_after()
+
+        def _go() -> None:
+            ver_memory_resume_prompt_after[0] = None
+            if ver_session_active[0]:
+                return
+            an = ver_account_name_var.get().strip()
+            ac = _ver_account_code_for_name(an) if an else ""
+            if ac != acc_code:
+                return
+            _ver_on_start()
+
+        ver_memory_resume_prompt_after[0] = root.after(1, _go)
+
+    # ---- Avvio sessione ----
+    def _ver_on_start() -> None:
+        try:
+            aid_s = ver_auto_start_defer_after[0]
+            if aid_s is not None:
+                root.after_cancel(aid_s)
+        except Exception:
+            pass
+        ver_auto_start_defer_after[0] = None
+        _ver_cancel_memory_resume_prompt_after()
+        acc_name = ver_account_name_var.get().strip()
+        if not acc_name:
+            messagebox.showerror("Verifica", "Seleziona un conto da verificare.")
+            return
+        acc_code = _ver_account_code_for_name(acc_name)
+        if not acc_code:
+            messagebox.showerror("Verifica", f"Conto '{acc_name}' non trovato.")
+            return
+        dcl = ver_accounts_declined_memory_keep[0]
+
+        saved = _ver_load_pending_from_db(acc_code)
+        skip_memory_resume = False
+        resuming_manual_batch = False
+        defer_memory_resume_ok = False
+        items_u = list((saved or {}).get("items") or [])
+        _ver_normalize_verification_items(items_u)
+        n_sosp_u = sum(1 for x in items_u if isinstance(x, dict) and not _ver_item_is_verified(x))
+        want_memory_prompt = bool(saved) and _ver_saved_has_verification_in_sospeso(saved)
+
+        if want_memory_prompt:
+            cd_m = str(saved.get("cutoff_date") or "").strip() or "—"
+            st_raw = str(saved.get("stmt_balance") or "").strip()
+            st_disp = "—"
+            if st_raw:
+                try:
+                    st_dec = normalize_euro_input(st_raw.replace(" ", ""))
+                    fv = format_euro_it(st_dec)
+                    if st_dec > 0 and not fv.startswith(("+", "-")):
+                        fv = "+" + fv
+                    st_disp = fv + " €"
+                except Exception:
+                    st_disp = st_raw + ("" if "€" in st_raw else " €")
+            lines_mem: list[str] = [
+                f"Per il conto «{acc_name}» risultano in memoria i dati di una verifica non completata.",
+                "",
+                f"Data di chiusura dell'estratto: {cd_m}",
+                f"Saldo in euro annotato: {st_disp}",
+            ]
+            if n_sosp_u > 0:
+                lines_mem.append(f"Dati di verifica ancora in sospeso (non abbinati): {n_sosp_u}.")
+            else:
+                lines_mem.append("Nessun dato in sospeso nell'elenco salvato.")
+            if _ver_saved_has_bancoposta(saved):
+                lines_mem.append("È presente anche il salvataggio legato all'estratto conto PDF.")
+            lines_mem.append("")
+            lines_mem.append("Procedere con la ripresa di questa memoria?")
+            msg_mem = "\n".join(lines_mem)
+            p_mem = _ver_activate_ui_for_modal_dialog()
+            if not messagebox.askokcancel(
+                "Verifica",
+                msg_mem,
+                parent=p_mem,
+            ):
+                if messagebox.askyesno(
+                    "Verifica",
+                    "Cancellare dalla memoria i dati salvati per questo conto?\n\n"
+                    "«Sì» elimina i dati. «No» li mantiene per il futuro (nuova verifica da zero).",
+                    parent=p_mem,
+                ):
+                    try:
+                        _ver_clear_pending_from_db(acc_code)
+                        persist_db_after_edit(None)
+                    except Exception:
+                        pass
+                    else:
+                        _ver_reset_verifica_after_cleared_saved_memory()
+                        return
+                else:
+                    dcl.add(acc_code)
+                saved = _ver_load_pending_from_db(acc_code)
+                skip_memory_resume = True
+                if acc_code in dcl:
+                    try:
+                        _ver_setup_start_buttons_state()
+                    except Exception:
+                        pass
+                    return
+            else:
+                dcl.discard(acc_code)
+                defer_memory_resume_ok = True
+                if not _ver_saved_has_bancoposta(saved):
+                    ver_cutoff_date_var.set(str(saved.get("cutoff_date") or "").strip())
+                    ver_stmt_balance_var.set(str(saved.get("stmt_balance") or "").strip())
+                    ver_pending_items[0] = list(saved.get("items") or [])
+                    _ver_normalize_verification_items(ver_pending_items[0])
+                    resuming_manual_batch = True
+
+        if defer_memory_resume_ok:
+            try:
+                _ver_activate_ui_for_modal_dialog()
+                root.update_idletasks()
+            except Exception:
+                pass
+
+        resuming_from_saved_pdf = bool(saved) and _ver_saved_has_bancoposta(saved) and not skip_memory_resume
+        ver_verifica_used_pdf_coda[0] = False
+
+        if resuming_from_saved_pdf:
+            cutoff_raw = str(saved.get("cutoff_date") or ver_cutoff_date_var.get() or "").strip()
+            if cutoff_raw:
+                ver_cutoff_date_var.set(cutoff_raw)
+            stmt_bal_str = saved.get("stmt_balance", "")
+            ver_stmt_balance_var.set(stmt_bal_str)
+            ver_pending_items[0] = list(saved.get("items") or [])
+            _ver_normalize_verification_items(ver_pending_items[0])
+            _ver_restore_bancoposta_from_saved(saved)
+            q_rest = ver_bancoposta_queue[0]
+            if isinstance(q_rest, list) and len(q_rest) > 0:
+                # Stesso percorso della prima lettura PDF: coda riga per riga, confronti, saldo e chiusura.
+                resuming_manual_batch = False
+            else:
+                ver_bancoposta_queue[0] = []
+                ver_bancoposta_idx[0] = -1
+                ver_bancoposta_closing[0] = None
+                ver_pdf_closing_balance_hint[0] = None
+                resuming_manual_batch = True
+        elif resuming_manual_batch:
+            cutoff_raw = ver_cutoff_date_var.get().strip()
+            pdf_path = ""
+            ver_bancoposta_queue[0] = []
+            ver_bancoposta_idx[0] = -1
+            ver_bancoposta_closing[0] = None
+            ver_pdf_closing_balance_hint[0] = None
+        else:
+            # Nuova verifica (o PDF da percorso in schermata): nessun residuo di saldo dalla sessione precedente.
+            ver_stmt_balance_var.set("")
+            cutoff_raw = ver_cutoff_date_var.get().strip()
+            if not cutoff_raw:
+                messagebox.showerror("Verifica", "Immetti la data di chiusura dell'estratto conto.")
+                ver_cutoff_entry.focus_set()
+                return
+            try:
+                parse_italian_ddmmyyyy_to_iso(cutoff_raw)
+            except Exception:
+                messagebox.showerror("Verifica", "Data non valida (formato gg/mm/aaaa).")
+                ver_cutoff_entry.focus_set()
+                return
+            ver_pending_items[0] = []
+            pdf_path = ver_bancoposta_pdf_var.get().strip()
+            if pdf_path:
+                pth = Path(pdf_path)
+                if not pth.is_file():
+                    messagebox.showerror(
+                        "Verifica",
+                        f"File PDF non trovato o non accessibile:\n{pth}",
+                    )
+                    return
+                try:
+                    filtered, ext_closing, n_pdf_raw = _ver_filtered_bancoposta_rows_from_pdf(pth, cutoff_raw)
+                except ImportError as exc:
+                    messagebox.showerror(
+                        "Verifica",
+                        "Per leggere gli estratti PDF è necessario il modulo pypdf.\n"
+                        f"Dettaglio: {exc}",
+                    )
+                    return
+                except Exception as exc:
+                    messagebox.showerror(
+                        "Verifica",
+                        f"Lettura del PDF estratto non riuscita:\n{exc}",
+                    )
+                    return
+                ver_bancoposta_closing[0] = ext_closing
+                ver_pdf_closing_balance_hint[0] = ext_closing
+                ver_bancoposta_queue[0] = filtered
+                ver_bancoposta_idx[0] = 0 if filtered else -1
+                if not filtered:
+                    skip_cutoff = VER_PDF_DISABLE_CUTOFF_DATE_FILTER or os.environ.get(
+                        "VER_PDF_SKIP_CUTOFF_FILTER", ""
+                    ).strip().lower() in ("1", "true", "yes", "on", "si")
+                    if n_pdf_raw == 0:
+                        msg = (
+                            "Il parser non ha estratto alcun movimento da questo PDF (layout non riconosciuto, "
+                            "testo non selezionabile o formato diverso da quello atteso).\n\n"
+                            "Suggerimento: avviare l'app con la variabile d'ambiente ESTRATTO_PDF_DEBUG=1 e riprovare: "
+                            "vengono creati file di testo con l'estratto letto da pypdf (vedere anche il terminale)."
+                        )
+                    elif skip_cutoff:
+                        msg = (
+                            f"Il parser ha prodotto {n_pdf_raw} movimento/i dal PDF ma la lista risulta vuota "
+                            "nonostante il filtro sulla data di chiusura sia disattivato: segnalare il caso.\n\n"
+                            "Con ESTRATTO_PDF_DEBUG=1 si possono ispezionare i file di dump del testo estratto."
+                        )
+                    else:
+                        msg = (
+                            f"Il parser ha letto {n_pdf_raw} movimento/i dal PDF ma nessuno risulta entro la data "
+                            f"di chiusura indicata ({cutoff_raw}). Controllare la data o spostare la chiusura.\n\n"
+                            "Per caricare comunque tutte le righe lette (solo diagnostica): "
+                            "VER_PDF_SKIP_CUTOFF_FILTER=1 nell'ambiente all'avvio."
+                        )
+                    messagebox.showwarning("Verifica", msg)
+            else:
+                ver_bancoposta_queue[0] = []
+                ver_bancoposta_idx[0] = -1
+                ver_bancoposta_closing[0] = None
+                ver_pdf_closing_balance_hint[0] = None
+
+        ver_account_code_var.set(acc_code)
+        ver_session_active[0] = True
+        ver_verifica_used_pdf_coda[0] = bool(ver_bancoposta_queue[0]) and not resuming_manual_batch
+        ver_manual_any_amount_submitted[0] = bool(ver_bancoposta_queue[0]) or resuming_manual_batch
+        ver_session_title_var.set(f"Verifica conto: {acc_name}  —  Chiusura: {cutoff_raw}")
+        ver_setup_saved_var.set("")
+
+        ver_setup_frame.pack_forget()
+        ver_results_frame.pack_forget()
+        ver_work_frame.pack(fill=tk.BOTH, expand=True)
+        try:
+            root.update_idletasks()
+        except Exception:
+            pass
+        _ver_place_pending_host(force_immissione_layout=True)
+        _ver_pack_ver_input_in_work_frame()
+
+        _q0 = ver_bancoposta_queue[0]
+        _i0 = ver_bancoposta_idx[0]
+        _pdf_coda_has_row = bool(_q0) and 0 <= _i0 < len(_q0)
+        if not resuming_manual_batch and not ver_pending_items[0] and not _pdf_coda_has_row:
+            if _ver_all_verified(acc_code):
+                ver_manual_any_amount_submitted[0] = True
+                messagebox.showinfo(
+                    "Verifica",
+                    f"Il conto {acc_name} risulta completamente verificato.\n"
+                    "È possibile immettere il saldo dell'estratto conto e stampare il rapporto."
+                )
+                prev_bal = ver_stmt_balance_var.get().strip()
+                _ver_on_end_input()
+                new_bal = ver_stmt_balance_var.get().strip()
+                if not new_bal and not prev_bal:
+                    ver_work_frame.pack_forget()
+                    ver_session_active[0] = False
+                    ver_verifica_used_pdf_coda[0] = False
+                    ver_setup_pdf_path_after_auto_fail[0] = False
+                    ver_setup_frame.pack(fill=tk.X)
+                    _ver_setup_start_buttons_state()
+                return
+
+        if resuming_manual_batch or defer_memory_resume_ok:
+            if defer_memory_resume_ok:
+                ver_status_var.set("Avvio ricerca automatica sui dati in memoria…")
+            n_mb = _ver_retry_pending()
+            _ver_refresh_pending_tree()
+            remaining_mb = _ver_count_pending_rows()
+            _q2 = ver_bancoposta_queue[0]
+            _i2 = ver_bancoposta_idx[0]
+            _pdf_coda_busy = bool(_q2) and 0 <= _i2 < len(_q2)
+            if n_mb > 0:
+                ver_status_var.set(
+                    f"Dati in memoria: {n_mb} {'associato' if n_mb == 1 else 'associati'} automaticamente. "
+                    f"Rimangono {remaining_mb} in sospeso."
+                )
+            elif remaining_mb:
+                ver_status_var.set(
+                    f"Dati in memoria: restano {remaining_mb} in sospeso da abbinare manualmente."
+                )
+            elif _pdf_coda_busy:
+                ver_status_var.set(
+                    "Dati in memoria: i movimenti in sospeso risultano abbinati. "
+                    "Continuare con l'estratto PDF (una riga alla volta)."
+                )
+            else:
+                ver_status_var.set("Dati in memoria: tutti i sospesi risultano abbinati.")
+                raw_sb_mb = ver_stmt_balance_var.get().strip()
+                stmt_hint_mb: Decimal | None = None
+                if raw_sb_mb:
+                    try:
+                        stmt_hint_mb = normalize_euro_input(raw_sb_mb.replace(" ", ""))
+                    except Exception:
+                        stmt_hint_mb = None
+                stmt_final_mb = _ver_ask_stmt_balance(initial_balance=stmt_hint_mb)
+                if stmt_final_mb is None:
+                    try:
+                        _ver_save_pending_to_db()
+                    except Exception:
+                        pass
+                    ver_status_var.set("Saldo non confermato: i dati restano salvati in memoria.")
+                    _ver_refresh_pending_tree()
+                    try:
+                        ver_ent_amt.focus_set()
+                    except tk.TclError:
+                        pass
+                    _ver_update_submit_visibility()
+                    return
+                try:
+                    _ver_clear_pending_from_db(acc_code)
+                    persist_db_after_edit(None)
+                except Exception:
+                    pass
+                ver_stmt_balance_var.set(str(stmt_final_mb))
+                _ver_place_double_star(acc_code)
+                try:
+                    persist_db_after_edit(None)
+                except Exception:
+                    pass
+                _movements_dirty[0] = True
+                ver_results_new_data_visible[0] = False
+                ver_pending_items[0] = []
+                ver_bancoposta_queue[0] = []
+                ver_bancoposta_idx[0] = -1
+                ver_bancoposta_closing[0] = None
+                ver_pdf_closing_balance_hint[0] = None
+                ver_verifica_used_pdf_coda[0] = False
+                ver_manual_any_amount_submitted[0] = False
+                ver_session_active[0] = False
+                try:
+                    ver_bancoposta_entry.configure(state="normal")
+                except tk.TclError:
+                    pass
+                _ver_set_bancoposta_browse_enabled(True)
+                _ver_show_results(acc_code, stmt_final_mb)
+                try:
+                    ver_work_frame.pack_forget()
+                except tk.TclError:
+                    pass
+                _ver_update_submit_visibility()
+                return
+        else:
+            ver_status_var.set("")
+            _ver_refresh_pending_tree()
+
+        if ver_bancoposta_queue[0] and ver_bancoposta_idx[0] >= 0:
+            _ver_bancoposta_fill_current()
+        else:
+            ver_ent_amt.focus_set()
+        _ver_lock_bancoposta_pdf_after_session_load()
+        _ver_update_submit_visibility()
+        try:
+            verifica_frame.update_idletasks()
+            root.update_idletasks()
+        except Exception:
+            pass
+
+    def _ver_amount_label_for_popup(amt: Decimal) -> str:
+        """Importo leggibile nei messaggi (stile griglia, con €)."""
+        t = format_euro_it(amt)
+        if amt > 0 and not t.startswith("+") and not t.startswith("-"):
+            t = "+" + t
+        return t + " €"
+
+    # ---- Immissione dato di verifica ----
+    def _ver_on_submit() -> None:
+        if _ver_candidate_pick_ui_active():
+            return
+        raw_amt = (ver_inp_amt_var.get() or "").strip()
+        if not raw_amt or raw_amt in ("+", "-"):
+            messagebox.showerror(
+                "Verifica",
+                "Immettere l'importo (valore numerico), con segno + (entrata) o − (uscita) rispetto al conto.",
+            )
+            ver_ent_amt.focus_set()
+            return
+        acc_code = ver_account_code_var.get()
+        q_bp = ver_bancoposta_queue[0]
+        i_bp = ver_bancoposta_idx[0]
+        pdf_assisted = bool(q_bp) and 0 <= i_bp < len(q_bp)
+        if not pdf_assisted:
+            if raw_amt not in ("+", "-") and not raw_amt.startswith(("+", "-")):
+                messagebox.showerror(
+                    "Verifica",
+                    "Nella verifica manuale l'importo deve iniziare con + (entrata) o - (uscita) rispetto al conto.",
+                )
+                ver_ent_amt.focus_set()
+                return
+        try:
+            amt = normalize_euro_input(raw_amt)
+        except InvalidOperation:
+            messagebox.showerror("Verifica", _VER_AMT_FOCUS_MSG, parent=verifica_frame)
+            ver_ent_amt.focus_set()
+            return
+        except Exception as exc:
+            messagebox.showerror("Verifica", str(exc), parent=verifica_frame)
+            ver_ent_amt.focus_set()
+            return
+        ver_manual_any_amount_submitted[0] = True
+        chq = ver_inp_chq_var.get().strip()
+        note = ver_inp_note_var.get().strip()
+        if not chq and not note:
+            messagebox.showerror("Verifica", "Immetti il testo dell'Assegno oppure della Nota.")
+            ver_ent_chq.focus_set()
+            return
+        if chq and note:
+            if pdf_assisted:
+                ver_inp_chq_var.set("")
+                chq = ""
+            else:
+                ver_inp_chq_var.set("")
+                chq = ""
+
+        pdf_booking_date = ""
+        pdf_note_full = ""
+        if pdf_assisted:
+            row_bp = q_bp[i_bp]
+            pdf_booking_date = str(row_bp.get("booking_date") or row_bp.get("booking") or "")
+            pdf_note_full = str(row_bp.get("note") or "")
+        if _ver_ui_on_results_page() and not pdf_assisted:
+            row_sp = {"amount": _ver_amount_storage_str(amt), "cheque": chq, "note": note, "verified": False}
+            ver_pending_items[0].append(row_sp)
+            try:
+                _ver_save_pending_to_db()
+            except Exception:
+                pass
+            ver_status_var.set("Dato aggiunto ai sospesi: verrà considerato con «Riavvia ricerca».")
+            ver_results_new_data_visible[0] = False
+            _ver_refresh_pending_tree()
+            _ver_reset_ver_entry_form()
+            ver_ent_amt.focus_set()
+            return
+        result_type, matched_rec, candidates = _ver_search_match(
+            acc_code,
+            amt,
+            chq,
+            note,
+            pdf_assisted=pdf_assisted,
+            pdf_booking_date=pdf_booking_date or None,
+        )
+
+        verified_this_submit = False
+        if result_type == "exact" and matched_rec is not None:
+            _touches, side = _ver_record_touches_account(matched_rec, acc_code)
+            _ver_mark_record_verified(matched_rec, side)
+            persist_db_after_edit(None)
+            _movements_dirty[0] = True
+            ver_status_var.set(
+                f"Registrazione verificata automaticamente (importo {format_euro_it(amt)})."
+            )
+            verified_this_submit = True
+            _log_ok = {"amount": _ver_amount_storage_str(amt), "cheque": chq, "note": note, "verified": True}
+            if (pdf_booking_date or "").strip():
+                _log_ok["booking_date"] = (pdf_booking_date or "").strip()
+            ver_pending_items[0].append(_log_ok)
+            _ver_refresh_pending_tree()
+        elif result_type == "contains" and matched_rec is not None:
+            if pdf_assisted:
+                if candidates:
+                    ver_status_var.set(
+                        "Estratto PDF: più candidati possibili — scegli dalla lista o «Nessuna corrispondenza»."
+                    )
+                    _ver_show_candidates(
+                        amt,
+                        chq,
+                        note,
+                        candidates,
+                        pdf_booking_date=pdf_booking_date,
+                        pdf_note_full=pdf_note_full,
+                    )
+                    return
+                row_sp = {"amount": _ver_amount_storage_str(amt), "cheque": chq, "note": note, "verified": False}
+                if (pdf_booking_date or "").strip():
+                    row_sp["booking_date"] = (pdf_booking_date or "").strip()
+                ver_pending_items[0].append(row_sp)
+                ver_status_var.set(
+                    "Estratto PDF: corrispondenza parziale non risolvibile automaticamente — dato in sospeso."
+                )
+                _ver_refresh_pending_tree()
+            else:
+                _, reg_map_tmp = _build_reg_index_maps()
+                reg_n_tmp = reg_map_tmp.get(record_legacy_stable_key(matched_rec), 0)
+                merged_cands: list[tuple[int, dict]] = [(reg_n_tmp, matched_rec)]
+                seen_rn = {reg_n_tmp}
+                for c in candidates or []:
+                    if c[0] not in seen_rn:
+                        seen_rn.add(c[0])
+                        merged_cands.append(c)
+                ver_status_var.set(
+                    "Corrispondenza parziale: scegli la registrazione nella griglia o «Nessuna corrispondenza»."
+                )
+                _ver_show_candidates(
+                    amt,
+                    chq,
+                    note,
+                    merged_cands,
+                    pdf_booking_date=pdf_booking_date,
+                    pdf_note_full=pdf_note_full,
+                )
+                return
+        elif result_type == "candidates" and candidates:
+            if pdf_assisted:
+                ver_status_var.set(
+                    "Estratto PDF: scegli la registrazione dalla lista o «Nessuna corrispondenza»."
+                )
+            _ver_show_candidates(
+                amt,
+                chq,
+                note,
+                candidates,
+                pdf_booking_date=pdf_booking_date,
+                pdf_note_full=pdf_note_full,
+            )
+            return
+        else:
+            row_sp = {"amount": _ver_amount_storage_str(amt), "cheque": chq, "note": note, "verified": False}
+            if (pdf_booking_date or "").strip():
+                row_sp["booking_date"] = (pdf_booking_date or "").strip()
+            ver_pending_items[0].append(row_sp)
+            if pdf_assisted:
+                ver_status_var.set(
+                    f"Estratto PDF: nessuna corrispondenza per {_ver_amount_label_for_popup(amt)} — dato in sospeso."
+                )
+            else:
+                ver_status_var.set("Nessuna registrazione corrispondente trovata. Dato aggiunto ai sospesi.")
+            _ver_refresh_pending_tree()
+
+        _ver_reset_ver_entry_form()
+        if verified_this_submit or pdf_assisted:
+            _ver_bancoposta_advance_after_line_done(verified=verified_this_submit)
+            if verified_this_submit and not pdf_assisted:
+                ver_ent_amt.focus_set()
+        else:
+            ver_ent_amt.focus_set()
+
+    ver_on_submit_pdf[0] = _ver_on_submit
+    ver_btn_verifica.bind("<Button-1>", lambda _e: _ver_on_submit())
+    ver_btn_immetti.bind("<ButtonPress-1>", _ver_suppress_next_amt_focusout_check, add="+")
+    ver_btn_immetti.bind("<Button-1>", lambda _e: _ver_on_submit())
+    ver_btn_cancel_immissione.bind("<ButtonPress-1>", _ver_suppress_next_amt_focusout_check, add="+")
+    ver_btn_cancel_immissione.bind("<Button-1>", lambda _e: _ver_on_cancel_results_input())
+
+    # ---- Proposta candidati all'utente ----
+
+    # ---- Gestione sospesi ----
+    def _ver_format_pending_item_date(it: dict) -> str:
+        """Data voce estratto PDF (sospesi/sessione), in gg/mm/aaaa; vuoto se assente (es. solo verifica manuale)."""
+        raw = str(it.get("booking_date") or it.get("booking") or "").strip()
+        if not raw:
+            return ""
+        parsed = parse_italian_ddmmyyyy_to_iso(raw)
+        if parsed:
+            return to_italian_date(parsed)
+        return raw
+
+    def _ver_sort_pending_items_for_display() -> bool:
+        """Riordina i sospesi: con PDF attivo, per vicinanza alla data della riga corrente; altrimenti per data estratto."""
+        items = ver_pending_items[0]
+        if len(items) <= 1:
+            return False
+        if any(_ver_item_is_verified(it) for it in items):
+            return False
+
+        before_ids = [id(it) for it in items]
+        q_bp = ver_bancoposta_queue[0]
+        i_bp = ver_bancoposta_idx[0]
+        ref_d: date | None = None
+        if q_bp and 0 <= i_bp < len(q_bp):
+            ref_raw = str(q_bp[i_bp].get("booking_date") or q_bp[i_bp].get("booking") or "").strip()
+            if ref_raw:
+                try:
+                    ref_d = date.fromisoformat(parse_italian_ddmmyyyy_to_iso(ref_raw))
+                except Exception:
+                    ref_d = None
+
+        indexed = list(enumerate(items))
+
+        def _sk(pr: tuple[int, dict]) -> tuple[int, int, int]:
+            orig_i, it = pr
+            bd = str(it.get("booking_date") or it.get("booking") or "").strip()
+            if ref_d is not None:
+                if not bd:
+                    return (2, 10**9, orig_i)
+                try:
+                    d = date.fromisoformat(parse_italian_ddmmyyyy_to_iso(bd))
+                except Exception:
+                    return (2, 10**9 - 1, orig_i)
+                return (0, abs((d - ref_d).days), orig_i)
+            if bd:
+                try:
+                    d = date.fromisoformat(parse_italian_ddmmyyyy_to_iso(bd))
+                    return (0, d.toordinal(), orig_i)
+                except Exception:
+                    return (1, 10**9, orig_i)
+            return (1, 10**9, orig_i)
+
+        indexed.sort(key=_sk)
+        new_list = [it for _, it in indexed]
+        ver_pending_items[0] = new_list
+        after_ids = [id(it) for it in new_list]
+        return before_ids != after_ids
+
+    def _ver_update_pending_action_buttons_visibility(_e: object = None) -> None:
+        """Risultati manuale: «Nuovo dato»; con PDF automatico no «Nuovo». Modifica/Elimina/Annulla se riga sospesa selezionata. Lavoro: Modifica/Elimina/Annulla (no «Nuovo»)."""
+        try:
+            ver_btn_annulla_sel_pending.pack_forget()
+            ver_btn_del_pending.pack_forget()
+            ver_btn_edit_pending.pack_forget()
+            ver_btn_new_ver_data.pack_forget()
+            on_res = _ver_ui_on_results_page()
+            if on_res and ver_results_new_data_visible[0]:
+                try:
+                    ver_pending_btns.update_idletasks()
+                    ver_pending_host.update_idletasks()
+                except tk.TclError:
+                    pass
+                return
+            if not on_res:
+                if not ver_session_active[0]:
+                    return
+                sel_w = ver_pending_tree.selection()
+                if not sel_w:
+                    return
+                sk0 = sel_w[0]
+                if sk0 == "__pdf_current__":
+                    ver_btn_annulla_sel_pending.pack(side=tk.LEFT, padx=(0, 8))
+                    return
+                try:
+                    idx_w = int(sk0)
+                except (ValueError, IndexError):
+                    return
+                if 0 <= idx_w < len(ver_pending_items[0]) and not _ver_item_is_verified(ver_pending_items[0][idx_w]):
+                    ver_btn_edit_pending.pack(side=tk.LEFT, padx=(0, 8))
+                    ver_btn_del_pending.pack(side=tk.LEFT, padx=(0, 8))
+                    ver_btn_annulla_sel_pending.pack(side=tk.LEFT, padx=(0, 8))
+                return
+            if not ver_verifica_used_pdf_coda[0] and ver_session_active[0]:
+                ver_btn_new_ver_data.pack(side=tk.LEFT, padx=(0, 8))
+            sel = ver_pending_tree.selection()
+            if not sel:
+                return
+            try:
+                idx = int(sel[0])
+            except (ValueError, IndexError):
+                return
+            if 0 <= idx < len(ver_pending_items[0]) and _ver_item_is_verified(ver_pending_items[0][idx]):
+                return
+            ver_btn_edit_pending.pack(side=tk.LEFT, padx=(0, 8))
+            ver_btn_del_pending.pack(side=tk.LEFT, padx=(0, 8))
+            ver_btn_annulla_sel_pending.pack(side=tk.LEFT, padx=(0, 8))
+        except tk.TclError:
+            pass
+        if _ver_ui_on_results_page():
+            try:
+                ver_pending_btns.update_idletasks()
+                ver_pending_host.update_idletasks()
+            except tk.TclError:
+                pass
+
+    def _ver_trunc_ver_result_cell(s: object, max_len: int) -> str:
+        t = str(s or "").replace("\n", " ").strip()
+        if len(t) <= max_len:
+            return t
+        if max_len <= 1:
+            return "…"
+        return t[: max_len - 1] + "…"
+
+    def _ver_place_pending_host(*, force_immissione_layout: bool = False) -> None:
+        """Immissione: griglia sessione sotto lo stato. Pagina risultati: colonna sinistra (~60%) con sospesi; Riepilogo a destra."""
+        try:
+            root.update_idletasks()
+        except Exception:
+            pass
+        try:
+            ver_pending_host.pack_forget()
+        except tk.TclError:
+            pass
+        try:
+            ver_results_pending_empty_lbl.pack_forget()
+        except tk.TclError:
+            pass
+        if force_immissione_layout:
+            # Dopo ``pack`` di ``ver_work_frame`` / ``pack_forget`` risultati, ``winfo_manager`` può essere ancora
+            # incoerente: evita di piazzare la griglia nella colonna risultati (non visibile).
+            on_results = False
+        else:
+            on_results = _ver_ui_on_results_page()
+            try:
+                if on_results and str(ver_work_frame.winfo_manager() or "").strip():
+                    # Evita falso «pagina risultati» subito dopo pack di ``ver_work_frame`` (manager non ancora coerente).
+                    on_results = False
+            except tk.TclError:
+                on_results = False
+        if on_results:
+            try:
+                ver_results_pending_empty_lbl.pack_forget()
+            except tk.TclError:
+                pass
+            try:
+                ver_pending_host.pack(fill=tk.BOTH, expand=True, anchor="nw", in_=ver_sospesi_left, padx=0, pady=0)
+            except tk.TclError:
+                pass
+            return
+        if not ver_session_active[0]:
+            return
+        try:
+            after_w = ver_status_lbl
+            if ver_cand_frame.winfo_ismapped():
+                after_w = ver_cand_frame
+        except tk.TclError:
+            after_w = ver_status_lbl
+        try:
+            ver_pending_host.pack(fill=tk.X, pady=(0, 4), in_=ver_work_frame, after=after_w)
+        except tk.TclError:
+            pass
+
+    def _ver_refresh_pending_tree() -> None:
+        changed = _ver_sort_pending_items_for_display()
+        if changed and ver_account_code_var.get().strip():
+            try:
+                _ver_save_pending_to_db()
+            except Exception:
+                pass
+        on_results = _ver_ui_on_results_page()
+        ver_pending_tree.delete(*ver_pending_tree.get_children())
+        for i, item in enumerate(ver_pending_items[0]):
+            if on_results and _ver_item_is_verified(item):
+                continue
+            date_disp = _ver_format_pending_item_date(item)
+            if on_results:
+                amt_str, pend_tag = _ver_grid_amount_from_amount_str(item.get("amount", "0"))
+                stato = "In sospeso"
+                row_tags = ("ver_sess_sosp", pend_tag)
+            elif _ver_item_is_verified(item):
+                amt_str, _pend = _ver_grid_amount_from_amount_str(item.get("amount", "0"))
+                stato = "Verificato"
+                row_tags = ("ver_sess_ok",)
+            else:
+                amt_str, pend_tag = _ver_grid_amount_from_amount_str(item.get("amount", "0"))
+                stato = "In sospeso"
+                row_tags = ("ver_sess_sosp", pend_tag)
+            chq_d = _ver_trunc_ver_result_cell(item.get("cheque", ""), 20)
+            note_d = _ver_trunc_ver_result_cell(item.get("note", ""), 120)
+            ver_pending_tree.insert(
+                "",
+                "end",
+                iid=str(i),
+                values=(date_disp, amt_str, chq_d, note_d, stato),
+                tags=row_tags,
+            )
+        if not on_results:
+            q_bp = ver_bancoposta_queue[0]
+            i_bp = ver_bancoposta_idx[0]
+            if q_bp and 0 <= i_bp < len(q_bp):
+                row = q_bp[i_bp]
+                try:
+                    amt_pdf = row["amount"]
+                    amt_str_p, pdf_tag = _ver_grid_amount_from_decimal(amt_pdf)
+                except Exception:
+                    amt_str_p, pdf_tag = _ver_grid_amount_from_amount_str(row.get("amount", "0"))
+                bd_pdf = str(row.get("booking_date") or row.get("booking") or "").strip()
+                date_pdf = _ver_format_pending_item_date({"booking_date": bd_pdf, "booking": bd_pdf})
+                note_pdf = str(row.get("note") or "")
+                if len(note_pdf) > 240:
+                    note_pdf = note_pdf[:237] + "..."
+                ver_pending_tree.insert(
+                    "",
+                    "end",
+                    iid="__pdf_current__",
+                    values=(date_pdf, amt_str_p, "", note_pdf, "Voce corrente (PDF)"),
+                    tags=(pdf_tag, "ver_sess_pdf"),
+                )
+        ch = ver_pending_tree.get_children()
+        if ch:
+            try:
+                try:
+                    verifica_frame.update_idletasks()
+                except tk.TclError:
+                    pass
+                ver_pending_tree.see(ch[-1])
+            except tk.TclError:
+                pass
+        items = ver_pending_items[0]
+        has_any = bool(items)
+        has_sosp = any(not _ver_item_is_verified(x) for x in items)
+        has_ok = any(_ver_item_is_verified(x) for x in items)
+        if on_results:
+            if has_sosp:
+                ver_pending_lbl.configure(
+                    text="Dati di verifica in sospeso — modifica o elimina prima di «Riavvia ricerca»"
+                )
+            else:
+                if not ver_session_active[0] and not has_any:
+                    ver_pending_lbl.configure(
+                        text="Verifica completata: nessun dato di sessione in sospeso."
+                    )
+                elif ver_verifica_used_pdf_coda[0]:
+                    ver_pending_lbl.configure(text="Nessun dato in sospeso per questa sessione.")
+                else:
+                    ver_pending_lbl.configure(
+                        text="Nessun dato in sospeso — usare «Nuovo dato di verifica» per aggiungerne."
+                    )
+        elif has_any and has_ok and has_sosp:
+            ver_pending_lbl.configure(
+                text="Dati immessi in sessione (colonna Stato: verificato / in sospeso)"
+            )
+        elif has_any and has_ok and not has_sosp:
+            ver_pending_lbl.configure(text="Tutti i dati di verifica di sessione risultano verificati")
+        else:
+            ver_pending_lbl.configure(text="Dati di verifica in sospeso")
+        _ver_update_pending_action_buttons_visibility()
+        _ver_place_pending_host()
+        _ver_update_results_session_ui_visibility()
+        if _ver_ui_on_results_page():
+            _ver_fill_ver_results_summary()
+            try:
+                ver_results_frame.update_idletasks()
+                ver_pending_host.update_idletasks()
+            except tk.TclError:
+                pass
+            _ver_pack_ver_input_on_results_page()
+
+    def _ver_on_annulla_sel_pending_click(_e: object = None) -> None:
+        try:
+            for iid in ver_pending_tree.selection():
+                ver_pending_tree.selection_remove(iid)
+        except tk.TclError:
+            pass
+        _ver_update_pending_action_buttons_visibility()
+
+    def _ver_del_pending() -> None:
+        sel = ver_pending_tree.selection()
+        if not sel:
+            return
+        if sel[0] == "__pdf_current__":
+            ver_status_var.set("La voce «PDF corrente» non si elimina da qui: usare l'immissione sopra.")
+            return
+        try:
+            idx = int(sel[0])
+        except (ValueError, IndexError):
+            return
+        if 0 <= idx < len(ver_pending_items[0]):
+            if _ver_item_is_verified(ver_pending_items[0][idx]):
+                ver_status_var.set("Le righe già verificate non si eliminano dalla griglia.")
+                return
+            ver_pending_items[0].pop(idx)
+            _ver_refresh_pending_tree()
+
+    def _ver_edit_pending() -> None:
+        sel = ver_pending_tree.selection()
+        if not sel:
+            return
+        if sel[0] == "__pdf_current__":
+            ver_status_var.set("Per la voce PDF corrente usare i campi di immissione sopra.")
+            return
+        try:
+            idx = int(sel[0])
+        except (ValueError, IndexError):
+            return
+        if idx < 0 or idx >= len(ver_pending_items[0]):
+            return
+        _ver_apply_edit_to_pending_item_index(idx)
+
+    ver_btn_del_pending.bind("<Button-1>", lambda _e: _ver_del_pending())
+    ver_btn_edit_pending.bind("<Button-1>", lambda _e: _ver_edit_pending())
+    ver_btn_annulla_sel_pending.bind("<Button-1>", lambda _e: _ver_on_annulla_sel_pending_click())
+    ver_pending_tree.bind("<<TreeviewSelect>>", _ver_update_pending_action_buttons_visibility)
+
+    # ---- Terminazione immissione e posizionamento ** ----
+    def _ver_ask_stmt_balance(*, initial_balance: Decimal | None = None) -> Decimal | None:
+        """Finestra dedicata per immissione saldo estratto conto con validazione euro."""
+        eff_initial = initial_balance
+        if eff_initial is None:
+            eff_initial = ver_pdf_closing_balance_hint[0]
+
+        dlg = tk.Toplevel(verifica_frame)
+        dlg.title("Saldo estratto conto")
+        try:
+            dlg.transient(verifica_frame.winfo_toplevel())
+        except Exception:
+            try:
+                dlg.transient(verifica_frame)
+            except Exception:
+                pass
+        dlg.resizable(False, False)
+        dlg.configure(bg=_VER_BG)
+
+        intro = (
+            f"Immetti il saldo del conto {ver_account_name_var.get()}\n"
+            f"risultante dall'estratto conto:"
+        )
+        if eff_initial is not None:
+            intro += "\n\nÈ possibile modificare il valore preimpostato prima di confermare."
+        tk.Label(
+            dlg,
+            text=intro,
+            font=_ver_ui_font,
+            bg=_VER_BG,
+            justify=tk.LEFT,
+        ).pack(padx=16, pady=(16, 8))
+        bal_var = tk.StringVar(value="")
+        if eff_initial is not None:
+            try:
+                ib = eff_initial.quantize(Decimal("0.01"))
+                iv = format_euro_it(ib)
+                if ib > 0 and not iv.startswith("+") and not iv.startswith("-"):
+                    iv = "+" + iv
+                bal_var.set(iv)
+            except Exception:
+                pass
+        bal_entry = ttk.Entry(dlg, textvariable=bal_var, width=18, style="NewReg.TEntry",
+                              font=("TkDefaultFont", 13))
+        bal_entry.pack(padx=16, pady=(0, 4))
+        bind_euro_amount_entry_validation(bal_entry, bal_var, allow_leading_sign=True)
+        if eff_initial is not None:
+            try:
+                ib2 = eff_initial.quantize(Decimal("0.01"))
+                iv2 = format_euro_it(ib2)
+                if ib2 > 0 and not iv2.startswith("+") and not iv2.startswith("-"):
+                    iv2 = "+" + iv2
+                bal_var.set(iv2)
+            except Exception:
+                pass
+
+        bal_err_var = tk.StringVar(value="")
+        tk.Label(dlg, textvariable=bal_err_var, font=("TkDefaultFont", 10), bg=_VER_BG,
+                 fg="#c62828").pack(padx=16, pady=(0, 4))
+
+        result: list[Decimal | None] = [None]
+
+        def _on_ok(_e: object = None) -> None:
+            raw = bal_var.get().strip()
+            if not raw:
+                bal_err_var.set("Importo obbligatorio.")
+                return
+            try:
+                val = normalize_euro_input(raw)
+            except Exception:
+                bal_err_var.set("Importo non valido.")
+                return
+            result[0] = val
+            dlg.destroy()
+
+        def _on_cancel() -> None:
+            dlg.destroy()
+
+        btn_frame = tk.Frame(dlg, bg=_VER_BG)
+        btn_frame.pack(padx=16, pady=(4, 16))
+        ttk.Button(btn_frame, text="Conferma", command=_on_ok, style="NewReg.TButton").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_frame, text="Annulla", command=_on_cancel, style="NewReg.TButton").pack(side=tk.LEFT)
+
+        bind_return_and_kp_enter(bal_entry, _on_ok)
+        try:
+            _ver_activate_ui_for_modal_dialog()
+            dlg.update_idletasks()
+            dlg.deiconify()
+            dlg.lift()
+            dlg.focus_force()
+        except Exception:
+            pass
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+        try:
+            bal_entry.focus_set()
+            bal_entry.icursor(tk.END)
+        except tk.TclError:
+            pass
+
+        dlg.wait_window()
+        return result[0]
+
+    def _ver_restore_immissione_after_stmt_cancelled() -> None:
+        """Dopo annullamento del saldo estratto conto: torna all'immissione nella sessione corrente."""
+        ver_results_after_persist_cb[0] = None
+        try:
+            ver_results_frame.pack_forget()
+        except tk.TclError:
+            pass
+        try:
+            ver_setup_frame.pack_forget()
+        except tk.TclError:
+            pass
+        ver_session_active[0] = True
+        if not bool(str(ver_work_frame.winfo_manager() or "").strip()):
+            try:
+                ver_work_frame.pack(fill=tk.BOTH, expand=True)
+            except tk.TclError:
+                pass
+        _ver_pack_ver_input_in_work_frame()
+        try:
+            _ver_place_pending_host()
+        except Exception:
+            pass
+        try:
+            _ver_refresh_pending_tree()
+        except Exception:
+            pass
+        _ver_update_submit_visibility()
+        _ver_update_pending_action_buttons_visibility()
+
+    def _ver_prompt_stmt_balance_after_pdf_done(closing: Decimal | None) -> None:
+        """Dopo l'ultima voce PDF: popup saldo (importo opzionale dall'estratto), senza usare Termina immissione."""
+        try:
+            ver_btn_end.pack_forget()
+        except tk.TclError:
+            pass
+        ver_btn_annulla_sel_pending.pack_forget()
+        ver_btn_del_pending.pack_forget()
+        ver_btn_edit_pending.pack_forget()
+        ver_btn_new_ver_data.pack_forget()
+        stmt_balance = _ver_ask_stmt_balance(initial_balance=closing)
+        if stmt_balance is None:
+            _ver_pack_ver_input_in_work_frame()
+            _ver_update_pending_action_buttons_visibility()
+            try:
+                ver_ent_amt.focus_set()
+            except tk.TclError:
+                pass
+            return
+        ver_stmt_balance_var.set(str(stmt_balance))
+        acc_code = ver_account_code_var.get()
+        if acc_code:
+            _ver_clear_pending_from_db(acc_code)
+        try:
+            _ver_refresh_pending_tree()
+        except Exception:
+            pass
+        _ver_place_double_star(acc_code)
+        persist_db_after_edit(None)
+        _movements_dirty[0] = True
+        _ver_show_results(acc_code, stmt_balance)
+        ver_bancoposta_closing[0] = None
+        ver_pdf_closing_balance_hint[0] = None
+
+    def _ver_on_end_input() -> None:
+        _ver_hide_resume_immissione_btn()
+        ver_btn_annulla_sel_pending.pack_forget()
+        ver_btn_del_pending.pack_forget()
+        ver_btn_edit_pending.pack_forget()
+        ver_btn_new_ver_data.pack_forget()
+
+        q_bp_end = ver_bancoposta_queue[0]
+        i_bp_end = ver_bancoposta_idx[0]
+        pdf_line_active = bool(q_bp_end) and 0 <= i_bp_end < len(q_bp_end)
+        if not pdf_line_active and not ver_manual_any_amount_submitted[0]:
+            ver_results_after_persist_cb[0] = None
+            need_resume = _ver_count_pending_rows() > 0 or bool(ver_bancoposta_queue[0])
+            if need_resume:
+                try:
+                    _ver_save_pending_to_db()
+                except Exception:
+                    pass
+            else:
+                acc_e = ver_account_code_var.get().strip()
+                if acc_e:
+                    saved_disk = _ver_load_pending_from_db(acc_e)
+                    if not _ver_saved_has_verification_in_sospeso(saved_disk):
+                        try:
+                            _ver_clear_pending_from_db(acc_e)
+                            persist_db_after_edit(None)
+                        except Exception:
+                            pass
+            ver_session_active[0] = False
+            ver_manual_any_amount_submitted[0] = False
+            ver_verifica_used_pdf_coda[0] = False
+            ver_pending_items[0] = []
+            ver_bancoposta_queue[0] = []
+            ver_bancoposta_idx[0] = -1
+            ver_bancoposta_closing[0] = None
+            ver_pdf_closing_balance_hint[0] = None
+            ver_bancoposta_pdf_var.set("")
+            try:
+                ver_bancoposta_entry.configure(state="normal")
+            except tk.TclError:
+                pass
+            _ver_set_bancoposta_browse_enabled(True)
+            ver_cand_frame.pack_forget()
+            ver_cand_candidates[0] = []
+            ver_cand_pending_item[0] = None
+            try:
+                ver_pending_host.pack_forget()
+            except tk.TclError:
+                pass
+            try:
+                ver_input_frame.pack_forget()
+            except tk.TclError:
+                pass
+            ver_work_frame.pack_forget()
+            ver_results_frame.pack_forget()
+            ver_account_name_var.set("")
+            ver_cutoff_date_var.set("")
+            ver_account_code_var.set("")
+            ver_stmt_balance_var.set("")
+            ver_status_var.set("")
+            ver_inp_amt_var.set("-")
+            ver_inp_chq_var.set("")
+            ver_inp_note_var.set("")
+            ver_setup_saved_var.set("")
+            ver_setup_pdf_path_after_auto_fail[0] = False
+            ver_setup_frame.pack(fill=tk.X, anchor=tk.W, pady=(0, 4), in_=ver_body)
+            _ver_populate_account_combo()
+            _ver_update_pending_action_buttons_visibility()
+            return
+
+        existing = ver_stmt_balance_var.get().strip()
+        if not existing:
+            pre_bal = ver_bancoposta_closing[0]
+            if pre_bal is None:
+                pre_bal = ver_pdf_closing_balance_hint[0]
+            if pre_bal is None:
+                pre_bal = _ver_reload_pdf_closing_only()
+                if pre_bal is not None:
+                    ver_pdf_closing_balance_hint[0] = pre_bal
+            if pre_bal is not None:
+                ver_stmt_balance_var.set(str(pre_bal))
+                existing = ver_stmt_balance_var.get().strip()
+        if existing:
+            try:
+                stmt_balance = Decimal(existing)
+            except Exception:
+                stmt_balance = None
+        else:
+            stmt_balance = None
+
+        if stmt_balance is None:
+            ask_hint = ver_pdf_closing_balance_hint[0]
+            if ask_hint is None:
+                ask_hint = ver_bancoposta_closing[0]
+            if ask_hint is None:
+                ask_hint = _ver_reload_pdf_closing_only()
+                if ask_hint is not None:
+                    ver_pdf_closing_balance_hint[0] = ask_hint
+            stmt_balance = _ver_ask_stmt_balance(initial_balance=ask_hint)
+            if stmt_balance is None:
+                _ver_restore_immissione_after_stmt_cancelled()
+                ver_status_var.set(
+                    "Saldo estratto conto non indicato: continuare l'immissione dei dati di verifica, "
+                    "oppure premere di nuovo «Termina immissione» quando il saldo è noto."
+                )
+                try:
+                    ver_btn_resume_immissione.pack(side=tk.RIGHT, padx=(0, 8), before=ver_btn_end)
+                except tk.TclError:
+                    pass
+                try:
+                    ver_ent_amt.focus_set()
+                except tk.TclError:
+                    pass
+                return
+            ver_stmt_balance_var.set(str(stmt_balance))
+
+        acc_code = ver_account_code_var.get()
+        try:
+            need_resume_end = _ver_count_pending_rows() > 0 or bool(ver_bancoposta_queue[0])
+            if need_resume_end:
+                _ver_save_pending_to_db()
+            else:
+                ac_end = (acc_code or "").strip()
+                if ac_end:
+                    _ver_clear_pending_from_db(ac_end)
+        except Exception:
+            pass
+        ver_results_after_persist_cb[0] = None
+        _ver_place_double_star(acc_code)
+        persist_db_after_edit(None)
+        _movements_dirty[0] = True
+        _ver_show_results(acc_code, stmt_balance)
+        ver_bancoposta_closing[0] = None
+        ver_pdf_closing_balance_hint[0] = None
+
+    def _ver_place_double_star(acc_code: str) -> None:
+        """Trova l'ultima registrazione verificata (*) consecutiva dal primo ** e pone ** su di essa."""
+        all_records, reg_map = _build_reg_index_maps()
+        ordered = sorted(
+            [(reg_map[record_legacy_stable_key(r)], r) for r in all_records],
+            key=lambda x: x[0],
+        )
+
+        first_double_idx: int | None = None
+        for i, (reg_n, rec) in enumerate(ordered):
+            if rec.get("is_cancelled"):
+                continue
+            touches, side = _ver_record_touches_account(rec, acc_code)
+            if not touches:
+                continue
+            stars = _ver_account_stars(rec, side)
+            if stars >= 2:
+                first_double_idx = i
+                break
+
+        start_scan = (first_double_idx + 1) if first_double_idx is not None else 0
+        last_verified_rec: dict | None = None
+        last_verified_side: str = ""
+        for i in range(start_scan, len(ordered)):
+            reg_n, rec = ordered[i]
+            if rec.get("is_cancelled"):
+                continue
+            touches, side = _ver_record_touches_account(rec, acc_code)
+            if not touches:
+                continue
+            stars = _ver_account_stars(rec, side)
+            if stars >= 1:
+                last_verified_rec = rec
+                last_verified_side = side
+            else:
+                break
+
+        if last_verified_rec is not None:
+            if first_double_idx is not None:
+                old_rec = ordered[first_double_idx][1]
+                _, old_side = _ver_record_touches_account(old_rec, acc_code)
+                old_stars = _ver_account_stars(old_rec, old_side)
+                if old_stars >= 2:
+                    _set_account_flags(old_rec, old_side, 1)
+            _set_account_flags(last_verified_rec, last_verified_side, 2)
+
+    ver_btn_end.bind("<Button-1>", lambda _e: _ver_on_end_input())
+
+    # ---- Mostra risultati finali ----
+    def _ver_show_results(acc_code: str, stmt_balance: Decimal) -> None:
+        cutoff_raw = ver_cutoff_date_var.get().strip()
+        try:
+            cutoff_iso = parse_italian_ddmmyyyy_to_iso(cutoff_raw)
+        except Exception:
+            cutoff_iso = date.today().isoformat()
+
+        ver_input_frame.pack_forget()
+
+        d = cur_db()
+        all_records, reg_map = _build_reg_index_maps()
+        acc_by_year = year_accounts_map(d)
+        cat_by_year = year_categories_map(d)
+
+        ordered = sorted(
+            [(reg_map[record_legacy_stable_key(r)], r) for r in all_records],
+            key=lambda x: x[0],
+        )
+
+        double_star_boundary = -1
+        for reg_n, rec in ordered:
+            if rec.get("is_cancelled"):
+                continue
+            touches, side = _ver_record_touches_account(rec, acc_code)
+            if not touches:
+                continue
+            if _ver_account_stars(rec, side) >= 2:
+                double_star_boundary = reg_n
+
+        unverified_before: list[tuple[int, dict, str]] = []
+        unverified_after: list[tuple[int, dict, str]] = []
+        sum_unverified = Decimal("0")
+        count_verified = 0
+        count_total_touching = 0
+
+        for reg_n, rec in ordered:
+            if reg_n <= double_star_boundary:
+                continue
+            if rec.get("is_cancelled"):
+                continue
+            touches, side = _ver_record_touches_account(rec, acc_code)
+            if not touches:
+                continue
+            count_total_touching += 1
+            stars = _ver_account_stars(rec, side)
+            if stars >= 1:
+                count_verified += 1
+                continue
+            rec_date = str(rec.get("date_iso", ""))
+            amt = _ver_record_amount_for_account(rec, side)
+            sum_unverified += amt
+            if rec_date <= cutoff_iso:
+                unverified_before.append((reg_n, rec, side))
+            else:
+                unverified_after.append((reg_n, rec, side))
+
+        latest_yb = latest_year_bucket(d)
+        names = [a["name"] for a in (latest_yb or {}).get("accounts", [])] if latest_yb else []
+        acc_idx = int(acc_code) - 1
+        la = legacy_absolute_account_amounts(d, len(names))
+        if la is not None:
+            new_fx = compute_new_records_effect(d)
+            canc = compute_cancelled_imported_records_balance_adjustment(
+                d, cutoff_date_iso="9999-12-31"
+            )
+            saldo_assoluti = [
+                la[i]
+                + (new_fx[i] if i < len(new_fx) else Decimal("0"))
+                + (canc[i] if i < len(canc) else Decimal("0"))
+                for i in range(len(names))
+            ]
+        else:
+            _, _, saldo_assoluti = compute_balances_from_2022_asof(d, cutoff_date_iso="9999-12-31")
+        current_balance = saldo_assoluti[acc_idx] if 0 <= acc_idx < len(saldo_assoluti) else Decimal("0")
+        projected = current_balance - sum_unverified
+
+        count_unverified = len(unverified_before) + len(unverified_after)
+        n_before_closure = len(unverified_before)
+        acc_nm = ver_account_name_var.get()
+        if count_unverified == 0:
+            ver_results_title.configure(
+                text=(
+                    f"Verifica conto {acc_nm} al {cutoff_raw}. "
+                    f"Registrazioni del conto: {count_total_touching}. "
+                    f"Verifiche positive: {count_verified}."
+                )
+            )
+        else:
+            ver_results_title.configure(
+                text=(
+                    f"Registrazioni non verificate del conto {acc_nm} al {cutoff_raw}. "
+                    f"Registrazioni del conto {count_total_touching}. "
+                    f"Verifiche positive: {count_verified}. "
+                    f"Non verificate: {count_unverified}, di cui anteriori alla data di chiusura: "
+                    f"{n_before_closure}."
+                )
+            )
+        ver_unver_tree.delete(*ver_unver_tree.get_children())
+        ver_unver_amt_tree.delete(*ver_unver_amt_tree.get_children())
+
+        for reg_n, rec, side in unverified_before:
+            y_acc = acc_by_year.get(rec.get("year"), [])
+            y_cat = cat_by_year.get(rec.get("year"), [])
+            cat_name = category_name_for_record(rec, y_cat)
+            acc_name = account_name_for_record(rec, y_acc, side)
+            amount_text, tone_uv = format_amount_for_verification_account(rec, side=side)
+            uv_tag = "ver_amt_neg" if tone_uv == "neg" else "ver_amt_pos"
+            iid = record_legacy_stable_key(rec)
+            ver_unver_tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(
+                    str(reg_n),
+                    to_italian_date(str(rec.get("date_iso", ""))),
+                    _ver_trunc_ver_result_cell(cat_name, 32),
+                    _ver_trunc_ver_result_cell(acc_name, 28),
+                    _ver_trunc_ver_result_cell(str(rec.get("cheque") or ""), 16),
+                    _ver_trunc_ver_result_cell(str(rec.get("note") or ""), 140),
+                    "✖",
+                ),
+                tags=("ver_uv_in_period",),
+            )
+            ver_unver_amt_tree.insert("", "end", iid=iid, values=(amount_text,), tags=(uv_tag,))
+
+        for reg_n, rec, side in unverified_after:
+            y_acc = acc_by_year.get(rec.get("year"), [])
+            y_cat = cat_by_year.get(rec.get("year"), [])
+            cat_name = category_name_for_record(rec, y_cat)
+            acc_name = account_name_for_record(rec, y_acc, side)
+            amount_text, tone_uv2 = format_amount_for_verification_account(rec, side=side)
+            uv_tag2 = "ver_amt_neg" if tone_uv2 == "neg" else "ver_amt_pos"
+            iid = record_legacy_stable_key(rec)
+            ver_unver_tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(
+                    str(reg_n),
+                    to_italian_date(str(rec.get("date_iso", ""))),
+                    _ver_trunc_ver_result_cell(cat_name, 32),
+                    _ver_trunc_ver_result_cell(acc_name, 28),
+                    _ver_trunc_ver_result_cell(str(rec.get("cheque") or ""), 16),
+                    _ver_trunc_ver_result_cell(str(rec.get("note") or ""), 140),
+                    "",
+                ),
+                tags=(),
+            )
+            ver_unver_amt_tree.insert("", "end", iid=iid, values=(amount_text,), tags=(uv_tag2,))
+
+        try:
+            _ver_unver_autofit_key_columns()
+        except Exception:
+            pass
+
+        match_ok = projected == stmt_balance
+        diff = stmt_balance - projected
+
+        ver_print_data[0] = {
+            "current_balance": current_balance,
+            "count_unverified": count_unverified,
+            "sum_unverified": sum_unverified,
+            "projected": projected,
+            "stmt_balance": stmt_balance,
+            "diff": diff,
+            "match_ok": match_ok,
+        }
+
+        ver_results_new_data_visible[0] = False
+        try:
+            ver_input_frame.pack_forget()
+        except tk.TclError:
+            pass
+        for _ver_rf in (
+            ver_sospesi_split,
+            ver_results_title,
+            ver_unver_tree_frame,
+            ver_unver_correzione_row,
+            ver_all_verified_lbl,
+            ver_results_pending_empty_lbl,
+            ver_results_footer_center,
+        ):
+            try:
+                _ver_rf.pack_forget()
+            except tk.TclError:
+                pass
+        try:
+            ver_pending_host.pack_forget()
+        except tk.TclError:
+            pass
+        try:
+            ver_results_btns.pack_forget()
+        except tk.TclError:
+            pass
+        try:
+            ver_work_frame.pack_forget()
+        except tk.TclError:
+            pass
+        ver_results_frame.pack(fill=tk.BOTH, expand=True)
+        try:
+            verifica_frame.update_idletasks()
+        except tk.TclError:
+            pass
+        ver_results_footer_center.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 6), in_=ver_results_frame)
+        ver_results_footer_inner.pack(expand=True, fill=tk.X)
+        try:
+            ver_results_btns.pack(anchor=tk.CENTER, pady=2)
+        except tk.TclError:
+            pass
+        ver_sospesi_split.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(2, 4), in_=ver_results_frame)
+        ver_results_title.pack(side=tk.TOP, fill=tk.X, pady=(6, 4), in_=ver_results_frame, after=ver_sospesi_split)
+        if count_unverified == 0:
+            try:
+                ver_unver_tree_frame.pack_forget()
+            except tk.TclError:
+                pass
+            try:
+                ver_unver_correzione_row.pack_forget()
+            except tk.TclError:
+                pass
+            for _ver_uv_clear in (ver_unver_tree, ver_unver_amt_tree):
+                for _iid in _ver_uv_clear.selection():
+                    _ver_uv_clear.selection_remove(_iid)
+            ver_unver_correzione_forza_revealed[0] = False
+            ver_unver_correzione_prev_key[0] = None
+            ver_all_verified_lbl.configure(
+                text=f"Tutte le registrazioni del conto {acc_nm} sono state verificate."
+            )
+            try:
+                ver_all_verified_lbl.pack_forget()
+            except tk.TclError:
+                pass
+            ver_all_verified_lbl.pack(
+                side=tk.TOP,
+                fill=tk.X,
+                pady=(4, 4),
+                in_=ver_results_frame,
+                after=ver_results_title,
+            )
+        else:
+            try:
+                ver_all_verified_lbl.pack_forget()
+            except tk.TclError:
+                pass
+            ver_unver_tree_frame.pack(
+                side=tk.TOP,
+                fill=tk.X,
+                expand=False,
+                pady=(0, 4),
+                in_=ver_results_frame,
+                after=ver_results_title,
+            )
+            ver_unver_correzione_row.pack(
+                side=tk.TOP,
+                fill=tk.X,
+                pady=(0, 4),
+                in_=ver_results_frame,
+                after=ver_unver_tree_frame,
+            )
+
+        try:
+            verifica_frame.update_idletasks()
+        except tk.TclError:
+            pass
+        _ver_refresh_pending_tree()
+
+        def _ver_results_after_persist_refresh() -> None:
+            ac = ver_account_code_var.get().strip()
+            raw_sb = ver_stmt_balance_var.get().strip()
+            if not ac or not raw_sb:
+                return
+            try:
+                sb = Decimal(raw_sb)
+            except Exception:
+                return
+            if not _ver_ui_on_results_page():
+                return
+            _ver_show_results(ac, sb)
+
+        ver_results_after_persist_cb[0] = _ver_results_after_persist_refresh
+        if count_unverified > 0:
+            _ver_refresh_ver_unver_correction_bar()
+
+    # ---- Stampa risultati ----
+    def _ver_on_print() -> None:
+        acc_name = ver_account_name_var.get()
+        cutoff_raw = ver_cutoff_date_var.get().strip()
+
+        pending_rows = ""
+        for item in ver_pending_items[0]:
+            if _ver_item_is_verified(item):
+                continue
+            amt_s, _ = _ver_grid_amount_from_amount_str(item.get("amount", "0"))
+            date_disp = _ver_format_pending_item_date(item)
+            pending_rows += (
+                f"<tr><td>{html_module.escape(date_disp)}</td>"
+                f"<td>{html_module.escape(amt_s)}</td>"
+                f"<td>{html_module.escape(item.get('cheque', ''))}</td>"
+                f"<td>{html_module.escape(item.get('note', ''))}</td>"
+                f"<td>In sospeso</td></tr>\n"
+            )
+
+        unver_rows = ""
+        for iid in ver_unver_tree.get_children():
+            lv = ver_unver_tree.item(iid, "values")
+            amt_cell = ""
+            if ver_unver_amt_tree.exists(iid):
+                av = ver_unver_amt_tree.item(iid, "values")
+                amt_cell = str(av[0]) if av else ""
+            full_vals = lv[:4] + (amt_cell,) + lv[4:]
+            row_cells = "".join(f"<td>{html_module.escape(str(v))}</td>" for v in full_vals)
+            unver_rows += f"<tr>{row_cells}</tr>\n"
+
+        d = cur_db()
+        uh_e = html_module.escape(print_user_header_text(d, session_holder[0]))
+
+        pd = ver_print_data[0] or {}
+        current_balance = pd.get("current_balance", Decimal("0"))
+        count_unverified = pd.get("count_unverified", 0)
+        sum_unverified = pd.get("sum_unverified", Decimal("0"))
+        projected = pd.get("projected", Decimal("0"))
+        stmt_balance = pd.get("stmt_balance", Decimal("0"))
+        diff = pd.get("diff", Decimal("0"))
+        match_ok = pd.get("match_ok", False)
+
+        if match_ok:
+            verdict_html = '<p style="margin-top:3mm; font-weight:700; font-size:12pt; color:#2e7d32;">✓ Verifica coincidente</p>'
+        else:
+            verdict_html = '<p style="margin-top:3mm; font-weight:700; font-size:12pt; color:#c62828;">✗ Scostamento: sono necessari controlli</p>'
+
+        spec_rows = _ver_summary_row_definitions(
+            current_balance=current_balance,
+            count_unverified=int(count_unverified),
+            sum_unverified=sum_unverified,
+            projected=projected,
+            stmt_balance=stmt_balance,
+            diff=diff,
+        )
+        diff_color = _ver_summary_diff_line_color(bool(match_ok))
+        summary_parts: list[str] = []
+        for desc, val in spec_rows:
+            if desc == "Differenza":
+                summary_parts.append(
+                    f'<tr class="diff-row"><td><strong>{html_module.escape(desc)}</strong></td>'
+                    f'<td class="amt" style="color:{diff_color};"><strong>'
+                    f"{html_module.escape(_ver_summary_signed_eur(val))}</strong></td></tr>\n"
+                )
+            else:
+                ac = _ver_summary_amount_line_color(val)
+                summary_parts.append(
+                    f"<tr><td>{html_module.escape(desc)}</td>"
+                    f'<td class="amt" style="color:{ac};">{html_module.escape(_ver_summary_signed_eur(val))}</td></tr>\n'
+                )
+        summary_rows = "".join(summary_parts)
+
+        html_doc = f"""<!DOCTYPE html>
+<html lang="it"><head><meta charset="utf-8"/><title>Verifica {html_module.escape(acc_name)}</title>
+<style>
+body {{ font-family: system-ui, -apple-system, sans-serif; color:#1a1a1a; padding:8mm; font-size:12pt; }}
+h2 {{ margin:0 0 3mm 0; font-size:14pt; }}
+h3 {{ font-size:13pt; }}
+p {{ margin:0 0 2mm 0; }}
+.user-hdr {{ text-align:center; font-weight:700; font-size:14pt; margin:0 0 4mm 0; }}
+table {{ width:100%; border-collapse:collapse; margin:0 0 4mm 0; }}
+th, td {{ border:1px solid #999; padding:4px 6px; vertical-align:top; text-align:left; }}
+th {{ background:#efefef; }}
+table.summary {{ width:auto; min-width:50%; margin:4mm 0; font-size:12pt; }}
+table.summary td {{ border:none; padding:3px 14px 3px 0; }}
+table.summary td.amt {{ text-align:right; font-family:monospace; padding-left:24px; white-space:nowrap; }}
+table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
+</style></head><body>
+<p class="user-hdr">{uh_e}</p>
+<h2>Verifica conto: {html_module.escape(acc_name)} — Chiusura: {html_module.escape(cutoff_raw)}</h2>
+<p>Data stampa: {html_module.escape(to_italian_date(date.today().isoformat()))}</p>
+"""
+        if pending_rows:
+            html_doc += """<h3>Dati di verifica in sospeso</h3>
+<table><tr><th>Data</th><th>Importo</th><th>Assegno</th><th>Nota</th><th>Stato</th></tr>
+""" + pending_rows + "</table>\n"
+        else:
+            html_doc += (
+                '<p style="margin:0 0 3mm 0; font-size:12pt; color:#2e7d32; font-weight:600;">'
+                "Tutti i dati di verifica hanno trovato corrispondenza.</p>\n"
+            )
+
+        if unver_rows:
+            html_doc += f"""<h3>Registrazioni non verificate</h3>
+<table><tr><th>#</th><th>Data</th><th>Categoria</th><th>Conto</th><th>Importo</th><th>Assegno</th><th>Nota</th><th>Periodo</th></tr>
+""" + unver_rows + "</table>\n"
+        else:
+            html_doc += '<p><em>Tutte le registrazioni sono state verificate.</em></p>\n'
+
+        html_doc += f'<h3>Riepilogo</h3>\n<table class="summary">\n{summary_rows}</table>\n'
+        html_doc += verdict_html
+        html_doc += "\n</body></html>"
+
+        try:
+            _print_ricerca_via_browser(html_doc)
+        except Exception as exc:
+            messagebox.showerror("Stampa verifica", str(exc))
+            return
+        # Resta sulla pagina risultati: uscita dalla verifica solo con «Chiudi verifica».
+
+    ver_btn_print.bind("<Button-1>", lambda _e: _ver_on_print())
+
+    # ---- Nuovo ciclo: ritenta verifica automatica sui sospesi ----
+    def _ver_retry_pending() -> int:
+        """Riesegue la verifica su ogni sospeso. Ritorna il numero di match riusciti."""
+        acc_code = ver_account_code_var.get()
+        matched = 0
+        for item in list(ver_pending_items[0]):
+            if _ver_item_is_verified(item):
+                continue
+            try:
+                amt = Decimal(item["amount"])
+            except Exception:
+                continue
+            chq = item.get("cheque", "")
+            note = item.get("note", "")
+            bd_raw = str(item.get("booking_date") or item.get("booking") or "").strip()
+            result_type, matched_rec, candidates = _ver_search_match(
+                acc_code,
+                amt,
+                chq,
+                note,
+                pdf_assisted=bool(bd_raw),
+                pdf_booking_date=bd_raw or None,
+            )
+            verify_rec: dict | None = None
+            if result_type == "exact" and matched_rec is not None:
+                verify_rec = matched_rec
+            elif result_type == "candidates" and len(candidates) == 1:
+                # Ripresa: un solo movimento non verificato con stesso importo nel «fascio» dopo ** → ok automatico.
+                verify_rec = candidates[0][1]
+            elif result_type == "contains" and matched_rec is not None and len(candidates) == 1:
+                verify_rec = matched_rec
+            if verify_rec is not None:
+                _touches, side = _ver_record_touches_account(verify_rec, acc_code)
+                _ver_mark_record_verified(verify_rec, side)
+                item["verified"] = True
+                matched += 1
+        if matched > 0:
+            persist_db_after_edit(None)
+            _movements_dirty[0] = True
+        return matched
+
+    def _ver_redisplay_final_results_after_retry() -> bool:
+        """Se c'è un saldo estratto già noto, ripresenta tabella risultati e tasti (stampa, …). Ritorna True se fatto."""
+        acc_code = ver_account_code_var.get().strip()
+        raw_bal = ver_stmt_balance_var.get().strip()
+        if not acc_code or not raw_bal:
+            return False
+        try:
+            stmt_balance = Decimal(raw_bal)
+        except Exception:
+            return False
+        try:
+            need_rd = _ver_count_pending_rows() > 0 or bool(ver_bancoposta_queue[0])
+            if need_rd:
+                _ver_save_pending_to_db()
+            else:
+                _ver_clear_pending_from_db(acc_code)
+        except Exception:
+            pass
+        try:
+            _ver_refresh_pending_tree()
+        except Exception:
+            pass
+        _ver_place_double_star(acc_code)
+        try:
+            persist_db_after_edit(None)
+        except Exception:
+            pass
+        _movements_dirty[0] = True
+        _ver_show_results(acc_code, stmt_balance)
+        try:
+            ver_work_frame.pack_forget()
+        except tk.TclError:
+            pass
+        return True
+
+    def _ver_on_new_cycle() -> None:
+        _ver_hide_resume_immissione_btn()
+        try:
+            ver_pending_host.pack_forget()
+        except tk.TclError:
+            pass
+        ver_results_frame.pack_forget()
+        before_n = _ver_count_pending_rows()
+        n = _ver_retry_pending()
+        after_n = _ver_count_pending_rows()
+        _ver_pack_ver_input_in_work_frame()
+        ver_work_frame.pack_forget()
+        ver_work_frame.pack(fill=tk.BOTH, expand=True)
+        _ver_refresh_pending_tree()
+        redisplay = False
+        if before_n == 0:
+            ver_status_var.set("Riavvio ricerca: nessun dato in sospeso.")
+            messagebox.showinfo(
+                "Verifica",
+                "Non ci sono dati di verifica in sospeso su cui eseguire la ricerca.",
+            )
+        elif n > 0:
+            ver_status_var.set(
+                f"Ricerca sui sospesi: {n} verificati automaticamente. "
+                f"Rimangono {after_n} in sospeso."
+            )
+            messagebox.showinfo(
+                "Verifica",
+                f"La ricerca sui dati in sospeso ha avuto successo per {n} "
+                f"{'dato' if n == 1 else 'dati'} su {before_n}.\n\n"
+                f"Dati che restano in sospeso: {after_n}.",
+            )
+            redisplay = _ver_redisplay_final_results_after_retry()
+        elif after_n > 0:
+            ver_status_var.set(
+                f"Ricerca sui sospesi: nessuna nuova corrispondenza. "
+                f"Rimangono {after_n} in sospeso."
+            )
+            messagebox.showwarning(
+                "Verifica",
+                f"La ricerca non ha trovato nuove corrispondenze automatiche "
+                f"per i {before_n} dati in sospeso.\n\n"
+                "I dati restano nell'elenco «Dati di verifica in sospeso».",
+            )
+        else:
+            ver_status_var.set("Ricerca sui sospesi: tutti i dati sono stati verificati.")
+            messagebox.showinfo(
+                "Verifica",
+                f"La ricerca ha avuto successo per tutti i dati in sospeso ({before_n}).\n\n"
+                "Nessun dato resta in sospeso.",
+            )
+            acc_code = ver_account_code_var.get()
+            if acc_code:
+                _ver_clear_pending_from_db(acc_code)
+            _ver_filter_session_to_pending_only()
+            _ver_refresh_pending_tree()
+            redisplay = _ver_redisplay_final_results_after_retry()
+        if not redisplay:
+            try:
+                ver_ent_amt.focus_set()
+            except tk.TclError:
+                pass
+
+    ver_btn_new_cycle.bind("<Button-1>", lambda _e: _ver_on_new_cycle())
+
+    # ---- Chiudi verifica ----
+    def _ver_apply_full_verification_teardown() -> None:
+        """Torna alla schermata iniziale verifica e azzera lo stato di sessione in memoria."""
+        _ver_hide_resume_immissione_btn()
+        ver_setup_pdf_path_after_auto_fail[0] = False
+        ver_results_after_persist_cb[0] = None
+        try:
+            ver_pending_host.pack_forget()
+        except tk.TclError:
+            pass
+        try:
+            ver_input_frame.pack_forget()
+        except tk.TclError:
+            pass
+        ver_session_active[0] = False
+        ver_manual_any_amount_submitted[0] = False
+        ver_verifica_used_pdf_coda[0] = False
+        ver_pending_items[0] = []
+        ver_bancoposta_queue[0] = []
+        ver_bancoposta_idx[0] = -1
+        ver_bancoposta_closing[0] = None
+        ver_pdf_closing_balance_hint[0] = None
+        ver_bancoposta_pdf_var.set("")
+        try:
+            ver_bancoposta_entry.configure(state="normal")
+        except tk.TclError:
+            pass
+        _ver_set_bancoposta_browse_enabled(True)
+        ver_cand_frame.pack_forget()
+        ver_cand_candidates[0] = []
+        ver_cand_pending_item[0] = None
+        ver_work_frame.pack_forget()
+        ver_results_frame.pack_forget()
+        ver_account_name_var.set("")
+        ver_cutoff_date_var.set("")
+        ver_account_code_var.set("")
+        ver_stmt_balance_var.set("")
+        ver_status_var.set("")
+        ver_inp_amt_var.set("-")
+        ver_inp_chq_var.set("")
+        ver_inp_note_var.set("")
+        ver_setup_saved_var.set("")
+        ver_setup_frame.pack(fill=tk.X, anchor=tk.W, pady=(0, 4), in_=ver_body)
+        _ver_populate_account_combo()
+
+    def _ver_on_close() -> None:
+        ver_amt_focusout_suppress_once[0] = True
+        try:
+            if not messagebox.askokcancel(
+                "Chiudi verifica",
+                "Uscire dalla verifica?\n\n"
+                "«Annulla» resta in questa pagina; «OK» chiude la sessione di verifica.",
+                parent=verifica_frame,
+            ):
+                return
+        except tk.TclError:
+            ver_amt_focusout_suppress_once[0] = False
+            return
+        need_resume = _ver_count_pending_rows() > 0 or bool(ver_bancoposta_queue[0])
+        n_sosp = _ver_count_pending_rows()
+        acc_nm = ver_account_name_var.get().strip() or "—"
+
+        if need_resume:
+            _ver_save_pending_to_db()
+            if n_sosp > 0:
+                if n_sosp == 1:
+                    sosp_intro = (
+                        f"È rimasto 1 dato di verifica del conto {acc_nm} che non ha trovato riscontro. "
+                        "Verrà riproposto alla prossima verifica sullo stesso conto."
+                    )
+                else:
+                    sosp_intro = (
+                        f"Sono rimasti {n_sosp} dati di verifica del conto {acc_nm} che non hanno trovato riscontro. "
+                        "Verranno riproposti alla prossima verifica sullo stesso conto."
+                    )
+                messagebox.showinfo(
+                    "Chiudi verifica",
+                    sosp_intro
+                    + "\n\n"
+                    + "I dati restano salvati nel file dell'applicazione e sono disponibili anche dopo "
+                    "la chiusura del programma.",
+                    parent=verifica_frame,
+                )
+            elif ver_bancoposta_queue[0]:
+                messagebox.showinfo(
+                    "Chiudi verifica",
+                    "Stato dell'estratto PDF (voci residue) salvato per la ripresa.\n\n"
+                    "Alla prossima apertura della verifica su questo conto comparirà il dialogo "
+                    "per riprendere l'estratto salvato.",
+                    parent=verifica_frame,
+                )
+        else:
+            acc_code = ver_account_code_var.get().strip()
+            if acc_code:
+                saved_disk = _ver_load_pending_from_db(acc_code)
+                if not _ver_saved_has_verification_in_sospeso(saved_disk):
+                    try:
+                        _ver_clear_pending_from_db(acc_code)
+                        persist_db_after_edit(None)
+                    except Exception:
+                        pass
+        _ver_apply_full_verification_teardown()
+
+    ver_btn_close.bind("<ButtonPress-1>", _ver_suppress_next_amt_focusout_check, add="+")
+    ver_btn_close.bind("<Button-1>", lambda _e: _ver_on_close())
+
+    # Popola combo alla apertura del tab
+    def _ver_on_tab_enter() -> None:
+        if not ver_session_active[0]:
+            _ver_populate_account_combo()
+            _ver_refresh_setup_saved_banner_global()
+            acc_nm_tab = ver_account_name_var.get().strip()
+            if acc_nm_tab:
+                ac_tab = _ver_account_code_for_name(acc_nm_tab)
+                sv_tab = _ver_load_pending_from_db(ac_tab) if ac_tab else None
+                if ac_tab and sv_tab and _ver_saved_has_verification_in_sospeso(sv_tab):
+                    _ver_schedule_memory_resume_prompt()
+
+    _ver_on_tab_enter_fn[0] = _ver_on_tab_enter
+    _ver_apply_bancoposta_pdf_lock_for_setup()
+    _ver_setup_start_buttons_state()
+    _ver_apply_bancoposta_pdf_lock_for_setup()
+    # ========================  FINE PAGINA VERIFICA  ========================
     pack_centered_page_title(
         statistiche_frame, title=_page_banner_title(), banner_style="MovCdc.TFrame", title_bg=MOVIMENTI_PAGE_BG
     )
@@ -9849,60 +15255,165 @@ th {{ background:#efefef; text-align:left; }}
     )
     ttk.Label(aiuto_frame, text="Pagina in preparazione").pack(anchor=tk.W)
 
-    # --- Scheda Categorie e conti (piano conti unico = ultimo anno; correzioni per nuove registrazioni) ---
+    # --- Schede Categorie e Conti (due pagine; piano unico = ultimo anno) ---
+    _PLAN_INTRO_CAT = (
+        "Qui vedi l’elenco unificato delle categorie (per codice) su tutti gli anni del database, più eventuali codici che compaiono solo nei movimenti "
+        "se in un anno manca ancora la riga nel piano: sono gli stessi nomi usabili nei filtri di ricerca. "
+        f"Limite: {MAX_CATEGORIES_COUNT} categorie. Puoi aggiungerne di nuove con il pulsante sotto l’elenco. "
+        "Non puoi eliminare una categoria. Il nome si può correggere solo con modifiche piccole e riconducibili al testo attuale; "
+        "se cambi il nome, le registrazioni già inserite vengono aggiornate solo dove il nome categoria salvato coincide esattamente con quello precedente. "
+        "La nota di categoria non entra nelle registrazioni: puoi cambiarla quando vuoi (tranne la nota predefinita della «Girata conto/conto», fissa da qui). "
+        "I nomi di «Consumi ordinari» e «Girata conto/conto» non si modificano da questa pagina. "
+        "Non esiste la categoria «dotazione iniziale»: la prima immissione si gestisce con una registrazione di tipo girata nel piano. "
+        "Per salvare nel file cifrato usa «Correggi» sulla riga interessata oppure «Salva modifiche», che registra in blocco tutto il piano così come risulta qui e nell’altra scheda del piano."
+    )
+    _PLAN_INTRO_ACC = (
+        f"Elenco unificato dei conti (massimo {MAX_ACCOUNTS_COUNT}). "
+        "Salvare aggiorna i nomi nel piano di tutti gli anni e propaga le modifiche alle registrazioni già inserite per quel conto. "
+        "Il conto «Cassa» e il conto «VIRTUALE» non sono modificabili o rimovibili da qui. "
+        "La colonna Saldo è quella del footer Movimenti (anno di riferimento). "
+        "La nota di «Consumi ordinari» si modifica nella scheda Categorie. "
+        "Usa «Salva modifiche» per scrivere nel database cifrato (salva anche le modifiche alle categorie se presenti)."
+    )
+
+    pack_centered_page_title(
+        plan_categorie_frame, title=_page_banner_title(), banner_style="MovCdc.TFrame", title_bg=MOVIMENTI_PAGE_BG
+    )
+    ttk.Label(plan_categorie_frame, text=_PLAN_INTRO_CAT, wraplength=760).pack(anchor=tk.W, pady=(0, 6))
+    ttk.Button(
+        plan_categorie_frame,
+        text="Vai alla scheda Conti…",
+        command=lambda: (notebook.select(plan_conti_frame),),
+    ).pack(anchor=tk.W, pady=(0, 8))
+
     pack_centered_page_title(
         plan_conti_frame, title=_page_banner_title(), banner_style="MovCdc.TFrame", title_bg=MOVIMENTI_PAGE_BG
     )
+    ttk.Label(plan_conti_frame, text=_PLAN_INTRO_ACC, wraplength=760).pack(anchor=tk.W, pady=(0, 6))
     ttk.Label(
         plan_conti_frame,
         text=(
-            "Le categorie mostrate sono l’unione di tutti gli anni (per codice) e degli eventuali codici presenti solo nei movimenti — "
-            "stessi nomi che puoi selezionare nei filtri di ricerca quando il piano di un singolo anno è incompleto. "
-            f"Massimo {MAX_CATEGORIES_COUNT} categorie e {MAX_ACCOUNTS_COUNT} conti. "
-            "Salvare aggiorna i nomi nel piano di tutti gli anni; le registrazioni già inserite restano invariate, salvo che non chiedi "
-            "esplicitamente di allineare il nome categoria quando la modifica è una piccola correzione riconducibile al nome precedente. "
-            "I nomi di «Consumi ordinari» e «Girata conto/conto» e la nota di «Girata conto/conto» non sono modificabili da qui; "
-            "il conto «Cassa» non è modificabile da qui. La nota di «Consumi ordinari» è invece libera. "
-            "Non è prevista una categoria «dotazione iniziale»: la prima immissione su un conto si fa con una girata da un altro conto. "
-            "Sotto le categorie trovi la sezione Conti (scorri se l’elenco è lungo). "
-            "Usa «Salva modifiche» per scrivere nel database cifrato."
+            "Estratti PDF (verifica conto): in «Opzioni» una sola cartella radice (nessuna sottocartella anno); qui il "
+            "«Nome base file PDF» è ciò che precede suffisso e .pdf (mese 01…12 o trimestre T1…T4, con o senza spazio "
+            "prima del suffisso). La ricerca automatica elenca solo quella cartella e carica il PDF con suffisso più alto "
+            "ancora compatibile con la data di chiusura."
         ),
         wraplength=760,
+        font=("TkDefaultFont", 9),
+        foreground="#444444",
+    ).pack(anchor=tk.W, pady=(0, 6))
+    ttk.Button(
+        plan_conti_frame,
+        text="Vai alla scheda Categorie…",
+        command=lambda: (notebook.select(plan_categorie_frame),),
     ).pack(anchor=tk.W, pady=(0, 8))
 
     plan_conti_status_var = tk.StringVar(value="")
     plan_ref_year_var = tk.StringVar(value="")
+    plan_cat_summary_var = tk.StringVar(value="")
     plan_cat_rows: list[dict] = []
     plan_acc_rows: list[dict] = []
 
-    plan_conti_scroll_wrap = ttk.Frame(plan_conti_frame, style="MovCdc.TFrame")
-    plan_conti_canvas = tk.Canvas(plan_conti_scroll_wrap, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
-    plan_conti_vscroll = ttk.Scrollbar(plan_conti_scroll_wrap, orient="vertical", command=plan_conti_canvas.yview)
-    plan_conti_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    plan_conti_vscroll.pack(side=tk.RIGHT, fill=tk.Y)
-    plan_conti_inner = ttk.Frame(plan_conti_canvas, style="MovCdc.TFrame")
-    plan_conti_inner_win = plan_conti_canvas.create_window((0, 0), window=plan_conti_inner, anchor="nw")
+    def _plan_page_mousewheel(cnv: tk.Canvas, event: tk.Event) -> str | None:
+        d = int(getattr(event, "delta", 0) or 0)
+        if not d:
+            return "break"
+        if platform.system() == "Darwin":
+            n = max(-14, min(14, -d))
+        else:
+            n = int(-d / 120)
+            if n == 0:
+                n = -1 if d > 0 else 1
+            n = max(-12, min(12, n))
+        cnv.yview_scroll(n, "units")
+        return "break"
 
-    def _plan_conti_inner_scroll(_e=None) -> None:
-        plan_conti_canvas.configure(scrollregion=plan_conti_canvas.bbox("all"))
+    def _plan_bind_canvas_mousewheel(cnv: tk.Canvas) -> None:
+        cnv.configure(yscrollincrement=28)
+        cnv.bind("<MouseWheel>", lambda e, c=cnv: _plan_page_mousewheel(c, e))
 
-    def _plan_conti_canvas_evt(e: tk.Event) -> None:
-        plan_conti_canvas.itemconfigure(plan_conti_inner_win, width=e.width)
+    # --- Scheda Categorie (solo griglia categorie) ---
+    plan_cat_scroll_wrap = ttk.Frame(plan_categorie_frame, style="MovCdc.TFrame")
+    plan_cat_canvas = tk.Canvas(plan_cat_scroll_wrap, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
+    plan_cat_vscroll = ttk.Scrollbar(plan_cat_scroll_wrap, orient="vertical", command=plan_cat_canvas.yview)
+    plan_cat_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    plan_cat_vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+    plan_cat_inner = ttk.Frame(plan_cat_canvas, style="MovCdc.TFrame")
+    plan_cat_inner_win = plan_cat_canvas.create_window((0, 0), window=plan_cat_inner, anchor="nw")
 
-    plan_conti_inner.bind("<Configure>", lambda _e: _plan_conti_inner_scroll())
-    plan_conti_canvas.bind("<Configure>", _plan_conti_canvas_evt)
-    plan_conti_canvas.configure(yscrollcommand=plan_conti_vscroll.set)
-    plan_conti_canvas.bind("<MouseWheel>", lambda e: plan_conti_canvas.yview_scroll(int(-e.delta / 120), "units"))
+    def _plan_cat_inner_scroll(_e: object = None) -> None:
+        plan_cat_canvas.configure(scrollregion=plan_cat_canvas.bbox("all"))
 
-    lf_cat = ttk.LabelFrame(plan_conti_inner, text="Categorie", padding=8)
-    lf_cat.pack(fill=tk.X, expand=False, pady=(0, 8))
+    def _plan_cat_canvas_evt(e: tk.Event) -> None:
+        plan_cat_canvas.itemconfigure(plan_cat_inner_win, width=e.width)
+
+    plan_cat_inner.bind("<Configure>", lambda _e: _plan_cat_inner_scroll())
+    plan_cat_canvas.bind("<Configure>", _plan_cat_canvas_evt)
+    plan_cat_canvas.configure(yscrollcommand=plan_cat_vscroll.set)
+    # Stessi criteri della griglia Movimenti (mov_tree): un «unit» ≈ altezza riga Treeview MovGrid.
+    plan_cat_canvas.configure(yscrollincrement=22)
+
+    def _plan_cat_on_mousewheel(event: tk.Event) -> str:
+        """Come `on_mousewheel` su mov_tree / amt_tree / note_tree (pagina Movimenti)."""
+        delta = 0
+        if hasattr(event, "delta") and event.delta:
+            delta = -1 if event.delta > 0 else 1
+        if delta:
+            plan_cat_canvas.yview("scroll", str(delta), "units")
+        return "break"
+
+    def _plan_cat_on_button_scroll(event: tk.Event) -> str:
+        """Come `on_button_scroll` sulla griglia Movimenti (Linux / rotella fisica)."""
+        if getattr(event, "num", None) == 4:
+            plan_cat_canvas.yview("scroll", "-1", "units")
+        elif getattr(event, "num", None) == 5:
+            plan_cat_canvas.yview("scroll", "1", "units")
+        return "break"
+
+    def _plan_cat_bind_wheel_like_movimenti() -> None:
+        """Binding sui widget dell’area (come sui Treeview), inclusi figli ricreati al reload."""
+
+        def _bind_one(w: tk.Misc) -> None:
+            w.bind("<MouseWheel>", _plan_cat_on_mousewheel)
+            w.bind("<Button-4>", _plan_cat_on_button_scroll)
+            w.bind("<Button-5>", _plan_cat_on_button_scroll)
+
+        def _rec(w: tk.Misc) -> None:
+            _bind_one(w)
+            for ch in w.winfo_children():
+                _rec(ch)
+
+        _rec(plan_cat_scroll_wrap)
+
+    lf_cat = ttk.LabelFrame(plan_cat_inner, text="Categorie", padding=8)
+    lf_cat.pack(fill=tk.BOTH, expand=True)
     plan_cat_grid = ttk.Frame(lf_cat)
     plan_cat_grid.pack(fill=tk.BOTH, expand=True)
     cat_btns = ttk.Frame(lf_cat)
     cat_btns.pack(fill=tk.X, pady=(8, 0))
 
-    lf_acc = ttk.LabelFrame(plan_conti_inner, text="Conti", padding=8)
-    lf_acc.pack(fill=tk.X, expand=False, pady=(0, 8))
+    # --- Scheda Conti (solo griglia conti) ---
+    plan_acc_scroll_wrap = ttk.Frame(plan_conti_frame, style="MovCdc.TFrame")
+    plan_acc_canvas = tk.Canvas(plan_acc_scroll_wrap, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
+    plan_acc_vscroll = ttk.Scrollbar(plan_acc_scroll_wrap, orient="vertical", command=plan_acc_canvas.yview)
+    plan_acc_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    plan_acc_vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+    plan_acc_inner = ttk.Frame(plan_acc_canvas, style="MovCdc.TFrame")
+    plan_acc_inner_win = plan_acc_canvas.create_window((0, 0), window=plan_acc_inner, anchor="nw")
+
+    def _plan_acc_inner_scroll(_e: object = None) -> None:
+        plan_acc_canvas.configure(scrollregion=plan_acc_canvas.bbox("all"))
+
+    def _plan_acc_canvas_evt(e: tk.Event) -> None:
+        plan_acc_canvas.itemconfigure(plan_acc_inner_win, width=e.width)
+
+    plan_acc_inner.bind("<Configure>", lambda _e: _plan_acc_inner_scroll())
+    plan_acc_canvas.bind("<Configure>", _plan_acc_canvas_evt)
+    plan_acc_canvas.configure(yscrollcommand=plan_acc_vscroll.set)
+    _plan_bind_canvas_mousewheel(plan_acc_canvas)
+
+    lf_acc = ttk.LabelFrame(plan_acc_inner, text="Conti", padding=8)
+    lf_acc.pack(fill=tk.BOTH, expand=True)
     plan_acc_grid = ttk.Frame(lf_acc)
     plan_acc_grid.pack(fill=tk.BOTH, expand=True)
     acc_btns = ttk.Frame(lf_acc)
@@ -9921,6 +15432,65 @@ th {{ background:#efefef; text-align:left; }}
         for yb in d.get("years") or []:
             yb.setdefault("accounts", []).append(copy.deepcopy(new_acc))
 
+    def _correct_plan_category(cd: str) -> None:
+        row = next((r for r in plan_cat_rows if str(r["code"]) == str(cd)), None)
+        if row is None:
+            return
+        d = cur_db()
+        if not d.get("years"):
+            messagebox.showwarning("Categorie", "Nessun anno contabile nel database.", parent=root)
+            return
+        on = str(row.get("orig_name", "") or "")
+        on_fmt = format_category_chart_name_stored(on)
+        orig_note = str(row.get("orig_note", "") or "")
+        name_locked = bool(row.get("locked"))
+        if name_locked:
+            cur_fmt = format_category_chart_name_stored(row["name"].get() or "")
+            if cur_fmt != on_fmt:
+                messagebox.showwarning("Categorie", "Il nome di questa categoria non è modificabile.", parent=root)
+                row["name"].set(on_fmt)
+                return
+            nm = on_fmt
+        else:
+            nm = format_category_chart_name_stored(row["name"].get() or "")
+            row["name"].set(nm)
+        nt = format_category_note_stored(row["note"].get() or "")
+        row["note"].set(nt)
+        nt_or_none = nt if nt else None
+        nt0 = format_category_note_stored(orig_note)
+        if nm == on_fmt and nt == nt0:
+            messagebox.showinfo("Categorie", "Nessuna modifica da applicare.", parent=root)
+            return
+        if not name_locked and nm != on_fmt:
+            if not plan_conti_names_have_attinenza(on_fmt, nm):
+                messagebox.showwarning(
+                    "Categorie",
+                    "Il nuovo nome deve essere una correzione parziale rispetto al nome attuale.",
+                    parent=root,
+                )
+                row["name"].set(on_fmt)
+                return
+        propagate_category_chart_by_code(d, cd, nm, nt_or_none)
+        if not name_locked and nm != on:
+            sync_record_category_names_if_identical_old(d, cd, on, nm)
+        try:
+            save_encrypted_db_dual(
+                d,
+                Path(data_file_var.get()),
+                Path(key_file_var.get()),
+            )
+        except Exception as exc:
+            messagebox.showerror("Categorie", str(exc), parent=root)
+            return
+        plan_conti_status_var.set("Correzione salvata.")
+        _movements_dirty[0] = True
+        try:
+            refresh_balance_footer()
+            refresh_category_account_dropdowns()
+        except Exception:
+            pass
+        _reload_plan_conti_form()
+
     def _reload_plan_conti_form() -> None:
         for w in plan_cat_grid.winfo_children():
             w.destroy()
@@ -9931,14 +15501,20 @@ th {{ background:#efefef; text-align:left; }}
         d = cur_db()
         if not d.get("years"):
             plan_ref_year_var.set("")
-            plan_conti_status_var.set("Nessun anno contabile: usa «Prepara anno corrente» o Import legacy.")
+            plan_cat_summary_var.set("")
+            plan_conti_status_var.set(
+                "Nessun anno contabile: dalla scheda Conti usa «Prepara anno corrente (vuoto)» oppure Import legacy."
+            )
             return
         ly = latest_year_bucket(d)
         n_cat = len(merged_categories_for_plan_editor(d))
         n_acc = len(merge_account_charts_across_years(d))
         y_ly = int(ly.get("year", 0)) if ly else 0
+        plan_cat_summary_var.set(
+            f"Elenco unificato: {n_cat} categorie (valide per tutti gli anni del database)."
+        )
         plan_ref_year_var.set(
-            f"Categorie: {n_cat} (elenco unificato). Conti: {n_acc}. Saldi in basso riferiti all’anno {y_ly}."
+            f"Categorie: {n_cat} (elenco unificato). Conti: {n_acc}. Saldi nella griglia — anno di riferimento movimenti {y_ly}."
         )
         plan_conti_status_var.set("")
         ttk.Label(plan_cat_grid, text="Cod.", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=0, sticky="w", padx=2, pady=2)
@@ -9960,8 +15536,10 @@ th {{ background:#efefef; text-align:left; }}
                     raw_nt = GIRATA_NOTE_DEFAULT
             name_locked = plan_conti_category_name_locked(raw_nm)
             note_locked = plan_conti_category_note_locked(raw_nm)
-            nv = tk.StringVar(value=raw_nm)
-            vv = tk.StringVar(value=raw_nt)
+            disp_nm = format_category_chart_name_stored(raw_nm)
+            disp_nt = format_category_note_stored(raw_nt)
+            nv = tk.StringVar(value=disp_nm)
+            vv = tk.StringVar(value=disp_nt)
             plan_cat_rows.append(
                 {
                     "code": code,
@@ -9977,77 +15555,27 @@ th {{ background:#efefef; text-align:left; }}
             est_nt = "readonly" if note_locked else "normal"
             ttk.Entry(plan_cat_grid, textvariable=nv, width=28, state=est_nm).grid(row=ri, column=1, sticky="we", padx=2, pady=1)
             ttk.Entry(plan_cat_grid, textvariable=vv, width=36, state=est_nt).grid(row=ri, column=2, sticky="we", padx=2, pady=1)
-            rm_state = "disabled" if name_locked else "normal"
 
-            def _rm_cat(cd: str = code) -> None:
-                d = cur_db()
-                cat_row = None
-                for yb in d.get("years") or []:
-                    cat_row = next(
-                        (x for x in yb.get("categories", []) if str(x.get("code", "")) == cd),
-                        None,
-                    )
-                    if cat_row is not None:
-                        break
-                if cat_row is None:
-                    messagebox.showwarning(
-                        "Categorie e conti",
-                        "Questo codice non è presente nel piano di nessun anno (solo nei movimenti): non si può rimuovere da qui.",
-                        parent=root,
-                    )
-                    return
-                if plan_conti_category_name_locked(str(cat_row.get("name", "") or "")):
-                    messagebox.showwarning("Categorie e conti", "Questa categoria non è modificabile o eliminabile da qui.", parent=root)
-                    return
-                if category_code_used_any_year(d, cd):
-                    messagebox.showwarning(
-                        "Categorie e conti",
-                        "Questa categoria è usata da registrazioni: non può essere rimossa.",
-                        parent=root,
-                    )
-                    return
-                if len(merged_categories_for_plan_editor(d)) <= 1:
-                    messagebox.showwarning("Categorie e conti", "Serve almeno una categoria.", parent=root)
-                    return
-                if not messagebox.askyesno(
-                    "Categorie e conti",
-                    f"Rimuovere la categoria {cd} da tutti gli anni?",
-                    parent=root,
-                ):
-                    return
-                remove_category_from_all_years(d, cd)
-                try:
-                    save_encrypted_db_dual(
-                        d,
-                        Path(data_file_var.get()),
-                        Path(key_file_var.get()),
-                    )
-                except Exception as exc:
-                    messagebox.showerror("Categorie e conti", str(exc), parent=root)
-                    return
-                plan_conti_status_var.set("Categoria rimossa e database salvato.")
-                _movements_dirty[0] = True
-                try:
-                    refresh_balance_footer()
-                    refresh_category_account_dropdowns()
-                except Exception:
-                    pass
-                _reload_plan_conti_form()
+            def _corr_cat(cd: str = code) -> None:
+                _correct_plan_category(cd)
 
-            ttk.Button(plan_cat_grid, text="Rimuovi", width=9, state=rm_state, command=_rm_cat).grid(
-                row=ri, column=3, sticky="w", padx=2, pady=1
-            )
+            ttk.Button(plan_cat_grid, text="Correggi", width=9, command=_corr_cat).grid(row=ri, column=3, sticky="w", padx=2, pady=1)
 
         ttk.Label(plan_acc_grid, text="Cod.", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=0, sticky="w", padx=2, pady=2)
         ttk.Label(plan_acc_grid, text="Nome conto", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=1, sticky="w", padx=2, pady=2)
         ttk.Label(plan_acc_grid, text="Saldo", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=2, sticky="w", padx=2, pady=2)
-        ttk.Label(plan_acc_grid, text="", width=10).grid(row=0, column=3, sticky="w")
+        ttk.Label(plan_acc_grid, text="Nome base file PDF", font=("TkDefaultFont", 10, "bold")).grid(
+            row=0, column=3, sticky="w", padx=2, pady=2
+        )
+        ttk.Label(plan_acc_grid, text="", width=10).grid(row=0, column=4, sticky="w")
         merged_acc = merge_account_charts_across_years(d)
         for ri, a in enumerate(merged_acc, start=1):
             code = str(a.get("code", str(ri))).strip()
             raw_nm = str(a.get("name", "") or "")
             locked_acc = plan_conti_account_is_cassa(raw_nm)
             nv = tk.StringVar(value=raw_nm)
+            stem_raw = str(a.get("estratti_pdf_stem") or "").strip()
+            stem_v = tk.StringVar(value=stem_raw)
             bal = account_balance_for_code_latest_chart(d, code)
             bal_s = "—" if bal is None else format_euro_it(bal)
             plan_acc_rows.append(
@@ -10055,13 +15583,18 @@ th {{ background:#efefef; text-align:left; }}
                     "code": code,
                     "name": nv,
                     "orig_name": raw_nm,
+                    "estratti_pdf_stem": stem_v,
                     "locked_acc": locked_acc,
                 }
             )
             ttk.Label(plan_acc_grid, text=code).grid(row=ri, column=0, sticky="w", padx=2, pady=1)
             est = "readonly" if locked_acc else "normal"
-            ttk.Entry(plan_acc_grid, textvariable=nv, width=36, state=est).grid(row=ri, column=1, sticky="we", padx=2, pady=1)
+            ttk.Entry(plan_acc_grid, textvariable=nv, width=32, state=est).grid(row=ri, column=1, sticky="we", padx=2, pady=1)
             ttk.Label(plan_acc_grid, text=bal_s).grid(row=ri, column=2, sticky="w", padx=2, pady=1)
+            stem_est = "readonly" if locked_acc else "normal"
+            ttk.Entry(plan_acc_grid, textvariable=stem_v, width=28, state=stem_est).grid(
+                row=ri, column=3, sticky="we", padx=2, pady=1
+            )
 
             def _rm_acc(cd: str = code) -> None:
                 dd = cur_db()
@@ -10132,13 +15665,19 @@ th {{ background:#efefef; text-align:left; }}
 
             rm_state = "disabled" if locked_acc else "normal"
             ttk.Button(plan_acc_grid, text="Rimuovi", width=9, state=rm_state, command=_rm_acc).grid(
-                row=ri, column=3, sticky="w", padx=2, pady=1
+                row=ri, column=4, sticky="w", padx=2, pady=1
             )
         plan_cat_grid.columnconfigure(1, weight=1)
         plan_cat_grid.columnconfigure(2, weight=1)
         plan_acc_grid.columnconfigure(1, weight=1)
+        plan_acc_grid.columnconfigure(3, weight=1)
+        for _cnv in (plan_cat_canvas, plan_acc_canvas):
+            try:
+                _cnv.configure(scrollregion=_cnv.bbox("all"))
+            except Exception:
+                pass
         try:
-            plan_conti_canvas.configure(scrollregion=plan_conti_canvas.bbox("all"))
+            _plan_cat_bind_wheel_like_movimenti()
         except Exception:
             pass
 
@@ -10149,30 +15688,40 @@ th {{ background:#efefef; text-align:left; }}
             return
         for row in plan_cat_rows:
             code = str(row["code"])
-            nm = clip_text(row["name"].get() or "", MAX_CATEGORY_NAME_LEN)
-            if row.get("locked"):
-                nm = clip_text(row.get("orig_name", "") or "", MAX_CATEGORY_NAME_LEN)
-            nt = clip_text(row["note"].get() or "", MAX_CATEGORY_NOTE_LEN)
+            on = str(row.get("orig_name", "") or "")
+            name_locked = bool(row.get("locked"))
+            on_fmt = format_category_chart_name_stored(on)
+            orig_note = str(row.get("orig_note", "") or "")
+            nt0 = format_category_note_stored(orig_note)
+            if name_locked:
+                nm = on_fmt
+            else:
+                nm = format_category_chart_name_stored(row["name"].get() or "")
+            nt = format_category_note_stored(row["note"].get() or "")
             nt_or_none = nt if nt else None
-            on = row.get("orig_name", "")
-            if nm != on:
-                propagate_category_chart_by_code(d, code, nm, nt_or_none)
-                if plan_conti_names_have_attinenza(on, nm) and category_code_used_any_year(d, code):
-                    if messagebox.askyesno(
+            if nm == on_fmt and nt == nt0 and on.strip() == nm:
+                continue
+            if not name_locked and nm != on_fmt:
+                if not plan_conti_names_have_attinenza(on_fmt, nm):
+                    messagebox.showwarning(
                         "Categorie e conti",
-                        "Il nuovo nome è vicino al precedente: vuoi sostituirlo anche in tutte le registrazioni già inserite che usano questa categoria?",
+                        f"Categoria {code}: il nuovo nome deve essere una correzione parziale del nome attuale.",
                         parent=root,
-                    ):
-                        sync_record_category_names_for_code(d, code, nm)
-                elif not plan_conti_names_have_attinenza(on, nm):
-                    # Solo piano conti: nessun aggiornamento automatico dei movimenti passati.
-                    pass
+                    )
+                    return
+                propagate_category_chart_by_code(d, code, nm, nt_or_none)
+                sync_record_category_names_if_identical_old(d, code, on, nm)
             else:
                 propagate_category_chart_by_code(d, code, nm, nt_or_none)
+                if not name_locked and nm != on.strip():
+                    sync_record_category_names_if_identical_old(d, code, on, nm)
         for row in plan_acc_rows:
+            code = str(row["code"])
+            stem_v = row.get("estratti_pdf_stem")
+            if isinstance(stem_v, tk.StringVar):
+                propagate_account_estratti_pdf_stem_by_code(d, code, stem_v.get() or "")
             if row.get("locked_acc"):
                 continue
-            code = str(row["code"])
             nm = clip_text(row["name"].get() or "", MAX_ACCOUNT_NAME_LEN)
             on = row.get("orig_name", "")
             if nm != on:
@@ -10224,9 +15773,73 @@ th {{ background:#efefef; text-align:left; }}
                     except ValueError:
                         pass
         nxt = max(nums) + 1 if nums else 1
-        new_cat = {"code": str(nxt), "name": "+Nuova", "note": None}
-        _append_category_all_years(new_cat)
-        _reload_plan_conti_form()
+        nxt_s = str(nxt)
+
+        def _existing_stored_names() -> set[str]:
+            out: set[str] = set()
+            for c in merged_categories_for_plan_editor(d):
+                out.add(format_category_chart_name_stored(str(c.get("name", "") or "")))
+            return out
+
+        top = tk.Toplevel(root)
+        top.title("Nuova categoria")
+        top.transient(root)
+        top.grab_set()
+        frm = ttk.Frame(top, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, text=f"Codice assegnato: {nxt_s}").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Label(frm, text="Nome categoria (+ o - davanti, poi testo)").grid(row=1, column=0, sticky="nw", pady=2)
+        ttk.Label(frm, text="Nota categoria").grid(row=2, column=0, sticky="nw", pady=2)
+        nm_var = tk.StringVar(value="+")
+        nt_var = tk.StringVar()
+        ent_nm = ttk.Entry(frm, textvariable=nm_var, width=42)
+        ent_nt = ttk.Entry(frm, textvariable=nt_var, width=42)
+        ent_nm.grid(row=1, column=1, sticky="we", padx=(8, 0), pady=2)
+        ent_nt.grid(row=2, column=1, sticky="we", padx=(8, 0), pady=2)
+        frm.columnconfigure(1, weight=1)
+        hint = (
+            f"Massimo {MAX_CATEGORY_NAME_LEN} caratteri per il nome e {MAX_CATEGORY_NOTE_LEN} per la nota; "
+            "nome tutto maiuscolo dopo il segno; prima lettera della nota maiuscola."
+        )
+        ttk.Label(frm, text=hint, wraplength=520, foreground="#555555").grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(8, 4)
+        )
+        err_lbl = ttk.Label(frm, text="", foreground="#b00020", wraplength=520)
+        err_lbl.grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        def _try_add() -> None:
+            err_lbl.configure(text="")
+            raw_nm = (nm_var.get() or "").strip()
+            if not raw_nm or raw_nm[0] not in "+-":
+                err_lbl.configure(text="Il nome deve iniziare con + o -.")
+                return
+            if len(raw_nm) > MAX_CATEGORY_NAME_LEN:
+                err_lbl.configure(text=f"Nome troppo lungo (massimo {MAX_CATEGORY_NAME_LEN} caratteri).")
+                return
+            raw_nt = nt_var.get() or ""
+            if len(raw_nt) > MAX_CATEGORY_NOTE_LEN:
+                err_lbl.configure(text=f"Nota troppo lunga (massimo {MAX_CATEGORY_NOTE_LEN} caratteri).")
+                return
+            nm = format_category_chart_name_stored(raw_nm)
+            nt = format_category_note_stored(raw_nt)
+            nt_or_none = nt if nt else None
+            if nm in _existing_stored_names():
+                err_lbl.configure(text="Esiste già una categoria con questo nome (dopo formattazione).")
+                return
+            new_cat = {"code": nxt_s, "name": nm, "note": nt_or_none}
+            _append_category_all_years(new_cat)
+            top.destroy()
+            _reload_plan_conti_form()
+            plan_conti_status_var.set("Categoria aggiunta in memoria: usa «Salva modifiche» per salvare nel file cifrato.")
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=5, column=0, columnspan=2, sticky="e", pady=(4, 0))
+        ttk.Button(btns, text="Annulla", command=top.destroy).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(btns, text="Aggiungi", command=_try_add).pack(side=tk.RIGHT)
+        try:
+            ent_nm.focus_set()
+        except Exception:
+            pass
 
     def _add_blank_account() -> None:
         d = cur_db()
@@ -10254,18 +15867,30 @@ th {{ background:#efefef; text-align:left; }}
         _append_account_all_years(new_acc)
         _reload_plan_conti_form()
 
-    pc_tool = ttk.Frame(plan_conti_frame)
-    pc_tool.pack(fill=tk.X, pady=(0, 6))
-    ttk.Label(pc_tool, textvariable=plan_ref_year_var).pack(side=tk.LEFT)
-    ttk.Button(pc_tool, text="Prepara anno corrente (vuoto)", command=_prepare_current_year_bucket).pack(
+    pc_tool_cat = ttk.Frame(plan_categorie_frame)
+    pc_tool_cat.pack(fill=tk.X, pady=(0, 6))
+    ttk.Label(pc_tool_cat, textvariable=plan_cat_summary_var).pack(side=tk.LEFT)
+    ttk.Button(
+        pc_tool_cat,
+        text="Salva modifiche",
+        command=_save_plan_conti_from_form,
+        style="NewReg.TButton",
+    ).pack(side=tk.LEFT, padx=(16, 10), pady=(2, 4))
+    ttk.Label(plan_categorie_frame, textvariable=plan_conti_status_var, foreground="#2e7d32").pack(anchor=tk.W, pady=(0, 6))
+    plan_cat_scroll_wrap.pack(fill=tk.BOTH, expand=True)
+    ttk.Button(cat_btns, text="Aggiungi categoria", command=_add_blank_category).pack(side=tk.LEFT, padx=(0, 8))
+    _plan_cat_bind_wheel_like_movimenti()
+
+    pc_tool_acc = ttk.Frame(plan_conti_frame)
+    pc_tool_acc.pack(fill=tk.X, pady=(0, 6))
+    ttk.Label(pc_tool_acc, textvariable=plan_ref_year_var).pack(side=tk.LEFT)
+    ttk.Button(pc_tool_acc, text="Prepara anno corrente (vuoto)", command=_prepare_current_year_bucket).pack(
         side=tk.LEFT, padx=(12, 8)
     )
-    ttk.Button(pc_tool, text="Aggiorna elenco", command=_reload_plan_conti_form).pack(side=tk.LEFT, padx=(0, 8))
-    ttk.Button(pc_tool, text="Salva modifiche", command=_save_plan_conti_from_form).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Button(pc_tool_acc, text="Aggiorna elenco", command=_reload_plan_conti_form).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Button(pc_tool_acc, text="Salva modifiche", command=_save_plan_conti_from_form).pack(side=tk.LEFT, padx=(0, 8))
     ttk.Label(plan_conti_frame, textvariable=plan_conti_status_var, foreground="#2e7d32").pack(anchor=tk.W, pady=(0, 6))
-
-    plan_conti_scroll_wrap.pack(fill=tk.BOTH, expand=True)
-    ttk.Button(cat_btns, text="Aggiungi categoria", command=_add_blank_category).pack(side=tk.LEFT, padx=(0, 8))
+    plan_acc_scroll_wrap.pack(fill=tk.BOTH, expand=True)
     ttk.Button(acc_btns, text="Aggiungi conto", command=_add_blank_account).pack(side=tk.LEFT, padx=(0, 8))
 
     def _try_open_plan_conti_pending() -> None:
@@ -10287,7 +15912,7 @@ th {{ background:#efefef; text-align:left; }}
         try:
             _reload_plan_conti_form()
             _ensure_plan_conti_tab()
-            notebook.select(plan_conti_frame)
+            notebook.select(plan_categorie_frame)
         except Exception:
             pass
 
@@ -10313,7 +15938,7 @@ th {{ background:#efefef; text-align:left; }}
 
     opz_scrollable.bind("<Configure>", _opz_on_scrollable_configure)
     opz_canvas.bind("<Configure>", _opz_on_canvas_configure)
-    opz_canvas.configure(yscrollcommand=opz_vsb.set)
+    opz_canvas.configure(yscrollcommand=opz_vsb.set, yscrollincrement=28)
     opz_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     opz_vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
@@ -10325,14 +15950,19 @@ th {{ background:#efefef; text-align:left; }}
     opz_plan_row.pack(fill=tk.X, pady=(0, 10))
     ttk.Label(
         opz_plan_row,
-        text="Struttura categorie e conti:",
+        text="Piano conti:",
         font=("TkDefaultFont", 11, "bold"),
     ).pack(side=tk.LEFT)
     ttk.Button(
         opz_plan_row,
-        text="Apri scheda Categorie e conti…",
+        text="Apri scheda Categorie…",
+        command=lambda: (_ensure_plan_conti_tab(), notebook.select(plan_categorie_frame), _reload_plan_conti_form()),
+    ).pack(side=tk.LEFT, padx=(12, 4))
+    ttk.Button(
+        opz_plan_row,
+        text="Apri scheda Conti…",
         command=lambda: (_ensure_plan_conti_tab(), notebook.select(plan_conti_frame), _reload_plan_conti_form()),
-    ).pack(side=tk.LEFT, padx=(12, 0))
+    ).pack(side=tk.LEFT, padx=(0, 0))
 
     mail_outer = ttk.LabelFrame(opz_scrollable, text="Posta e sicurezza", padding=10)
     mail_outer.pack(fill=tk.X, pady=(0, 14))
@@ -10695,6 +16325,10 @@ th {{ background:#efefef; text-align:left; }}
     ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
     legacy_path_var = tk.StringVar(value=str(DEFAULT_CDC_ROOT))
+    _ep_init = estratti_pdf_settings_from_db(cur_db())
+    estratti_pdf_root_var = tk.StringVar(value=str(_ep_init.get("root_folder", "") or ""))
+    estratti_pdf_feedback_var = tk.StringVar(value="")
+    _estratti_pdf_save_feedback_after: list[int | None] = [None]
 
     ttk.Label(
         opzioni_inner,
@@ -10841,6 +16475,86 @@ th {{ background:#efefef; text-align:left; }}
     status_var = tk.StringVar(value="")
     ttk.Label(opzioni_inner, textvariable=status_var).grid(row=9, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
+    ttk.Label(
+        opzioni_inner,
+        text="Estratti conto PDF (verifica conto)",
+        font=("TkDefaultFont", 11, "italic"),
+    ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(16, 4))
+    ttk.Label(opzioni_inner, text="Cartella radice degli estratti").grid(row=11, column=0, sticky="w", pady=(0, 4))
+    estratti_pdf_entry = ttk.Entry(opzioni_inner, textvariable=estratti_pdf_root_var, width=80)
+    estratti_pdf_entry.grid(row=12, column=0, sticky="we", padx=(0, 8))
+
+    def browse_estratti_pdf_root() -> None:
+        init = (estratti_pdf_root_var.get() or "").strip()
+        picked = filedialog.askdirectory(
+            initialdir=init if init and Path(init).is_dir() else str(Path.home()),
+            title="Cartella radice estratti PDF",
+        )
+        if picked:
+            estratti_pdf_root_var.set(picked)
+            estratti_pdf_feedback_var.set("")
+
+    def save_estratti_pdf_root() -> None:
+        raw = (estratti_pdf_root_var.get() or "").strip()
+        try:
+            to_store = str(Path(raw).expanduser().resolve()) if raw else ""
+        except Exception:
+            to_store = raw
+        estratti_pdf_settings_from_db(cur_db())["root_folder"] = to_store
+        try:
+            save_encrypted_db_dual(
+                cur_db(),
+                Path(data_file_var.get()).expanduser().resolve(),
+                Path(key_file_var.get()).expanduser().resolve(),
+            )
+            estratti_pdf_root_var.set(to_store)
+            msg = "Cartella radice estratti PDF: salvata nel database cifrato."
+            status_var.set(msg)
+            estratti_pdf_feedback_var.set("Salvato nel file .enc (vedi anche dialogo).")
+            aid = _estratti_pdf_save_feedback_after[0]
+            if aid is not None:
+                try:
+                    root.after_cancel(aid)
+                except Exception:
+                    pass
+
+            def _clr_estratti_pdf_fb() -> None:
+                estratti_pdf_feedback_var.set("")
+                _estratti_pdf_save_feedback_after[0] = None
+
+            _estratti_pdf_save_feedback_after[0] = root.after(15000, _clr_estratti_pdf_fb)
+            messagebox.showinfo(
+                "Estratti PDF — salvataggio",
+                "Il percorso della cartella radice è stato registrato nel database cifrato.\n\n"
+                + (to_store if to_store else "(nessun percorso: campo vuoto)"),
+                parent=root,
+            )
+        except Exception as exc:
+            messagebox.showerror("Estratti PDF", str(exc), parent=root)
+
+    _estr_btns = ttk.Frame(opzioni_inner)
+    _estr_btns.grid(row=12, column=1, sticky="w")
+    ttk.Button(_estr_btns, text="Sfoglia…", command=browse_estratti_pdf_root).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Button(_estr_btns, text="Salva cartella", command=save_estratti_pdf_root).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Label(
+        _estr_btns,
+        textvariable=estratti_pdf_feedback_var,
+        font=("TkDefaultFont", 10, "bold"),
+        foreground="#1b5e20",
+    ).pack(side=tk.LEFT, padx=(4, 0))
+    ttk.Label(
+        opzioni_inner,
+        text=(
+            "Un’unica cartella radice (nessuna sottocartella obbligatoria per anno): dentro ci sono i PDF con nome "
+            "«nomebase» + spazio + mese 01…12 o trimestre T1…T4. Dopo aver modificato il percorso usare «Salva cartella» "
+            "per scriverlo nel .enc (Sfoglia o incolla da soli non salvano). In «Conti» il nome base senza suffisso né .pdf. "
+            "Modulo: estratto_conto_pdf.py (ESTRATTO_PDF_DEBUG=1 per adattamenti)."
+        ),
+        wraplength=620,
+        font=("TkDefaultFont", 9),
+        foreground="#444444",
+    ).grid(row=13, column=0, columnspan=2, sticky="w", pady=(4, 8))
+
     def opzioni_restore_from_library_backup() -> None:
         primary = Path(data_file_var.get()).expanduser().resolve()
         kp = Path(key_file_var.get()).expanduser().resolve()
@@ -10890,6 +16604,13 @@ th {{ background:#efefef; text-align:left; }}
         refresh_balance_footer()
         refresh_window_title()
         _refresh_backup_path_hint()
+        try:
+            estratti_pdf_root_var.set(
+                str(estratti_pdf_settings_from_db(cur_db()).get("root_folder") or "")
+            )
+        except Exception:
+            pass
+        estratti_pdf_feedback_var.set("")
         status_var.set("Ripristino da Library completato; file light aggiornato.")
         messagebox.showinfo(
             "Ripristino",
@@ -10915,7 +16636,7 @@ th {{ background:#efefef; text-align:left; }}
         except Exception:
             show = False
         if show:
-            ripristina_btn.grid(row=10, column=0, columnspan=2, sticky="w", pady=(12, 0))
+            ripristina_btn.grid(row=14, column=0, columnspan=2, sticky="w", pady=(12, 0))
         else:
             ripristina_btn.grid_remove()
 
@@ -10996,18 +16717,18 @@ th {{ background:#efefef; text-align:left; }}
         opzioni_inner,
         text="Import legacy (sorgente applicazione precedente)",
         font=("TkDefaultFont", 11, "italic"),
-    ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(20, 4))
+    ).grid(row=15, column=0, columnspan=2, sticky="w", pady=(20, 4))
 
-    ttk.Label(opzioni_inner, text="Sorgente import legacy").grid(row=12, column=0, sticky="w", pady=(0, 6))
+    ttk.Label(opzioni_inner, text="Sorgente import legacy").grid(row=16, column=0, sticky="w", pady=(0, 6))
     legacy_entry = ttk.Entry(opzioni_inner, textvariable=legacy_path_var, width=80)
-    legacy_entry.grid(row=13, column=0, sticky="we", padx=(0, 8))
-    ttk.Button(opzioni_inner, text="Sfoglia...", command=browse_legacy).grid(row=13, column=1, sticky="w")
+    legacy_entry.grid(row=17, column=0, sticky="we", padx=(0, 8))
+    ttk.Button(opzioni_inner, text="Sfoglia...", command=browse_legacy).grid(row=17, column=1, sticky="w")
 
     ttk.Button(
         opzioni_inner,
         text="Ricarica importi legacy (sovrascrive dati nuova app)",
         command=reload_legacy_overwrite,
-    ).grid(row=14, column=0, sticky="w", pady=(16, 0))
+    ).grid(row=18, column=0, sticky="w", pady=(16, 0))
 
     # --- Azzeramento di emergenza saldo virtuale ---
     def _emergency_reset_virtuale() -> None:
@@ -11036,13 +16757,13 @@ th {{ background:#efefef; text-align:left; }}
         opzioni_inner,
         text="Saldo virtuale — emergenza",
         font=("TkDefaultFont", 11, "italic"),
-    ).grid(row=15, column=0, columnspan=2, sticky="w", pady=(20, 4))
+    ).grid(row=19, column=0, columnspan=2, sticky="w", pady=(20, 4))
 
     ttk.Button(
         opzioni_inner,
         text="Azzera saldo virtuale (emergenza)",
         command=_emergency_reset_virtuale,
-    ).grid(row=16, column=0, sticky="w", pady=(4, 0))
+    ).grid(row=20, column=0, sticky="w", pady=(4, 0))
 
     # --- Diagnostica e recovery file cifrati ---
     def _enc_file_info(p: Path) -> str | None:
@@ -11191,10 +16912,10 @@ th {{ background:#efefef; text-align:left; }}
         opzioni_inner,
         text="Diagnostica file cifrato",
         font=("TkDefaultFont", 11, "italic"),
-    ).grid(row=17, column=0, columnspan=2, sticky="w", pady=(20, 4))
+    ).grid(row=21, column=0, columnspan=2, sticky="w", pady=(20, 4))
 
     _diag_btn_row = tk.Frame(opzioni_inner, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    _diag_btn_row.grid(row=18, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    _diag_btn_row.grid(row=22, column=0, columnspan=2, sticky="w", pady=(4, 0))
     ttk.Button(
         _diag_btn_row,
         text="Verifica coerenza Dropbox ↔ Library",
@@ -11214,17 +16935,26 @@ th {{ background:#efefef; text-align:left; }}
     opzioni_inner.columnconfigure(0, weight=1)
 
     def _opz_canvas_mousewheel(event: tk.Event) -> str | None:
-        d = getattr(event, "delta", 0)
-        if d:
-            opz_canvas.yview_scroll(int(-d / 120), "units")
-        return None
+        # Su macOS il delta del trackpad non è multiplo di 120: int(-d/120) risulta 0 e non c’è scroll.
+        d = int(getattr(event, "delta", 0) or 0)
+        if not d:
+            return "break"
+        if platform.system() == "Darwin":
+            n = max(-14, min(14, -d))
+        else:
+            n = int(-d / 120)
+            if n == 0:
+                n = -1 if d > 0 else 1
+            n = max(-12, min(12, n))
+        opz_canvas.yview_scroll(n, "units")
+        return "break"
 
     def _opz_canvas_mousewheel_linux(event: tk.Event) -> str | None:
         if event.num == 4:
             opz_canvas.yview_scroll(-1, "units")
         elif event.num == 5:
             opz_canvas.yview_scroll(1, "units")
-        return None
+        return "break"
 
     def _bind_opz_mousewheel_recursive(w: tk.Misc) -> None:
         w.bind("<MouseWheel>", _opz_canvas_mousewheel, add="+")
@@ -11239,6 +16969,12 @@ th {{ background:#efefef; text-align:left; }}
     opz_canvas.bind("<MouseWheel>", _opz_canvas_mousewheel)
     opz_canvas.bind("<Button-4>", _opz_canvas_mousewheel_linux)
     opz_canvas.bind("<Button-5>", _opz_canvas_mousewheel_linux)
+    opz_scroll_outer.bind("<MouseWheel>", _opz_canvas_mousewheel)
+    opz_scroll_outer.bind("<Button-4>", _opz_canvas_mousewheel_linux)
+    opz_scroll_outer.bind("<Button-5>", _opz_canvas_mousewheel_linux)
+    opz_vsb.bind("<MouseWheel>", _opz_canvas_mousewheel)
+    opz_vsb.bind("<Button-4>", _opz_canvas_mousewheel_linux)
+    opz_vsb.bind("<Button-5>", _opz_canvas_mousewheel_linux)
     _bind_opz_mousewheel_recursive(opz_scrollable)
 
     def _startup_periodic_due_check() -> None:
@@ -11338,6 +17074,31 @@ th {{ background:#efefef; text-align:left; }}
             root.focus_force()
             root.update_idletasks()
         except Exception:
+            pass
+
+    def _on_app_close() -> None:
+        if ver_session_active[0]:
+            try:
+                messagebox.showwarning(
+                    "Verifica in corso",
+                    "Non è possibile chiudere l'applicazione mentre è attiva una sessione di verifica.\n\n"
+                    "Concludere la verifica dalla scheda Verifica: «Chiudi verifica» oppure "
+                    "«Termina immissione» e completamento del flusso.",
+                    parent=root,
+                )
+            except Exception:
+                pass
+            return
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+    root.protocol("WM_DELETE_WINDOW", _on_app_close)
+    if platform.system() == "Darwin":
+        try:
+            root.createcommand("tk::mac::Quit", _on_app_close)
+        except tk.TclError:
             pass
 
     _present_main_window()
