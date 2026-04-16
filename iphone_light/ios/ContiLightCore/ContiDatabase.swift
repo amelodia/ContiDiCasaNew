@@ -25,12 +25,19 @@ public struct ContiRecordRow: Identifiable, Hashable, Sendable {
     public let sourceIndex: Int
 }
 
-/// Saldi per conto: colonna «assoluti» e «alla data di oggi» (come il footer Movimenti desktop).
+/// Saldi per conto: stesse colonne del footer «Saldi» desktop (carte di credito: spese CC sulla colonna di riferimento).
 public struct ContiSaldRiga: Identifiable, Hashable, Sendable {
     public let id: String
     public let accountName: String
     public let saldoAssoluto: Decimal
     public let saldoOggi: Decimal
+    /// True se il conto è marcato come carta nel piano (ultimo anno).
+    public let isCreditCard: Bool
+    /// Registrazioni con data successiva al cutoff (stesso significato del desktop).
+    public let speseFuture: Decimal
+    public let speseCC: Decimal
+    /// Per conti non-carta: saldo assoluto + spese future + spese CC; per carta: zero in tabella desktop.
+    public let disponibilita: Decimal
 }
 
 /// Voce piano categorie per la scheda immissione (ultimo anno), come «Nuove registrazioni» sul desktop.
@@ -44,6 +51,9 @@ public struct ContiImmissioneCategoria: Hashable, Sendable {
 public struct ContiImmissioneConto: Hashable, Sendable {
     public let code: String
     public let name: String
+    public let isCreditCard: Bool
+    /// Nome conto di riferimento (solo lettura, come sul desktop); vuoto se non carta o senza riferimento.
+    public let referenceAccountName: String
 }
 
 public enum ContiDBError: Error {
@@ -554,28 +564,54 @@ public enum ContiDatabase {
         return (d, intFromJSON(block["year_basis"]))
     }
 
+    /// Totali riga «non carta» dal blocco ``light_saldi`` (opzionale, file generato da desktop/iOS recente).
+    public static func lightSaldiTotalsNonCc(sessionDb: Any?) -> (abs: Decimal, sf: Decimal, scc: Decimal, disp: Decimal)? {
+        guard let db = dictionaryFromAnyRoot(sessionDb) else { return nil }
+        guard let block = dictionaryFromAnyRoot(db["light_saldi"]),
+              let t = dictionaryFromAnyRoot(block["totals"])
+        else { return nil }
+        guard let abs = parseLooseDecimal(stringFromJSON(t["saldo_assoluti_non_cc"])),
+              let sf = parseLooseDecimal(stringFromJSON(t["spese_future_non_cc"])),
+              let scc = parseLooseDecimal(stringFromJSON(t["spese_cc_non_cc"])),
+              let disp = parseLooseDecimal(stringFromJSON(t["disponibilita_non_cc"]))
+        else { return nil }
+        return (abs, sf, scc, disp)
+    }
+
     /// Aggiorna ``light_saldi`` in memoria dopo una nuova registrazione (stesse regole del desktop). Da chiamare al salvataggio iOS prima di ricifrare.
     public static func applyNewRecordToLightSaldi(db: inout [String: Any], record: [String: Any], cutoffDateIso: String) {
         guard var block = dictionaryFromAnyRoot(db["light_saldi"]) else { return }
         let rowDicts = coerceToArrayOfStringKeyedDicts(block["rows"])
         let n = rowDicts.count
         guard n > 0 else { return }
+
+        func rowIndexMatchingAccountCode(_ code: String) -> Int? {
+            let t = code.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty else { return nil }
+            for i in 0 ..< n {
+                let rc = stringFromJSON(rowDicts[i]["account_code"]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if rc == t { return i }
+                if let a = Int(rc), let b = Int(t), a == b { return i }
+            }
+            return nil
+        }
+
         var absB = (0 ..< n).map { parseLooseDecimal(stringFromJSON(rowDicts[$0]["saldo_assoluto"])) ?? .zero }
         var dayB = (0 ..< n).map { parseLooseDecimal(stringFromJSON(rowDicts[$0]["saldo_alla_data"])) ?? .zero }
 
         if boolFromJSON(record["is_cancelled"]) { return }
         let y = intFromJSON(record["year"])
-        if isDotazioneRecord(record), y != 2022 { return }
+        if isDotazioneRecord(record), y != legacyDotazioneYear { return }
 
         let amount = parseLooseDecimal(stringFromJSON(record["amount_eur"])) ?? .zero
         let c1 = stringFromJSON(record["account_primary_code"])
         let c2 = stringFromJSON(record["account_secondary_code"])
-        let i1 = accountCodeZeroBasedIndex(c1)
-        let i2 = accountCodeZeroBasedIndex(c2)
+        let i1 = rowIndexMatchingAccountCode(c1)
+        let i2 = rowIndexMatchingAccountCode(c2)
 
         func applyAmount(_ arr: inout [Decimal]) {
-            if i1 >= 0, i1 < n { arr[i1] += amount }
-            if isGirocontoRecord(record), i2 >= 0, i2 < n { arr[i2] -= amount }
+            if let ix = i1, ix >= 0, ix < n { arr[ix] += amount }
+            if isGirocontoRecord(record), let ix = i2, ix >= 0, ix < n { arr[ix] -= amount }
         }
 
         applyAmount(&absB)
@@ -588,14 +624,20 @@ public enum ContiDatabase {
         for i in 0 ..< n {
             let code = stringFromJSON(rowDicts[i]["account_code"])
             let nm = stringFromJSON(rowDicts[i]["account_name"])
-            newRows.append([
+            var row: [String: Any] = [
                 "account_code": code.isEmpty ? String(i + 1) : code,
                 "account_name": nm,
                 "saldo_assoluto": decimalStringForLightJson(absB[i]),
                 "saldo_alla_data": decimalStringForLightJson(dayB[i]),
-            ])
+            ]
+            if rowDicts[i]["credit_card"] != nil { row["credit_card"] = boolFromJSON(rowDicts[i]["credit_card"]) }
+            if rowDicts[i]["spese_cc"] != nil { row["spese_cc"] = stringFromJSON(rowDicts[i]["spese_cc"]) }
+            if rowDicts[i]["spese_future"] != nil { row["spese_future"] = stringFromJSON(rowDicts[i]["spese_future"]) }
+            if rowDicts[i]["disponibilita"] != nil { row["disponibilita"] = stringFromJSON(rowDicts[i]["disponibilita"]) }
+            newRows.append(row)
         }
         block["rows"] = newRows
+        refreshLightSaldiRowDerivedFromAbsDay(&block)
         db["light_saldi"] = block
     }
 
@@ -634,71 +676,318 @@ public enum ContiDatabase {
         return (y, rank, folder, file, idx)
     }
 
-    /// Ricalcola ``light_saldi`` dal DB **completo** (come `compute_balances_from_2022` + as-of oggi).
+    private static let legacyDotazioneYear = 1990
+    private static let planReferenceYear = 2026
+
+    /// Ricalcola ``light_saldi`` dal DB **completo** (stesso modello di ``saldi_footer_amount_vectors`` / ``compute_light_saldi_snapshot`` in ``main_app.py``).
     public static func recomputeLightSaldiFromFullDb(_ db: inout [String: Any]) {
-        guard let snap = computeLightSaldiBlock(from: db) else { return }
+        guard let snap = buildLightSaldiSnapshotDict(from: db) else { return }
         db["light_saldi"] = snap
     }
 
-    private static func computeLightSaldiBlock(from fullDb: [String: Any]) -> [String: Any]? {
-        guard let years = fullDb["years"] as? [[String: Any]], !years.isEmpty else { return nil }
-        let latestYear = years.map { intFromJSON($0["year"]) }.max() ?? 0
-        guard let yearData = years.first(where: { intFromJSON($0["year"]) == latestYear }),
-              let accounts = yearData["accounts"] as? [[String: Any]] else { return nil }
-        let n = accounts.count
-        guard n > 0 else { return nil }
-        let cutoff = todayIsoLocal()
+    private static func yearBucketForCalendar(db: [String: Any], year: Int) -> [String: Any]? {
+        guard let years = db["years"] as? [[String: Any]] else { return nil }
+        return years.first { intFromJSON($0["year"]) == year }
+    }
 
+    private static func mergedPlanAccounts(db: [String: Any]) -> [[String: Any]] {
+        if let yb = yearBucketForCalendar(db: db, year: planReferenceYear) {
+            return coerceToArrayOfStringKeyedDicts(yb["accounts"])
+        }
+        guard let years = db["years"] as? [[String: Any]], !years.isEmpty else { return [] }
+        let latest = years.max { intFromJSON($0["year"]) < intFromJSON($1["year"]) }!
+        return coerceToArrayOfStringKeyedDicts(latest["accounts"])
+    }
+
+    private static func saldiVisibleIndices(
+        db: [String: Any],
+        latestAccounts: [[String: Any]],
+        namesFull: [String]
+    ) -> [Int] {
+        let frozenCodes = Set(
+            mergedPlanAccounts(db: db).compactMap { a -> String? in
+                guard boolFromJSON(a["frozen"]) else { return nil }
+                let c = stringFromJSON(a["code"]).trimmingCharacters(in: .whitespacesAndNewlines)
+                return c.isEmpty ? nil : c
+            }
+        )
+        var out: [Int] = []
+        for i in 0 ..< min(namesFull.count, latestAccounts.count) {
+            let code = stringFromJSON(latestAccounts[i]["code"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if frozenCodes.contains(code) { continue }
+            out.append(i)
+        }
+        return out
+    }
+
+    private static func legacyAbsoluteAmounts(db: [String: Any], nAccounts: Int) -> [Decimal]? {
+        guard let yb = yearBucketForCalendar(db: db, year: planReferenceYear) else { return nil }
+        guard let ls = dictionaryFromAnyRoot(yb["legacy_saldi"]),
+              let raw = ls["amounts"] as? [Any],
+              !raw.isEmpty
+        else { return nil }
+        var out: [Decimal] = []
+        for i in 0 ..< nAccounts {
+            if i < raw.count {
+                out.append(parseLooseDecimal(stringFromJSON(raw[i])) ?? .zero)
+            } else {
+                out.append(.zero)
+            }
+        }
+        return out
+    }
+
+    private static func computeBalancesAsOf(db: [String: Any], latestYear: Int, nAccounts: Int, cutoff: String) -> [Decimal] {
         var pool: [[String: Any]] = []
-        for yd in years {
-            let y = intFromJSON(yd["year"])
-            if y < 2022 || y > latestYear { continue }
-            pool.append(contentsOf: coerceToArrayOfStringKeyedDicts(yd["records"]))
+        if let years = db["years"] as? [[String: Any]] {
+            for yd in years {
+                let y = intFromJSON(yd["year"])
+                if y > latestYear { continue }
+                pool.append(contentsOf: coerceToArrayOfStringKeyedDicts(yd["records"]))
+            }
         }
         pool.sort { recordMergeSortKey($0) < recordMergeSortKey($1) }
-
-        var absB = Array(repeating: Decimal.zero, count: n)
-        var dayB = Array(repeating: Decimal.zero, count: n)
-
+        var balances = Array(repeating: Decimal.zero, count: nAccounts)
         for rec in pool {
             if boolFromJSON(rec["is_cancelled"]) { continue }
+            if boolFromJSON(rec["is_virtuale_discharge"]) { continue }
             let y = intFromJSON(rec["year"])
-            if isDotazioneRecord(rec), y != 2022 { continue }
+            if isDotazioneRecord(rec), y != legacyDotazioneYear { continue }
+            let rDate = stringFromJSON(rec["date_iso"])
+            if !rDate.isEmpty, rDate > cutoff { continue }
             let amount = parseLooseDecimal(stringFromJSON(rec["amount_eur"])) ?? .zero
             let c1 = stringFromJSON(rec["account_primary_code"])
             let c2 = stringFromJSON(rec["account_secondary_code"])
             let i1 = accountCodeZeroBasedIndex(c1)
             let i2 = accountCodeZeroBasedIndex(c2)
-            func apply(_ arr: inout [Decimal]) {
-                if i1 >= 0, i1 < n { arr[i1] += amount }
-                if isGirocontoRecord(rec), i2 >= 0, i2 < n { arr[i2] -= amount }
-            }
-            apply(&absB)
-            let rDate = stringFromJSON(rec["date_iso"])
-            if rDate.isEmpty || rDate <= cutoff {
-                apply(&dayB)
+            if i1 >= 0, i1 < nAccounts { balances[i1] += amount }
+            if isGirocontoRecord(rec), i2 >= 0, i2 < nAccounts { balances[i2] -= amount }
+        }
+        return balances
+    }
+
+    private static func computeFutureDatedOnly(db: [String: Any], latestYear: Int, nAccounts: Int, today: String) -> [Decimal] {
+        var pool: [[String: Any]] = []
+        if let years = db["years"] as? [[String: Any]] {
+            for yd in years {
+                let y = intFromJSON(yd["year"])
+                if y > latestYear { continue }
+                pool.append(contentsOf: coerceToArrayOfStringKeyedDicts(yd["records"]))
             }
         }
+        pool.sort { recordMergeSortKey($0) < recordMergeSortKey($1) }
+        var balances = Array(repeating: Decimal.zero, count: nAccounts)
+        for rec in pool {
+            if boolFromJSON(rec["is_cancelled"]) { continue }
+            if boolFromJSON(rec["is_virtuale_discharge"]) { continue }
+            let y = intFromJSON(rec["year"])
+            if isDotazioneRecord(rec), y != legacyDotazioneYear { continue }
+            let rDate = stringFromJSON(rec["date_iso"])
+            if rDate.isEmpty || rDate <= today { continue }
+            let amount = parseLooseDecimal(stringFromJSON(rec["amount_eur"])) ?? .zero
+            let c1 = stringFromJSON(rec["account_primary_code"])
+            let c2 = stringFromJSON(rec["account_secondary_code"])
+            let i1 = accountCodeZeroBasedIndex(c1)
+            let i2 = accountCodeZeroBasedIndex(c2)
+            if i1 >= 0, i1 < nAccounts { balances[i1] += amount }
+            if isGirocontoRecord(rec), i2 >= 0, i2 < nAccounts { balances[i2] -= amount }
+        }
+        return balances
+    }
 
-        let names = accounts.map { stringFromJSON($0["name"]) }
+    private static func computeNewRecordsEffectSwift(db: [String: Any], nAccounts: Int) -> [Decimal] {
+        var balances = Array(repeating: Decimal.zero, count: nAccounts)
+        guard let years = db["years"] as? [[String: Any]] else { return balances }
+        for yd in years {
+            for rec in coerceToArrayOfStringKeyedDicts(yd["records"]) {
+                if boolFromJSON(rec["is_cancelled"]) { continue }
+                if !(stringFromJSON(rec["raw_record"]).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) { continue }
+                if boolFromJSON(rec["is_virtuale_discharge"]) { continue }
+                let y = intFromJSON(rec["year"])
+                if isDotazioneRecord(rec), y != legacyDotazioneYear { continue }
+                let amount = parseLooseDecimal(stringFromJSON(rec["amount_eur"])) ?? .zero
+                let i1 = accountCodeZeroBasedIndex(stringFromJSON(rec["account_primary_code"]))
+                let i2 = accountCodeZeroBasedIndex(stringFromJSON(rec["account_secondary_code"]))
+                if i1 >= 0, i1 < nAccounts { balances[i1] += amount }
+                if isGirocontoRecord(rec), i2 >= 0, i2 < nAccounts { balances[i2] -= amount }
+            }
+        }
+        return balances
+    }
+
+    private static func computeCancelledImportedAdjustment(
+        db: [String: Any],
+        latestYear: Int,
+        nAccounts: Int,
+        cutoff: String
+    ) -> [Decimal] {
+        var adj = Array(repeating: Decimal.zero, count: nAccounts)
+        guard let years = db["years"] as? [[String: Any]] else { return adj }
+        var pool: [[String: Any]] = []
+        for yd in years {
+            let y = intFromJSON(yd["year"])
+            if y > latestYear { continue }
+            pool.append(contentsOf: coerceToArrayOfStringKeyedDicts(yd["records"]))
+        }
+        pool.sort { recordMergeSortKey($0) < recordMergeSortKey($1) }
+        for rec in pool {
+            if !boolFromJSON(rec["is_cancelled"]) { continue }
+            if stringFromJSON(rec["raw_record"]).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
+            if boolFromJSON(rec["is_virtuale_discharge"]) { continue }
+            let y = intFromJSON(rec["year"])
+            if isDotazioneRecord(rec), y != legacyDotazioneYear { continue }
+            let rDate = stringFromJSON(rec["date_iso"])
+            if !rDate.isEmpty, rDate > cutoff { continue }
+            let amount = -(parseLooseDecimal(stringFromJSON(rec["amount_eur"])) ?? .zero)
+            let i1 = accountCodeZeroBasedIndex(stringFromJSON(rec["account_primary_code"]))
+            let i2 = accountCodeZeroBasedIndex(stringFromJSON(rec["account_secondary_code"]))
+            if i1 >= 0, i1 < nAccounts { adj[i1] += amount }
+            if isGirocontoRecord(rec), i2 >= 0, i2 < nAccounts { adj[i2] -= amount }
+        }
+        return adj
+    }
+
+    private static func accountChartIndexForReferenceCode(accs: [[String: Any]], refCode: String) -> Int? {
+        let r = refCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !r.isEmpty else { return nil }
+        for (ix, acc) in accs.enumerated() {
+            let c = stringFromJSON(acc["code"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if c.isEmpty { continue }
+            if c == r { return ix }
+            if c.unicodeScalars.allSatisfy({ CharacterSet.decimalDigits.contains($0) }),
+               r.unicodeScalars.allSatisfy({ CharacterSet.decimalDigits.contains($0) }),
+               let ic = Int(c), let ir = Int(r), ic == ir {
+                return ix
+            }
+        }
+        return nil
+    }
+
+    private static func computeSpeseCcFooterAmounts(saldoAssoluti: [Decimal], accounts: [[String: Any]]) -> [Decimal] {
+        let n = saldoAssoluti.count
+        var out = (0 ..< n).map { _ in Decimal.zero }
+        guard n > 0 else { return out }
+        for i in 0 ..< min(n, accounts.count) {
+            if !boolFromJSON(accounts[i]["credit_card"]) { continue }
+            let ref = stringFromJSON(accounts[i]["credit_card_reference_code"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !ref.isEmpty else { continue }
+            guard let j = accountChartIndexForReferenceCode(accs: accounts, refCode: ref), j >= 0, j < n, j != i else { continue }
+            out[j] = out[j] + saldoAssoluti[i]
+        }
+        return out
+    }
+
+    private static func refreshLightSaldiRowDerivedFromAbsDay(_ block: inout [String: Any]) {
+        var rows = coerceToArrayOfStringKeyedDicts(block["rows"])
+        guard !rows.isEmpty else { return }
+        var newRows: [[String: Any]] = []
+        for var m in rows {
+            let a = parseLooseDecimal(stringFromJSON(m["saldo_assoluto"])) ?? .zero
+            let d = parseLooseDecimal(stringFromJSON(m["saldo_alla_data"])) ?? .zero
+            let sf = a - d
+            m["spese_future"] = decimalStringForLightJson(sf)
+            let isCc = boolFromJSON(m["credit_card"])
+            let scc = parseLooseDecimal(stringFromJSON(m["spese_cc"])) ?? .zero
+            let disp = isCc ? Decimal.zero : (a + sf + scc)
+            m["disponibilita"] = decimalStringForLightJson(disp)
+            newRows.append(m)
+        }
+        rows = newRows
+        let isCcFlags = rows.map { boolFromJSON($0["credit_card"]) }
+        let absVals = rows.map { parseLooseDecimal(stringFromJSON($0["saldo_assoluto"])) ?? .zero }
+        let sfVals = rows.map { parseLooseDecimal(stringFromJSON($0["spese_future"])) ?? .zero }
+        let sccVals = rows.map { parseLooseDecimal(stringFromJSON($0["spese_cc"])) ?? .zero }
+        var tAbs = Decimal.zero
+        var tSf = Decimal.zero
+        var tScc = Decimal.zero
+        for i in 0 ..< rows.count where !isCcFlags[i] {
+            tAbs += absVals[i]
+            tSf += sfVals[i]
+            tScc += sccVals[i]
+        }
+        block["rows"] = rows
+        block["totals"] = [
+            "saldo_assoluti_non_cc": decimalStringForLightJson(tAbs),
+            "spese_future_non_cc": decimalStringForLightJson(tSf),
+            "spese_cc_non_cc": decimalStringForLightJson(tScc),
+            "disponibilita_non_cc": decimalStringForLightJson(tAbs + tSf + tScc),
+        ]
+    }
+
+    private static func buildLightSaldiSnapshotDict(from db: [String: Any]) -> [String: Any]? {
+        guard let years = db["years"] as? [[String: Any]], !years.isEmpty else { return nil }
+        let latestYear = years.map { intFromJSON($0["year"]) }.max() ?? 0
+        guard let yearData = years.first(where: { intFromJSON($0["year"]) == latestYear }),
+              let accounts = yearData["accounts"] as? [[String: Any]] else { return nil }
+        let n = accounts.count
+        guard n > 0 else { return nil }
+        let today = todayIsoLocal()
+        let namesFull = accounts.map { stringFromJSON($0["name"]) }
+        let fut = computeFutureDatedOnly(db: db, latestYear: latestYear, nAccounts: n, today: today)
+        guard fut.count == n else { return nil }
+
+        let saldoAbsFull: [Decimal]
+        if let la = legacyAbsoluteAmounts(db: db, nAccounts: n) {
+            let nfx = computeNewRecordsEffectSwift(db: db, nAccounts: n)
+            let canc = computeCancelledImportedAdjustment(db: db, latestYear: latestYear, nAccounts: n, cutoff: today)
+            saldoAbsFull = (0 ..< n).map { i in
+                la[i] + (i < nfx.count ? nfx[i] : .zero) + (i < canc.count ? canc[i] : .zero)
+            }
+        } else {
+            let v = computeBalancesAsOf(db: db, latestYear: latestYear, nAccounts: n, cutoff: today)
+            saldoAbsFull = v
+        }
+        guard saldoAbsFull.count == n else { return nil }
+
+        let speseCcFull = computeSpeseCcFooterAmounts(saldoAssoluti: saldoAbsFull, accounts: accounts)
+        let ccFlags = (0 ..< n).map { i in i < accounts.count ? boolFromJSON(accounts[i]["credit_card"]) : false }
+        let keep = saldiVisibleIndices(db: db, latestAccounts: accounts, namesFull: namesFull)
+
         var rows: [[String: Any]] = []
-        for i in 0 ..< n {
+        for i in keep {
+            let a = saldoAbsFull[i]
+            let sf = fut[i]
+            let scc = i < speseCcFull.count ? speseCcFull[i] : .zero
+            let cc = i < ccFlags.count ? ccFlags[i] : false
+            let oggi = a - sf
+            let disp = cc ? Decimal.zero : (a + sf + scc)
+            let code = stringFromJSON(accounts[i]["code"]).trimmingCharacters(in: .whitespacesAndNewlines)
             rows.append([
-                "account_code": String(i + 1),
-                "account_name": names[i],
-                "saldo_assoluto": decimalStringForLightJson(absB[i]),
-                "saldo_alla_data": decimalStringForLightJson(dayB[i]),
+                "account_code": code.isEmpty ? String(i + 1) : code,
+                "account_name": namesFull[i],
+                "saldo_assoluto": decimalStringForLightJson(a),
+                "saldo_alla_data": decimalStringForLightJson(oggi),
+                "spese_future": decimalStringForLightJson(sf),
+                "spese_cc": decimalStringForLightJson(scc),
+                "disponibilita": decimalStringForLightJson(disp),
+                "credit_card": cc,
             ])
         }
+        var tAbs = Decimal.zero
+        var tSf = Decimal.zero
+        var tScc = Decimal.zero
+        for i in keep {
+            let cc = i < ccFlags.count ? ccFlags[i] : false
+            if cc { continue }
+            tAbs += saldoAbsFull[i]
+            tSf += fut[i]
+            tScc += i < speseCcFull.count ? speseCcFull[i] : .zero
+        }
         return [
-            "snapshot_date_iso": cutoff,
+            "snapshot_date_iso": today,
             "year_basis": latestYear,
             "rows": rows,
+            "totals": [
+                "saldo_assoluti_non_cc": decimalStringForLightJson(tAbs),
+                "spese_future_non_cc": decimalStringForLightJson(tSf),
+                "spese_cc_non_cc": decimalStringForLightJson(tScc),
+                "disponibilita_non_cc": decimalStringForLightJson(tAbs + tSf + tScc),
+            ],
         ]
     }
 
     private static func attachLightSaldiFromFull(into lightDb: inout [String: Any], fullDb: [String: Any]) {
-        guard let snap = computeLightSaldiBlock(from: fullDb) else { return }
+        guard let snap = buildLightSaldiSnapshotDict(from: fullDb) else { return }
         lightDb["light_saldi"] = snap
     }
 
@@ -912,8 +1201,21 @@ public enum ContiDatabase {
             let alla = parseLooseDecimal(stringFromJSON(r["saldo_alla_data"]))
                 ?? parseLooseDecimal(stringFromJSON(r["saldo_oggi"]))
                 ?? .zero
+            let isCc = boolFromJSON(r["credit_card"])
+            let sf = parseLooseDecimal(stringFromJSON(r["spese_future"])) ?? (abs - alla)
+            let scc = parseLooseDecimal(stringFromJSON(r["spese_cc"])) ?? .zero
+            let disp = parseLooseDecimal(stringFromJSON(r["disponibilita"])) ?? (isCc ? .zero : (abs + sf + scc))
             let id = code.isEmpty ? "acc-\(i)" : "acc-\(code)"
-            return ContiSaldRiga(id: id, accountName: name, saldoAssoluto: abs, saldoOggi: alla)
+            return ContiSaldRiga(
+                id: id,
+                accountName: name,
+                saldoAssoluto: abs,
+                saldoOggi: alla,
+                isCreditCard: isCc,
+                speseFuture: sf,
+                speseCC: scc,
+                disponibilita: disp
+            )
         }
     }
 
@@ -1034,11 +1336,32 @@ public enum ContiDatabase {
             return a.displayName.localizedStandardCompare(b.displayName) == .orderedAscending
         }
 
+        func accountNameForCode(_ refCode: String) -> String {
+            let rc = refCode.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !rc.isEmpty else { return "" }
+            for a in accs {
+                let c = stringFromJSON(a["code"]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if c == rc { return stringFromJSON(a["name"]).trimmingCharacters(in: .whitespacesAndNewlines) }
+                if c.unicodeScalars.allSatisfy({ CharacterSet.decimalDigits.contains($0) }),
+                   rc.unicodeScalars.allSatisfy({ CharacterSet.decimalDigits.contains($0) }),
+                   let ic = Int(c), let ir = Int(rc), ic == ir {
+                    return stringFromJSON(a["name"]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+            return ""
+        }
+
         var conti: [ContiImmissioneConto] = []
         for (i, a) in accs.enumerated() {
-            let code = String(i + 1)
+            let codeRaw = stringFromJSON(a["code"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let code = codeRaw.isEmpty ? String(i + 1) : codeRaw
             let name = stringFromJSON(a["name"]).trimmingCharacters(in: .whitespacesAndNewlines)
-            conti.append(ContiImmissioneConto(code: code, name: name))
+            let isCc = boolFromJSON(a["credit_card"])
+            let refCode = stringFromJSON(a["credit_card_reference_code"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let refName = isCc ? accountNameForCode(refCode) : ""
+            conti.append(
+                ContiImmissioneConto(code: code, name: name, isCreditCard: isCc, referenceAccountName: refName)
+            )
         }
         conti.sort { a, b in
             if a.name.lowercased() == "cassa" { return true }

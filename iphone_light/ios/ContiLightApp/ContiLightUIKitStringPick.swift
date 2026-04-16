@@ -112,6 +112,8 @@ final class ContiLightCodePickTableVC: UITableViewController {
     struct Row: Hashable {
         let code: String
         let label: String
+        /// Sottotitolo (es. carta → conto di riferimento); opzionale.
+        let subtitle: String?
     }
 
     var rows: [Row] = []
@@ -147,6 +149,12 @@ final class ContiLightCodePickTableVC: UITableViewController {
         } else {
             let r = rows[indexPath.row - offset]
             content.text = r.label
+            if let sub = r.subtitle, !sub.isEmpty {
+                content.secondaryText = sub
+                content.secondaryTextProperties.color = .secondaryLabel
+            } else {
+                content.secondaryText = nil
+            }
             content.textProperties.numberOfLines = 0
             let on = selectedCode == r.code
             cell.accessoryType = on ? .checkmark : .none
@@ -169,7 +177,7 @@ final class ContiLightCodePickTableVC: UITableViewController {
 
 struct ContiLightUIKitCodePickRepresentable: UIViewControllerRepresentable {
     let title: String
-    let rowItems: [(code: String, label: String)]
+    let rowItems: [(code: String, label: String, subtitle: String?)]
     let includeNone: Bool
     let noneLabel: String
     @Binding var selectedCode: String
@@ -201,7 +209,7 @@ struct ContiLightUIKitCodePickRepresentable: UIViewControllerRepresentable {
     }
 
     private func sync(vc: ContiLightCodePickTableVC, coord: CodePickCoordinator) {
-        vc.rows = rowItems.map { ContiLightCodePickTableVC.Row(code: $0.code, label: $0.label) }
+        vc.rows = rowItems.map { ContiLightCodePickTableVC.Row(code: $0.code, label: $0.label, subtitle: $0.subtitle) }
         vc.includeNone = includeNone
         vc.noneLabel = noneLabel
         vc.selectedCode = coord.selectedCode.wrappedValue

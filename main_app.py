@@ -711,8 +711,14 @@ def normalize_category_leading_sign_in_stored(raw: str) -> str:
     return (raw or "").strip()
 
 
+def strip_residual_category_display_prefix(name: str) -> str:
+    """Rimuove ``=`` residui all'inizio (legacy / import) per la sola visualizzazione."""
+    return (name or "").strip().lstrip("=").strip()
+
+
 def category_display_name(raw: str) -> str:
     base = normalize_category_leading_sign_in_stored((raw or "").strip())
+    base = strip_residual_category_display_prefix(base)
     return base[1:].strip() if base[:1] in {"+", "-"} else base
 
 
@@ -774,6 +780,44 @@ def year_bucket_for_calendar_year(db: dict, year: int) -> dict | None:
         if int(yb.get("year", 0)) == int(year):
             return yb
     return None
+
+
+def movement_filter_dataset_bounds(db: dict) -> tuple[date, date, list[int]]:
+    """
+    Limiti di data e elenco anni per preset/calendario in Movimenti.
+
+    Gli anni uniscono le date effettive delle registrazioni e i ``years[].year`` del DB:
+    un anno presente nel piano ma senza record (o con date non leggibili) resta comunque
+    selezionabile nel calendario, così non sembra «mancante dall'import».
+    """
+    records = [r for y in (db.get("years") or []) for r in (y.get("records") or [])]
+    parsed: list[date] = []
+    for rr in records:
+        iso = str(rr.get("date_iso", "")).strip()
+        if not iso:
+            continue
+        try:
+            parsed.append(date.fromisoformat(iso[:10]))
+        except Exception:
+            continue
+    bucket_years: list[int] = []
+    for yb in db.get("years") or []:
+        if not isinstance(yb, dict):
+            continue
+        try:
+            yn = int(yb.get("year", 0))
+        except (TypeError, ValueError):
+            continue
+        if yn > 0:
+            bucket_years.append(yn)
+    years_union = sorted(set(bucket_years) | {d.year for d in parsed})
+    td = date.today()
+    if not years_union:
+        return td, td, [td.year]
+    if parsed:
+        return min(parsed), max(parsed), years_union
+    lo, hi = min(years_union), max(years_union)
+    return date(lo, 1, 1), date(hi, 12, 31), years_union
 
 
 def chart_clone_source_bucket(db: dict) -> dict | None:
@@ -1107,9 +1151,12 @@ def category_code_used_any_year(db: dict, code: str) -> bool:
 
 
 def account_code_used_any_year(db: dict, code: str) -> bool:
+    """True se esiste almeno una registrazione non annullata che coinvolge il conto."""
     c = str(code).strip()
     for yb in db.get("years", []) or []:
         for r in yb.get("records", []) or []:
+            if r.get("is_cancelled"):
+                continue
             if str(r.get("account_primary_code", "")).strip() == c:
                 return True
             if str(r.get("account_secondary_code", "")).strip() == c:
@@ -1288,7 +1335,7 @@ def category_name_for_record(rec: dict, categories_for_year: list[dict[str, str]
             return False
 
     if not code.isdigit():
-        out = (rec.get("category_name") or "").strip()
+        out = strip_residual_category_display_prefix(str(rec.get("category_name") or ""))
         if is_hidden_dotazione_category_name(out) and not _allow_dotazione_visible():
             return ""
         return out
@@ -1301,7 +1348,7 @@ def category_name_for_record(rec: dict, categories_for_year: list[dict[str, str]
         try:
             idx = int(code)
         except ValueError:
-            out = (rec.get("category_name") or "").strip()
+            out = strip_residual_category_display_prefix(str(rec.get("category_name") or ""))
             if is_hidden_dotazione_category_name(out) and not _allow_dotazione_visible():
                 return ""
             return out
@@ -1310,6 +1357,7 @@ def category_name_for_record(rec: dict, categories_for_year: list[dict[str, str]
         else:
             base = str(rec.get("category_name") or "")
     base = normalize_category_leading_sign_in_stored(base)
+    base = strip_residual_category_display_prefix(base)
     out = base[1:].strip() if base[:1] in {"+", "-"} else base.strip()
     if is_hidden_dotazione_category_name(out) and not _allow_dotazione_visible():
         return ""
@@ -1367,6 +1415,19 @@ def is_giroconto_record(rec: dict) -> bool:
     return _category_code_int(rec) == 1
 
 
+def giro_record_secondary_amount_flip(rec: dict, side: str) -> bool:
+    """True se l'importo sul lato secondary va mostrato/calcolato come opposto di ``amount_eur`` (convenzione girata).
+
+    Le girate di chiusura verifica carta (``is_credit_card_settlement``) usano lo stesso movimento contabile
+    della girata ma **senza** inversione di segno sul secondo conto in verifica/stampa riepilogo.
+    """
+    if side != "secondary" or not is_giroconto_record(rec):
+        return False
+    if rec.get("is_credit_card_settlement"):
+        return False
+    return True
+
+
 def is_dotazione_record(rec: dict) -> bool:
     """Solo dati legacy/import: categoria codice 0. In app non è prevista: valorizzare un conto con una girata conto/conto."""
     return _category_code_int(rec) == 0
@@ -1374,7 +1435,7 @@ def is_dotazione_record(rec: dict) -> bool:
 
 def format_amount_for_verification_account(rec: dict, *, side: str) -> tuple[str, str]:
     """Importo mostrato dal punto di vista del conto in verifica (girata sul conto 2: stesso segno usato nei totali)."""
-    flip = side == "secondary" and is_giroconto_record(rec)
+    flip = giro_record_secondary_amount_flip(rec, side)
     year = int(rec.get("year", 0))
     if year <= 2001 and rec.get("amount_lire_original") is not None:
         value = to_decimal(rec["amount_lire_original"])
@@ -1614,6 +1675,234 @@ def compute_balances_future_dated_only(db: dict, *, today_iso: str) -> tuple[int
 
     names = [a["name"] for a in accounts]
     return latest_year, names, balances
+
+
+def compute_credit_card_impegni_by_account_index(db: dict) -> list[Decimal]:
+    """Spese per carte di credito (stesso ordine dei conti dell'ultimo anno del piano).
+
+    Struttura pronta per la logica contabile sulle registrazioni carta; finché non definita,
+    restituisce zeri.
+    """
+    if not db.get("years"):
+        return []
+    latest_year = max(y["year"] for y in db["years"])
+    year_data = next(y for y in db["years"] if y["year"] == latest_year)
+    n_accounts = len(year_data.get("accounts") or [])
+    return [Decimal("0")] * n_accounts
+
+
+def _account_chart_index_for_code(accs: list[dict], ref_code: str) -> int | None:
+    """Indice conto nel piano (lista ``accs``) per ``credit_card_reference_code`` / codice conto."""
+    r = str(ref_code or "").strip()
+    if not r:
+        return None
+    for ix, acc in enumerate(accs):
+        c = str(acc.get("code", "") or "").strip()
+        if not c:
+            continue
+        if c == r:
+            return ix
+        if c.isdigit() and r.isdigit() and int(c) == int(r):
+            return ix
+    return None
+
+
+def compute_spese_cc_footer_amounts(db: dict, saldo_assoluti: list[Decimal]) -> list[Decimal]:
+    """Riga «Spese per carte di credito» per colonna conto (ordine = saldi / piano ultimo anno).
+
+    Parte da ``compute_credit_card_impegni_by_account_index``; per ogni conto con ``credit_card``,
+    somma il **saldo assoluto** della carta nella colonna del conto di riferimento
+    (``credit_card_reference_code``), non nella colonna della carta.
+
+    Più carte collegate allo **stesso** conto ordinario contribuiscono in **somma** a quella colonna;
+    il valore è ricalcolato a ogni aggiornamento dei saldi (nessuna cache).
+    """
+    n = len(saldo_assoluti)
+    if not db.get("years") or n == 0:
+        return []
+    base = compute_credit_card_impegni_by_account_index(db)
+    out = [(base[i] if i < len(base) else Decimal("0")) for i in range(n)]
+    latest_year = max(y["year"] for y in db["years"])
+    year_data = next(y for y in db["years"] if y["year"] == latest_year)
+    accs = year_data.get("accounts") or []
+    for i in range(min(n, len(accs))):
+        acc = accs[i]
+        if not bool(acc.get("credit_card")):
+            continue
+        ref = str(acc.get("credit_card_reference_code") or "").strip()
+        if not ref:
+            continue
+        j = _account_chart_index_for_code(accs, ref)
+        if j is None or j < 0 or j >= n or j == i:
+            continue
+        out[j] = out[j] + saldo_assoluti[i]
+    return out
+
+
+def saldi_footer_amount_vectors(db: dict, *, today_iso: str | None = None) -> dict[str, object] | None:
+    """Vettori allineati a ``refresh_balance_footer`` / ``_saldi_snapshot_for_print`` (dopo filtro conti congelati).
+
+    Usato dal sidecar ``*_light.enc`` (``compute_light_saldi_snapshot``) e dall’app iOS per coerenza con i Saldi desktop.
+    """
+    if not db.get("years"):
+        return None
+    today = (today_iso or date.today().isoformat())[:10]
+    _, names_full, amts_future_full = compute_balances_future_dated_only(db, today_iso=today)
+    latest_year = max(int(y["year"]) for y in db["years"])
+    year_data = next(y for y in db["years"] if int(y["year"]) == latest_year)
+    accounts = year_data.get("accounts") or []
+    n_accounts = len(accounts)
+    if n_accounts == 0 or len(names_full) != n_accounts or len(amts_future_full) != n_accounts:
+        return None
+    la = legacy_absolute_account_amounts(db, n_accounts)
+    if la is not None:
+        new_fx = compute_new_records_effect(db)
+        canc = compute_cancelled_imported_records_balance_adjustment(db, cutoff_date_iso=today)
+        saldo_abs_full = [
+            la[i]
+            + (new_fx[i] if i < len(new_fx) else Decimal("0"))
+            + (canc[i] if i < len(canc) else Decimal("0"))
+            for i in range(n_accounts)
+        ]
+    else:
+        _, _, saldo_abs_full = compute_balances_from_2022_asof(db, cutoff_date_iso=today)
+        if len(saldo_abs_full) != n_accounts:
+            return None
+    cc_full = account_is_credit_card_column_flags(db, n_accounts)
+    spese_cc_full = compute_spese_cc_footer_amounts(db, saldo_abs_full)
+    _keep = saldi_visible_account_column_indices(db, list(names_full))
+    out_names: list[str] = []
+    out_codes: list[str] = []
+    saldo_assoluti: list[Decimal] = []
+    saldo_oggi: list[Decimal] = []
+    spese_future: list[Decimal] = []
+    spese_cc: list[Decimal] = []
+    disponibilita: list[Decimal] = []
+    is_cc: list[bool] = []
+    for i in _keep:
+        out_names.append(str(names_full[i]).strip())
+        code = str(accounts[i].get("code", "")).strip() if i < len(accounts) else ""
+        if not code.isdigit():
+            code = str(i + 1)
+        out_codes.append(code)
+        a = saldo_abs_full[i]
+        sf = amts_future_full[i] if i < len(amts_future_full) else Decimal("0")
+        scc = spese_cc_full[i] if i < len(spese_cc_full) else Decimal("0")
+        cc = bool(cc_full[i]) if i < len(cc_full) else False
+        oggi = a - sf
+        disp = Decimal("0") if cc else (a + sf + scc)
+        saldo_assoluti.append(a)
+        saldo_oggi.append(oggi)
+        spese_future.append(sf)
+        spese_cc.append(scc)
+        is_cc.append(cc)
+        disponibilita.append(disp)
+    total_abs = sum((saldo_assoluti[i] for i in range(len(is_cc)) if not is_cc[i]), Decimal("0"))
+    total_sf = sum((spese_future[i] for i in range(len(is_cc)) if not is_cc[i]), Decimal("0"))
+    total_scc = sum((spese_cc[i] for i in range(len(is_cc)) if not is_cc[i]), Decimal("0"))
+    total_disp = total_abs + total_sf + total_scc
+    return {
+        "year_basis": latest_year,
+        "names": out_names,
+        "account_codes": out_codes,
+        "saldo_assoluti": saldo_assoluti,
+        "saldo_oggi": saldo_oggi,
+        "spese_future": spese_future,
+        "spese_cc": spese_cc,
+        "disponibilita": disponibilita,
+        "is_credit_card": is_cc,
+        "totals": {
+            "saldo_assoluti_non_cc": total_abs,
+            "spese_future_non_cc": total_sf,
+            "spese_cc_non_cc": total_scc,
+            "disponibilita_non_cc": total_disp,
+        },
+        "snapshot_date_iso": today,
+    }
+
+
+def compute_light_saldi_snapshot(db: dict, *, today_iso: str | None = None) -> dict[str, object] | None:
+    """Blocco JSON ``light_saldi`` per il file ``*_light.enc`` (stessi numeri del footer Saldi desktop, inclusi CC)."""
+    v = saldi_footer_amount_vectors(db, today_iso=today_iso)
+    if not v:
+        return None
+    names = list(v["names"])
+    codes = list(v["account_codes"])
+    abs_vals: list[Decimal] = list(v["saldo_assoluti"])
+    oggi_vals: list[Decimal] = list(v["saldo_oggi"])
+    sf_vals: list[Decimal] = list(v["spese_future"])
+    scc_vals: list[Decimal] = list(v["spese_cc"])
+    disp_vals: list[Decimal] = list(v["disponibilita"])
+    is_cc = list(v["is_credit_card"])
+    rows: list[dict[str, object]] = []
+    for i in range(len(names)):
+        rows.append(
+            {
+                "account_code": str(codes[i]).strip() or str(i + 1),
+                "account_name": names[i],
+                "saldo_assoluto": str(abs_vals[i]),
+                "saldo_alla_data": str(oggi_vals[i]),
+                "spese_future": str(sf_vals[i]),
+                "spese_cc": str(scc_vals[i]),
+                "disponibilita": str(disp_vals[i]),
+                "credit_card": bool(is_cc[i]),
+            }
+        )
+    t = v["totals"]
+    if not isinstance(t, dict):
+        t = {}
+    return {
+        "snapshot_date_iso": str(v["snapshot_date_iso"]),
+        "year_basis": int(v["year_basis"]),
+        "rows": rows,
+        "totals": {
+            "saldo_assoluti_non_cc": str(t.get("saldo_assoluti_non_cc", Decimal("0"))),
+            "spese_future_non_cc": str(t.get("spese_future_non_cc", Decimal("0"))),
+            "spese_cc_non_cc": str(t.get("spese_cc_non_cc", Decimal("0"))),
+            "disponibilita_non_cc": str(t.get("disponibilita_non_cc", Decimal("0"))),
+        },
+    }
+
+
+def account_is_credit_card_column_flags(db: dict, n_names: int) -> list[bool]:
+    """True per indice conto se il conto è carta di credito (piano ultimo anno, stesso ordine di ``names``)."""
+    if not db.get("years") or n_names <= 0:
+        return [False] * max(0, n_names)
+    latest_year = max(y["year"] for y in db["years"])
+    year_data = next(y for y in db["years"] if y["year"] == latest_year)
+    accs = year_data.get("accounts") or []
+    out: list[bool] = []
+    for i in range(n_names):
+        if i < len(accs):
+            out.append(bool(accs[i].get("credit_card")))
+        else:
+            out.append(False)
+    return out
+
+
+def account_dict_for_code_latest_year(db: dict, acc_code: str) -> dict | None:
+    """Riga conto nel piano dell'anno più recente, per codice conto (match come in verifica)."""
+    ac = str(acc_code or "").strip()
+    if not ac or not db.get("years"):
+        return None
+    latest_year = max(y["year"] for y in db["years"])
+    year_data = next(y for y in db["years"] if y["year"] == latest_year)
+    for a in year_data.get("accounts") or []:
+        if account_codes_match_for_verification(str(a.get("code", "")), ac):
+            return a
+    return None
+
+
+def account_is_credit_card_by_code(db: dict, acc_code: str) -> bool:
+    a = account_dict_for_code_latest_year(db, acc_code)
+    return bool(a and a.get("credit_card"))
+
+
+def credit_card_reference_code_str(db: dict, acc_code: str) -> str:
+    a = account_dict_for_code_latest_year(db, acc_code)
+    if not a:
+        return ""
+    return str(a.get("credit_card_reference_code") or "").strip()
 
 
 def balance_amount_fg(value: Decimal) -> str:
@@ -1883,7 +2172,7 @@ def _pdf_safe_text(value: object) -> str:
 
 
 def _print_balances_fpdf(snap: dict) -> bool:
-    """Fallback Windows: PDF A4 verticale, tabella trasposta (4 colonne come HTML)."""
+    """Fallback Windows: PDF A4 verticale, tabella trasposta (quattro colonne importo come HTML)."""
     try:
         from fpdf import FPDF
         from fpdf.enums import XPos, YPos
@@ -1927,8 +2216,8 @@ def _print_balances_fpdf(snap: dict) -> bool:
         _sh = 0.88
         tw = epw * _sh
         x_table = pdf.l_margin + (epw - tw) / 2.0
-        w_conti = tw * 0.16
-        w_amt = tw * 0.28
+        w_conti = tw * 0.14
+        w_amt = (tw - w_conti) / 4.0
         font_boost = 1.4
         line_h = (6.5 if n > 12 else 7.0) * _sh * font_boost
         fs_head = round(7 * _sh * font_boost, 2)
@@ -1941,6 +2230,16 @@ def _print_balances_fpdf(snap: dict) -> bool:
             pdf.set_font("Helvetica", "B" if bold else "", fs_body)
             pdf.cell(w, line_h, _pdf_safe_text(format_saldo_cell(valuta, amt)), border=1, align="R")
 
+        def dash_amt_cell(w: float) -> None:
+            pdf.set_text_color(136, 136, 136)
+            pdf.set_font("Helvetica", "", fs_body)
+            pdf.cell(w, line_h, "-", border=1, align="R")
+            pdf.set_text_color(0, 0, 0)
+
+        is_cc: list[bool] = list(snap.get("column_is_credit_card") or [False] * len(names))
+        if len(is_cc) < len(names):
+            is_cc.extend([False] * (len(names) - len(is_cc)))
+
         # Intestazione
         pdf.set_x(x_table)
         pdf.set_text_color(0, 0, 0)
@@ -1949,9 +2248,11 @@ def _print_balances_fpdf(snap: dict) -> bool:
         pdf.set_font("Helvetica", "B", fs_head)
         pdf.cell(w_amt, line_h * 1.3, "Saldi assol.", border=1, align="C")
         pdf.set_font("Helvetica", "B", fs_head)
-        pdf.cell(w_amt, line_h * 1.3, "Saldi oggi", border=1, align="C")
+        pdf.cell(w_amt, line_h * 1.3, "Spese fut.", border=1, align="C")
+        pdf.set_font("Helvetica", "B", fs_head)
+        pdf.cell(w_amt, line_h * 1.3, "Spese CC", border=1, align="C")
         pdf.set_font("Helvetica", "", fs_head)
-        pdf.cell(w_amt, line_h * 1.3, "Differenze", border=1, align="C")
+        pdf.cell(w_amt, line_h * 1.3, "Dispon.", border=1, align="C")
         pdf.ln(line_h * 1.3)
 
         for i, nm in enumerate(names):
@@ -1960,9 +2261,16 @@ def _print_balances_fpdf(snap: dict) -> bool:
             pdf.set_font("Helvetica", "B", fs_body)
             show_nm = _pdf_safe_text((nm or "").strip()[:10])
             pdf.cell(w_conti, line_h, show_nm, border=1, align="L")
+            cc = is_cc[i] if i < len(is_cc) else False
             amt_cell(snap["amts_abs"][i], w_amt, bold=True)
-            amt_cell(snap["amts_today"][i], w_amt, bold=True)
-            amt_cell(snap["diffs"][i], w_amt, bold=False)
+            if cc:
+                dash_amt_cell(w_amt)
+                dash_amt_cell(w_amt)
+                dash_amt_cell(w_amt)
+            else:
+                amt_cell(snap["amts_spese_future"][i], w_amt, bold=True)
+                amt_cell(snap["amts_spese_cc"][i], w_amt, bold=True)
+                amt_cell(snap["amts_disponibilita"][i], w_amt, bold=False)
             pdf.ln(line_h)
 
         pdf.set_fill_color(240, 240, 240)
@@ -1972,8 +2280,9 @@ def _print_balances_fpdf(snap: dict) -> bool:
         pdf.cell(w_conti, line_h, "TOTALE", border=1, align="L", fill=True)
         for amt, bold in (
             (snap["total_abs"], True),
-            (snap["total_today"], True),
-            (snap["total_diff"], False),
+            (snap["total_spese_future"], True),
+            (snap["total_spese_cc"], True),
+            (snap["total_disponibilita"], False),
         ):
             fg = balance_amount_fg(amt)
             r, g, b = _hex_to_rgb_triplet(fg)
@@ -2169,6 +2478,109 @@ def merge_account_charts_across_years(db: dict) -> list[dict]:
     return sorted(merged, key=_ak)
 
 
+# Quietanza minima (saldo zero e nessun movimento con data contabile nel periodo) per congelare o rimuovere un conto.
+ACCOUNT_IDLE_MIN_DAYS = 92
+
+
+def record_touches_account_code(rec: dict, account_code: str) -> bool:
+    ac = str(account_code or "").strip()
+    if not ac:
+        return False
+    return str(rec.get("account_primary_code", "")).strip() == ac or str(rec.get("account_secondary_code", "")).strip() == ac
+
+
+def account_code_is_frozen(db: dict, account_code: str) -> bool:
+    c = str(account_code or "").strip()
+    if not c:
+        return False
+    for a in merge_account_charts_across_years(db):
+        if str(a.get("code", "")).strip() == c:
+            return bool(a.get("frozen"))
+    return False
+
+
+def record_touches_frozen_account(db: dict, rec: dict) -> bool:
+    for k in ("account_primary_code", "account_secondary_code"):
+        c = str(rec.get(k, "")).strip()
+        if c and account_code_is_frozen(db, c):
+            return True
+    return False
+
+
+def account_activity_date_for_idle_check(rec: dict) -> date | None:
+    ds = str(rec.get("date_iso") or "").strip()
+    if len(ds) >= 10:
+        try:
+            return date.fromisoformat(ds[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def account_has_movement_on_or_after(db: dict, account_code: str, cutoff: date) -> bool:
+    for yb in db.get("years") or []:
+        for r in yb.get("records") or []:
+            if r.get("is_cancelled"):
+                continue
+            if not record_touches_account_code(r, account_code):
+                continue
+            ad = account_activity_date_for_idle_check(r)
+            if ad is None:
+                continue
+            if ad >= cutoff:
+                return True
+    return False
+
+
+def account_meets_three_month_idle_for_freeze_or_remove(db: dict, account_code: str) -> tuple[bool, str]:
+    code = str(account_code or "").strip()
+    if not code:
+        return False, "Codice conto non valido."
+    bal = account_balance_for_code_latest_chart(db, code)
+    if bal is None or bal != Decimal("0"):
+        return False, "Il saldo assoluto attuale del conto deve essere esattamente zero."
+    since = date.today() - timedelta(days=ACCOUNT_IDLE_MIN_DAYS)
+    if account_has_movement_on_or_after(db, code, since):
+        return (
+            False,
+            "Da almeno tre mesi il conto deve restare fermo: nessun movimento con data contabile nel periodo e saldo zero. "
+            "È stata rilevata attività nel periodo.",
+        )
+    return True, ""
+
+
+def propagate_account_frozen_by_code(db: dict, code: str, *, frozen: bool) -> None:
+    sc = str(code or "").strip()
+    if not sc:
+        return
+    for yb in db.get("years") or []:
+        for a in yb.get("accounts") or []:
+            if str(a.get("code", "")).strip() != sc:
+                continue
+            if frozen:
+                a["frozen"] = True
+            else:
+                a.pop("frozen", None)
+
+
+def saldi_visible_account_column_indices(db: dict, names: list[str]) -> list[int]:
+    """Indici colonna conto da mostrare nei Saldi (footer/stampa): esclude conti con ``frozen``."""
+    ly = latest_year_bucket(db)
+    accs = (ly or {}).get("accounts") or []
+    frozen_codes = {
+        str(a.get("code", "")).strip()
+        for a in merge_account_charts_across_years(db)
+        if bool(a.get("frozen"))
+    }
+    out: list[int] = []
+    for i in range(len(names)):
+        code = str(accs[i].get("code", "")).strip() if i < len(accs) else ""
+        if code in frozen_codes:
+            continue
+        out.append(i)
+    return out
+
+
 def category_row_merged_note(c: dict) -> str:
     return str(c.get("note") or c.get("category_note") or "").strip()
 
@@ -2204,6 +2616,29 @@ def record_legacy_stable_key(rec: dict) -> str:
     if isinstance(k, str) and k.strip():
         return k
     return f"{rec.get('year', '')}:{rec.get('source_folder', '')}:{rec.get('source_file', '')}:{rec.get('source_index', '')}"
+
+
+def account_codes_match_for_verification(stored_code: str, verify_code: str) -> bool:
+    """True se il codice conto nel record coincide con quello della sessione di verifica.
+
+    Usa strip; per sole cifre confronta come interi così ``8`` e ``08`` coincidono (import legacy vs piano attuale).
+    """
+    a = str(stored_code or "").strip()
+    b = str(verify_code or "").strip()
+    if not a or not b:
+        return False
+    if a.isdigit() and b.isdigit():
+        return int(a) == int(b)
+    return a == b
+
+
+def verification_flag_star_equivalent_count(flags: str) -> int:
+    """Livelli di verifica su un lato conto: conta ``*``; se assenti, caratteri non-spazio (flag Conti legacy)."""
+    s = str(flags or "")
+    if "*" in s:
+        return s.count("*")
+    t = "".join(ch for ch in s if ch not in " \t\n\r\f\v")
+    return len(t)
 
 
 def find_record_year_and_ref(db: dict, stable_key: str) -> tuple[dict, dict] | None:
@@ -2587,6 +3022,16 @@ def _merge_account_estratti_pdf_stems_from_previous_db(imported_db: dict, previo
                 a["estratti_pdf_stem"] = stem_old
 
 
+def _clear_account_frozen_flags_in_db(db: dict) -> None:
+    """Rimuove ``frozen`` da tutti i conti (tutti gli anni). Dopo import legacy i conti non restano congelati."""
+    for yd in db.get("years") or []:
+        if not isinstance(yd, dict):
+            continue
+        for a in yd.get("accounts") or []:
+            if isinstance(a, dict):
+                a.pop("frozen", None)
+
+
 def _merge_preserved_app_sections_from_previous_db(imported_db: dict, previous_db: dict | None) -> None:
     """
     Il JSON prodotto da ImportLegacy contiene solo anni/registrazioni e metadati import.
@@ -2929,9 +3374,13 @@ def build_ui(
 
     _cdc_current: list[tk.Widget | None] = [None]
     _plan_conti_visible: list[bool] = [False]
+    # (pagina_attuale, pagina_destinazione) -> True se si può procedere al cambio tab; assegnato dopo la UI piano.
+    _plan_tab_leave_check: list[Callable[[tk.Widget, tk.Widget], bool] | None] = [None]
     _frame_to_tab_label: dict[tk.Widget, tk.Label] = {}
     # Sessione Verifica (manuale/automatica): definito qui per uso in _cdc_select (blocco uscita pagina).
     ver_session_active: list[bool] = [False]
+    # Codice conto (solo cifre) dell'ultima sessione avviata: usato se StringVar è vuota al momento di ``**``.
+    ver_session_account_code: list[str] = [""]
 
     def _cdc_ordered_tabs() -> list[tk.Widget]:
         o: list[tk.Widget] = [
@@ -2999,6 +3448,11 @@ def build_ui(
                 )
             except Exception:
                 pass
+            _cdc_sync_tab_style()
+            return
+        old_tab = _cdc_current[0]
+        leave_chk = _plan_tab_leave_check[0]
+        if old_tab is not None and leave_chk is not None and not leave_chk(old_tab, f):
             _cdc_sync_tab_style()
             return
         for pf in _pages_all:
@@ -3164,29 +3618,12 @@ def build_ui(
 
     # Bounds dataset iniziali (per calcolare subito i preset default).
     try:
-        d0 = cur_db()
-        records0 = [r for y in d0.get("years", []) for r in y.get("records", [])]
-        parsed0: list[date] = []
-        for rr in records0:
-            iso = str(rr.get("date_iso", "")).strip()
-            if not iso:
-                continue
-            try:
-                parsed0.append(date.fromisoformat(iso))
-            except Exception:
-                continue
-        if parsed0:
-            _dataset_min_date = min(parsed0)
-            _dataset_max_date = max(parsed0)
-            _dataset_years_with_records = sorted({d.year for d in parsed0})
-        else:
-            _dataset_min_date = date.today()
-            _dataset_max_date = date.today()
-            _dataset_years_with_records = [date.today().year]
+        _dataset_min_date, _dataset_max_date, _dataset_years_with_records = movement_filter_dataset_bounds(cur_db())
     except Exception:
-        _dataset_min_date = date.today()
-        _dataset_max_date = date.today()
-        _dataset_years_with_records = [date.today().year]
+        _td = date.today()
+        _dataset_min_date = _td
+        _dataset_max_date = _td
+        _dataset_years_with_records = [_td.year]
 
     filters_row = ttk.Frame(movimenti_body, style="MovCdc.TFrame")
     filters_row.pack(fill=tk.X, pady=(0, 2))
@@ -4043,7 +4480,10 @@ def build_ui(
                 if record_has_account_verification_flags(rec):
                     has_verifica_flags = True
                 forza_ok_recency = record_is_within_forza_verifica_recency(rec)
-                if not record_is_within_recent_mod_delete_window(rec):
+                if record_touches_frozen_account(cur_db(), rec):
+                    want_msg = True
+                    msg_text = "Conto congelato: la registrazione non è modificabile né eliminabile."
+                elif not record_is_within_recent_mod_delete_window(rec):
                     want_msg = True
                 else:
                     want_modifica = True
@@ -4113,6 +4553,13 @@ def build_ui(
         if not pair:
             return
         _yd, rec = pair
+        if record_touches_frozen_account(cur_db(), rec):
+            messagebox.showwarning(
+                "Movimenti",
+                "La registrazione coinvolge un conto congelato: non è modificabile.",
+                parent=root,
+            )
+            return
         if not record_is_within_edit_age(rec):
             return
         year_n = int(rec.get("year", 0))
@@ -4185,6 +4632,13 @@ def build_ui(
         if not pair:
             return
         _yd, rec = pair
+        if record_touches_frozen_account(cur_db(), rec):
+            messagebox.showwarning(
+                "Movimenti",
+                "La registrazione coinvolge un conto congelato: non è modificabile.",
+                parent=root,
+            )
+            return
         if not record_is_within_edit_age(rec):
             return
         year_categories = year_categories_map(cur_db()).get(rec.get("year"), [])
@@ -4240,6 +4694,13 @@ def build_ui(
         if not pair:
             return
         _yd, rec = pair
+        if record_touches_frozen_account(cur_db(), rec):
+            messagebox.showwarning(
+                "Movimenti",
+                "La registrazione coinvolge un conto congelato: non è modificabile.",
+                parent=root,
+            )
+            return
         if not record_is_within_edit_age(rec) or record_has_account_verification_flags(rec):
             return
         accounts = year_accounts_map(cur_db()).get(rec.get("year"), [])
@@ -4283,6 +4744,13 @@ def build_ui(
         if not pair:
             return
         _yd, rec = pair
+        if record_touches_frozen_account(cur_db(), rec):
+            messagebox.showwarning(
+                "Movimenti",
+                "La registrazione coinvolge un conto congelato: non è modificabile.",
+                parent=root,
+            )
+            return
         if not record_is_within_edit_age(rec) or record_has_account_verification_flags(rec):
             return
         if not is_giroconto_record(rec):
@@ -4329,6 +4797,13 @@ def build_ui(
         if not pair:
             return
         _yd, rec = pair
+        if record_touches_frozen_account(cur_db(), rec):
+            messagebox.showwarning(
+                "Movimenti",
+                "La registrazione coinvolge un conto congelato: non è modificabile.",
+                parent=root,
+            )
+            return
         if not record_is_within_edit_age(rec):
             return
         top = tk.Toplevel(root)
@@ -4355,6 +4830,13 @@ def build_ui(
         if not pair:
             return
         _yd, rec = pair
+        if record_touches_frozen_account(cur_db(), rec):
+            messagebox.showwarning(
+                "Movimenti",
+                "La registrazione coinvolge un conto congelato: non è modificabile.",
+                parent=root,
+            )
+            return
         if not record_is_within_edit_age(rec) or record_has_account_verification_flags(rec):
             return
         year = int(rec.get("year", 0))
@@ -4399,6 +4881,13 @@ def build_ui(
         if not pair:
             return
         _yd, rec = pair
+        if record_touches_frozen_account(cur_db(), rec):
+            messagebox.showwarning(
+                "Movimenti",
+                "La registrazione coinvolge un conto congelato: non è modificabile.",
+                parent=root,
+            )
+            return
         if not record_is_within_edit_age(rec):
             return
         top = tk.Toplevel(root)
@@ -4450,6 +4939,13 @@ def build_ui(
         if not cur:
             return
         _key0, rec0 = cur
+        if record_touches_frozen_account(cur_db(), rec0):
+            messagebox.showwarning(
+                "Movimenti",
+                "La registrazione coinvolge un conto congelato: non è modificabile.",
+                parent=root,
+            )
+            return
         is_virtuale_rec = _record_has_virtuale(rec0)
         forza_revealed_cell[0] = True
         refresh_bar()
@@ -4523,6 +5019,13 @@ def build_ui(
         if not cur:
             return
         stable_key, rec = cur
+        if record_touches_frozen_account(cur_db(), rec):
+            messagebox.showwarning(
+                "Forza verifica",
+                "La registrazione coinvolge un conto congelato: operazione non consentita.",
+                parent=root,
+            )
+            return
         if not record_has_account_verification_flags(rec):
             return
         if not record_is_within_forza_verifica_recency(rec):
@@ -4695,6 +5198,12 @@ th {{ background:#efefef; text-align:left; }}
         if not cur:
             return
         stable_key, rec = cur
+        if record_touches_frozen_account(cur_db(), rec):
+            messagebox.showwarning(
+                "Elimina registrazione",
+                "La registrazione coinvolge un conto congelato: non è eliminabile.",
+            )
+            return
         if _record_has_virtuale(rec):
             messagebox.showwarning(
                 "Eliminazione non ammessa",
@@ -4829,13 +5338,15 @@ th {{ background:#efefef; text-align:left; }}
             year_categories = categories_by_year.get(year, [])
             account_1_name = account_name_for_record(r, year_accounts, "primary")
             account_2_name = account_name_for_record(r, year_accounts, "secondary")
+            acc1_norm = (account_1_name or "").strip().lower()
+            acc2_norm = (account_2_name or "").strip().lower()
             category_name = category_name_for_record(r, year_categories)
             stars_1 = r.get("account_primary_flags", "")
             stars_2 = r.get("account_secondary_flags", "")
             if filter_order_applied_var.get() == "date":
                 if q_cat and q_cat != (category_name or "").lower():
                     continue
-                if q_acc and q_acc not in (account_1_name or "").lower() and q_acc not in (account_2_name or "").lower():
+                if q_acc and q_acc != acc1_norm and q_acc != acc2_norm:
                     continue
                 if q_amt is not None:
                     try:
@@ -4856,7 +5367,7 @@ th {{ background:#efefef; text-align:left; }}
                     else:
                         if nreg < reg_from_n or nreg > reg_to_n:
                             continue
-                if q_acc and q_acc not in (account_1_name or "").lower() and q_acc not in (account_2_name or "").lower():
+                if q_acc and q_acc != acc1_norm and q_acc != acc2_norm:
                     continue
                 if q_note and q_note not in str(r.get("note") or "").casefold():
                     continue
@@ -4910,24 +5421,8 @@ th {{ background:#efefef; text-align:left; }}
         reg_seq_map = unified_registration_sequence_map(records)
 
         # Bounds date del dataset (servono per preset e per calendario).
-        nonlocal _dataset_min_date, _dataset_max_date
-        parsed_dates: list[date] = []
-        for rr in records:
-            iso = str(rr.get("date_iso", "")).strip()
-            if not iso:
-                continue
-            try:
-                parsed_dates.append(date.fromisoformat(iso))
-            except Exception:
-                continue
-        if parsed_dates:
-            _dataset_min_date = min(parsed_dates)
-            _dataset_max_date = max(parsed_dates)
-            _dataset_years_with_records = sorted({d.year for d in parsed_dates})
-        else:
-            _dataset_min_date = date.today()
-            _dataset_max_date = date.today()
-            _dataset_years_with_records = [date.today().year]
+        nonlocal _dataset_min_date, _dataset_max_date, _dataset_years_with_records
+        _dataset_min_date, _dataset_max_date, _dataset_years_with_records = movement_filter_dataset_bounds(d)
 
         # Se la UI date è già stata creata, riallinea i campi preset su nuovi bounds (es. dopo import legacy).
         try:
@@ -6487,7 +6982,7 @@ th {{ background:#efefef; text-align:left; }}
     balance_left = tk.Frame(balance_footer_row, bg=MOVIMENTI_PAGE_BG)
     balance_left.pack(side=tk.LEFT, anchor="n")
     _saldo_hdr_font = ("TkDefaultFont", 12, "bold")
-    _SALDO_ROW_LONGEST = "Saldi alla data di oggi"
+    _SALDO_ROW_LONGEST = "Spese per carte di credito"
     # Stesso corpo/grassetto degli importi nella tabella accanto (12 bold) per allineamento verticale riga per riga.
     _saldo_title_col_font = tkfont.Font(root, font=_saldo_hdr_font)
     # Larghezza fissa (px) dal testo più lungo, misurata all’avvio con quel font.
@@ -6495,7 +6990,7 @@ th {{ background:#efefef; text-align:left; }}
     # Altezza riga comune (tabella nel canvas + colonna titoli): stesso minsize su entrambe le griglie.
     _saldo_grid_row_h = int(_saldo_title_col_font.metrics("linespace")) + 2
     # Altezza iniziale; dopo refresh viene impostata su winfo_reqheight della tabella (evita taglio ultima riga).
-    _saldo_canvas_body_h = 4 * (_saldo_grid_row_h + 2) + 8
+    _saldo_canvas_body_h = 5 * (_saldo_grid_row_h + 2) + 8
     balance_lbl_col = tk.Frame(
         balance_footer_row, width=_saldo_lbl_col_px, highlightthickness=0, bg=MOVIMENTI_PAGE_BG
     )
@@ -6503,7 +6998,7 @@ th {{ background:#efefef; text-align:left; }}
     # anchor=n: allinea il top della colonna titoli al top della tabella (canvas create_window nw), non al centro del canvas alto 92.
     balance_lbl_col.pack(side=tk.LEFT, anchor="n", padx=(2, 1))
     balance_lbl_col.grid_columnconfigure(0, weight=1)
-    for _sr in range(4):
+    for _sr in range(5):
         balance_lbl_col.grid_rowconfigure(_sr, minsize=_saldo_grid_row_h)
     tk.Label(
         balance_lbl_col,
@@ -6521,23 +7016,31 @@ th {{ background:#efefef; text-align:left; }}
         bg=MOVIMENTI_PAGE_BG,
         fg="#1a1a1a",
     ).grid(row=1, column=0, sticky="e", pady=(0, 1))
-    balance_lbl_saldi_oggi = tk.Label(
+    tk.Label(
+        balance_lbl_col,
+        text="Spese future",
+        font=_saldo_title_col_font,
+        anchor="e",
+        bg=MOVIMENTI_PAGE_BG,
+        fg="#1a1a1a",
+    ).grid(row=2, column=0, sticky="e", pady=(0, 1))
+    tk.Label(
         balance_lbl_col,
         text=_SALDO_ROW_LONGEST,
         font=_saldo_title_col_font,
         anchor="e",
         bg=MOVIMENTI_PAGE_BG,
         fg="#1a1a1a",
-    )
-    balance_lbl_saldi_oggi.grid(row=2, column=0, sticky="e", pady=(0, 1))
-    tk.Label(
+    ).grid(row=3, column=0, sticky="e", pady=(0, 1))
+    balance_lbl_disponibilita = tk.Label(
         balance_lbl_col,
-        text="Differenze",
+        text="Disponibilità",
         font=_saldo_title_col_font,
         anchor="e",
         bg=MOVIMENTI_PAGE_BG,
         fg="#1a1a1a",
-    ).grid(row=3, column=0, sticky="e", pady=(0, 1))
+    )
+    balance_lbl_disponibilita.grid(row=4, column=0, sticky="e", pady=(0, 1))
     balance_scroll_block = tk.Frame(balance_footer_row, bg=MOVIMENTI_PAGE_BG)
     balance_scroll_block.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, anchor="n")
     balance_center = tk.Frame(balance_scroll_block, bg=MOVIMENTI_PAGE_BG)
@@ -6603,28 +7106,44 @@ th {{ background:#efefef; text-align:left; }}
             canc = compute_cancelled_imported_records_balance_adjustment(
                 cur_db(), cutoff_date_iso=today_iso
             )
-            saldo_assoluti = [
+            saldo_abs_full = [
                 la[i]
                 + (new_fx[i] if i < len(new_fx) else Decimal("0"))
                 + (canc[i] if i < len(canc) else Decimal("0"))
                 for i in range(len(names))
             ]
         else:
-            _, _, saldo_assoluti = compute_balances_from_2022_asof(cur_db(), cutoff_date_iso=today_iso)
-        saldo_oggi = [saldo_assoluti[i] - amts_future[i] for i in range(len(names))]
-        total_assoluti = sum(saldo_assoluti, Decimal("0"))
-        total_oggi = sum(saldo_oggi, Decimal("0"))
-        diffs = [a - b for a, b in zip(saldo_assoluti, saldo_oggi)]
-        total_diff = total_assoluti - total_oggi
+            _, _, saldo_abs_full = compute_balances_from_2022_asof(cur_db(), cutoff_date_iso=today_iso)
+        cc_full = account_is_credit_card_column_flags(cur_db(), len(names))
+        spese_cc_full = compute_spese_cc_footer_amounts(cur_db(), saldo_abs_full)
+        _keep_sp = saldi_visible_account_column_indices(cur_db(), names)
+        names = [names[i] for i in _keep_sp]
+        saldo_assoluti = [saldo_abs_full[i] for i in _keep_sp]
+        amts_future = [amts_future[i] for i in _keep_sp]
+        is_cc = [cc_full[i] for i in _keep_sp]
+        spese_cc = [spese_cc_full[i] for i in _keep_sp]
+        saldo_oggi = [saldo_assoluti[j] - amts_future[j] for j in range(len(names))]
+        spese_future = [saldo_assoluti[j] - saldo_oggi[j] for j in range(len(names))]
+        disponibilita = [
+            (a + sf + sc) if not is_cc[i] else Decimal("0")
+            for i, (a, sf, sc) in enumerate(zip(saldo_assoluti, spese_future, spese_cc))
+        ]
+        total_abs = sum((saldo_assoluti[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
+        total_spese_future = sum((spese_future[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
+        total_spese_cc = sum((spese_cc[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
+        total_disponibilita = total_abs + total_spese_future + total_spese_cc
         return {
             "valuta": "E",
             "names": [n.strip() for n in names],
+            "column_is_credit_card": is_cc,
             "amts_abs": saldo_assoluti,
-            "amts_today": saldo_oggi,
-            "diffs": diffs,
-            "total_abs": total_assoluti,
-            "total_today": total_oggi,
-            "total_diff": total_diff,
+            "amts_spese_future": spese_future,
+            "amts_spese_cc": spese_cc,
+            "amts_disponibilita": disponibilita,
+            "total_abs": total_abs,
+            "total_spese_future": total_spese_future,
+            "total_spese_cc": total_spese_cc,
+            "total_disponibilita": total_disponibilita,
             "date_it": to_italian_date(date.today().isoformat()),
             "user_header": print_user_header_text(cur_db(), session_holder[0]),
         }
@@ -6635,9 +7154,9 @@ th {{ background:#efefef; text-align:left; }}
         for_native: bool = False,
         native_text_width_pt: float | None = None,
     ) -> str:
-        """Stampa A4: tabella trasposta — righe = conti, colonne = tre tipi di saldo + TOTALE in chiusura.
+        """Stampa A4: tabella trasposta — righe = conti, colonne = saldi assoluti / spese future / spese CC / disponibilità + TOTALE.
 
-        Con ``native_text_width_pt=iw`` (solo macOS) colgroup e larghezza tabella sono in **punti** (proporzioni 16/28/28/28).
+        Con ``native_text_width_pt=iw`` (solo macOS) colgroup e larghezza tabella sono in **punti** (Conti 14%, quattro colonne importo).
         """
         valuta = snap["valuta"]
         names: list[str] = snap["names"]
@@ -6659,9 +7178,9 @@ th {{ background:#efefef; text-align:left; }}
         cell_pad = "1px 2px"
         line_h = 1.05
         body_pad_css = "0" if for_native else f"{body_pad_v} {body_pad_h}"
-        # Larghezze colonne: 16% Conti, 28% ciascuna colonna importo (100% totale).
-        pct_conti = 16
-        pct_amt = 28
+        # Larghezze colonne: 14% Conti, resto diviso equamente tra le quattro colonne importo.
+        pct_conti = 14
+        pct_amt = (100.0 - float(pct_conti)) / 4.0
         native_root_style = ""
         native_wrap_style = ""
         native_table_style = ""
@@ -6678,13 +7197,12 @@ th {{ background:#efefef; text-align:left; }}
             _inner_tw = max(100.0, _tw - 2.0 * _edge_gutter_pt)
             _pad_h = _side + _edge_gutter_pt
             w_c = _inner_tw * pct_conti / 100.0
-            w_a = _inner_tw * pct_amt / 100.0
+            w_a = max(1.0, (_inner_tw - w_c) / 4.0)
+            _col_amt = "".join(f'<col style="width:{w_a:.2f}pt" />' for _ in range(4))
             colgroup_html = (
                 "<colgroup>"
                 f'<col class="col-conti" style="width:{w_c:.2f}pt" />'
-                f'<col style="width:{w_a:.2f}pt" />'
-                f'<col style="width:{w_a:.2f}pt" />'
-                f'<col style="width:{w_a:.2f}pt" />'
+                f"{_col_amt}"
                 "</colgroup>"
             )
             native_root_style = (
@@ -6701,12 +7219,12 @@ th {{ background:#efefef; text-align:left; }}
                 f'table-layout:fixed;border-collapse:collapse;border-spacing:0;"'
             )
         else:
+            _pct_amt_s = f"{pct_amt:.2f}".rstrip("0").rstrip(".")
+            _col_amt_pct = "".join(f'<col style="width:{_pct_amt_s}%" />' for _ in range(4))
             colgroup_html = (
                 "<colgroup>"
                 f'<col class="col-conti" style="width:{pct_conti}%" />'
-                f'<col style="width:{pct_amt}%" />'
-                f'<col style="width:{pct_amt}%" />'
-                f'<col style="width:{pct_amt}%" />'
+                f"{_col_amt_pct}"
                 "</colgroup>"
             )
         _table_width_css_block = (
@@ -6741,29 +7259,41 @@ th {{ background:#efefef; text-align:left; }}
             inner = f"<strong>{t}</strong>" if bold else t
             return f'<td class="{cls}" style="color:{html_module.escape(fg)}">{inner}</td>'
 
+        def td_cc_dash(*, bold: bool) -> str:
+            cls = "num amt-b" if bold else "num amt-n"
+            inner = "—"
+            return f'<td class="{cls}" style="color:#888888">{inner}</td>'
+
+        is_cc: list[bool] = list(snap.get("column_is_credit_card") or [False] * len(names))
+        if len(is_cc) < len(names):
+            is_cc.extend([False] * (len(names) - len(is_cc)))
+
         header_cells = (
             '<th class="hdr-name">Conti</th>'
             '<th class="col-hdr col-hdr-b"><strong>Saldi assoluti</strong></th>'
-            '<th class="col-hdr col-hdr-b"><strong>Saldi alla data<br/>di oggi</strong></th>'
-            '<th class="col-hdr col-hdr-n">Differenze</th>'
+            '<th class="col-hdr col-hdr-b"><strong>Spese future</strong></th>'
+            '<th class="col-hdr col-hdr-b"><strong>Spese per carte<br/>di credito</strong></th>'
+            '<th class="col-hdr col-hdr-n">Disponibilità</th>'
         )
 
         body_lines: list[str] = []
         for i, nm in enumerate(names):
-            body_lines.append(
-                "<tr>"
-                + conti_cell(nm)
+            cc = is_cc[i] if i < len(is_cc) else False
+            row_cells = (
+                conti_cell(nm)
                 + td_num(snap["amts_abs"][i], bold=True)
-                + td_num(snap["amts_today"][i], bold=True)
-                + td_num(snap["diffs"][i], bold=False)
-                + "</tr>"
+                + (td_cc_dash(bold=True) if cc else td_num(snap["amts_spese_future"][i], bold=True))
+                + (td_cc_dash(bold=True) if cc else td_num(snap["amts_spese_cc"][i], bold=True))
+                + (td_cc_dash(bold=False) if cc else td_num(snap["amts_disponibilita"][i], bold=False))
             )
+            body_lines.append("<tr>" + row_cells + "</tr>")
         body_lines.append(
             '<tr class="totale">'
             + conti_cell("TOTALE")
             + td_num(snap["total_abs"], bold=True)
-            + td_num(snap["total_today"], bold=True)
-            + td_num(snap["total_diff"], bold=False)
+            + td_num(snap["total_spese_future"], bold=True)
+            + td_num(snap["total_spese_cc"], bold=True)
+            + td_num(snap["total_disponibilita"], bold=False)
             + "</tr>"
         )
         tbody_html = "\n".join(body_lines)
@@ -7262,20 +7792,20 @@ th {{ background:#efefef; text-align:left; }}
     btn_stampa_saldi.bind("<Leave>", lambda _e: btn_stampa_saldi.configure(bg=_PRINT_RED))
 
     def _align_stampa_saldi_to_middle_row() -> None:
-        """Centro verticale del tasto = centro dell’etichetta «Saldi alla data di oggi» (non solo minsize teorico)."""
+        """Centro verticale del tasto = centro dell’etichetta «Disponibilità» (non solo minsize teorico)."""
         try:
             root.update_idletasks()
             bh = btn_stampa_saldi.winfo_height()
             if bh <= 1:
                 bh = btn_stampa_saldi.winfo_reqheight()
-            lh = balance_lbl_saldi_oggi.winfo_height()
+            lh = balance_lbl_disponibilita.winfo_height()
             if lh <= 1:
-                lh = balance_lbl_saldi_oggi.winfo_reqheight()
+                lh = balance_lbl_disponibilita.winfo_reqheight()
             if lh <= 0 or bh <= 0:
-                mid = (2 + 0.5) * _saldo_grid_row_h
+                mid = (4 + 0.5) * _saldo_grid_row_h
                 ptop = max(0, int(mid - bh / 2))
             else:
-                ly = balance_lbl_saldi_oggi.winfo_rooty() + lh / 2
+                ly = balance_lbl_disponibilita.winfo_rooty() + lh / 2
                 by0 = balance_left.winfo_rooty()
                 ptop = int(round(ly - by0 - bh / 2))
                 ptop = max(0, ptop)
@@ -7295,21 +7825,34 @@ th {{ background:#efefef; text-align:left; }}
             canc = compute_cancelled_imported_records_balance_adjustment(
                 cur_db(), cutoff_date_iso=today_iso
             )
-            saldo_assoluti = [
+            saldo_abs_full = [
                 la[i]
                 + (new_fx[i] if i < len(new_fx) else Decimal("0"))
                 + (canc[i] if i < len(canc) else Decimal("0"))
                 for i in range(len(names))
             ]
         else:
-            _, _, saldo_assoluti = compute_balances_from_2022_asof(cur_db(), cutoff_date_iso=today_iso)
-        saldo_oggi = [saldo_assoluti[i] - amts_future[i] for i in range(len(names))]
-        total_assoluti = sum(saldo_assoluti, Decimal("0"))
-        total_oggi = sum(saldo_oggi, Decimal("0"))
-        diffs = [a - b for a, b in zip(saldo_assoluti, saldo_oggi)]
-        total_diff = total_assoluti - total_oggi
+            _, _, saldo_abs_full = compute_balances_from_2022_asof(cur_db(), cutoff_date_iso=today_iso)
+        cc_full = account_is_credit_card_column_flags(cur_db(), len(names))
+        spese_cc_full = compute_spese_cc_footer_amounts(cur_db(), saldo_abs_full)
+        _keep_saldi = saldi_visible_account_column_indices(cur_db(), names)
+        names = [names[i] for i in _keep_saldi]
+        saldo_assoluti = [saldo_abs_full[i] for i in _keep_saldi]
+        amts_future = [amts_future[i] for i in _keep_saldi]
+        is_cc = [cc_full[i] for i in _keep_saldi]
+        spese_cc = [spese_cc_full[i] for i in _keep_saldi]
+        saldo_oggi = [saldo_assoluti[j] - amts_future[j] for j in range(len(names))]
+        spese_future = [saldo_assoluti[j] - saldo_oggi[j] for j in range(len(names))]
+        disponibilita = [
+            (a + sf + sc) if not is_cc[i] else Decimal("0")
+            for i, (a, sf, sc) in enumerate(zip(saldo_assoluti, spese_future, spese_cc))
+        ]
+        total_assoluti = sum((saldo_assoluti[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
+        total_spese_future = sum((spese_future[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
+        total_spese_cc = sum((spese_cc[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
+        total_disponibilita = total_assoluti + total_spese_future + total_spese_cc
 
-        # Riga 1 = *sld* + variazioni in app (o fallback da movimenti); riga 2 = assoluti − data > oggi.
+        # Riga 1 assoluti; 2 spese future; 3 spese CC; 4 disponibilità = somma algebrica (1+2+3). Colonna TOTALE senza conti carta.
         table = tk.Frame(balance_center_canvas, highlightthickness=0, bd=0)
         balance_center_canvas.create_window((0, 0), window=table, anchor="nw")
 
@@ -7338,6 +7881,17 @@ th {{ background:#efefef; text-align:left; }}
                 anchor=tk.E,
             ).grid(row=row, column=col, sticky="e", padx=(pl, pr), pady=(0, 1))
 
+        def dash_cell(row: int, col: int) -> None:
+            pl, pr = (0, 2) if col == 0 else (0, 6)
+            tk.Label(
+                table,
+                text="—",
+                font=amount_font,
+                fg="#888888",
+                width=AMT_CELL_WIDTH,
+                anchor=tk.E,
+            ).grid(row=row, column=col, sticky="e", padx=(pl, pr), pady=(0, 1))
+
         # Solo TOTALE + conti nello scroll orizzontale; etichette righe fisse in balance_lbl_col.
         header_cell(0, "TOTALE")
         for i, name in enumerate(names):
@@ -7347,17 +7901,30 @@ th {{ background:#efefef; text-align:left; }}
         for i, amt in enumerate(saldo_assoluti):
             amount_cell(1, i + 1, amt)
 
-        amount_cell(2, 0, total_oggi)
-        for i, amt in enumerate(saldo_oggi):
-            amount_cell(2, i + 1, amt)
+        amount_cell(2, 0, total_spese_future)
+        for i, amt in enumerate(spese_future):
+            if is_cc[i]:
+                dash_cell(2, i + 1)
+            else:
+                amount_cell(2, i + 1, amt)
 
-        amount_cell(3, 0, total_diff)
-        for i, amt in enumerate(diffs):
-            amount_cell(3, i + 1, amt)
-        for _sr in range(4):
+        amount_cell(3, 0, total_spese_cc)
+        for i, amt in enumerate(spese_cc):
+            if is_cc[i]:
+                dash_cell(3, i + 1)
+            else:
+                amount_cell(3, i + 1, amt)
+
+        amount_cell(4, 0, total_disponibilita)
+        for i, amt in enumerate(disponibilita):
+            if is_cc[i]:
+                dash_cell(4, i + 1)
+            else:
+                amount_cell(4, i + 1, amt)
+        for _sr in range(5):
             table.grid_rowconfigure(_sr, minsize=_saldo_grid_row_h)
         table.update_idletasks()
-        # Altezza viewport canvas = tabella reale (pady delle celle + minsize possono superare 4*row_h).
+        # Altezza viewport canvas = tabella reale (pady delle celle + minsize possono superare 5*row_h).
         try:
             _tbl_h = max(1, table.winfo_reqheight())
             balance_center_canvas.configure(height=_tbl_h + 4)
@@ -7619,6 +8186,8 @@ th {{ background:#efefef; text-align:left; }}
         acc_opts: list[tuple[str, str]] = []
         for i, a in enumerate(accs):
             code = str(a.get("code", str(i + 1))).strip()
+            if account_code_is_frozen(d, code):
+                continue
             name = str(a.get("name", "")).strip()
             acc_opts.append((name, code))
         def _acc_rank(item: tuple[str, str]) -> tuple[int, int, str]:
@@ -8703,6 +9272,14 @@ th {{ background:#efefef; text-align:left; }}
                 notebook.select(movimenti_frame)
             return
         rec, preview = payload
+        c_ins = str(rec.get("account_primary_code", "")).strip()
+        c_ins2 = str(rec.get("account_secondary_code", "")).strip()
+        if (c_ins and account_code_is_frozen(cur_db(), c_ins)) or (c_ins2 and account_code_is_frozen(cur_db(), c_ins2)):
+            messagebox.showwarning(
+                "Nuova registrazione",
+                "Uno dei conti selezionati è congelato: non è possibile registrare movimenti su quel conto.",
+            )
+            return
         title = "Concludi immissione" if finish else "Conferma immissione"
         if not messagebox.askyesno(title, f"Confermi l'inserimento della registrazione?\n\n{preview}"):
             return
@@ -11357,19 +11934,9 @@ th {{ background:#efefef; text-align:left; }}
                 return
             if not _ver_widget_or_ancestor_is(fg, verifica_frame):
                 return
-            if fg in (ver_ent_chq, ver_ent_note):
-                return
-            if _ver_widget_or_ancestor_is(fg, ver_btn_end):
-                return
-            if _ver_widget_or_ancestor_is(fg, ver_btn_verifica):
-                return
-            if _ver_widget_or_ancestor_is(fg, ver_input_actions):
-                return
-            if _ver_widget_or_ancestor_is(fg, ver_btn_immetti):
-                return
-            if _ver_widget_or_ancestor_is(fg, ver_btn_cancel_immissione):
-                return
-            if _ver_widget_or_ancestor_is(fg, ver_pending_btns):
+            # Ancora nel blocco immissione (frame riga, +/−, Verifica, Termina, …): niente popup.
+            # Copre anche il caso in cui after_idle vede il focus sul frame genitore prima che passi al Label.
+            if _ver_widget_or_ancestor_is(fg, ver_input_frame):
                 return
             if _ver_widget_or_ancestor_is(fg, ver_pending_host) and not _ver_widget_or_ancestor_is(
                 fg, ver_input_frame
@@ -11530,33 +12097,6 @@ th {{ background:#efefef; text-align:left; }}
         bd=1,
         takefocus=1,
     )
-
-    ver_btn_resume_immissione = ttk.Button(
-        ver_input_actions,
-        text="Riprendi immissione",
-        style="NewReg.TButton",
-    )
-    try:
-        ver_btn_resume_immissione.pack_forget()
-    except tk.TclError:
-        pass
-
-    def _ver_hide_resume_immissione_btn() -> None:
-        try:
-            ver_btn_resume_immissione.pack_forget()
-        except tk.TclError:
-            pass
-
-    def _ver_on_resume_immissione_click() -> None:
-        """Dopo annullamento saldo: chiude il messaggio guida e nasconde «Riprendi immissione» (i campi restano attivi)."""
-        ver_status_var.set("")
-        _ver_hide_resume_immissione_btn()
-        try:
-            ver_ent_amt.focus_set()
-        except tk.TclError:
-            pass
-
-    ver_btn_resume_immissione.configure(command=_ver_on_resume_immissione_click)
 
     def _ver_chq_or_note_nonempty_for_submit() -> bool:
         return bool(ver_inp_chq_var.get().strip()) or bool(ver_inp_note_var.get().strip())
@@ -12571,6 +13111,171 @@ th {{ background:#efefef; text-align:left; }}
     )
     ver_btn_close.pack(side=tk.LEFT)
 
+    def _ver_cc_settlement_try_execute(
+        d: dict,
+        acc_code: str,
+        pd: dict,
+        *,
+        parent: tk.Misc,
+        confirm_dialog: bool,
+        refresh_results: bool,
+        done_message: bool,
+    ) -> bool:
+        """Inserisce la girata di chiusura verifica carta + ``**`` sul lato carta. Ritorna True se salvato."""
+        acc_code = str(acc_code or "").strip()
+        if not acc_code or not account_is_credit_card_by_code(d, acc_code):
+            return False
+        if not bool(pd.get("match_ok")):
+            if confirm_dialog:
+                messagebox.showwarning(
+                    "Verifica carta",
+                    "La girata di chiusura è disponibile solo con verifica coincidente (saldo proiettato = estratto).",
+                    parent=parent,
+                )
+            return False
+        ref_code = credit_card_reference_code_str(d, acc_code)
+        if not ref_code:
+            messagebox.showerror("Verifica carta", "Conto carta senza conto di riferimento nel piano conti.", parent=parent)
+            return False
+        acc_cc = account_dict_for_code_latest_year(d, acc_code)
+        acc_ref = account_dict_for_code_latest_year(d, ref_code)
+        if not acc_cc or not acc_ref:
+            messagebox.showerror("Verifica carta", "Impossibile risolvere i conti carta / di riferimento.", parent=parent)
+            return False
+        if account_code_is_frozen(d, acc_code) or account_code_is_frozen(d, ref_code):
+            messagebox.showwarning("Verifica carta", "Uno dei conti è congelato: operazione non consentita.", parent=parent)
+            return False
+        bal = pd.get("current_balance", Decimal("0"))
+        if not isinstance(bal, Decimal):
+            try:
+                bal = Decimal(str(bal))
+            except Exception:
+                bal = Decimal("0")
+        amt = (-bal).quantize(Decimal("0.01"))
+        if abs(amt) < Decimal("0.005"):
+            if confirm_dialog or done_message:
+                messagebox.showinfo("Verifica carta", "Il saldo della carta risulta già a zero: nessuna girata necessaria.", parent=parent)
+            return True
+        nm_cc = str(acc_cc.get("name") or "").strip()
+        nm_ref = str(acc_ref.get("name") or "").strip()
+        cutoff_raw = ver_cutoff_date_var.get().strip()
+        try:
+            d_iso = parse_italian_ddmmyyyy_to_iso(cutoff_raw)
+        except Exception:
+            d_iso = date.today().isoformat()
+        if not d_iso:
+            d_iso = date.today().isoformat()
+        yb = latest_year_bucket(d)
+        cat_row = None
+        for c in (yb or {}).get("categories") or []:
+            if str(c.get("code", "")).strip() == "1":
+                cat_row = c
+                break
+        if not cat_row:
+            messagebox.showerror(
+                "Verifica carta",
+                "Categoria «Girata conto/conto» (codice 1) non trovata nel piano conti.",
+                parent=parent,
+            )
+            return False
+        cat_code = "1"
+        cat_name_raw = str(cat_row.get("name") or "Girata conto/conto")
+        cat_note = str(cat_row.get("note") or cat_row.get("category_note") or "") or ""
+        note = sanitize_single_line_text(
+            f"Riallineamento verifica carta — chiusura {cutoff_raw}".strip(),
+            max_len=MAX_RECORD_NOTE_LEN,
+        )
+        n_uv = int(pd.get("count_unverified", 0) or 0)
+        uv_tail = (
+            f"\n\nSul conto carta risultano ancora {n_uv} registrazioni non verificate "
+            "(la coincidenza con l'estratto riguarda il confronto saldi, non l'azzeramento delle singole righe)."
+            if n_uv > 0
+            else ""
+        )
+        if confirm_dialog:
+            if not messagebox.askyesno(
+                "Girata di chiusura carta",
+                f"Verrà inserita una Girata conto/conto:\n"
+                f"• Dal conto: {nm_cc}\n"
+                f"• Al conto: {nm_ref}\n"
+                f"• Importo: {('+' if amt >= 0 else '')}{format_euro_it(amt)} €\n\n"
+                "L'importo è calcolato sul saldo contabile attuale della carta: la verifica coincidente con l'estratto "
+                "non modifica da sola quel saldo; questa girata lo aggiorna trasferendo l'effetto sul conto di riferimento "
+                "(senza inversione di segno sul secondo conto nelle schermate di verifica). "
+                "Se l'importo coincide con il saldo della carta, dopo la registrazione il saldo carta risulta in genere a zero."
+                f"{uv_tail}\n\n"
+                "Procedere?",
+                parent=parent,
+            ):
+                return False
+        dpar = date.fromisoformat(d_iso)
+        ty = dpar.year
+        y_bucket = _ensure_year_bucket(ty)
+        y_records = y_bucket.get("records", [])
+        source_index = max((int(r.get("source_index", 0) or 0) for r in y_records), default=0) + 1
+        reg_n = _next_registration_number()
+        rec = {
+            "year": ty,
+            "source_folder": "APP",
+            "source_file": "manual",
+            "source_index": source_index,
+            "legacy_registration_number": source_index,
+            "legacy_registration_key": f"APP:cc_verifica_settle:{ty}:{source_index}",
+            "registration_number": reg_n,
+            "date_iso": d_iso,
+            "category_code": cat_code,
+            "category_name": cat_name_raw,
+            "category_note": cat_note,
+            "account_primary_code": str(acc_cc.get("code", "")).strip(),
+            "account_primary_flags": "",
+            "account_primary_with_flags": str(acc_cc.get("code", "")).strip(),
+            "account_primary_name": nm_cc,
+            "account_secondary_code": str(acc_ref.get("code", "")).strip(),
+            "account_secondary_flags": "",
+            "account_secondary_with_flags": str(acc_ref.get("code", "")).strip(),
+            "account_secondary_name": nm_ref,
+            "amount_eur": format_money(amt),
+            "amount_lire_original": None,
+            "note": note or "-",
+            "cheque": "-",
+            "raw_flags": "",
+            "is_cancelled": False,
+            "source_currency": "E",
+            "display_currency": "E",
+            "display_amount": format_money(amt),
+            "raw_record": "",
+            "is_virtuale_discharge": False,
+            "is_credit_card_settlement": True,
+        }
+        y_bucket.setdefault("records", []).append(rec)
+        undo_cc_stars = _ver_place_double_star_on_cc_settlement(acc_code, rec)
+        try:
+            save_encrypted_db_dual(
+                d,
+                Path(data_file_var.get()),
+                Path(key_file_var.get()),
+            )
+        except Exception as exc:
+            undo_cc_stars()
+            y_bucket["records"].pop()
+            messagebox.showerror("Verifica carta", str(exc), parent=parent)
+            return False
+        _movements_dirty[0] = True
+        try:
+            refresh_balance_footer()
+        except Exception:
+            pass
+        if done_message:
+            messagebox.showinfo("Verifica carta", "Girata di chiusura registrata.", parent=parent)
+        if refresh_results:
+            raw_sb = ver_stmt_balance_var.get().strip()
+            try:
+                sb2 = normalize_euro_input(raw_sb.replace(" ", "")) if raw_sb else Decimal("0")
+            except Exception:
+                sb2 = Decimal("0")
+            _ver_show_results(acc_code, sb2)
+        return True
+
     def _ver_suppress_next_amt_focusout_check(_e: object = None) -> None:
         ver_amt_focusout_suppress_once[0] = True
 
@@ -12608,10 +13313,6 @@ th {{ background:#efefef; text-align:left; }}
             return
         try:
             ver_btn_end.pack_forget()
-        except tk.TclError:
-            pass
-        try:
-            ver_btn_resume_immissione.pack_forget()
         except tk.TclError:
             pass
         try:
@@ -12696,7 +13397,10 @@ th {{ background:#efefef; text-align:left; }}
             name = acc["name"].strip()
             if name.lower() == "cassa" or _is_virtuale_account(name):
                 continue
-            out.append((name, str(acc.get("code", ""))))
+            ccd = str(acc.get("code", "")).strip()
+            if account_code_is_frozen(d, ccd):
+                continue
+            out.append((name, ccd))
         return out
 
     # ---- Helper: trova il codice numerico del conto dal nome ----
@@ -12806,7 +13510,6 @@ th {{ background:#efefef; text-align:left; }}
         has_saved_memory_for_start = _ver_saved_has_verification_in_sospeso(saved_pending)
         has_stem = bool(account_estratti_pdf_stem_for_code(cur_db(), acc_code).strip())
         expects_auto_pdf = _ver_account_expects_auto_estratto_pdf(cur_db(), acc_code)
-
         show_pdf_row = False
         if has_saved_pdf_session and saved_pending:
             show_pdf_row = True
@@ -12847,7 +13550,9 @@ th {{ background:#efefef; text-align:left; }}
             return
 
         try:
-            ver_btn_start_resume.configure(text="Avvia verifica")
+            ver_btn_start_resume.configure(
+                text="Avvia verifica"
+            )
         except tk.TclError:
             pass
 
@@ -12988,6 +13693,7 @@ th {{ background:#efefef; text-align:left; }}
             ver_stmt_balance_var.set("")
         except tk.TclError:
             pass
+        ver_session_account_code[0] = ""
         ver_cutoff_manual_mode[0] = False
         if not _ver_bancoposta_pdf_ui_locked():
             try:
@@ -13000,22 +13706,35 @@ th {{ background:#efefef; text-align:left; }}
     # ---- Ricerca registrazioni per verifica ----
     def _ver_record_touches_account(rec: dict, acc_code: str) -> tuple[bool, str]:
         """Restituisce (True, 'primary'|'secondary') se il record tocca il conto con codice acc_code."""
+        ac = str(acc_code or "").strip()
+        if not ac:
+            return False, ""
         c1 = str(rec.get("account_primary_code", "")).strip()
         c2 = str(rec.get("account_secondary_code", "")).strip()
-        if c1 == acc_code:
+        primary_hit = bool(c1) and account_codes_match_for_verification(c1, ac)
+        secondary_hit = bool(c2) and account_codes_match_for_verification(c2, ac)
+        if primary_hit and secondary_hit:
+            sp = _ver_account_stars(rec, "primary")
+            ss = _ver_account_stars(rec, "secondary")
+            if ss > sp:
+                return True, "secondary"
+            if sp > ss:
+                return True, "primary"
             return True, "primary"
-        if c2 == acc_code:
+        if primary_hit:
+            return True, "primary"
+        if secondary_hit:
             return True, "secondary"
         return False, ""
 
     def _ver_account_stars(rec: dict, side: str) -> int:
         fk = "account_primary_flags" if side == "primary" else "account_secondary_flags"
-        return str(rec.get(fk) or "").count("*")
+        return verification_flag_star_equivalent_count(str(rec.get(fk) or ""))
 
     def _ver_record_amount_for_account(rec: dict, side: str) -> Decimal:
         """Importo con segno dal punto di vista del conto: + se primary, - se secondary (giroconto)."""
         amt = to_decimal(rec.get("amount_eur", "0"))
-        if side == "secondary" and is_giroconto_record(rec):
+        if giro_record_secondary_amount_flip(rec, side):
             return -amt
         return amt
 
@@ -13093,6 +13812,73 @@ th {{ background:#efefef; text-align:left; }}
             return False
         return str(rec.get("date_iso") or "").strip() == pdf_iso
 
+    def _ver_side_is_double_star_verification_marker(rec: dict, side: str) -> bool:
+        """True se quel lato ha il marcatore ``**`` di verifica.
+
+        Richiede almeno un ``*`` nei flag così due caratteri legacy senza asterisco non contano come doppio
+        (falso «primo **»). Con ``*`` presente, ``verification_flag_star_equivalent_count`` coincide con il
+        numero di ``*``.
+        """
+        fk = "account_primary_flags" if side == "primary" else "account_secondary_flags"
+        f = str(rec.get(fk) or "")
+        if "*" not in f:
+            return False
+        return verification_flag_star_equivalent_count(f) >= 2
+
+    def _ver_last_double_star_floor(ordered: list[tuple[int, dict]], ac: str) -> tuple[int | None, str]:
+        """Ultimo ``**`` sul conto (progressivo globale più alto): ``(reg_n, date_iso)`` oppure ``(None, \"\")``.
+
+        Il confine utile per ricerca e risultati è il doppio asterisco **più recente**; un ``**`` storico
+        più indietro nel libro non deve riaprire lo scope su movimenti già chiusi da verifiche successive.
+        """
+        acs = str(ac or "").strip()
+        if not acs:
+            return None, ""
+        for reg_n, rec in reversed(ordered):
+            if rec.get("is_cancelled"):
+                continue
+            touches, side = _ver_record_touches_account(rec, acs)
+            if not touches:
+                continue
+            if _ver_side_is_double_star_verification_marker(rec, side):
+                d = str(rec.get("date_iso") or "").strip()
+                return reg_n, d
+        return None, ""
+
+    def _ver_record_in_verification_scope(
+        *,
+        reg_n: int,
+        rec: dict,
+        side: str,
+        floor_reg: int | None,
+        floor_date_iso: str,
+        cutoff_iso: str,
+    ) -> bool:
+        """False se il movimento non va considerato nelle procedure di verifica (fuori dal fascio utile).
+
+        Con almeno un ``**`` sul conto: solo registrazioni con numero globale >= all'**ultimo** ``**`` e,
+        se quella riga ha una data contabile, data >= a quella data (così non rientrano immissioni
+        posteriori per numero ma ancorate a periodi precedenti al confine).
+        Senza ``**`` sul conto (prima verifica o mai marcato): rientrano le registrazioni fino alla data di
+        chiusura estratto inclusa; si escludono solo quelle con data contabile successiva alla chiusura.
+        Le già marcate con ``*`` restano sempre nello scope.
+        """
+        if floor_reg is not None:
+            if reg_n < floor_reg:
+                return False
+            fd = str(floor_date_iso or "").strip()
+            if fd:
+                d = str(rec.get("date_iso") or "").strip()
+                if d and d < fd:
+                    return False
+            return True
+        if _ver_account_stars(rec, side) >= 1:
+            return True
+        d = str(rec.get("date_iso") or "").strip()
+        if d and d > cutoff_iso:
+            return False
+        return True
+
     def _ver_search_match(
         acc_code: str,
         target_amt: Decimal,
@@ -13121,12 +13907,21 @@ th {{ background:#efefef; text-align:left; }}
         Con ``pdf_booking_date``, i candidati con lo stesso importo sono ordinati per
         vicinanza temporale e sovrapposizione lessicale sulle note.
         """
+        ac = str(acc_code or "").strip()
+        if not ac:
+            return ("none", None, [])
         all_records, reg_map = _build_reg_index_maps()
-        ordered = sorted(
+        ordered_fwd = sorted(
             [(reg_map[record_legacy_stable_key(r)], r) for r in all_records],
             key=lambda x: x[0],
-            reverse=True,
         )
+        floor_reg, floor_date_iso = _ver_last_double_star_floor(ordered_fwd, ac)
+        cutoff_raw_s = ver_cutoff_date_var.get().strip()
+        try:
+            cutoff_iso_srch = parse_italian_ddmmyyyy_to_iso(cutoff_raw_s)
+        except Exception:
+            cutoff_iso_srch = date.today().isoformat()
+        ordered = list(reversed(ordered_fwd))
 
         _Q = Decimal("0.01")
         target_norm = target_amt.quantize(_Q)
@@ -13138,11 +13933,20 @@ th {{ background:#efefef; text-align:left; }}
         for reg_n, rec in ordered:
             if rec.get("is_cancelled"):
                 continue
-            touches, side = _ver_record_touches_account(rec, acc_code)
+            touches, side = _ver_record_touches_account(rec, ac)
             if not touches:
                 continue
+            if not _ver_record_in_verification_scope(
+                reg_n=reg_n,
+                rec=rec,
+                side=side,
+                floor_reg=floor_reg,
+                floor_date_iso=floor_date_iso,
+                cutoff_iso=cutoff_iso_srch,
+            ):
+                continue
             stars = _ver_account_stars(rec, side)
-            if stars >= 2:
+            if _ver_side_is_double_star_verification_marker(rec, side):
                 break
             if stars >= 1:
                 continue
@@ -13190,28 +13994,35 @@ th {{ background:#efefef; text-align:left; }}
         _set_account_flags(rec, side, 1)
 
     def _ver_all_verified(acc_code: str) -> bool:
-        """True se tutte le registrazioni del conto dopo il confine ** sono già verificate."""
+        """True se tutte le registrazioni del conto nello scope di verifica sono già verificate."""
+        ac = str(acc_code or "").strip()
+        if not ac:
+            return False
+        cutoff_raw_av = ver_cutoff_date_var.get().strip()
+        try:
+            cutoff_iso_av = parse_italian_ddmmyyyy_to_iso(cutoff_raw_av)
+        except Exception:
+            cutoff_iso_av = date.today().isoformat()
         all_records, reg_map = _build_reg_index_maps()
         ordered = sorted(
             [(reg_map[record_legacy_stable_key(r)], r) for r in all_records],
             key=lambda x: x[0],
         )
-        double_star_boundary = -1
+        floor_reg, floor_date_iso = _ver_last_double_star_floor(ordered, ac)
         for reg_n, rec in ordered:
             if rec.get("is_cancelled"):
                 continue
-            touches, side = _ver_record_touches_account(rec, acc_code)
+            touches, side = _ver_record_touches_account(rec, ac)
             if not touches:
                 continue
-            if _ver_account_stars(rec, side) >= 2:
-                double_star_boundary = reg_n
-        for reg_n, rec in ordered:
-            if reg_n <= double_star_boundary:
-                continue
-            if rec.get("is_cancelled"):
-                continue
-            touches, side = _ver_record_touches_account(rec, acc_code)
-            if not touches:
+            if not _ver_record_in_verification_scope(
+                reg_n=reg_n,
+                rec=rec,
+                side=side,
+                floor_reg=floor_reg,
+                floor_date_iso=floor_date_iso,
+                cutoff_iso=cutoff_iso_av,
+            ):
                 continue
             if _ver_account_stars(rec, side) < 1:
                 return False
@@ -13580,6 +14391,7 @@ th {{ background:#efefef; text-align:left; }}
                 ver_pdf_closing_balance_hint[0] = None
 
         ver_account_code_var.set(acc_code)
+        ver_session_account_code[0] = str(acc_code or "").strip()
         ver_session_active[0] = True
         ver_verifica_used_pdf_coda[0] = bool(ver_bancoposta_queue[0]) and not resuming_manual_batch
         ver_manual_any_amount_submitted[0] = bool(ver_bancoposta_queue[0]) or resuming_manual_batch
@@ -13613,6 +14425,7 @@ th {{ background:#efefef; text-align:left; }}
                 if not new_bal and not prev_bal:
                     ver_work_frame.pack_forget()
                     ver_session_active[0] = False
+                    ver_session_account_code[0] = ""
                     ver_verifica_used_pdf_coda[0] = False
                     ver_setup_pdf_path_after_auto_fail[0] = False
                     ver_setup_frame.pack(fill=tk.X)
@@ -13671,7 +14484,8 @@ th {{ background:#efefef; text-align:left; }}
                 except Exception:
                     pass
                 ver_stmt_balance_var.set(str(stmt_final_mb))
-                _ver_place_double_star(acc_code)
+                if not account_is_credit_card_by_code(cur_db(), acc_code):
+                    _ver_place_double_star(acc_code)
                 try:
                     persist_db_after_edit(None)
                 except Exception:
@@ -13686,6 +14500,7 @@ th {{ background:#efefef; text-align:left; }}
                 ver_verifica_used_pdf_coda[0] = False
                 ver_manual_any_amount_submitted[0] = False
                 ver_session_active[0] = False
+                ver_session_account_code[0] = ""
                 try:
                     ver_bancoposta_entry.configure(state="normal")
                 except tk.TclError:
@@ -14379,14 +15194,17 @@ th {{ background:#efefef; text-align:left; }}
                 pass
             return
         ver_stmt_balance_var.set(str(stmt_balance))
-        acc_code = ver_account_code_var.get()
+        acc_code = str(ver_account_code_var.get() or "").strip() or str(
+            ver_session_account_code[0] or ""
+        ).strip()
         if acc_code:
             _ver_clear_pending_from_db(acc_code)
         try:
             _ver_refresh_pending_tree()
         except Exception:
             pass
-        _ver_place_double_star(acc_code)
+        if not account_is_credit_card_by_code(cur_db(), acc_code):
+            _ver_place_double_star(acc_code)
         persist_db_after_edit(None)
         _movements_dirty[0] = True
         _ver_show_results(acc_code, stmt_balance)
@@ -14394,7 +15212,7 @@ th {{ background:#efefef; text-align:left; }}
         ver_pdf_closing_balance_hint[0] = None
 
     def _ver_on_end_input() -> None:
-        _ver_hide_resume_immissione_btn()
+        _ver_suppress_next_amt_focusout_check()
         ver_btn_annulla_sel_pending.pack_forget()
         ver_btn_del_pending.pack_forget()
         ver_btn_edit_pending.pack_forget()
@@ -14422,6 +15240,7 @@ th {{ background:#efefef; text-align:left; }}
                         except Exception:
                             pass
             ver_session_active[0] = False
+            ver_session_account_code[0] = ""
             ver_manual_any_amount_submitted[0] = False
             ver_verifica_used_pdf_coda[0] = False
             ver_pending_items[0] = []
@@ -14499,17 +15318,15 @@ th {{ background:#efefef; text-align:left; }}
                     "oppure premere di nuovo «Termina immissione» quando il saldo è noto."
                 )
                 try:
-                    ver_btn_resume_immissione.pack(side=tk.RIGHT, padx=(0, 8), before=ver_btn_end)
-                except tk.TclError:
-                    pass
-                try:
                     ver_ent_amt.focus_set()
                 except tk.TclError:
                     pass
                 return
             ver_stmt_balance_var.set(str(stmt_balance))
 
-        acc_code = ver_account_code_var.get()
+        acc_code = str(ver_account_code_var.get() or "").strip() or str(
+            ver_session_account_code[0] or ""
+        ).strip()
         try:
             need_resume_end = _ver_count_pending_rows() > 0 or bool(ver_bancoposta_queue[0])
             if need_resume_end:
@@ -14521,7 +15338,8 @@ th {{ background:#efefef; text-align:left; }}
         except Exception:
             pass
         ver_results_after_persist_cb[0] = None
-        _ver_place_double_star(acc_code)
+        if not account_is_credit_card_by_code(cur_db(), acc_code):
+            _ver_place_double_star(acc_code)
         persist_db_after_edit(None)
         _movements_dirty[0] = True
         _ver_show_results(acc_code, stmt_balance)
@@ -14529,96 +15347,172 @@ th {{ background:#efefef; text-align:left; }}
         ver_pdf_closing_balance_hint[0] = None
 
     def _ver_place_double_star(acc_code: str) -> None:
-        """Trova l'ultima registrazione verificata (*) consecutiva dal primo ** e pone ** su di essa."""
+        """Trova l'ultima registrazione verificata (*) consecutiva dall'ultimo ** e pone ** su di essa.
+
+        Per i conti carta di credito non si usa: il ``**`` va sulla girata di chiusura verifica (vedi
+        ``_ver_place_double_star_on_cc_settlement``).
+        """
+        ac = str(acc_code or "").strip() or str(ver_session_account_code[0] or "").strip()
+        if not ac:
+            return
         all_records, reg_map = _build_reg_index_maps()
         ordered = sorted(
             [(reg_map[record_legacy_stable_key(r)], r) for r in all_records],
             key=lambda x: x[0],
         )
 
-        first_double_idx: int | None = None
-        for i, (reg_n, rec) in enumerate(ordered):
-            if rec.get("is_cancelled"):
-                continue
-            touches, side = _ver_record_touches_account(rec, acc_code)
-            if not touches:
-                continue
-            stars = _ver_account_stars(rec, side)
-            if stars >= 2:
-                first_double_idx = i
-                break
+        floor_reg, floor_date_iso = _ver_last_double_star_floor(ordered, ac)
+        cutoff_raw_ds = ver_cutoff_date_var.get().strip()
+        try:
+            cutoff_iso_ds = parse_italian_ddmmyyyy_to_iso(cutoff_raw_ds)
+        except Exception:
+            cutoff_iso_ds = date.today().isoformat()
+        marker_double_idx: int | None = None
+        if floor_reg is not None:
+            for i, (reg_n, rec) in enumerate(ordered):
+                if reg_n == floor_reg:
+                    marker_double_idx = i
+                    break
 
-        start_scan = (first_double_idx + 1) if first_double_idx is not None else 0
+        start_scan = (marker_double_idx + 1) if marker_double_idx is not None else 0
         last_verified_rec: dict | None = None
         last_verified_side: str = ""
         for i in range(start_scan, len(ordered)):
             reg_n, rec = ordered[i]
             if rec.get("is_cancelled"):
                 continue
-            touches, side = _ver_record_touches_account(rec, acc_code)
+            touches, side = _ver_record_touches_account(rec, ac)
             if not touches:
+                continue
+            if not _ver_record_in_verification_scope(
+                reg_n=reg_n,
+                rec=rec,
+                side=side,
+                floor_reg=floor_reg,
+                floor_date_iso=floor_date_iso,
+                cutoff_iso=cutoff_iso_ds,
+            ):
                 continue
             stars = _ver_account_stars(rec, side)
             if stars >= 1:
                 last_verified_rec = rec
                 last_verified_side = side
             else:
-                break
+                # Righe fuori dalla griglia Movimenti (es. Dotazione cat.0) non devono interrompere la catena.
+                if show_record_in_movements_grid(rec):
+                    break
 
         if last_verified_rec is not None:
-            if first_double_idx is not None:
-                old_rec = ordered[first_double_idx][1]
-                _, old_side = _ver_record_touches_account(old_rec, acc_code)
-                old_stars = _ver_account_stars(old_rec, old_side)
-                if old_stars >= 2:
+            if marker_double_idx is not None:
+                old_rec = ordered[marker_double_idx][1]
+                _, old_side = _ver_record_touches_account(old_rec, ac)
+                if _ver_side_is_double_star_verification_marker(old_rec, old_side) or _ver_account_stars(
+                    old_rec, old_side
+                ) >= 2:
                     _set_account_flags(old_rec, old_side, 1)
             _set_account_flags(last_verified_rec, last_verified_side, 2)
 
-    ver_btn_end.bind("<Button-1>", lambda _e: _ver_on_end_input())
+    def _ver_place_double_star_on_cc_settlement(acc_code: str, settle_rec: dict) -> Callable[[], None]:
+        """Per carte: ``**`` sulla girata di chiusura (lato conto carta), non sull'ultima riga con ``*``.
 
-    # ---- Mostra risultati finali ----
-    def _ver_show_results(acc_code: str, stmt_balance: Decimal) -> None:
-        cutoff_raw = ver_cutoff_date_var.get().strip()
-        try:
-            cutoff_iso = parse_italian_ddmmyyyy_to_iso(cutoff_raw)
-        except Exception:
-            cutoff_iso = date.today().isoformat()
+        Demuove l'eventuale ``**`` precedente sullo stesso conto. Ritorna una funzione ``undo`` per rollback
+        se il salvataggio fallisce.
+        """
+        ac = str(acc_code or "").strip()
 
-        ver_input_frame.pack_forget()
+        def _noop() -> None:
+            return
 
-        d = cur_db()
+        if not ac or not settle_rec:
+            return _noop
+
+        fk_s = "account_primary_flags"
+        wk_s = "account_primary_with_flags"
+        prev_s_f = str(settle_rec.get(fk_s) or "")
+        prev_s_wf = str(settle_rec.get(wk_s) or "")
+
         all_records, reg_map = _build_reg_index_maps()
-        acc_by_year = year_accounts_map(d)
-        cat_by_year = year_categories_map(d)
-
         ordered = sorted(
             [(reg_map[record_legacy_stable_key(r)], r) for r in all_records],
             key=lambda x: x[0],
         )
+        floor_reg, _ = _ver_last_double_star_floor(ordered, ac)
+        demote: tuple[dict, str, str, str, str] | None = None
+        if floor_reg is not None:
+            for reg_n, old_rec in ordered:
+                if reg_n != floor_reg:
+                    continue
+                _, old_side = _ver_record_touches_account(old_rec, ac)
+                if _ver_side_is_double_star_verification_marker(old_rec, old_side) or _ver_account_stars(
+                    old_rec, old_side
+                ) >= 2:
+                    fk = "account_primary_flags" if old_side == "primary" else "account_secondary_flags"
+                    wk = "account_primary_with_flags" if old_side == "primary" else "account_secondary_with_flags"
+                    demote = (
+                        old_rec,
+                        fk,
+                        wk,
+                        str(old_rec.get(fk) or ""),
+                        str(old_rec.get(wk) or ""),
+                    )
+                    _set_account_flags(old_rec, old_side, 1)
+                break
 
-        double_star_boundary = -1
-        for reg_n, rec in ordered:
-            if rec.get("is_cancelled"):
-                continue
-            touches, side = _ver_record_touches_account(rec, acc_code)
-            if not touches:
-                continue
-            if _ver_account_stars(rec, side) >= 2:
-                double_star_boundary = reg_n
+        _set_account_flags(settle_rec, "primary", 2)
 
+        def _undo() -> None:
+            settle_rec[fk_s] = prev_s_f
+            settle_rec[wk_s] = prev_s_wf
+            cd = str(settle_rec.get("account_primary_code") or "").strip()
+            fl = str(settle_rec.get(fk_s) or "")
+            settle_rec[wk_s] = f"{cd}{fl}" if cd else ""
+            if demote is not None:
+                dr, dfk, dwk, df, dwf = demote
+                dr[dfk] = df
+                dr[dwk] = dwf
+
+        return _undo
+
+    ver_btn_end.bind("<Button-1>", lambda _e: _ver_on_end_input())
+
+    def _ver_verification_summary(
+        d: dict,
+        acc_code: str,
+        *,
+        cutoff_raw: str,
+        stmt_balance: Decimal,
+    ) -> tuple[dict, list[tuple[int, dict, str]], list[tuple[int, dict, str]], int, int]:
+        """Ricalcolo riepilogo verifica (stesso criterio della pagina risultati): dict stampa + liste non verificate."""
+        try:
+            cutoff_iso = parse_italian_ddmmyyyy_to_iso(cutoff_raw)
+        except Exception:
+            cutoff_iso = date.today().isoformat()
+        ac = str(acc_code or "").strip()
+        all_records, reg_map = _build_reg_index_maps()
+        ordered = sorted(
+            [(reg_map[record_legacy_stable_key(r)], r) for r in all_records],
+            key=lambda x: x[0],
+        )
+        floor_reg, floor_date_iso = _ver_last_double_star_floor(ordered, ac)
         unverified_before: list[tuple[int, dict, str]] = []
         unverified_after: list[tuple[int, dict, str]] = []
         sum_unverified = Decimal("0")
         count_verified = 0
         count_total_touching = 0
-
         for reg_n, rec in ordered:
-            if reg_n <= double_star_boundary:
-                continue
             if rec.get("is_cancelled"):
                 continue
-            touches, side = _ver_record_touches_account(rec, acc_code)
+            touches, side = _ver_record_touches_account(rec, ac)
             if not touches:
+                continue
+            if not _ver_record_in_verification_scope(
+                reg_n=reg_n,
+                rec=rec,
+                side=side,
+                floor_reg=floor_reg,
+                floor_date_iso=floor_date_iso,
+                cutoff_iso=cutoff_iso,
+            ):
                 continue
             count_total_touching += 1
             stars = _ver_account_stars(rec, side)
@@ -14632,10 +15526,9 @@ th {{ background:#efefef; text-align:left; }}
                 unverified_before.append((reg_n, rec, side))
             else:
                 unverified_after.append((reg_n, rec, side))
-
         latest_yb = latest_year_bucket(d)
         names = [a["name"] for a in (latest_yb or {}).get("accounts", [])] if latest_yb else []
-        acc_idx = int(acc_code) - 1
+        acc_idx = int(ac) - 1 if ac.isdigit() else -1
         la = legacy_absolute_account_amounts(d, len(names))
         if la is not None:
             new_fx = compute_new_records_effect(d)
@@ -14652,8 +15545,39 @@ th {{ background:#efefef; text-align:left; }}
             _, _, saldo_assoluti = compute_balances_from_2022_asof(d, cutoff_date_iso="9999-12-31")
         current_balance = saldo_assoluti[acc_idx] if 0 <= acc_idx < len(saldo_assoluti) else Decimal("0")
         projected = current_balance - sum_unverified
-
         count_unverified = len(unverified_before) + len(unverified_after)
+        match_ok = projected == stmt_balance
+        diff = stmt_balance - projected
+        pd = {
+            "current_balance": current_balance,
+            "count_unverified": count_unverified,
+            "sum_unverified": sum_unverified,
+            "projected": projected,
+            "stmt_balance": stmt_balance,
+            "diff": diff,
+            "match_ok": match_ok,
+        }
+        return pd, unverified_before, unverified_after, count_total_touching, count_verified
+
+    # ---- Mostra risultati finali ----
+    def _ver_show_results(acc_code: str, stmt_balance: Decimal) -> None:
+        cutoff_raw = ver_cutoff_date_var.get().strip()
+        try:
+            cutoff_iso = parse_italian_ddmmyyyy_to_iso(cutoff_raw)
+        except Exception:
+            cutoff_iso = date.today().isoformat()
+
+        ver_input_frame.pack_forget()
+
+        d = cur_db()
+        ac = str(acc_code or "").strip() or str(ver_session_account_code[0] or "").strip()
+        acc_by_year = year_accounts_map(d)
+        cat_by_year = year_categories_map(d)
+
+        pd, unverified_before, unverified_after, count_total_touching, count_verified = _ver_verification_summary(
+            d, ac, cutoff_raw=cutoff_raw, stmt_balance=stmt_balance
+        )
+        count_unverified = int(pd["count_unverified"])
         n_before_closure = len(unverified_before)
         acc_nm = ver_account_name_var.get()
         if count_unverified == 0:
@@ -14732,18 +15656,7 @@ th {{ background:#efefef; text-align:left; }}
         except Exception:
             pass
 
-        match_ok = projected == stmt_balance
-        diff = stmt_balance - projected
-
-        ver_print_data[0] = {
-            "current_balance": current_balance,
-            "count_unverified": count_unverified,
-            "sum_unverified": sum_unverified,
-            "projected": projected,
-            "stmt_balance": stmt_balance,
-            "diff": diff,
-            "match_ok": match_ok,
-        }
+        ver_print_data[0] = pd
 
         ver_results_new_data_visible[0] = False
         try:
@@ -14802,9 +15715,17 @@ th {{ background:#efefef; text-align:left; }}
                     _ver_uv_clear.selection_remove(_iid)
             ver_unver_correzione_forza_revealed[0] = False
             ver_unver_correzione_prev_key[0] = None
-            ver_all_verified_lbl.configure(
-                text=f"Tutte le registrazioni del conto {acc_nm} sono state verificate."
-            )
+            if count_total_touching == 0:
+                ver_all_verified_lbl.configure(
+                    text=(
+                        f"Nessuna registrazione del conto {acc_nm} rientra nello scope di verifica "
+                        f"alla data di chiusura {cutoff_raw} (controllare data e movimenti sul conto)."
+                    )
+                )
+            else:
+                ver_all_verified_lbl.configure(
+                    text=f"Tutte le registrazioni del conto {acc_nm} sono state verificate."
+                )
             try:
                 ver_all_verified_lbl.pack_forget()
             except tk.TclError:
@@ -15045,7 +15966,8 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
             _ver_refresh_pending_tree()
         except Exception:
             pass
-        _ver_place_double_star(acc_code)
+        if not account_is_credit_card_by_code(cur_db(), acc_code):
+            _ver_place_double_star(acc_code)
         try:
             persist_db_after_edit(None)
         except Exception:
@@ -15059,7 +15981,6 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         return True
 
     def _ver_on_new_cycle() -> None:
-        _ver_hide_resume_immissione_btn()
         try:
             ver_pending_host.pack_forget()
         except tk.TclError:
@@ -15126,7 +16047,6 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
     # ---- Chiudi verifica ----
     def _ver_apply_full_verification_teardown() -> None:
         """Torna alla schermata iniziale verifica e azzera lo stato di sessione in memoria."""
-        _ver_hide_resume_immissione_btn()
         ver_setup_pdf_path_after_auto_fail[0] = False
         ver_results_after_persist_cb[0] = None
         try:
@@ -15158,6 +16078,7 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         ver_results_frame.pack_forget()
         ver_account_name_var.set("")
         ver_cutoff_date_var.set("")
+        ver_session_account_code[0] = ""
         ver_account_code_var.set("")
         ver_stmt_balance_var.set("")
         ver_status_var.set("")
@@ -15170,18 +16091,81 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
 
     def _ver_on_close() -> None:
         ver_amt_focusout_suppress_once[0] = True
-        try:
-            if not messagebox.askokcancel(
-                "Chiudi verifica",
+        acc_code = ver_account_code_var.get().strip()
+        need_resume = _ver_count_pending_rows() > 0 or bool(ver_bancoposta_queue[0])
+        d_pre = cur_db()
+        cc_close_with_girata = False
+        pd_cc: dict | None = None
+        if not need_resume and acc_code and account_is_credit_card_by_code(d_pre, acc_code):
+            raw_sb = ver_stmt_balance_var.get().strip()
+            sb_try: Decimal | None = None
+            if raw_sb:
+                try:
+                    sb_try = normalize_euro_input(raw_sb.replace(" ", ""))
+                except Exception:
+                    sb_try = None
+            if sb_try is not None and _ver_all_verified(acc_code):
+                pd0, _, _, _, _ = _ver_verification_summary(
+                    d_pre,
+                    acc_code,
+                    cutoff_raw=ver_cutoff_date_var.get().strip(),
+                    stmt_balance=sb_try,
+                )
+                if bool(pd0.get("match_ok")):
+                    bal_c = pd0.get("current_balance", Decimal("0"))
+                    if not isinstance(bal_c, Decimal):
+                        try:
+                            bal_c = Decimal(str(bal_c))
+                        except Exception:
+                            bal_c = Decimal("0")
+                    if abs(bal_c) >= Decimal("0.005"):
+                        cc_close_with_girata = True
+                        pd_cc = pd0
+
+        if cc_close_with_girata and pd_cc is not None:
+            ref_cd = credit_card_reference_code_str(d_pre, acc_code)
+            acc_cc = account_dict_for_code_latest_year(d_pre, acc_code)
+            acc_ref = account_dict_for_code_latest_year(d_pre, str(ref_cd or ""))
+            nm_cc = str((acc_cc or {}).get("name") or "").strip()
+            nm_ref = str((acc_ref or {}).get("name") or "").strip()
+            bal_x = pd_cc.get("current_balance", Decimal("0"))
+            if not isinstance(bal_x, Decimal):
+                try:
+                    bal_x = Decimal(str(bal_x))
+                except Exception:
+                    bal_x = Decimal("0")
+            amt_x = (-bal_x).quantize(Decimal("0.01"))
+            n_uv = int(pd_cc.get("count_unverified", 0) or 0)
+            uv_tail = (
+                f"\n\nSul conto carta risultano ancora {n_uv} registrazioni non verificate "
+                "(la coincidenza con l'estratto riguarda il confronto saldi, non l'azzeramento delle singole righe)."
+                if n_uv > 0
+                else ""
+            )
+            close_msg = (
+                "Chiudendo la verifica verrà registrata una Girata conto/conto sul conto di riferimento "
+                "(saldo carta non a zero):\n"
+                f"• Dal conto: {nm_cc}\n"
+                f"• Al conto: {nm_ref}\n"
+                f"• Importo: {('+' if amt_x >= 0 else '')}{format_euro_it(amt_x)} €\n\n"
+                "L'importo è calcolato sul saldo contabile attuale della carta; la girata lo riallinea sul conto di riferimento "
+                "(senza inversione di segno sul secondo conto nelle schermate di verifica)."
+                f"{uv_tail}\n\n"
+                "«Annulla» resta in questa pagina. «OK» salva la girata e chiude la sessione di verifica."
+            )
+        else:
+            close_msg = (
                 "Uscire dalla verifica?\n\n"
-                "«Annulla» resta in questa pagina; «OK» chiude la sessione di verifica.",
-                parent=verifica_frame,
-            ):
+                "«Annulla» resta in questa pagina; «OK» chiude la sessione di verifica."
+            )
+        try:
+            if not messagebox.askokcancel("Chiudi verifica", close_msg, parent=verifica_frame):
+                ver_amt_focusout_suppress_once[0] = False
                 return
         except tk.TclError:
             ver_amt_focusout_suppress_once[0] = False
             return
-        need_resume = _ver_count_pending_rows() > 0 or bool(ver_bancoposta_queue[0])
+
         n_sosp = _ver_count_pending_rows()
         acc_nm = ver_account_name_var.get().strip() or "—"
 
@@ -15215,12 +16199,30 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                     parent=verifica_frame,
                 )
         else:
-            acc_code = ver_account_code_var.get().strip()
-            if acc_code:
-                saved_disk = _ver_load_pending_from_db(acc_code)
+            acc_code_close = ver_account_code_var.get().strip()
+            if cc_close_with_girata and pd_cc is not None:
+                if not _ver_cc_settlement_try_execute(
+                    cur_db(),
+                    acc_code_close,
+                    pd_cc,
+                    parent=verifica_frame,
+                    confirm_dialog=False,
+                    refresh_results=False,
+                    done_message=False,
+                ):
+                    ver_amt_focusout_suppress_once[0] = False
+                    return
+                if acc_code_close:
+                    try:
+                        _ver_clear_pending_from_db(acc_code_close)
+                        persist_db_after_edit(None)
+                    except Exception:
+                        pass
+            elif acc_code_close:
+                saved_disk = _ver_load_pending_from_db(acc_code_close)
                 if not _ver_saved_has_verification_in_sospeso(saved_disk):
                     try:
-                        _ver_clear_pending_from_db(acc_code)
+                        _ver_clear_pending_from_db(acc_code_close)
                         persist_db_after_edit(None)
                     except Exception:
                         pass
@@ -15270,15 +16272,21 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         "La nota di categoria non entra nelle registrazioni: puoi cambiarla quando vuoi (tranne la nota predefinita della «Girata conto/conto», fissa da qui). "
         "I nomi di «Consumi ordinari» e «Girata conto/conto» non si modificano da questa pagina. "
         "Non esiste la categoria «dotazione iniziale»: la prima immissione si gestisce con una registrazione di tipo girata nel piano. "
-        "Per salvare nel file cifrato usa «Correggi» sulla riga interessata oppure «Salva modifiche», che registra in blocco tutto il piano così come risulta qui e nell’altra scheda del piano."
+        "Per salvare nel file cifrato usa «Correggi» sulla riga interessata oppure «Salva categorie» nella barra in alto a questa scheda."
     )
     _PLAN_INTRO_ACC = (
         f"Elenco unificato dei conti (massimo {MAX_ACCOUNTS_COUNT}). "
-        "Salvare aggiorna i nomi nel piano di tutti gli anni e propaga le modifiche alle registrazioni già inserite per quel conto. "
-        "Il conto «Cassa» e il conto «VIRTUALE» non sono modificabili o rimovibili da qui. "
-        "La colonna Saldo è quella del footer Movimenti (anno di riferimento). "
-        "La nota di «Consumi ordinari» si modifica nella scheda Categorie. "
-        "Usa «Salva modifiche» per scrivere nel database cifrato (salva anche le modifiche alle categorie se presenti)."
+        "Con «Aggiungi conto» immetti il nome (tutto maiuscolo, nei limiti di lunghezza), poi un importo: "
+        "se è zero non viene creata alcuna registrazione; se è diverso da zero servono data, categoria (non girata) e nota per la prima registrazione. "
+        "I nomi conto già in elenco non si modificano da questa pagina. "
+        "Puoi impostare il «Nome base file PDF» per la verifica con estratto. "
+        "Usa «Salva conti (PDF)» per scrivere nel file cifrato i nomi base PDF. "
+        "Il conto «Cassa» e il conto «VIRTUALE» non sono rimovibili da qui. "
+        "La colonna Saldo coincide con i valori del pie di pagina Movimenti. "
+        "«Congela» è consentito solo se il saldo assoluto attuale è zero e non ci sono movimenti con data contabile "
+        f"negli ultimi ~{ACCOUNT_IDLE_MIN_DAYS} giorni; le registrazioni restano consultabili in Movimenti ma non modificabili, "
+        "il conto non compare nei Saldi e non è selezionabile in nuove registrazioni. "
+        "«Rimuovi» è consentito solo con le stesse condizioni di quiete e se il conto non è usato da registrazioni."
     )
 
     pack_centered_page_title(
@@ -15314,7 +16322,6 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
     ).pack(anchor=tk.W, pady=(0, 8))
 
     plan_conti_status_var = tk.StringVar(value="")
-    plan_ref_year_var = tk.StringVar(value="")
     plan_cat_summary_var = tk.StringVar(value="")
     plan_cat_rows: list[dict] = []
     plan_acc_rows: list[dict] = []
@@ -15419,6 +16426,15 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
 
     lf_acc = ttk.LabelFrame(plan_acc_inner, text="Conti", padding=8)
     lf_acc.pack(fill=tk.BOTH, expand=True)
+    ttk.Label(
+        lf_acc,
+        text=(
+            "Per i conti carta di credito è indicato il conto di riferimento: non può essere modificato. "
+            "Per collegare la carta a un conto ordinario diverso occorre creare un nuovo conto carta di credito."
+        ),
+        wraplength=820,
+        foreground="#555555",
+    ).pack(fill=tk.X, anchor="w", pady=(0, 6))
     plan_acc_grid = ttk.Frame(lf_acc)
     plan_acc_grid.pack(fill=tk.BOTH, expand=True)
     acc_btns = ttk.Frame(lf_acc)
@@ -15505,21 +16521,15 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         plan_acc_rows.clear()
         d = cur_db()
         if not d.get("years"):
-            plan_ref_year_var.set("")
             plan_cat_summary_var.set("")
             plan_conti_status_var.set(
-                "Nessun anno contabile: dalla scheda Conti usa «Prepara anno corrente (vuoto)» oppure Import legacy."
+                "Nessun anno contabile nel database: usa Import legacy oppure crea l’anno con la prima registrazione "
+                "(anno contabile scelto in immissione; il programma aggiunge l’anno al bisogno)."
             )
             return
-        ly = latest_year_bucket(d)
         n_cat = len(merged_categories_for_plan_editor(d))
-        n_acc = len(merge_account_charts_across_years(d))
-        y_ly = int(ly.get("year", 0)) if ly else 0
         plan_cat_summary_var.set(
             f"Elenco unificato: {n_cat} categorie (valide per tutti gli anni del database)."
-        )
-        plan_ref_year_var.set(
-            f"Categorie: {n_cat} (elenco unificato). Conti: {n_acc}. Saldi nella griglia — anno di riferimento movimenti {y_ly}."
         )
         plan_conti_status_var.set("")
         ttk.Label(plan_cat_grid, text="Cod.", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=0, sticky="w", padx=2, pady=2)
@@ -15568,40 +16578,116 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
 
         ttk.Label(plan_acc_grid, text="Cod.", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=0, sticky="w", padx=2, pady=2)
         ttk.Label(plan_acc_grid, text="Nome conto", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=1, sticky="w", padx=2, pady=2)
-        ttk.Label(plan_acc_grid, text="Saldo", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=2, sticky="w", padx=2, pady=2)
-        ttk.Label(plan_acc_grid, text="Nome base file PDF", font=("TkDefaultFont", 10, "bold")).grid(
+        ttk.Label(plan_acc_grid, text="Stato", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=2, sticky="w", padx=2, pady=2)
+        ttk.Label(plan_acc_grid, text="Conto di riferimento (carta)", font=("TkDefaultFont", 10, "bold")).grid(
             row=0, column=3, sticky="w", padx=2, pady=2
         )
-        ttk.Label(plan_acc_grid, text="", width=10).grid(row=0, column=4, sticky="w")
+        ttk.Label(plan_acc_grid, text="Saldo", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=4, sticky="w", padx=2, pady=2)
+        ttk.Label(plan_acc_grid, text="Nome base file PDF", font=("TkDefaultFont", 10, "bold")).grid(
+            row=0, column=5, sticky="w", padx=2, pady=2
+        )
+        ttk.Label(plan_acc_grid, text="", width=9).grid(row=0, column=6, sticky="w")
+        ttk.Label(plan_acc_grid, text="", width=10).grid(row=0, column=7, sticky="w")
         merged_acc = merge_account_charts_across_years(d)
+        acc_name_by_code: dict[str, str] = {}
+        for ax in merged_acc:
+            c_ax = str(ax.get("code", "")).strip()
+            if c_ax:
+                acc_name_by_code[c_ax] = str(ax.get("name", "") or "").strip()
+        _plan_acc_red_bg = "#b71c1c"
+        _plan_acc_red_fg = "#ffffff"
+        _plan_acc_red_dis_bg = "#bdbdbd"
+        _plan_acc_red_dis_fg = "#e0e0e0"
         for ri, a in enumerate(merged_acc, start=1):
             code = str(a.get("code", str(ri))).strip()
             raw_nm = str(a.get("name", "") or "")
             locked_acc = plan_conti_account_is_cassa(raw_nm)
-            nv = tk.StringVar(value=raw_nm)
+            is_frozen = bool(a.get("frozen"))
             stem_raw = str(a.get("estratti_pdf_stem") or "").strip()
             stem_v = tk.StringVar(value=stem_raw)
             bal = account_balance_for_code_latest_chart(d, code)
             bal_s = "—" if bal is None else format_euro_it(bal)
+            is_cc_row = bool(a.get("credit_card"))
+            ref_cd = str(a.get("credit_card_reference_code") or "").strip()
+            if is_cc_row and ref_cd:
+                ref_disp = (acc_name_by_code.get(ref_cd) or "").strip() or f"(codice {ref_cd})"
+            elif is_cc_row:
+                ref_disp = "—"
+            else:
+                ref_disp = ""
             plan_acc_rows.append(
                 {
                     "code": code,
-                    "name": nv,
                     "orig_name": raw_nm,
                     "estratti_pdf_stem": stem_v,
                     "locked_acc": locked_acc,
+                    "frozen_acc": is_frozen,
                 }
             )
             ttk.Label(plan_acc_grid, text=code).grid(row=ri, column=0, sticky="w", padx=2, pady=1)
-            est = "readonly" if locked_acc else "normal"
-            ttk.Entry(plan_acc_grid, textvariable=nv, width=32, state=est).grid(row=ri, column=1, sticky="we", padx=2, pady=1)
-            ttk.Label(plan_acc_grid, text=bal_s).grid(row=ri, column=2, sticky="w", padx=2, pady=1)
-            stem_est = "readonly" if locked_acc else "normal"
+            row_locked = locked_acc or is_frozen
+            ttk.Label(plan_acc_grid, text=raw_nm, wraplength=360).grid(row=ri, column=1, sticky="we", padx=2, pady=1)
+            if is_frozen:
+                ttk.Label(
+                    plan_acc_grid,
+                    text="Congelato",
+                    font=("TkDefaultFont", 10, "bold"),
+                    foreground="#6d4c41",
+                ).grid(row=ri, column=2, sticky="w", padx=2, pady=1)
+            else:
+                ttk.Label(plan_acc_grid, text="—", foreground="#888888").grid(row=ri, column=2, sticky="w", padx=2, pady=1)
+            ttk.Label(plan_acc_grid, text=ref_disp, wraplength=280).grid(row=ri, column=3, sticky="we", padx=2, pady=1)
+            ttk.Label(plan_acc_grid, text=bal_s).grid(row=ri, column=4, sticky="w", padx=2, pady=1)
+            stem_est = "readonly" if row_locked else "normal"
             ttk.Entry(plan_acc_grid, textvariable=stem_v, width=28, state=stem_est).grid(
-                row=ri, column=3, sticky="we", padx=2, pady=1
+                row=ri, column=5, sticky="we", padx=2, pady=1
             )
 
-            def _rm_acc(cd: str = code) -> None:
+            def _freeze_acc(cd: str = code, nm_chk: str = raw_nm, fr: bool = is_frozen) -> None:
+                dd = cur_db()
+                if plan_conti_account_is_cassa(nm_chk):
+                    messagebox.showwarning("Conti", "Il conto Cassa non può essere congelato.", parent=root)
+                    return
+                if _is_virtuale_account(nm_chk):
+                    messagebox.showwarning("Conti", "Il conto VIRTUALE non può essere congelato.", parent=root)
+                    return
+                acc_nm = nm_chk.strip() or cd
+                if account_code_is_frozen(dd, cd):
+                    messagebox.showinfo("Conti", "Il conto risulta già congelato.", parent=root)
+                    return
+                ok, err = account_meets_three_month_idle_for_freeze_or_remove(dd, cd)
+                if not ok:
+                    messagebox.showwarning("Congela conto", err, parent=root)
+                    return
+                if not messagebox.askyesno(
+                    "Congela conto",
+                    f"Congelare il conto «{acc_nm}» (codice {cd})?\n"
+                    "Le registrazioni restano in archivio e consultabili in Movimenti, ma non saranno più modificabili "
+                    "se coinvolgono questo conto; il conto non comparirà nei Saldi né in nuove registrazioni.",
+                    parent=root,
+                ):
+                    return
+                propagate_account_frozen_by_code(dd, cd, frozen=True)
+                try:
+                    save_encrypted_db_dual(
+                        dd,
+                        Path(data_file_var.get()),
+                        Path(key_file_var.get()),
+                    )
+                except Exception as exc:
+                    propagate_account_frozen_by_code(dd, cd, frozen=False)
+                    messagebox.showerror("Conti", str(exc), parent=root)
+                    return
+                plan_conti_status_var.set("Conto congelato e database salvato.")
+                _movements_dirty[0] = True
+                try:
+                    refresh_balance_footer()
+                    refresh_category_account_dropdowns()
+                except Exception:
+                    pass
+                _reload_plan_conti_form()
+
+            def _rm_acc(cd: str = code, fr: bool = is_frozen) -> None:
                 dd = cur_db()
                 acc_row = None
                 for yb in dd.get("years") or []:
@@ -15625,6 +16711,13 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                 if _is_virtuale_account(acc_name_str):
                     messagebox.showwarning("Categorie e conti", "Il conto VIRTUALE non può essere rimosso.", parent=root)
                     return
+                if fr:
+                    messagebox.showwarning(
+                        "Conti",
+                        "Un conto congelato resta nel piano per la consultazione storica: non è rimuovibile da qui.",
+                        parent=root,
+                    )
+                    return
                 if account_code_used_any_year(dd, cd):
                     messagebox.showwarning(
                         "Categorie e conti",
@@ -15632,13 +16725,9 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                         parent=root,
                     )
                     return
-                b = account_balance_for_code_latest_chart(dd, cd)
-                if b is None or b != Decimal("0"):
-                    messagebox.showwarning(
-                        "Categorie e conti",
-                        "Il conto può essere rimosso solo se il saldo è esattamente zero.",
-                        parent=root,
-                    )
+                ok_idle, err_idle = account_meets_three_month_idle_for_freeze_or_remove(dd, cd)
+                if not ok_idle:
+                    messagebox.showwarning("Conti", err_idle, parent=root)
                     return
                 if len(merge_account_charts_across_years(dd)) <= 1:
                     messagebox.showwarning("Categorie e conti", "Serve almeno un conto.", parent=root)
@@ -15668,14 +16757,44 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                     pass
                 _reload_plan_conti_form()
 
-            rm_state = "disabled" if locked_acc else "normal"
-            ttk.Button(plan_acc_grid, text="Rimuovi", width=9, state=rm_state, command=_rm_acc).grid(
-                row=ri, column=4, sticky="w", padx=2, pady=1
+            rm_active = not (locked_acc or is_frozen)
+            rm_lbl = tk.Label(
+                plan_acc_grid,
+                text="Rimuovi",
+                font=("TkDefaultFont", 9, "bold"),
+                bg=_plan_acc_red_bg if rm_active else _plan_acc_red_dis_bg,
+                fg=_plan_acc_red_fg if rm_active else _plan_acc_red_dis_fg,
+                padx=10,
+                pady=3,
+                cursor="hand2" if rm_active else "arrow",
             )
+            rm_lbl.grid(row=ri, column=6, sticky="w", padx=2, pady=1)
+            if rm_active:
+                rm_lbl.bind("<Button-1>", lambda _e, fn=_rm_acc: fn())
+            if is_frozen:
+                ttk.Label(plan_acc_grid, text="—", foreground="#888888", width=8).grid(
+                    row=ri, column=7, sticky="w", padx=2, pady=1
+                )
+            else:
+                fz_active = rm_active
+                fz_lbl = tk.Label(
+                    plan_acc_grid,
+                    text="Congela",
+                    font=("TkDefaultFont", 9, "bold"),
+                    bg=_plan_acc_red_bg if fz_active else _plan_acc_red_dis_bg,
+                    fg=_plan_acc_red_fg if fz_active else _plan_acc_red_dis_fg,
+                    padx=10,
+                    pady=3,
+                    cursor="hand2" if fz_active else "arrow",
+                )
+                fz_lbl.grid(row=ri, column=7, sticky="w", padx=2, pady=1)
+                if fz_active:
+                    fz_lbl.bind("<Button-1>", lambda _e, fn=_freeze_acc: fn())
         plan_cat_grid.columnconfigure(1, weight=1)
         plan_cat_grid.columnconfigure(2, weight=1)
         plan_acc_grid.columnconfigure(1, weight=1)
         plan_acc_grid.columnconfigure(3, weight=1)
+        plan_acc_grid.columnconfigure(5, weight=1)
         for _cnv in (plan_cat_canvas, plan_acc_canvas):
             try:
                 _cnv.configure(scrollregion=_cnv.bbox("all"))
@@ -15686,11 +16805,57 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         except Exception:
             pass
 
-    def _save_plan_conti_from_form() -> None:
+    def _discard_unsaved_plan_pdf_stems() -> None:
+        """Ripristina in griglia solo i campi «Nome base file PDF» dal DB in memoria (non tocca la scheda Categorie)."""
+        d = cur_db()
+        if not plan_acc_rows:
+            plan_conti_status_var.set("Nessun conto in elenco.")
+            return
+        for row in plan_acc_rows:
+            code = str(row.get("code") or "").strip()
+            stem_v = row.get("estratti_pdf_stem")
+            if not isinstance(stem_v, tk.StringVar):
+                continue
+            stem_v.set(account_estratti_pdf_stem_for_code(d, code))
+        plan_conti_status_var.set(
+            "Nomi base PDF ripristinati dal database in memoria (per salvarli nel file cifrato usa «Salva conti (PDF)»)."
+        )
+
+    def _plan_category_form_is_dirty() -> bool:
+        for row in plan_cat_rows:
+            on = str(row.get("orig_name", "") or "")
+            name_locked = bool(row.get("locked"))
+            on_fmt = format_category_chart_name_stored(on)
+            orig_note = str(row.get("orig_note", "") or "")
+            nt0 = format_category_note_stored(orig_note)
+            if name_locked:
+                nm = on_fmt
+            else:
+                nm = format_category_chart_name_stored(row["name"].get() or "")
+            nt = format_category_note_stored(row["note"].get() or "")
+            if nm == on_fmt and nt == nt0 and on.strip() == nm:
+                continue
+            return True
+        return False
+
+    def _plan_accounts_pdf_is_dirty() -> bool:
+        d = cur_db()
+        for row in plan_acc_rows:
+            if row.get("frozen_acc"):
+                continue
+            code = str(row.get("code") or "").strip()
+            stem_v = row.get("estratti_pdf_stem")
+            if not isinstance(stem_v, tk.StringVar):
+                continue
+            if (stem_v.get() or "").strip() != account_estratti_pdf_stem_for_code(d, code).strip():
+                return True
+        return False
+
+    def _save_plan_categories_only() -> bool:
         d = cur_db()
         if not d.get("years"):
-            messagebox.showwarning("Categorie e conti", "Nessun anno contabile nel database.", parent=root)
-            return
+            messagebox.showwarning("Categorie", "Nessun anno contabile nel database.", parent=root)
+            return False
         for row in plan_cat_rows:
             code = str(row["code"])
             on = str(row.get("orig_name", "") or "")
@@ -15709,29 +16874,17 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
             if not name_locked and nm != on_fmt:
                 if not plan_conti_names_have_attinenza(on_fmt, nm):
                     messagebox.showwarning(
-                        "Categorie e conti",
+                        "Categorie",
                         f"Categoria {code}: il nuovo nome deve essere una correzione parziale del nome attuale.",
                         parent=root,
                     )
-                    return
+                    return False
                 propagate_category_chart_by_code(d, code, nm, nt_or_none)
                 sync_record_category_names_if_identical_old(d, code, on, nm)
             else:
                 propagate_category_chart_by_code(d, code, nm, nt_or_none)
                 if not name_locked and nm != on.strip():
                     sync_record_category_names_if_identical_old(d, code, on, nm)
-        for row in plan_acc_rows:
-            code = str(row["code"])
-            stem_v = row.get("estratti_pdf_stem")
-            if isinstance(stem_v, tk.StringVar):
-                propagate_account_estratti_pdf_stem_by_code(d, code, stem_v.get() or "")
-            if row.get("locked_acc"):
-                continue
-            nm = clip_text(row["name"].get() or "", MAX_ACCOUNT_NAME_LEN)
-            on = row.get("orig_name", "")
-            if nm != on:
-                propagate_account_chart_by_code(d, code, nm)
-                sync_record_account_names_for_code(d, code, nm)
         try:
             save_encrypted_db_dual(
                 d,
@@ -15739,9 +16892,9 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                 Path(key_file_var.get()),
             )
         except Exception as exc:
-            messagebox.showerror("Categorie e conti", str(exc), parent=root)
-            return
-        plan_conti_status_var.set("Modifiche salvate.")
+            messagebox.showerror("Categorie", str(exc), parent=root)
+            return False
+        plan_conti_status_var.set("Categorie: modifiche salvate nel file cifrato.")
         _movements_dirty[0] = True
         try:
             refresh_balance_footer()
@@ -15749,12 +16902,69 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         except Exception:
             pass
         _reload_plan_conti_form()
+        return True
 
-    def _prepare_current_year_bucket() -> None:
+    def _save_plan_accounts_pdf_only() -> bool:
         d = cur_db()
-        y0 = date.today().year
-        periodiche.ensure_year_bucket(d, y0)
+        if not d.get("years"):
+            messagebox.showwarning("Conti", "Nessun anno contabile nel database.", parent=root)
+            return False
+        for row in plan_acc_rows:
+            if row.get("frozen_acc"):
+                continue
+            code = str(row["code"])
+            stem_v = row.get("estratti_pdf_stem")
+            if isinstance(stem_v, tk.StringVar):
+                propagate_account_estratti_pdf_stem_by_code(d, code, stem_v.get() or "")
+        try:
+            save_encrypted_db_dual(
+                d,
+                Path(data_file_var.get()),
+                Path(key_file_var.get()),
+            )
+        except Exception as exc:
+            messagebox.showerror("Conti", str(exc), parent=root)
+            return False
+        plan_conti_status_var.set("Conti: modifiche ai PDF salvate nel file cifrato.")
+        _movements_dirty[0] = True
+        try:
+            refresh_balance_footer()
+            refresh_category_account_dropdowns()
+        except Exception:
+            pass
         _reload_plan_conti_form()
+        return True
+
+    def _plan_tab_leave_before_navigate(old: tk.Widget, new: tk.Widget) -> bool:
+        if old is plan_categorie_frame and new is not plan_categorie_frame:
+            if plan_cat_rows and _plan_category_form_is_dirty():
+                r = messagebox.askyesnocancel(
+                    "Categorie",
+                    "Le modifiche alla scheda Categorie non sono state salvate sul file cifrato.\n\n"
+                    "Salvare prima di uscire?",
+                    parent=root,
+                )
+                if r is None:
+                    return False
+                if r:
+                    return _save_plan_categories_only()
+                _reload_plan_conti_form()
+        if old is plan_conti_frame and new is not plan_conti_frame:
+            if plan_acc_rows and _plan_accounts_pdf_is_dirty():
+                r = messagebox.askyesnocancel(
+                    "Conti",
+                    "Le modifiche ai «Nome base file PDF» non sono state salvate sul file cifrato.\n\n"
+                    "Salvare prima di uscire?",
+                    parent=root,
+                )
+                if r is None:
+                    return False
+                if r:
+                    return _save_plan_accounts_pdf_only()
+                _discard_unsaved_plan_pdf_stems()
+        return True
+
+    _plan_tab_leave_check[0] = _plan_tab_leave_before_navigate
 
     def _add_blank_category() -> None:
         d = cur_db()
@@ -15835,7 +17045,7 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
             _append_category_all_years(new_cat)
             top.destroy()
             _reload_plan_conti_form()
-            plan_conti_status_var.set("Categoria aggiunta in memoria: usa «Salva modifiche» per salvare nel file cifrato.")
+            plan_conti_status_var.set("Categoria aggiunta in memoria: usa «Salva categorie» per salvare nel file cifrato.")
 
         btns = ttk.Frame(frm)
         btns.grid(row=5, column=0, columnspan=2, sticky="e", pady=(4, 0))
@@ -15847,19 +17057,44 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
             pass
 
     def _add_blank_account() -> None:
-        d = cur_db()
-        if not d.get("years"):
-            messagebox.showwarning("Categorie e conti", "Crea prima un anno contabile.", parent=root)
+        """``wiz`` memorizza apertura carta di credito + codice conto di riferimento per l'append al piano."""
+        wiz: dict[str, object] = {"credit_card": False, "credit_card_reference_code": ""}
+
+        def _reference_accounts_for_credit_card(dd: dict) -> list[tuple[str, str]]:
+            out: list[tuple[str, str]] = []
+            for a in merge_account_charts_across_years(dd):
+                code = str(a.get("code", "")).strip()
+                name = str(a.get("name", "") or "").strip()
+                if not code or not name:
+                    continue
+                if bool(a.get("credit_card")):
+                    continue
+                nu = name.upper()
+                if nu == "CASSA" or nu == str(VIRTUALE_ACCOUNT_NAME).upper():
+                    continue
+                out.append((name, code))
+            return out
+
+        def _base_new_acc(name_stored: str) -> dict:
+            acc: dict[str, object] = {"code": nxt_s, "name": name_stored}
+            if bool(wiz.get("credit_card")) and str(wiz.get("credit_card_reference_code") or "").strip():
+                acc["credit_card"] = True
+                acc["credit_card_reference_code"] = str(wiz.get("credit_card_reference_code") or "").strip()
+            return acc
+
+        d0 = cur_db()
+        if not d0.get("years"):
+            messagebox.showwarning("Conti", "Crea prima un anno contabile.", parent=root)
             return
-        if len(merge_account_charts_across_years(d)) >= MAX_ACCOUNTS_COUNT:
+        if len(merge_account_charts_across_years(d0)) >= MAX_ACCOUNTS_COUNT:
             messagebox.showwarning(
-                "Categorie e conti",
+                "Conti",
                 f"Hai già raggiunto il massimo di {MAX_ACCOUNTS_COUNT} conti.",
                 parent=root,
             )
             return
         nums: list[int] = []
-        for yb in d.get("years") or []:
+        for yb in d0.get("years") or []:
             for a in yb.get("accounts") or []:
                 s = str(a.get("code", "")).strip()
                 if s.isdigit():
@@ -15868,17 +17103,437 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                     except ValueError:
                         pass
         nxt = max(nums) + 1 if nums else 1
-        new_acc = {"code": str(nxt), "name": ""}
-        _append_account_all_years(new_acc)
-        _reload_plan_conti_form()
+        nxt_s = str(nxt)
+
+        def _existing_account_names_upper(dd: dict) -> set[str]:
+            return {
+                str(a.get("name", "") or "").strip().upper()
+                for a in merge_account_charts_across_years(dd)
+                if str(a.get("name", "") or "").strip()
+            }
+
+        def _save_db_after_change() -> bool:
+            try:
+                save_encrypted_db_dual(
+                    cur_db(),
+                    Path(data_file_var.get()),
+                    Path(key_file_var.get()),
+                )
+            except Exception as exc:
+                messagebox.showerror("Conti", str(exc), parent=root)
+                return False
+            return True
+
+        def _refresh_after_account_change() -> None:
+            _movements_dirty[0] = True
+            try:
+                refresh_balance_footer()
+                refresh_category_account_dropdowns()
+            except Exception:
+                pass
+            _reload_plan_conti_form()
+
+        def _open_cat_note_step(name_stored: str, amt: Decimal) -> None:
+            cat_opts_all, _, cat_note_by_code, _, cat_raw_name_by_code = _cat_and_acc_options()
+            cat_opts = [(n, c) for n, c in cat_opts_all if not _is_giro_label(n)]
+            if not cat_opts:
+                messagebox.showerror(
+                    "Conti",
+                    "Non ci sono categorie utilizzabili (escluse le girate): impossibile creare la registrazione.\n"
+                    "Ripeti l’operazione con importo zero per creare solo il conto.",
+                    parent=root,
+                )
+                return
+            top_c = tk.Toplevel(root)
+            top_c.title("Nuovo conto — registrazione")
+            top_c.transient(root)
+            top_c.grab_set()
+            fc = ttk.Frame(top_c, padding=14)
+            fc.pack(fill=tk.BOTH, expand=True)
+            ttk.Label(
+                fc,
+                text=f"Importo: {format_euro_it(amt)} €. Completa data, categoria e nota per la prima registrazione.",
+                wraplength=440,
+            ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+            dmin, dmax = immissione_date_bounds()
+            today_clamped = max(dmin, min(date.today(), dmax))
+            date_var = tk.StringVar(value=to_italian_date(today_clamped.isoformat()))
+            ttk.Label(fc, text="Data (gg/mm/aaaa)").grid(row=1, column=0, sticky="nw", pady=2)
+            drow = ttk.Frame(fc)
+            drow.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=2)
+            ent_dt = ttk.Entry(drow, textvariable=date_var, width=12)
+            ent_dt.pack(side=tk.LEFT)
+
+            def _open_add_acc_calendar() -> None:
+                cur_iso = parse_italian_ddmmyyyy_to_iso(date_var.get()) or today_clamped.isoformat()
+                try:
+                    cur_d = date.fromisoformat(cur_iso)
+                except Exception:
+                    cur_d = today_clamped
+                cur_d = max(dmin, min(cur_d, dmax))
+
+                def _on_dt_chosen(dsel: date) -> None:
+                    date_var.set(to_italian_date(dsel.isoformat()))
+
+                cal = build_immissione_calendar_toplevel(
+                    root,
+                    title="Data registrazione",
+                    anchor=ent_dt,
+                    field_min=dmin,
+                    field_max=dmax,
+                    current=cur_d,
+                    on_date_chosen=_on_dt_chosen,
+                    ui_font=("TkDefaultFont", 11, "bold"),
+                )
+                try:
+                    cal.transient(top_c)
+                except Exception:
+                    pass
+
+            ttk.Button(drow, text="Calendario…", command=_open_add_acc_calendar).pack(side=tk.LEFT, padx=(8, 0))
+            cat_var = tk.StringVar(value=cat_opts[0][0])
+            ttk.Label(fc, text="Categoria").grid(row=2, column=0, sticky="nw", pady=2)
+            cb = ttk.Combobox(
+                fc, textvariable=cat_var, width=34, state="readonly", values=[n for n, _ in cat_opts]
+            )
+            cb.grid(row=2, column=1, sticky="we", padx=(8, 0), pady=2)
+            nt_var = tk.StringVar()
+            ttk.Label(fc, text="Nota registrazione").grid(row=3, column=0, sticky="nw", pady=2)
+            ent_nt = ttk.Entry(fc, textvariable=nt_var, width=40)
+            ent_nt.grid(row=3, column=1, sticky="we", padx=(8, 0), pady=2)
+            fc.columnconfigure(1, weight=1)
+            er2 = ttk.Label(fc, text="", foreground="#b00020", wraplength=440)
+            er2.grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+            def _code_for_cat_display(display_name: str) -> str:
+                dn = (display_name or "").strip()
+                for n, c in cat_opts:
+                    if n == dn:
+                        return c
+                return str(cat_opts[0][1])
+
+            def _cc_close() -> None:
+                try:
+                    top_c.destroy()
+                except Exception:
+                    pass
+
+            def _cc_ok() -> None:
+                er2.configure(text="")
+                cc = _code_for_cat_display(cat_var.get())
+                if not cc:
+                    er2.configure(text="Selezionare una categoria.")
+                    return
+                note = sanitize_single_line_text(nt_var.get() or "", max_len=MAX_RECORD_NOTE_LEN)
+                if not note.strip():
+                    er2.configure(text="La nota è obbligatoria.")
+                    return
+                raw_d = (date_var.get() or "").strip()
+                d_iso = parse_italian_ddmmyyyy_to_iso(raw_d)
+                if not d_iso:
+                    er2.configure(text="Data non valida (usare gg/mm/aaaa).")
+                    return
+                try:
+                    dpar = date.fromisoformat(d_iso)
+                except Exception:
+                    er2.configure(text="Data non valida.")
+                    return
+                if dpar < dmin or dpar > dmax:
+                    er2.configure(
+                        text=(
+                            "La data è fuori dall’intervallo consentito per l’immissione: "
+                            f"da {to_italian_date(dmin.isoformat())} a {to_italian_date(dmax.isoformat())}."
+                        )
+                    )
+                    return
+                ty = dpar.year
+                dd = cur_db()
+                new_acc = _base_new_acc(name_stored)
+                _append_account_all_years(new_acc)
+                y_bucket = _ensure_year_bucket(ty)
+                y_records = y_bucket.get("records", [])
+                source_index = max((int(r.get("source_index", 0) or 0) for r in y_records), default=0) + 1
+                reg_n = _next_registration_number()
+                cat_name_raw = str(cat_raw_name_by_code.get(cc) or "").strip() or cat_var.get().strip()
+                cat_note = str(cat_note_by_code.get(cc) or "")
+                acc_name_stored = name_stored
+                for ax in merge_account_charts_across_years(dd):
+                    if str(ax.get("code", "")).strip() == nxt_s:
+                        acc_name_stored = str(ax.get("name", "") or "").strip()
+                        break
+                rec = {
+                    "year": ty,
+                    "source_folder": "APP",
+                    "source_file": "manual",
+                    "source_index": source_index,
+                    "legacy_registration_number": source_index,
+                    "legacy_registration_key": f"APP:add_account:{ty}:{source_index}",
+                    "registration_number": reg_n,
+                    "date_iso": d_iso,
+                    "category_code": cc,
+                    "category_name": cat_name_raw,
+                    "category_note": cat_note,
+                    "account_primary_code": nxt_s,
+                    "account_primary_flags": "",
+                    "account_primary_with_flags": nxt_s,
+                    "account_primary_name": acc_name_stored,
+                    "account_secondary_code": "",
+                    "account_secondary_flags": "",
+                    "account_secondary_with_flags": "",
+                    "account_secondary_name": "",
+                    "amount_eur": format_money(amt),
+                    "amount_lire_original": None,
+                    "note": note,
+                    "cheque": "-",
+                    "raw_flags": "",
+                    "is_cancelled": False,
+                    "source_currency": "E",
+                    "display_currency": "E",
+                    "display_amount": format_money(amt),
+                    "raw_record": "",
+                    "is_virtuale_discharge": False,
+                }
+                y_bucket.setdefault("records", []).append(rec)
+                if not _save_db_after_change():
+                    return
+                plan_conti_status_var.set("Conto e prima registrazione salvati nel file cifrato.")
+                _refresh_after_account_change()
+                _cc_close()
+
+            bfc = ttk.Frame(fc)
+            bfc.grid(row=5, column=0, columnspan=2, sticky="e", pady=(8, 0))
+            ttk.Button(bfc, text="Annulla", command=_cc_close).pack(side=tk.RIGHT, padx=(8, 0))
+            ttk.Button(bfc, text="Salva", command=_cc_ok).pack(side=tk.RIGHT)
+            try:
+                ent_dt.focus_set()
+            except Exception:
+                pass
+
+        def _open_amount_step(name_stored: str) -> None:
+            top_am = tk.Toplevel(root)
+            top_am.title("Nuovo conto — importo")
+            top_am.transient(root)
+            top_am.grab_set()
+            fr = ttk.Frame(top_am, padding=14)
+            fr.pack(fill=tk.BOTH, expand=True)
+            ttk.Label(
+                fr,
+                text=(
+                    "Importo iniziale sul nuovo conto (euro, formato italiano).\n"
+                    "Se l’importo è zero, viene creato solo il conto (nessuna registrazione)."
+                ),
+                wraplength=440,
+            ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+            amt_var = tk.StringVar(value="")
+            ent_am = ttk.Entry(fr, textvariable=amt_var, width=24)
+            ent_am.grid(row=1, column=0, sticky="w", pady=4)
+            bind_euro_amount_entry_validation(ent_am, amt_var, allow_leading_sign=True)
+            err = ttk.Label(fr, text="", foreground="#b00020", wraplength=440)
+            err.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+            def _am_close() -> None:
+                try:
+                    top_am.destroy()
+                except Exception:
+                    pass
+
+            def _am_ok() -> None:
+                err.configure(text="")
+                raw = (amt_var.get() or "").strip()
+                if raw == "":
+                    err.configure(text="Inserire un importo (0 se non vuoi creare registrazioni).")
+                    return
+                try:
+                    amt = normalize_euro_input(raw)
+                except Exception as ex:
+                    err.configure(text=str(ex))
+                    return
+                amt = amt.quantize(Decimal("0.01"))
+                if amt == Decimal("0") or amt == Decimal("0.00"):
+                    _append_account_all_years(_base_new_acc(name_stored))
+                    if not _save_db_after_change():
+                        return
+                    plan_conti_status_var.set("Conto aggiunto (nessuna registrazione) e salvato nel file cifrato.")
+                    _refresh_after_account_change()
+                    _am_close()
+                    return
+                cat_opts_all, _, _, _, _ = _cat_and_acc_options()
+                if not [(n, c) for n, c in cat_opts_all if not _is_giro_label(n)]:
+                    err.configure(
+                        text="Non ci sono categorie (non girate) per una registrazione: usa importo zero o aggiungi categorie."
+                    )
+                    return
+                _am_close()
+                _open_cat_note_step(name_stored, amt)
+
+            bf = ttk.Frame(fr)
+            bf.grid(row=3, column=0, columnspan=2, sticky="e", pady=(8, 0))
+            ttk.Button(bf, text="Annulla", command=_am_close).pack(side=tk.RIGHT, padx=(8, 0))
+            ttk.Button(bf, text="Continua", command=_am_ok).pack(side=tk.RIGHT)
+            try:
+                ent_am.focus_set()
+            except Exception:
+                pass
+
+        top_nm = tk.Toplevel(root)
+        top_nm.title("Nuovo conto — nome")
+        top_nm.transient(root)
+        top_nm.grab_set()
+        frm = ttk.Frame(top_nm, padding=14)
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            frm,
+            text=(
+                f"Nome del nuovo conto (tutto maiuscolo; massimo {MAX_ACCOUNT_NAME_LEN} caratteri). "
+                "Alla fine il nome sarà salvato e comparirà in immissione, ricerca e modifica."
+            ),
+            wraplength=440,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        nm_var = tk.StringVar()
+        ent_nm = ttk.Entry(frm, textvariable=nm_var, width=36)
+        ent_nm.grid(row=1, column=0, columnspan=2, sticky="we", pady=4)
+        err_lbl = ttk.Label(frm, text="", foreground="#b00020", wraplength=440)
+        err_lbl.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        def _nm_dismiss() -> None:
+            wiz["credit_card"] = False
+            wiz["credit_card_reference_code"] = ""
+            try:
+                top_nm.destroy()
+            except Exception:
+                pass
+
+        def _nm_next() -> None:
+            err_lbl.configure(text="")
+            raw = (nm_var.get() or "").strip().upper()
+            if not raw:
+                err_lbl.configure(text="Inserire un nome conto.")
+                return
+            if len(raw) > MAX_ACCOUNT_NAME_LEN:
+                err_lbl.configure(text=f"Nome troppo lungo (massimo {MAX_ACCOUNT_NAME_LEN} caratteri).")
+                return
+            stored = clip_text(raw, MAX_ACCOUNT_NAME_LEN)
+            if stored.strip().upper() != raw:
+                err_lbl.configure(text="Nome non valido dopo il taglio alla lunghezza massima.")
+                return
+            if stored.upper() in _existing_account_names_upper(cur_db()):
+                err_lbl.configure(text="Esiste già un conto con questo nome (senza distinguere maiuscole/minuscole).")
+                return
+            _nm_dismiss()
+            _open_amount_step(stored)
+
+        def _open_cc_reference_step(name_stored: str) -> None:
+            choices = _reference_accounts_for_credit_card(cur_db())
+            if not choices:
+                messagebox.showwarning(
+                    "Conti",
+                    "Non è disponibile alcun conto di riferimento: servono conti ordinari nel piano "
+                    "(esclusi Cassa, VIRTUALE e altri conti carta di credito).",
+                    parent=top_nm,
+                )
+                return
+
+            def _code_for_ref_display(display_name: str) -> str:
+                dn = (display_name or "").strip()
+                for n, c in choices:
+                    if n == dn:
+                        return c
+                return str(choices[0][1])
+
+            top_ref = tk.Toplevel(top_nm)
+            top_ref.title("Nuovo conto — carta di credito")
+            top_ref.transient(top_nm)
+            top_ref.grab_set()
+            fr_ref = ttk.Frame(top_ref, padding=14)
+            fr_ref.pack(fill=tk.BOTH, expand=True)
+            ttk.Label(
+                fr_ref,
+                text=(
+                    "Scegli il conto di riferimento per la carta: deve essere un conto ordinario "
+                    "(non Cassa, non VIRTUALE, non un altro conto carta di credito). "
+                    "Non potrà essere modificato in seguito: per collegare la carta a un altro conto ordinario "
+                    "occorrerà creare un nuovo conto carta di credito."
+                ),
+                wraplength=440,
+            ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+            ref_var = tk.StringVar(value=choices[0][0])
+            ttk.Label(fr_ref, text="Conto di riferimento").grid(row=1, column=0, sticky="nw", pady=2)
+            cb_ref = ttk.Combobox(
+                fr_ref, textvariable=ref_var, width=34, state="readonly", values=[n for n, _ in choices]
+            )
+            cb_ref.grid(row=1, column=1, sticky="we", padx=(8, 0), pady=2)
+            fr_ref.columnconfigure(1, weight=1)
+            er_ref = ttk.Label(fr_ref, text="", foreground="#b00020", wraplength=440)
+            er_ref.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+            def _ref_close() -> None:
+                try:
+                    top_ref.destroy()
+                except Exception:
+                    pass
+
+            def _ref_ok() -> None:
+                er_ref.configure(text="")
+                cc_ref = _code_for_ref_display(ref_var.get())
+                if not cc_ref:
+                    er_ref.configure(text="Selezionare un conto di riferimento.")
+                    return
+                if account_is_credit_card_by_code(cur_db(), cc_ref):
+                    er_ref.configure(text="Il conto di riferimento non può essere un conto carta di credito.")
+                    return
+                wiz["credit_card"] = True
+                wiz["credit_card_reference_code"] = cc_ref
+                _ref_close()
+                try:
+                    top_nm.destroy()
+                except Exception:
+                    pass
+                _open_amount_step(name_stored)
+
+            bref = ttk.Frame(fr_ref)
+            bref.grid(row=3, column=0, columnspan=2, sticky="e", pady=(8, 0))
+            ttk.Button(bref, text="Annulla", command=_ref_close).pack(side=tk.RIGHT, padx=(8, 0))
+            ttk.Button(bref, text="Continua", command=_ref_ok).pack(side=tk.RIGHT)
+            try:
+                cb_ref.focus_set()
+            except Exception:
+                pass
+
+        def _nm_credit_card() -> None:
+            err_lbl.configure(text="")
+            raw = (nm_var.get() or "").strip().upper()
+            if not raw:
+                err_lbl.configure(text="Inserire un nome conto.")
+                return
+            if len(raw) > MAX_ACCOUNT_NAME_LEN:
+                err_lbl.configure(text=f"Nome troppo lungo (massimo {MAX_ACCOUNT_NAME_LEN} caratteri).")
+                return
+            stored = clip_text(raw, MAX_ACCOUNT_NAME_LEN)
+            if stored.strip().upper() != raw:
+                err_lbl.configure(text="Nome non valido dopo il taglio alla lunghezza massima.")
+                return
+            if stored.upper() in _existing_account_names_upper(cur_db()):
+                err_lbl.configure(text="Esiste già un conto con questo nome (senza distinguere maiuscole/minuscole).")
+                return
+            _open_cc_reference_step(stored)
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=3, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        ttk.Button(btns, text="Continua", command=_nm_next).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Carta di credito", command=_nm_credit_card).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(btns, text="Annulla", command=_nm_dismiss).pack(side=tk.RIGHT, padx=(8, 0))
+        try:
+            ent_nm.focus_set()
+        except Exception:
+            pass
 
     pc_tool_cat = ttk.Frame(plan_categorie_frame)
     pc_tool_cat.pack(fill=tk.X, pady=(0, 6))
     ttk.Label(pc_tool_cat, textvariable=plan_cat_summary_var).pack(side=tk.LEFT)
     ttk.Button(
         pc_tool_cat,
-        text="Salva modifiche",
-        command=_save_plan_conti_from_form,
+        text="Salva categorie",
+        command=_save_plan_categories_only,
         style="NewReg.TButton",
     ).pack(side=tk.LEFT, padx=(16, 10), pady=(2, 4))
     ttk.Label(plan_categorie_frame, textvariable=plan_conti_status_var, foreground="#2e7d32").pack(anchor=tk.W, pady=(0, 6))
@@ -15888,12 +17543,20 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
 
     pc_tool_acc = ttk.Frame(plan_conti_frame)
     pc_tool_acc.pack(fill=tk.X, pady=(0, 6))
-    ttk.Label(pc_tool_acc, textvariable=plan_ref_year_var).pack(side=tk.LEFT)
-    ttk.Button(pc_tool_acc, text="Prepara anno corrente (vuoto)", command=_prepare_current_year_bucket).pack(
-        side=tk.LEFT, padx=(12, 8)
+    ttk.Button(pc_tool_acc, text="Annulla cambiamenti non salvati", command=_discard_unsaved_plan_pdf_stems).pack(
+        side=tk.LEFT, padx=(0, 8)
     )
-    ttk.Button(pc_tool_acc, text="Aggiorna elenco", command=_reload_plan_conti_form).pack(side=tk.LEFT, padx=(0, 8))
-    ttk.Button(pc_tool_acc, text="Salva modifiche", command=_save_plan_conti_from_form).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Button(pc_tool_acc, text="Salva conti (PDF)", command=_save_plan_accounts_pdf_only).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Label(
+        plan_conti_frame,
+        text=(
+            "«Annulla cambiamenti non salvati» ripristina solo i campi «Nome base file PDF» dal database in memoria "
+            "(senza ricaricare l’elenco né la scheda Categorie)."
+        ),
+        wraplength=760,
+        font=("TkDefaultFont", 9),
+        foreground="#444444",
+    ).pack(anchor=tk.W, pady=(0, 4))
     ttk.Label(plan_conti_frame, textvariable=plan_conti_status_var, foreground="#2e7d32").pack(anchor=tk.W, pady=(0, 6))
     plan_acc_scroll_wrap.pack(fill=tk.BOTH, expand=True)
     ttk.Button(acc_btns, text="Aggiungi conto", command=_add_blank_account).pack(side=tk.LEFT, padx=(0, 8))
@@ -16668,6 +18331,7 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
             run_import_legacy(legacy_root, output_json)
             new_db = json.loads(output_json.read_text(encoding="utf-8"))
             _merge_preserved_app_sections_from_previous_db(new_db, previous_db)
+            _clear_account_frozen_flags_in_db(new_db)
             periodiche.ensure_periodic_registrations(new_db)
             email_client.ensure_email_settings(new_db)
             security_auth.ensure_security(new_db)
@@ -16703,11 +18367,31 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                     + "\n".join(oob)
                     + "\n\nI dati importati restano utilizzabili; non potrai aggiungere categorie o conti oltre questi limiti finché non ne rimuovi.",
                 )
-            messagebox.showinfo(
-                "Import completato",
+            skipped = new_db.get("years_skipped") or []
+            done_msg = (
                 "Import legacy completato.\n"
-                "Dati contabili aggiornati; profilo, posta e periodiche sono stati mantenuti.",
+                "Dati contabili aggiornati; profilo, posta e periodiche sono stati mantenuti.\n\n"
+                "File JSON dell'import (testo; contiene years_imported e years_skipped):\n"
+                f"{output_json.resolve()}"
             )
+            if skipped:
+                lines = []
+                for item in skipped[:12]:
+                    if isinstance(item, dict):
+                        lines.append(f"• {item.get('folder', '?')}: {item.get('reason', '')}")
+                    else:
+                        lines.append(f"• {item!r}")
+                tail = "\n…" if len(skipped) > 12 else ""
+                messagebox.showwarning(
+                    "Import completato — alcune cartelle saltate",
+                    done_msg
+                    + "\n\nLe seguenti cartelle annuali non sono state importate "
+                    "(nome non riconosciuto, file mancanti o errore di lettura):\n\n"
+                    + "\n".join(lines)
+                    + tail,
+                )
+            else:
+                messagebox.showinfo("Import completato", done_msg)
             status_var.set("Ultimo import: completato (dati legacy aggiornati, impostazioni app conservate).")
         except Exception as exc:
             messagebox.showerror("Errore import", str(exc))

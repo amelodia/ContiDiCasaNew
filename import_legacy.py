@@ -9,6 +9,7 @@ a single JSON database for the new app.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import re
 from dataclasses import asdict, dataclass
@@ -281,7 +282,8 @@ def parse_dat_records(
 
 def guess_year_from_folder(folder_name: str) -> int:
     """
-    Conti90 → 1990, Conti26 → 2026. Accetta anche cartelle tipo Conti1990 / Conti2026 (4 cifre).
+    Conti90 → 1990, Conti26 → 2026. Conti1990 / Conti2026 (4 cifre).
+    Conti095 → 1995: suffisso a tre cifre con zero iniziale (stessa regola secolo delle due cifre).
     """
     fn = folder_name.strip()
     m4 = re.fullmatch(r"Conti(\d{4})", fn, flags=re.IGNORECASE)
@@ -289,6 +291,11 @@ def guess_year_from_folder(folder_name: str) -> int:
         y = int(m4.group(1))
         if 1900 <= y <= 2100:
             return y
+    m3 = re.fullmatch(r"Conti(0\d{2})", fn, flags=re.IGNORECASE)
+    if m3:
+        tail = m3.group(1)
+        yy = int(tail[1:3])
+        return 1900 + yy if yy >= 90 else 2000 + yy
     m2 = re.fullmatch(r"Conti(\d{2})", fn, flags=re.IGNORECASE)
     if m2:
         yy = int(m2.group(1))
@@ -296,8 +303,25 @@ def guess_year_from_folder(folder_name: str) -> int:
     raise ValueError(f"Impossibile dedurre l'anno da: {folder_name!r}")
 
 
+def glob_files_case_insensitive(folder: Path, pattern: str) -> list[Path]:
+    """File nella cartella (non ricorsivo) con pattern tipo ``*dat.aco``, senza distinzione maiuscole/minuscole."""
+    pat = pattern.lower()
+    out: list[Path] = []
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return []
+    for p in entries:
+        if not p.is_file():
+            continue
+        if fnmatch.fnmatch(p.name.lower(), pat):
+            out.append(p)
+    out.sort(key=lambda x: x.name.lower())
+    return out
+
+
 def find_single_file(folder: Path, pattern: str) -> Path:
-    candidates = sorted(folder.glob(pattern))
+    candidates = glob_files_case_insensitive(folder, pattern)
     if len(candidates) != 1:
         raise FileNotFoundError(f"Atteso 1 file {pattern} in {folder}, trovati {len(candidates)}")
     return candidates[0]
@@ -313,7 +337,7 @@ def parse_sld_balances(folder: Path, n_accounts: int) -> dict[str, object] | Non
     Legge *sld.aco: prima riga valuta (E/L) da trascurare come dato numerico, poi 8 saldi
     assoluti per i primi 8 conti (Cassa = primo). Estende con zeri se il piano ha più conti.
     """
-    candidates = sorted(folder.glob("*sld.aco"))
+    candidates = glob_files_case_insensitive(folder, "*sld.aco")
     if len(candidates) != 1:
         return None
     lines = [ln.strip().strip('"') for ln in candidates[0].read_text(encoding="latin-1", errors="ignore").splitlines() if ln.strip()]
@@ -379,7 +403,7 @@ def parse_category_notes_for_n_categories(folder: Path, n_categories: int) -> li
 
     Opzionale: una sola riga titolo in più (come *cat.aco) se len(file) == n_categories + 1.
     """
-    notes_files = sorted(folder.glob("*not.aco"))
+    notes_files = glob_files_case_insensitive(folder, "*not.aco")
     if not notes_files or n_categories <= 0:
         return []
     raw_lines = notes_files[0].read_text(encoding="latin-1", errors="ignore").splitlines()
@@ -413,7 +437,7 @@ def load_year(
     cat_file = find_single_file(folder, "*cat.aco")
     coc_file = find_single_file(folder, "*coc.aco")
     dat_file = find_single_file(folder, "*dat.aco")
-    not_candidates = sorted(folder.glob("*not.aco"))
+    not_candidates = glob_files_case_insensitive(folder, "*not.aco")
 
     categories = parse_aco_list(cat_file)
     accounts = parse_aco_list(coc_file)
@@ -461,9 +485,9 @@ def load_year(
 
 
 def iter_year_folders(root: Path) -> Iterable[Path]:
-    """Cartelle annuali: Conti90, Conti26, oppure Conti1990, Conti2026, …"""
+    """Cartelle annuali: Conti90, Conti095, Conti26, Conti1990, … (``Conti??`` = 7 caratteri; ``Conti???`` = 8)."""
     seen: set[Path] = set()
-    for pattern in ("Conti????", "Conti??"):
+    for pattern in ("Conti????", "Conti???", "Conti??"):
         for path in sorted(root.glob(pattern)):
             if not path.is_dir():
                 continue
@@ -499,7 +523,7 @@ def build_unified_database(cdc_root: Path) -> dict:
     not_name_2026: str | None = None
     legacy_saldi_2026: dict | None = None
     if folder_2026 is not None:
-        nn = sorted(folder_2026.glob("*not.aco"))
+        nn = glob_files_case_insensitive(folder_2026, "*not.aco")
         not_name_2026 = nn[0].name if nn else None
         try:
             cat_26 = find_single_file(folder_2026, "*cat.aco")

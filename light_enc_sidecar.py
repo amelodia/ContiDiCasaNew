@@ -6,8 +6,9 @@ Sidecar cifrato per l'app iOS light: ``*_light.enc`` nella stessa cartella del f
   completi (profilo, categorie/conti per anno incluso).
 - All'avvio il desktop importa dal file light le righe create sul telefono, riconosciute
   dal campo ``conti_light_record_id`` (UUID), e le fonde nel DB principale.
-- Il JSON light include ``light_saldi`` (saldi assoluti + alla data di oggi) calcolati sul **DB completo**,
-  così l'app iOS non ricostruisce i saldi dai soli movimenti nella finestra mobile.
+- Il JSON light include ``light_saldi`` (saldi allineati al **footer Saldi** del desktop: assoluti, alla data,
+  spese future, spese per carte di credito sulle colonne di riferimento, disponibilità; conti congelati esclusi)
+  calcolati sul **DB completo**, così l'app iOS non ricostruisce i saldi dai soli movimenti nella finestra mobile.
 
 L'app light usa la stessa **cartella dati** scelta sul desktop: ``.key``, ``conti_utente_<hash>.enc`` e
 ``conti_utente_<hash>_light.enc`` affiancati. Per ogni nuova registrazione sul telefono,
@@ -117,27 +118,11 @@ def _attach_light_saldi_snapshot(light_db: dict, full_db: dict) -> None:
     except Exception:
         return
     try:
-        ly, names, amts_abs = _m.compute_balances_from_2022(full_db)
-        _, _, amts_today = _m.compute_balances_from_2022_asof(
-            full_db, cutoff_date_iso=date.today().isoformat()
-        )
+        snap = _m.compute_light_saldi_snapshot(full_db, today_iso=date.today().isoformat())
     except Exception:
         return
-    rows: list[dict] = []
-    for i, name in enumerate(names):
-        rows.append(
-            {
-                "account_code": str(i + 1),
-                "account_name": str(name or "").strip(),
-                "saldo_assoluto": str(amts_abs[i]),
-                "saldo_alla_data": str(amts_today[i]),
-            }
-        )
-    light_db["light_saldi"] = {
-        "snapshot_date_iso": date.today().isoformat(),
-        "year_basis": int(ly),
-        "rows": rows,
-    }
+    if isinstance(snap, dict) and snap.get("rows"):
+        light_db["light_saldi"] = snap
 
 
 def _max_registration_number(db: dict) -> int:

@@ -14,6 +14,16 @@ Il modulo **non** è addestrabile con ML: usa regole e regex. Per adattare un nu
 Lettura diversificata: preambolo ignorato fino alla prima riga che sembra un movimento; date gg-mm-aa
 o gg.mm.aa normalizzate a barre; righe spezzate; secondo passaggio layout; terzo passaggio unione pagine.
 
+**American Express:** estrazione con **``visitor_text``** e ``Tm``×``Cm`` (pypdf), righe per **Y** poi **X**;
+marcatore ``<<<AMEX_HRULE>>>`` su salti verticali forti; in tabella gli importi sono **tutti positivi**: in app
+diventano **negativi** (addebiti), salvo i **crediti** riconosciuti da ``CR`` in nota (tipicamente riga ``CR`` sotto
+l'importo, unificata in fase di lettura) → **positivi**; TLD+data; **saldo**: prima riga ``EUR …`` dopo il **primo**
+``<<<AMEX_HRULE>>>`` nel testo posizionale, altrimenti fallback geometrico sulla pagina 1; righe movimento spezzate
+(doppia data senza parse) **riunite** con la riga successiva; in nota non si accodano righe con **due date** in testo;
+«Addebito in c/c salvo buon fine» escluso; stessa giornata come sul foglio. Se una riga contiene più coppie
+``data data`` (testo orizzontale concatenato), il movimento con importo in coda usa l'**ultima** coppia prima
+dell'importo.
+
 Alcuni PDF (es. estratti a colonne) espongono il testo con **uno spazio tra ogni carattere**; in quel caso
 si collassano gli spazi sulla riga prima del riconoscimento. Le date possono comparire **attaccate**
 (``05/01/202605/01/2026``); l'importo in colonna entrate può avere il simbolo **€** subito dopo le cifre.
@@ -59,7 +69,8 @@ def _expand_yy_to_yyyy(dd_mm_yy: str) -> str:
     return f"{d}/{m}/{y}"
 
 
-_AMT_RE = re.compile(r"^((?:\d{1,3}(?:\.\d{3})*|\d+),\d{2})\s*€?$")
+# Opz. ``€`` o ``EUR`` (anche attaccato all'importo in estratti carta / PDF stretti).
+_AMT_RE = re.compile(r"^((?:\d{1,3}(?:\.\d{3})*|\d+),\d{2})\s*(?:€|EUR)?\s*$", re.I)
 
 # Anno a 4 cifre prima di 2: evita che in ``05/01/202605/01/2026`` il secondo blocco data
 # mangi ``20`` come anno a 2 cifre lasciando ``2699,93`` come importo.
@@ -104,13 +115,50 @@ _RE_ONE_DATE = re.compile(
 )
 # Una data attaccata all'importo: 05/01/202699,93€...
 _RE_ONE_DATE_COMPACT = re.compile("^(" + _DATE_Y + ")(" + _AMT_CORE + r")\s*€?(.*)$")
+# Suffisso valuta dopo l'importo in coda (carta / layout PDF).
+_AMT_LINE_SUFFIX = r"\s*(?:€|EUR)?\s*"
+# Due date, descrizione, importo in coda (solo euristica «sembra movimento»; il parse usa
+# ``_parse_two_date_desc_amount_from_line_tail`` con ultima coppia date prima dell'importo).
+# ``.+?`` + ``\s*`` prima dell'importo: spesso manca lo spazio tra ultima parola e cifre (es. ``AMSTERDAM18,70``).
+_RE_TWO_DATE_DESC_AMT_TAIL = re.compile(
+    "^("
+    + _DATE_Y
+    + r")\s+("
+    + _DATE_Y
+    + r")\s+(.+?)\s*("
+    + _AMT_CORE
+    + r")"
+    + _AMT_LINE_SUFFIX
+    + r"(?:\s+CR\s*)?$",
+    re.I,
+)
+# Una data, descrizione, importo in coda; opz. `` CR`` dopo l'importo
+_RE_ONE_DATE_DESC_AMT_TAIL = re.compile(
+    "^(" + _DATE_Y + r")\s+(.+?)\s*(" + _AMT_CORE + r")" + _AMT_LINE_SUFFIX + r"(?:\s+CR\s*)?$",
+    re.I,
+)
+# Riga che inizia con doppia data operazione/valuta seguita da testo (movimento anche se spezzato su più righe PDF)
+_RE_LINE_START_TWO_DATES = re.compile(rf"^{_DATE_Y}\s+{_DATE_Y}\s+\S")
 
 # Date con separatore - o . (comuni in estratti non Poste)
 _RE_DATE_SEP = re.compile(r"\b(\d{2})[-.](\d{2})[-.](\d{2,4})\b")
+# Riga solo importo italiano (evita di accodarla come nota al movimento precedente su Amex)
+_RE_ORPHAN_AMOUNT_LINE = re.compile(
+    rf"^(?:\d{{1,3}}(?:\.\d{{3}})*|\d+),\d{{2}}{_AMT_LINE_SUFFIX}$",
+    re.I,
+)
+# Riga isolata «CR» sotto l'importo (American Express)
+_RE_STANDALONE_CR_LINE = re.compile(r"^\s*\*?\s*CR\s*\*?\s*$", re.I)
+# ``CR`` come parola in nota (dopo merge riga sotto o in coda alla riga importo)
+_RE_AMEX_NOTE_HAS_CR = re.compile(r"(?i)(?<![A-Z0-9])\bCR\b(?![A-Z0-9])")
+
+# Marcatore inserito dall'estrazione posizionale Amex tra gruppi di righe separati da un salto verticale forte
+# (tipico di riga orizzontale / sezione): non va unito alle note dei movimenti.
+_AMEX_BLOCK_MARKER = "<<<AMEX_HRULE>>>"
 
 
 def _parse_it_amount(s: str) -> Decimal | None:
-    """Accetta importo italiano opz. con € finale (es. ``99,93€``)."""
+    """Accetta importo italiano opz. con ``€`` o ``EUR`` finale (es. ``99,93€``, ``18,70 EUR``)."""
     s = (s or "").strip()
     if not s:
         return None
@@ -207,6 +255,37 @@ def _merge_broken_statement_lines(lines: list[str]) -> list[str]:
     return out
 
 
+def _insert_space_before_glued_calendar_date(line: str) -> str:
+    """
+    Separa una data ``gg.mm.(aa|aaaa)`` o ``gg/mm/…`` incollata:
+
+    - dopo un TLD (tipico Amex: ``americanexpress.it05.01.26``);
+    - dopo una **lettera** (es. ``Estratto Conto22.02.26``) così ``\\b`` in ``_normalize_date_separators`` la riconosce.
+    """
+    t = line or ""
+    t = re.sub(
+        r"(?i)(\.(?:it|com|eu|org|net|io|biz|info))(?=\d{2}[./]\d{2}[./](?:\d{4}|\d{2})\b)",
+        r"\1 ",
+        t,
+    )
+    # Lettera latina (incl. accentate comuni) subito prima di gg.[./]mm.[./](aa|aaaa)
+    t = re.sub(
+        r"(?<=[A-Za-zàèéìòùÀÈÉÌÒÙáíóúÁÍÓÚäöüÄÖÜß])(?=\d{2}[./]\d{2}[./](?:\d{4}|\d{2})\b)",
+        " ",
+        t,
+    )
+    return t
+
+
+def _amex_trim_leading_before_movement_dates(line: str) -> str:
+    """Rimuove testo promozionale davanti alla prima coppia ``data data`` che apre un movimento."""
+    s = _normalize_date_separators(_insert_space_before_glued_calendar_date(line))
+    m = re.search(rf"({_DATE_Y})\s+({_DATE_Y})\s+\S", s)
+    if not m:
+        return s
+    return s[m.start(1) :].strip()
+
+
 def _prepare_statement_lines(text: str) -> list[str]:
     raw: list[str] = []
     for x in text.splitlines():
@@ -216,9 +295,10 @@ def _prepare_statement_lines(text: str) -> list[str]:
         x1 = x.replace("\n", " ")
         if _line_looks_shattered(x1):
             x = _collapse_shattered_line(x1)
+        x = _insert_space_before_glued_calendar_date(x)
         raw.append(x)
     merged = _merge_broken_statement_lines(raw)
-    return [_normalize_date_separators(L) for L in merged]
+    return [_normalize_date_separators(_insert_space_before_glued_calendar_date(L)) for L in merged]
 
 
 def _bcc_note_bonifico_a_favore_di_terzi(desc: str) -> bool:
@@ -343,6 +423,10 @@ def _skip_description(desc: str) -> bool:
         return True
     if "SALDOFINALE" in c or "SALDO FINALE" in u:
         return True
+    if "ADDEBITO" in u and "C/C" in u and "BUON FINE" in u:
+        return True
+    if "ADDEBITOINCC" in c and "BUONFINE" in c:
+        return True
     return False
 
 
@@ -363,6 +447,10 @@ def _line_is_summary_not_movement(line: str) -> bool:
     if "TOTALE AD" in u and "BIT" in u:
         return True
     if "TOTALE ACC" in u:
+        return True
+    if "ADDEBITO" in u and "C/C" in u and "BUON FINE" in u:
+        return True
+    if "ADDEBITOINCC" in c and "BUONFINE" in c:
         return True
     return False
 
@@ -409,6 +497,17 @@ def _try_parse_saldo_finale_amount(line: str) -> Decimal | None:
         idx = u.find(kw)
         if idx >= 0:
             got = _last_amt_in(t[idx + len(kw) :])
+            if got is not None:
+                return got
+
+    for kw_amex in (
+        "IMPORTO DOVUTO ATTUALE ESTRATTO CONTO",
+        "IMPORTO DOVUTO ATTUALE",
+        "IMPORTO DOVUTO",
+    ):
+        idx = u.find(kw_amex)
+        if idx >= 0:
+            got = _last_amt_in(t[idx + len(kw_amex) :])
             if got is not None:
                 return got
 
@@ -814,6 +913,8 @@ def _line_starts_like_new_movement(line: str, *, max_note_len: int) -> bool:
     t = line.strip()
     if not t:
         return False
+    if t == _AMEX_BLOCK_MARKER:
+        return False
     x = t.replace("\n", " ")
     if _line_looks_shattered(x):
         t = _collapse_shattered_line(x)
@@ -822,13 +923,27 @@ def _line_starts_like_new_movement(line: str, *, max_note_len: int) -> bool:
         return True
     if _RE_ONE_DATE.match(t) or _RE_ONE_DATE_COMPACT.match(t):
         return True
+    if _RE_TWO_DATE_DESC_AMT_TAIL.match(t) or _RE_ONE_DATE_DESC_AMT_TAIL.match(t):
+        return True
+    if _RE_LINE_START_TWO_DATES.match(t):
+        return True
     return False
 
 
-def _should_append_continuation(line: str, *, max_note_len: int) -> bool:
+def _should_append_continuation(
+    line: str,
+    *,
+    max_note_len: int,
+    strict_amex: bool = False,
+    prev_amex_block: bool = False,
+) -> bool:
     """Unisce righe successive alla nota (IBAN, riferimenti, testo spezzato) fino al prossimo movimento."""
     s = line.strip()
     if not s:
+        return False
+    if s == _AMEX_BLOCK_MARKER or s.startswith("<<<AMEX_"):
+        return False
+    if prev_amex_block:
         return False
     if _parse_movement_line(s, max_note_len=max_note_len):
         return False
@@ -850,6 +965,21 @@ def _should_append_continuation(line: str, *, max_note_len: int) -> bool:
         return False
     if re.match(r"^G\s+\d", s):
         return False
+    if strict_amex:
+        if _RE_STANDALONE_CR_LINE.match(s):
+            return False
+        if _RE_ORPHAN_AMOUNT_LINE.match(s):
+            return False
+        if re.search(r"(?i)\baddebito\s+in\s+c/c", s):
+            return False
+        if len(s) > 120 and re.search(rf"{_DATE_Y}", s):
+            return False
+        tchk = _normalize_date_separators(_insert_space_before_glued_calendar_date(s))
+        if len(re.findall(rf"{_DATE_Y}", tchk[:220])) >= 2:
+            return False
+        # Evita di incollare in nota la riga successiva se inizia con una data (frammento di altro movimento).
+        if re.match(rf"^\s*{_DATE_Y}\b", tchk):
+            return False
     return True
 
 
@@ -872,13 +1002,58 @@ def _movement_row(
     }
 
 
+def _parse_two_date_desc_amount_from_line_tail(
+    line: str, *, max_note_len: int
+) -> dict[str, object] | None:
+    """
+    Doppia data + causale + importo in coda.
+
+    L'estrazione posizionale Amex può produrre **una sola riga** con più coppie di date in sequenza
+    (colonna tabella «appiccicata»): la prima coppia non è quella dell'importo finale. Si usa l'**ultima**
+    coppia ``data data`` presente prima dell'importo in fondo riga.
+    """
+    s = line.strip()
+    s = re.sub(r"\s*<<<AMEX_HRULE>>>\s*$", "", s, flags=re.I).strip()
+    m_amt = re.search(
+        rf"(?<![0-9,])({_AMT_CORE})({_AMT_LINE_SUFFIX})(?:\s+CR\s*)?$",
+        s,
+        re.I,
+    )
+    if not m_amt:
+        return None
+    ams = m_amt.group(1)
+    amt = _parse_it_amount(ams)
+    if amt is None:
+        return None
+    pre = s[: m_amt.start()].rstrip()
+    pair_rx = re.compile(rf"(?<![0-9/])({_DATE_Y})\s+({_DATE_Y})(?=\s)")
+    pairs = list(pair_rx.finditer(pre))
+    if not pairs:
+        return None
+    m_pair = pairs[-1]
+    d1, d2 = m_pair.group(1), m_pair.group(2)
+    desc = pre[m_pair.end() :].strip()
+    if not desc:
+        return None
+    if _skip_description(desc):
+        return None
+    row = _movement_row(d1, amt, desc, max_note_len=max_note_len)
+    if re.search(r"(?i)\s+CR\s*$", s):
+        note0 = str(row.get("note") or "")
+        if not _RE_AMEX_NOTE_HAS_CR.search(note0):
+            row["note"] = ((note0 + " CR").strip())[:max_note_len]
+    return row
+
+
 def _parse_movement_line(line: str, *, max_note_len: int) -> dict[str, object] | None:
     """Interpreta una riga come movimento; None se non riconosciuta."""
     line = _normalize_pdf_line(line)
     x = line.replace("\n", " ")
     if _line_looks_shattered(x):
         line = _collapse_shattered_line(x)
+    line = _insert_space_before_glued_calendar_date(line)
     line = _normalize_date_separators(line)
+    line = re.sub(r"\s*<<<AMEX_HRULE>>>\s*$", "", line, flags=re.I).strip()
 
     for regex in (_RE_TWO_DATE_COMPACT, _RE_TWO_DATE, _RE_ONE_DATE_COMPACT, _RE_ONE_DATE):
         m = regex.match(line)
@@ -896,6 +1071,23 @@ def _parse_movement_line(line: str, *, max_note_len: int) -> dict[str, object] |
             continue
         return _movement_row(d1, amt, desc, max_note_len=max_note_len)
 
+    row_two_tail = _parse_two_date_desc_amount_from_line_tail(line, max_note_len=max_note_len)
+    if row_two_tail is not None:
+        return row_two_tail
+
+    m1 = _RE_ONE_DATE_DESC_AMT_TAIL.match(line)
+    if m1:
+        d1, desc, ams = m1.groups()
+        amt = _parse_it_amount(ams)
+        if amt is not None and not _skip_description(desc):
+            row = _movement_row(d1, amt, desc, max_note_len=max_note_len)
+            # Il gruppo descrizione non include ``CR`` in coda (regex opzionale): ripristinalo per la nota Amex.
+            if re.search(r"(?i)\s+CR\s*$", line.strip()):
+                note0 = str(row.get("note") or "")
+                if not _RE_AMEX_NOTE_HAS_CR.search(note0):
+                    row["note"] = ((note0 + " CR").strip())[:max_note_len]
+            return row
+
     return None
 
 
@@ -907,9 +1099,195 @@ def _first_movement_line_index(prepared: list[str], *, max_note_len: int) -> int
     return 0
 
 
+_AMEX_HEADER_SCAN_CHARS = 120_000
+
+
+def _looks_like_amex_estratto(text: str) -> bool:
+    """Riconoscimento testata estratto American Express (testo estraibile)."""
+    head = (text or "")[:_AMEX_HEADER_SCAN_CHARS]
+    u = head.upper()
+    c = _compact_for_keyword(head)
+    if "AMERICANEXPRESS" in c or "AMERICAN EXPRESS" in u:
+        return True
+    return False
+
+
+def _amex_merge_cr_line_pairs(lines: list[str]) -> list[str]:
+    """
+    Unisce ``… 18,70 €`` sulla riga successiva isolata ``CR`` (credito su estratto Amex tutto in positivo).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        cur = lines[i]
+        if i + 1 < n and _RE_STANDALONE_CR_LINE.match(lines[i + 1].strip()):
+            c0 = _normalize_pdf_line(cur.replace("\n", " "))
+            if re.search(rf"(?:{_AMT_CORE}){_AMT_LINE_SUFFIX}$", c0, re.I):
+                out.append(_normalize_pdf_line(c0 + " CR"))
+                i += 2
+                continue
+        out.append(cur)
+        i += 1
+    return out
+
+
+def _amex_rejoin_split_movement_lines(lines: list[str], *, max_note_len: int) -> list[str]:
+    """
+    Se una riga inizia con doppia data ma il parse fallisce (es. descrizione/importo spezzati su due righe PDF),
+    unisce le righe successive finché il parse ha successo o finché la riga successiva non inizia un altro movimento.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        ln = lines[i]
+        st = ln.strip()
+        if st == _AMEX_BLOCK_MARKER:
+            out.append(ln)
+            i += 1
+            continue
+        buf = ln
+        j = i
+        merges_sub = 0
+        while j + 1 < n and merges_sub < 8:
+            nxt0 = lines[j + 1].strip()
+            if nxt0 == _AMEX_BLOCK_MARKER:
+                break
+            tbuf = _normalize_date_separators(_insert_space_before_glued_calendar_date(buf.strip()))
+            if not re.match(rf"^\s*{_DATE_Y}\s+{_DATE_Y}\b", tbuf):
+                break
+            if _parse_movement_line(buf.strip(), max_note_len=max_note_len) is not None:
+                break
+            nxt_norm = _normalize_date_separators(_insert_space_before_glued_calendar_date(nxt0))
+            if re.match(rf"^\s*{_DATE_Y}\s+{_DATE_Y}\b", nxt_norm):
+                break
+            merged = _normalize_pdf_line(buf.strip() + " " + lines[j + 1].strip())
+            if merged == buf.strip():
+                break
+            buf = merged
+            j += 1
+            merges_sub += 1
+        out.append(buf)
+        i = j + 1
+    return out
+
+
+def _amex_merge_wrapped_statement_lines(lines: list[str], *, max_note_len: int) -> list[str]:
+    """
+    Unisce righe spezzate a metà riga (importo/causale sulla riga successiva senza data iniziale).
+
+    Si ferma quando la riga successiva inizia con ``gg/mm/(aa|aaaa)`` e la corrente è già un movimento
+    completo (evita di incollare due movimenti). Le righe di sola continuazione nota restano separate:
+    se la corrente è già un movimento valido e unirla alla successiva rompe il parse, non si unisce.
+    """
+    re_bol_date = re.compile(r"^\d{2}/\d{2}/(?:\d{4}|\d{2})\b")
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        cur = lines[i]
+        i += 1
+        merges = 0
+        while i < n and merges < 40:
+            merges += 1
+            raw_next = lines[i]
+            nxt = raw_next.strip()
+            if not nxt:
+                i += 1
+                continue
+            if nxt == _AMEX_BLOCK_MARKER:
+                break
+            merged = _normalize_pdf_line(cur + " " + raw_next)
+            bol_next = bool(re_bol_date.match(nxt))
+            p_cur = _parse_movement_line(cur, max_note_len=max_note_len)
+            p_mrg = _parse_movement_line(merged, max_note_len=max_note_len)
+
+            if bol_next and p_cur is not None:
+                break
+            if bol_next and p_cur is None:
+                if p_mrg is not None:
+                    cur = merged
+                    i += 1
+                    continue
+                break
+            if p_cur is not None and p_mrg is None:
+                break
+            if p_cur is None and p_mrg is None and merges > 14:
+                break
+            cur = merged
+            i += 1
+        out.append(cur)
+    return out
+
+
+def _amex_apply_statement_amount_signs(rows: list[dict[str, object]]) -> None:
+    """
+    Estratto Amex: in tabella gli importi sono positivi.
+
+    - Addebiti → **negativi** in app.
+    - Credito con ``CR`` in nota (riga sotto unificata da ``_amex_merge_cr_line_pairs`` o ``CR`` in coda riga) → **positivi**.
+    """
+    for r in rows:
+        amt = r.get("amount")
+        if not isinstance(amt, Decimal):
+            continue
+        v = abs(amt)
+        note = str(r.get("note", "") or "")
+        if _RE_AMEX_NOTE_HAS_CR.search(note):
+            r["amount"] = v
+        else:
+            r["amount"] = -v
+
+
+def _amex_sort_rows_by_booking(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    """
+    Ordine per data contabile (prima delle due date), poi come sull'estratto stampato.
+
+    L'estrazione posizionale può elencare stessa giornata dall'ultima riga tabella alla prima;
+    ``_amex_doc_i`` è l'ordine di arrivo dal parser, quindi si ordina per ``(y,m,d, -_amex_doc_i)``.
+    """
+
+    def key_fn(r: dict[str, object]) -> tuple[int, int, int, int]:
+        b = str(r.get("booking") or "")
+        parts = b.split("/")
+        if len(parts) != 3:
+            return (9999, 99, 99, 0)
+        try:
+            d, m, y = int(parts[0]), int(parts[1]), int(parts[2])
+            if y < 100:
+                y += 2000
+            di = int(r.get("_amex_doc_i", 0))
+            return (y, m, d, -di)
+        except ValueError:
+            return (9999, 99, 99, 0)
+
+    return sorted(rows, key=key_fn)
+
+
+def _amex_filter_non_movement_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Rimuove righe tipo addebito c/c salvo buon fine se parse come movimento."""
+    out: list[dict[str, object]] = []
+    for r in rows:
+        note = str(r.get("note", "") or "")
+        u = " ".join(note.split()).upper()
+        c = _compact_for_keyword(note)
+        if "ADDEBITO" in u and "C/C" in u and "BUON FINE" in u:
+            continue
+        if "ADDEBITOINCC" in c and "BUONFINE" in c:
+            continue
+        out.append(r)
+    return out
+
+
 def _parse_statement_text(text: str, *, max_note_len: int) -> tuple[list[dict[str, object]], Decimal | None]:
     """Estrae movimenti e saldo finale da testo già letto dal PDF."""
+    is_amex = _looks_like_amex_estratto(text)
     prepared = _prepare_statement_lines(text)
+    if is_amex:
+        prepared = _amex_merge_cr_line_pairs(prepared)
+        prepared = _amex_merge_wrapped_statement_lines(prepared, max_note_len=max_note_len)
+        prepared = _amex_rejoin_split_movement_lines(prepared, max_note_len=max_note_len)
     joined = "\n".join(prepared)
     if _looks_like_bcc_estratto(joined):
         rows_bcc, cl_bcc = _parse_statement_text_bcc(prepared, max_note_len=max_note_len)
@@ -917,40 +1295,55 @@ def _parse_statement_text(text: str, *, max_note_len: int) -> tuple[list[dict[st
             return rows_bcc, cl_bcc
 
     closing_balance: Decimal | None = None
-
-    for line in prepared:
-        got = _try_parse_saldo_finale_amount(line)
-        if got is not None:
-            closing_balance = got
+    if not is_amex:
+        for line in prepared:
+            got = _try_parse_saldo_finale_amount(line)
+            if got is not None:
+                closing_balance = got
 
     start = _first_movement_line_index(prepared, max_note_len=max_note_len)
     rows: list[dict[str, object]] = []
+    prev_amex_block = False
+    amex_doc_i = 0
 
     for line in prepared[start:]:
-        if re.match(r"^Pag\.", line, re.I):
+        if line.strip() == _AMEX_BLOCK_MARKER:
+            prev_amex_block = True
             continue
-        if _line_is_summary_not_movement(line):
+        work = _amex_trim_leading_before_movement_dates(line) if is_amex else line
+        if re.match(r"^Pag\.", work, re.I):
             continue
-        uu = line.upper()
-        ckln = _compact_for_keyword(line)
+        if _line_is_summary_not_movement(work):
+            continue
+        uu = work.upper()
+        ckln = _compact_for_keyword(work)
         if "SALDO FINALE" in uu or "SALDOFINALE" in ckln:
             continue
         if "SALDO CONTABILE" in uu or "SALDOCONTABILE" in ckln:
             continue
         if "SALDO DISPONIBILE" in uu or "SALDISPONIBILE" in ckln:
             continue
-        if _line_is_probable_table_header(line, max_note_len=max_note_len):
+        if _line_is_probable_table_header(work, max_note_len=max_note_len):
             continue
 
-        row = _parse_movement_line(line, max_note_len=max_note_len)
+        row = _parse_movement_line(work, max_note_len=max_note_len)
         if row is not None:
+            if is_amex:
+                row["_amex_doc_i"] = amex_doc_i
+                amex_doc_i += 1
             rows.append(row)
+            prev_amex_block = False
             continue
 
-        if rows and line and _should_append_continuation(line, max_note_len=max_note_len):
+        if rows and line and _should_append_continuation(
+            work if is_amex else line,
+            max_note_len=max_note_len,
+            strict_amex=is_amex,
+            prev_amex_block=prev_amex_block,
+        ):
             prev = rows[-1]
             tail = str(prev.get("note", ""))
-            xadd = line.replace("\n", " ")
+            xadd = (work if is_amex else line).replace("\n", " ")
             if _line_looks_shattered(xadd):
                 add = _collapse_shattered_line(xadd)
             else:
@@ -958,8 +1351,18 @@ def _parse_statement_text(text: str, *, max_note_len: int) -> tuple[list[dict[st
             if add:
                 merged = (tail + " " + add).strip()[:max_note_len]
                 prev["note"] = merged
+            prev_amex_block = False
+            continue
+
+        prev_amex_block = False
 
     rows = [r for r in rows if not _note_looks_like_summary_row(str(r.get("note", "")))]
+    if is_amex:
+        rows = _amex_filter_non_movement_rows(rows)
+        _amex_apply_statement_amount_signs(rows)
+        rows = _amex_sort_rows_by_booking(rows)
+        for r in rows:
+            r.pop("_amex_doc_i", None)
     return rows, closing_balance
 
 
@@ -974,6 +1377,256 @@ def _extract_text_from_reader(reader: object, *, layout: bool, page_joiner: str)
             t = page.extract_text() or ""
         chunks.append(t)
     return page_joiner.join(chunks)
+
+
+def _matrix6f(cm_tm: object) -> list[float]:
+    """Converte CTM/Tm pypdf in 6 float (identità se assente o incompleto)."""
+    ident = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    if cm_tm is None:
+        return ident.copy()
+    try:
+        seq = list(cm_tm[:6])  # type: ignore[index]
+    except Exception:
+        return ident.copy()
+    out: list[float] = []
+    for i in range(6):
+        try:
+            out.append(float(seq[i]))
+        except (TypeError, ValueError, IndexError):
+            out.append(ident[i])
+    return out
+
+
+def _peek_pdf_plain_header(reader: object, *, max_pages: int = 4, max_chars: int = _AMEX_HEADER_SCAN_CHARS) -> str:
+    """Primi fogli in modalità plain (solo per riconoscere testata Amex)."""
+    parts: list[str] = []
+    for idx, page in enumerate(reader.pages):
+        if idx >= max_pages:
+            break
+        try:
+            t = page.extract_text(extraction_mode="plain") or ""
+        except TypeError:
+            t = page.extract_text() or ""
+        parts.append(t)
+    return "\n".join(parts)[:max_chars]
+
+
+def _amex_closing_balance_from_positional_text(amex_text: str) -> Decimal | None:
+    """
+    Dopo indirizzo/intestazione, il saldo compare spesso subito dopo il primo ``<<<AMEX_HRULE>>>`` come
+    ``EUR 3.633,49`` (importo italiano con migliaia).
+    """
+    marker = _AMEX_BLOCK_MARKER
+    if marker in amex_text:
+        idx = amex_text.find(marker)
+        window = amex_text[idx + len(marker) : idx + len(marker) + 4000]
+    else:
+        window = amex_text[:4000]
+    for line in window.splitlines():
+        ln = line.strip()
+        if not ln:
+            continue
+        m = re.search(
+            r"(?i)\bEUR\s+((?:\d{1,3}(?:\.\d{3})+|\d+),\d{2})",
+            ln,
+        )
+        if m:
+            got = _parse_it_amount(m.group(1))
+            if got is not None:
+                return got
+    return None
+
+
+def _amex_closing_balance_from_first_page(reader: object) -> Decimal | None:
+    """
+    «Importo dovuto» in testata Amex: nella fascia alta della prima pagina si cercano frammenti che sono
+    **solo** importo italiano (``Tm×Cm``). Si raggruppano per fascia **Y** (stessa riga visiva); la riga con
+    **più** importi coincide di solito con i riquadri in testa; si prende il **primo** importo da sinistra
+    in quella riga. Se non c'è una riga con almeno due importi, si usa il primo importo della fascia alta.
+    """
+    try:
+        from pypdf._text_extraction import mult
+    except ImportError:
+        return None
+    try:
+        pages = getattr(reader, "pages", None)
+        if not pages:
+            return None
+        page = pages[0]
+        mb = page.mediabox
+        bottom = float(mb.bottom)
+        top = float(mb.top)
+    except Exception:
+        return None
+    band_top_h = (top - bottom) * 0.25
+    y_cut = top - band_top_h
+    spans: list[tuple[float, float, str]] = []
+
+    def visitor_text(
+        text: object,
+        cm: object,
+        tm: object,
+        font_res: object,
+        fsize: object,
+    ) -> None:
+        if text is None:
+            return
+        ts = str(text)
+        if not ts.strip():
+            return
+        try:
+            cm_l = _matrix6f(cm)
+            tm_l = _matrix6f(tm)
+            m = mult(tm_l, cm_l)
+            x, y = float(m[4]), float(m[5])
+        except Exception:
+            return
+        if y < y_cut:
+            return
+        spans.append((x, y, ts))
+
+    try:
+        page.extract_text(visitor_text=visitor_text, extraction_mode="plain")
+    except TypeError:
+        try:
+            page.extract_text(visitor_text=visitor_text)
+        except TypeError:
+            return None
+
+    if not spans:
+        return None
+    spans.sort(key=lambda s: (-s[1], s[0]))
+    cells: list[tuple[float, float, Decimal]] = []
+    for x, y, ts in spans:
+        t0 = _normalize_pdf_line(ts.replace("\n", " ")).replace(" ", "").replace("\xa0", "")
+        if not t0:
+            continue
+        m = re.fullmatch(rf"(?P<a>{_AMT_CORE})€?", t0)
+        if not m:
+            continue
+        parsed = _parse_it_amount(m.group("a"))
+        if parsed is not None:
+            cells.append((x, y, parsed))
+    if not cells:
+        return None
+    y_band_tol = max(5.5, (top - bottom) * 0.012)
+    bands: list[list[tuple[float, float, Decimal]]] = []
+    for c in cells:
+        if not bands:
+            bands.append([c])
+            continue
+        ref_y = sum(z[1] for z in bands[-1]) / len(bands[-1])
+        if abs(c[1] - ref_y) <= y_band_tol:
+            bands[-1].append(c)
+        else:
+            bands.append([c])
+    multi = [b for b in bands if len(b) >= 2]
+    if multi:
+        chosen = max(multi, key=len)
+    else:
+        chosen = bands[0]
+    chosen.sort(key=lambda t: t[0])
+    return chosen[0][2]
+
+
+def _extract_amex_text_position_grouped(reader: object, *, page_joiner: str) -> str:
+    """
+    Ricompone il testo per **posizione**: stessa fascia Y → stessa riga visiva, ordinamento per X.
+    Risolve PDF che elencano prima tutte le descrizioni e poi tutti gli importi (ordine stream).
+    """
+    try:
+        from pypdf._text_extraction import mult
+    except ImportError:
+        return ""
+
+    page_chunks: list[str] = []
+
+    for page in reader.pages:
+        spans: list[tuple[float, float, str, float]] = []
+
+        def visitor_text(
+            text: object,
+            cm: object,
+            tm: object,
+            font_res: object,
+            fsize: object,
+        ) -> None:
+            if text is None:
+                return
+            ts = str(text)
+            if not ts.strip():
+                return
+            try:
+                cm_l = _matrix6f(cm)
+                tm_l = _matrix6f(tm)
+                m = mult(tm_l, cm_l)
+                x, y = float(m[4]), float(m[5])
+            except Exception:
+                return
+            try:
+                fsz = float(fsize) if fsize is not None else 8.0
+            except (TypeError, ValueError):
+                fsz = 8.0
+            spans.append((x, y, ts, fsz))
+
+        try:
+            page.extract_text(visitor_text=visitor_text, extraction_mode="plain")
+        except TypeError:
+            try:
+                page.extract_text(visitor_text=visitor_text)
+            except TypeError:
+                page_chunks.append("")
+                continue
+
+        if not spans:
+            page_chunks.append("")
+            continue
+
+        sizes = sorted(s[3] for s in spans if s[3] > 0.1)
+        fs_med = sizes[len(sizes) // 2] if sizes else 8.0
+        y_tol = max(3.0, min(14.0, fs_med * 0.45))
+
+        spans.sort(key=lambda s: (-s[1], s[0]))
+        lines_spans: list[list[tuple[float, float, str, float]]] = []
+        for sp in spans:
+            _, y, _, _ = sp
+            if not lines_spans:
+                lines_spans.append([sp])
+                continue
+            avg_y = sum(s[1] for s in lines_spans[-1]) / len(lines_spans[-1])
+            if abs(y - avg_y) <= y_tol:
+                lines_spans[-1].append(sp)
+            else:
+                lines_spans.append([sp])
+
+        line_metas: list[tuple[float, float, float, str]] = []
+        for grp in lines_spans:
+            ys = [s[1] for s in grp]
+            y_hi, y_lo = max(ys), min(ys)
+            avg_y = sum(ys) / len(ys)
+            grp.sort(key=lambda s: s[0])
+            parts = [s[2] for s in grp]
+            merged = "".join(parts)
+            merged = _normalize_pdf_line(merged.replace("\n", " "))
+            merged = _insert_space_before_glued_calendar_date(merged)
+            if merged:
+                line_metas.append((y_hi, y_lo, avg_y, merged))
+
+        line_metas.sort(key=lambda t: -t[2])
+        gap_need = max(26.0, fs_med * 2.85)
+        line_strs: list[str] = []
+        prev_y_lo: float | None = None
+        for y_hi, y_lo, _avg_y, txt in line_metas:
+            if prev_y_lo is not None:
+                gap = prev_y_lo - y_hi
+                if gap > gap_need:
+                    line_strs.append(_AMEX_BLOCK_MARKER)
+            line_strs.append(txt)
+            prev_y_lo = y_lo
+
+        page_chunks.append("\n".join(line_strs))
+
+    return page_joiner.join(page_chunks)
 
 
 def _maybe_dump_debug_text(path: Path, label: str, text: str) -> None:
@@ -1025,17 +1678,49 @@ def extract_estratto_conto_movements_from_pdf(path: Path, *, max_note_len: int =
 
     reader = PdfReader(str(path))
 
+    rows: list[dict[str, object]] = []
+    closing_balance: Decimal | None = None
+    last_text = ""
+    dbg = bool(os.environ.get("ESTRATTO_PDF_DEBUG", "").strip())
+
+    peek = _peek_pdf_plain_header(reader)
+    if _looks_like_amex_estratto(peek):
+        for joiner, label_amex in (("\n\n", "amex_pos_pages"), ("\n", "amex_pos")):
+            try:
+                amex_text = _extract_amex_text_position_grouped(reader, page_joiner=joiner)
+            except Exception:
+                amex_text = ""
+            if amex_text.strip():
+                last_text = amex_text
+            if dbg:
+                if amex_text.strip():
+                    _maybe_dump_debug_text(path, label_amex, amex_text)
+                else:
+                    _maybe_dump_debug_text(
+                        path,
+                        label_amex,
+                        f"[{label_amex}] estrazione posizionale American Express vuota o non disponibile.\n",
+                    )
+            if not amex_text.strip():
+                continue
+            rows, closing_balance = _parse_statement_text(amex_text, max_note_len=max_note_len)
+            bal_txt = _amex_closing_balance_from_positional_text(amex_text)
+            if bal_txt is not None:
+                closing_balance = bal_txt
+            else:
+                bal_geo = _amex_closing_balance_from_first_page(reader)
+                if bal_geo is not None:
+                    closing_balance = bal_geo
+            if rows or closing_balance is not None:
+                return EstrattoContoPdfExtract(rows, closing_balance)
+        rows, closing_balance = [], None
+
     variants: list[tuple[str, bool, str]] = [
         ("plain", False, "\n"),
         ("layout", True, "\n"),
         ("plain_pages", False, "\n\n"),
         ("layout_pages", True, "\n\n"),
     ]
-
-    rows: list[dict[str, object]] = []
-    closing_balance: Decimal | None = None
-    last_text = ""
-    dbg = bool(os.environ.get("ESTRATTO_PDF_DEBUG", "").strip())
 
     for label, layout, joiner in variants:
         text = _extract_text_from_reader(reader, layout=layout, page_joiner=joiner)

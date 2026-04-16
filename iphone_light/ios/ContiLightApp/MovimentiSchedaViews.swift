@@ -54,23 +54,30 @@ struct ContiLightSaldiSchedaView: View {
         ContiDatabase.saldiDueForme(sessionDb: sessionDb, todayIso: ContiDatabase.todayIsoLocal())
     }
 
+    /// Totali «non carta» come nel footer desktop (se presenti nel JSON light).
+    private var totalsNonCc: (abs: Decimal, sf: Decimal, scc: Decimal, disp: Decimal)? {
+        ContiDatabase.lightSaldiTotalsNonCc(sessionDb: sessionDb)
+    }
+
     private var saldiIntroText: String {
         if let meta = ContiDatabase.lightSaldiSnapshotMeta(sessionDb: sessionDb) {
             return """
-            Valori copiati dal desktop sul database completo (blocco «light_saldi»). \
+            Stessi importi della pagina Saldi del desktop (incluse colonne legate alle carte di credito). \
+            Nessuna funzione di verifica su iPhone. \
             Riferimento \(meta.dateIso), anno piano \(meta.yearBasis). \
-            Dopo nuove immissioni su iOS, al salvataggio si aggiornano in locale; salva sul desktop per ricalcolo globale.
+            Dopo immissioni su iOS, al salvataggio si aggiornano in locale; salva sul desktop per rigenerare il light.
             """
         }
         return "Dati mancanti: nel file non c’è il blocco «light_saldi». Rigenera il file *_light.enc dal desktop (salvataggio app desktop)."
     }
 
     private var sommaAssoluti: Decimal {
-        rows.reduce(Decimal.zero) { $0 + $1.saldoAssoluto }
+        if let t = totalsNonCc { return t.abs }
+        return rows.filter { !$0.isCreditCard }.reduce(Decimal.zero) { $0 + $1.saldoAssoluto }
     }
 
     private var sommaAllaData: Decimal {
-        rows.reduce(Decimal.zero) { $0 + $1.saldoOggi }
+        rows.filter { !$0.isCreditCard }.reduce(Decimal.zero) { $0 + $1.saldoOggi }
     }
 
     var body: some View {
@@ -96,7 +103,7 @@ struct ContiLightSaldiSchedaView: View {
                     .frame(minHeight: 120)
                 }
             } else {
-                Section("Saldi totali") {
+                Section("Totali (conti non carta)") {
                     HStack {
                         Text("Somma saldi assoluti")
                             .foregroundStyle(.secondary)
@@ -115,15 +122,54 @@ struct ContiLightSaldiSchedaView: View {
                             .foregroundStyle(amountColor(sommaAllaData))
                     }
                     .font(.subheadline.weight(.medium))
-                    Text("Somma algebrica dei conti elencati sotto (come riga di totale in elenco).")
+                    if let t = totalsNonCc {
+                        HStack {
+                            Text("Spese future (non carta)")
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text(ContiDatabase.formatEuroTwoDecimals(t.sf))
+                                .monospacedDigit()
+                                .foregroundStyle(amountColor(t.sf))
+                        }
+                        .font(.subheadline.weight(.medium))
+                        HStack {
+                            Text("Spese per carte (colonne conti)")
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text(ContiDatabase.formatEuroTwoDecimals(t.scc))
+                                .monospacedDigit()
+                                .foregroundStyle(amountColor(t.scc))
+                        }
+                        .font(.subheadline.weight(.medium))
+                        HStack {
+                            Text("Disponibilità (somma)")
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text(ContiDatabase.formatEuroTwoDecimals(t.disp))
+                                .monospacedDigit()
+                                .foregroundStyle(amountColor(t.disp))
+                        }
+                        .font(.subheadline.weight(.medium))
+                    }
+                    Text("Le carte non entrano nella somma «assoluti» (come sul desktop). Per ogni conto: disponibilità = assoluto + spese future + spese CC, tranne sulle colonne carta (—).")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
                 Section {
                     ForEach(rows) { r in
                         VStack(alignment: .leading, spacing: 8) {
-                            Text(r.accountName)
-                                .font(.subheadline.weight(.semibold))
+                            HStack(alignment: .firstTextBaseline) {
+                                Text(r.accountName)
+                                    .font(.subheadline.weight(.semibold))
+                                if r.isCreditCard {
+                                    Text("Carta")
+                                        .font(.caption2)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(Color.blue.opacity(0.15))
+                                        .clipShape(Capsule())
+                                }
+                            }
                             HStack {
                                 Text("Assoluto")
                                     .foregroundStyle(.secondary)
@@ -134,12 +180,54 @@ struct ContiLightSaldiSchedaView: View {
                             }
                             .font(.subheadline)
                             HStack {
-                                Text("Alla data (oggi al salvataggio desktop)")
+                                Text("Alla data")
                                     .foregroundStyle(.secondary)
                                 Spacer()
                                 Text(ContiDatabase.formatEuroTwoDecimals(r.saldoOggi))
                                     .monospacedDigit()
                                     .foregroundStyle(amountColor(r.saldoOggi))
+                            }
+                            .font(.subheadline)
+                            HStack {
+                                Text("Spese future")
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                if r.isCreditCard {
+                                    Text("—")
+                                        .foregroundStyle(.tertiary)
+                                } else {
+                                    Text(ContiDatabase.formatEuroTwoDecimals(r.speseFuture))
+                                        .monospacedDigit()
+                                        .foregroundStyle(amountColor(r.speseFuture))
+                                }
+                            }
+                            .font(.subheadline)
+                            HStack {
+                                Text("Spese CC")
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                if r.isCreditCard {
+                                    Text("—")
+                                        .foregroundStyle(.tertiary)
+                                } else {
+                                    Text(ContiDatabase.formatEuroTwoDecimals(r.speseCC))
+                                        .monospacedDigit()
+                                        .foregroundStyle(amountColor(r.speseCC))
+                                }
+                            }
+                            .font(.subheadline)
+                            HStack {
+                                Text("Disponibilità")
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                if r.isCreditCard {
+                                    Text("—")
+                                        .foregroundStyle(.tertiary)
+                                } else {
+                                    Text(ContiDatabase.formatEuroTwoDecimals(r.disponibilita))
+                                        .monospacedDigit()
+                                        .foregroundStyle(amountColor(r.disponibilita))
+                                }
                             }
                             .font(.subheadline)
                         }
@@ -163,7 +251,7 @@ struct ContiLightSaldiSchedaView: View {
 
 private struct ImmissioneCodePickView: View {
     let title: String
-    let rows: [(code: String, label: String)]
+    let rows: [(code: String, label: String, subtitle: String?)]
     let includeNone: Bool
     let noneLabel: String
     @Binding var selectedCode: String
@@ -198,12 +286,22 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         return ContiDatabase.immissionePickLists(from: db)
     }
 
-    private var catRows: [(code: String, label: String)] {
-        (lists?.categorie ?? []).map { ($0.code, $0.displayName) }
+    private var catRows: [(code: String, label: String, subtitle: String?)] {
+        (lists?.categorie ?? []).map { ($0.code, $0.displayName, nil) }
     }
 
-    private var accRows: [(code: String, label: String)] {
-        (lists?.conti ?? []).map { ($0.code, $0.name) }
+    private var accRows: [(code: String, label: String, subtitle: String?)] {
+        (lists?.conti ?? []).map { c in
+            let sub: String?
+            if c.isCreditCard {
+                sub = c.referenceAccountName.isEmpty
+                    ? "Carta di credito"
+                    : "Carta · riferimento: \(c.referenceAccountName)"
+            } else {
+                sub = nil
+            }
+            return (c.code, c.name, sub)
+        }
     }
 
     private var selectedCatNote: String {
@@ -236,6 +334,8 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                     Section {
                         Text(
                             "Scheda allineata alla pagina «Nuove registrazioni» del desktop (campi principali). " +
+                                "Conti carta: il conto di riferimento è indicato in elenco (solo informativo). " +
+                                "Nessuna verifica estratto su iPhone. " +
                                 "Niente memoria/saldo cassa su iOS. Il salvataggio sul file cifrato non è ancora attivo da questa app."
                         )
                         .font(.footnote)
