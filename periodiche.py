@@ -176,7 +176,7 @@ def build_periodic_record(
             f"{acc2_code}{acc2_flags}" if acc2_code and acc2_flags else (acc2_code or "")
         ),
         "account_secondary_name": acc2_name,
-        "amount_eur": format_money(amt_dec.quantize(Decimal("0.01"))),
+        "amount_eur": format_money(amt_dec),
         "amount_lire_original": None,
         "note": note,
         "cheque": chq,
@@ -184,7 +184,7 @@ def build_periodic_record(
         "is_cancelled": False,
         "source_currency": "E",
         "display_currency": "E",
-        "display_amount": format_money(amt_dec.quantize(Decimal("0.01"))),
+        "display_amount": format_money(amt_dec),
         "raw_record": "",
     }
 

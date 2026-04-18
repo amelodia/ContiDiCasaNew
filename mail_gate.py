@@ -40,7 +40,10 @@ def run_startup_mail_gate(parent: tk.Misc, db: dict, save: SaveFn) -> bool:
     win = tk.Toplevel(parent)
     win.title("Conti di casa — Configurazione posta")
     win.resizable(True, False)
-    win.grab_set()
+    try:
+        win.withdraw()
+    except Exception:
+        pass
     frm = ttk.Frame(win, padding=14)
     frm.pack(fill=tk.BOTH, expand=True)
 
@@ -229,6 +232,15 @@ def run_startup_mail_gate(parent: tk.Misc, db: dict, save: SaveFn) -> bool:
         sw = win.winfo_screenwidth()
         sh = win.winfo_screenheight()
         win.geometry(f"{ww}x{wh}+{(sw - ww) // 2}+{(sh - wh) // 3}")
+    except Exception:
+        pass
+
+    try:
+        win.deiconify()
+    except Exception:
+        pass
+    try:
+        win.grab_set()
     except Exception:
         pass
 

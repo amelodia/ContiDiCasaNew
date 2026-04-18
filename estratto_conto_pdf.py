@@ -167,7 +167,7 @@ def _parse_it_amount(s: str) -> Decimal | None:
         return None
     raw = m.group(1)
     try:
-        return Decimal(raw.replace(".", "").replace(",", ".")).quantize(Decimal("0.01"))
+        return Decimal(raw.replace(".", "").replace(",", "."))
     except (InvalidOperation, ValueError):
         return None
 

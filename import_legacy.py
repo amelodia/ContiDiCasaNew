@@ -26,6 +26,7 @@ ANNULLATA_PREFIX = "registrazione annullata"
 # New app input constraints
 MIN_AMOUNT_EUR = Decimal("-999999999.99")
 MAX_AMOUNT_EUR = Decimal("999999999.99")
+_EURO_MAX_DECIMAL_PLACES = 2
 MAX_CATEGORY_NAME_LEN = 20
 MAX_CATEGORY_NOTE_LEN = 100
 MAX_ACCOUNT_NAME_LEN = 16
@@ -70,10 +71,20 @@ class LegacyRecord:
     raw_record: str
 
 
+def assert_euro_at_most_two_decimal_places(amount: Decimal) -> None:
+    """Rifiuta importi con più di due cifre decimali (nessun arrotondamento)."""
+    t = amount.as_tuple()
+    if t.exponent < -_EURO_MAX_DECIMAL_PLACES:
+        raise ValueError(
+            "L'importo può avere al massimo due cifre decimali (nessuna terza cifra consentita)."
+        )
+
+
 def normalize_euro_input(value: str) -> Decimal:
     """
     Parse user input amount for the new app.
     Both '.' and ',' are accepted as decimal separators.
+    Al massimo due cifre decimali: niente arrotondamento, valori non validi → ValueError.
     """
     s = value.strip().replace(" ", "")
     if not s:
@@ -86,7 +97,8 @@ def normalize_euro_input(value: str) -> Decimal:
     amount = Decimal(s)
     if amount < MIN_AMOUNT_EUR or amount > MAX_AMOUNT_EUR:
         raise ValueError(f"Importo fuori limiti: {amount}")
-    return amount.quantize(Decimal("0.01"))
+    assert_euro_at_most_two_decimal_places(amount)
+    return amount
 
 
 def format_euro_it(value: Decimal) -> str:
@@ -135,8 +147,10 @@ def parse_amount(value: str) -> Decimal:
 
 
 def format_money(value: Decimal) -> str:
-    quantized = value.quantize(Decimal("0.001"))
-    return f"{quantized:.3f}"
+    """Serializzazione importo euro: esattamente due decimali, senza arrotondamenti impliciti."""
+    assert_euro_at_most_two_decimal_places(value)
+    q = value.quantize(Decimal("0.01"))
+    return f"{q:.2f}"
 
 
 def format_date_yyyymmdd(raw: str) -> str:
@@ -217,6 +231,12 @@ def parse_dat_records(
                 amount_eur = Decimal("0")
             else:
                 continue
+        try:
+            assert_euro_at_most_two_decimal_places(amount_eur)
+        except ValueError as exc:
+            raise ValueError(
+                f"{path.name}: registrazione {idx + 1}, importo euro nel .dat con più di due decimali."
+            ) from exc
 
         category_name = clip_text(categories[cat_idx], MAX_CATEGORY_NAME_LEN)
         cat_code = str(cat_int)
@@ -358,9 +378,17 @@ def parse_sld_balances(folder: Path, n_accounts: int) -> dict[str, object] | Non
             return
         clean = t.replace(".", "").replace(",", ".") if "," in t else t
         try:
-            nums.append(Decimal(clean))
+            d = Decimal(clean)
         except InvalidOperation:
             nums.append(Decimal("0"))
+            return
+        try:
+            assert_euro_at_most_two_decimal_places(d)
+        except ValueError as exc:
+            raise ValueError(
+                f"*sld.aco*: saldo legacy {t!r} con più di due cifre decimali (nessun arrotondamento)."
+            ) from exc
+        nums.append(d)
 
     if first_parts and first_parts[0].upper() in ("E", "L"):
         for part in first_parts[1:]:

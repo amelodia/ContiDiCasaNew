@@ -720,94 +720,169 @@ public enum ContiDatabase {
         return out
     }
 
+    private static func importedRecordBalanceTwinKey(_ rec: [String: Any]) -> (String, String, String, String) {
+        let d = String(stringFromJSON(rec["date_iso"]).prefix(10))
+        let c1 = stringFromJSON(rec["account_primary_code"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let c2 = stringFromJSON(rec["account_secondary_code"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        var amtS = stringFromJSON(rec["amount_eur"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if amtS.isEmpty, let v = parseLooseDecimal(stringFromJSON(rec["amount_eur"])) {
+            amtS = NSDecimalNumber(decimal: v).stringValue
+        }
+        return (d, c1, c2, amtS)
+    }
+
+    private static func importCancelTwinBalanceKeys(db: [String: Any]) -> Set<String> {
+        var imp: [[String: Any]] = []
+        guard let years = db["years"] as? [[String: Any]] else { return [] }
+        for yd in years {
+            for rec in coerceToArrayOfStringKeyedDicts(yd["records"]) {
+                if !stringFromJSON(rec["raw_record"]).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    imp.append(rec)
+                }
+            }
+        }
+        var cKeys = Set<String>()
+        var aKeys = Set<String>()
+        for r in imp {
+            let k = importedRecordBalanceTwinKey(r)
+            let tag = "\(k.0)|\(k.1)|\(k.2)|\(k.3)"
+            if boolFromJSON(r["is_cancelled"]) {
+                cKeys.insert(tag)
+            } else {
+                aKeys.insert(tag)
+            }
+        }
+        return cKeys.intersection(aKeys)
+    }
+
+    private static func twinKeyTag(_ k: (String, String, String, String)) -> String {
+        "\(k.0)|\(k.1)|\(k.2)|\(k.3)"
+    }
+
+    /// Allineato a ``account_column_index_in_latest_chart`` in ``main_app.py``: colonna = codice nel piano, non posizione ``codice-1``.
+    private static func accountColumnIndexInLatestChart(_ chartAccounts: [[String: Any]], codeRaw: String) -> Int {
+        let r = codeRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !r.isEmpty else { return -1 }
+        return accountChartIndexForReferenceCode(accs: chartAccounts, refCode: r) ?? -1
+    }
+
+    private static func indicesTouchedByImportTwinActives(
+        db: [String: Any],
+        twinTags: Set<String>,
+        nAccounts: Int,
+        chartAccounts: [[String: Any]]
+    ) -> Set<Int> {
+        guard !twinTags.isEmpty else { return Set() }
+        var out = Set<Int>()
+        guard let years = db["years"] as? [[String: Any]] else { return out }
+        for yd in years {
+            for rec in coerceToArrayOfStringKeyedDicts(yd["records"]) {
+                if boolFromJSON(rec["is_cancelled"]) { continue }
+                if stringFromJSON(rec["raw_record"]).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
+                let tag = twinKeyTag(importedRecordBalanceTwinKey(rec))
+                if !twinTags.contains(tag) { continue }
+                let amount = parseLooseDecimal(stringFromJSON(rec["amount_eur"])) ?? .zero
+                let c1 = stringFromJSON(rec["account_primary_code"])
+                let c2 = stringFromJSON(rec["account_secondary_code"])
+                let i1 = accountColumnIndexInLatestChart(chartAccounts, c1)
+                let i2 = accountColumnIndexInLatestChart(chartAccounts, c2)
+                if i1 >= 0, i1 < nAccounts, amount != .zero { out.insert(i1) }
+                if isGirocontoRecord(rec), i2 >= 0, i2 < nAccounts, amount != .zero { out.insert(i2) }
+            }
+        }
+        return out
+    }
+
+    private static func accountCodesEqualForRecords(_ a: String, _ b: String) -> Bool {
+        let x = a.trimmingCharacters(in: .whitespacesAndNewlines)
+        let y = b.trimmingCharacters(in: .whitespacesAndNewlines)
+        if x.isEmpty || y.isEmpty { return false }
+        if x == y { return true }
+        if x.unicodeScalars.allSatisfy({ CharacterSet.decimalDigits.contains($0) }),
+           y.unicodeScalars.allSatisfy({ CharacterSet.decimalDigits.contains($0) }),
+           let ix = Int(x), let iy = Int(y), ix == iy {
+            return true
+        }
+        return false
+    }
+
+    private static func accountHasNonCancelledMovementTouchingCode(db: [String: Any], accountCode: String) -> Bool {
+        let code = accountCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        if code.isEmpty { return false }
+        guard let years = db["years"] as? [[String: Any]] else { return false }
+        for yd in years {
+            for rec in coerceToArrayOfStringKeyedDicts(yd["records"]) {
+                if boolFromJSON(rec["is_cancelled"]) { continue }
+                if boolFromJSON(rec["is_virtuale_discharge"]) { continue }
+                let c1 = stringFromJSON(rec["account_primary_code"]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if accountCodesEqualForRecords(c1, code) { return true }
+                if isGirocontoRecord(rec) {
+                    let c2 = stringFromJSON(rec["account_secondary_code"]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if accountCodesEqualForRecords(c2, code) { return true }
+                }
+            }
+        }
+        return false
+    }
+
+    private static let legacyDatRecordLen = 121
+
+    private static func canonicalLegacySaldoCodeKey(_ ck: String) -> String {
+        let s = ck.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty { return "" }
+        if s.unicodeScalars.allSatisfy({ CharacterSet.decimalDigits.contains($0) }), let n = Int(s) {
+            return String(n)
+        }
+        return s
+    }
+
+    /// Saldi *sld.aco* (snapshot all’import) rimappati per **codice conto** all’ultimo anno.
     private static func legacyAbsoluteAmounts(db: [String: Any], nAccounts: Int) -> [Decimal]? {
         guard let yb = yearBucketForCalendar(db: db, year: planReferenceYear) else { return nil }
         guard let ls = dictionaryFromAnyRoot(yb["legacy_saldi"]),
               let raw = ls["amounts"] as? [Any],
               !raw.isEmpty
         else { return nil }
+        let accsRef = coerceToArrayOfStringKeyedDicts(yb["accounts"])
+        var legacyByCode: [String: Decimal] = [:]
+        for j in 0 ..< min(accsRef.count, raw.count) {
+            let ck = stringFromJSON(accsRef[j]["code"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !ck.isEmpty else { continue }
+            let key = canonicalLegacySaldoCodeKey(ck)
+            guard !key.isEmpty else { continue }
+            legacyByCode[key] = parseLooseDecimal(stringFromJSON(raw[j])) ?? .zero
+        }
+        guard let years = db["years"] as? [[String: Any]], !years.isEmpty else { return nil }
+        let latestYear = years.map { intFromJSON($0["year"]) }.max() ?? 0
+        guard let yearData = years.first(where: { intFromJSON($0["year"]) == latestYear }) else { return nil }
+        let accountsLatest = coerceToArrayOfStringKeyedDicts(yearData["accounts"])
         var out: [Decimal] = []
         for i in 0 ..< nAccounts {
-            if i < raw.count {
-                out.append(parseLooseDecimal(stringFromJSON(raw[i])) ?? .zero)
-            } else {
+            if i >= accountsLatest.count {
                 out.append(.zero)
+                continue
             }
+            var ck = stringFromJSON(accountsLatest[i]["code"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if ck.isEmpty { ck = String(i + 1) }
+            out.append(legacyByCode[canonicalLegacySaldoCodeKey(ck)] ?? .zero)
         }
         return out
     }
 
-    private static func computeBalancesAsOf(db: [String: Any], latestYear: Int, nAccounts: Int, cutoff: String) -> [Decimal] {
-        var pool: [[String: Any]] = []
-        if let years = db["years"] as? [[String: Any]] {
-            for yd in years {
-                let y = intFromJSON(yd["year"])
-                if y > latestYear { continue }
-                pool.append(contentsOf: coerceToArrayOfStringKeyedDicts(yd["records"]))
-            }
-        }
-        pool.sort { recordMergeSortKey($0) < recordMergeSortKey($1) }
-        var balances = Array(repeating: Decimal.zero, count: nAccounts)
-        for rec in pool {
-            if boolFromJSON(rec["is_cancelled"]) { continue }
-            if boolFromJSON(rec["is_virtuale_discharge"]) { continue }
-            let y = intFromJSON(rec["year"])
-            if isDotazioneRecord(rec), y != legacyDotazioneYear { continue }
-            let rDate = stringFromJSON(rec["date_iso"])
-            if !rDate.isEmpty, rDate > cutoff { continue }
-            let amount = parseLooseDecimal(stringFromJSON(rec["amount_eur"])) ?? .zero
-            let c1 = stringFromJSON(rec["account_primary_code"])
-            let c2 = stringFromJSON(rec["account_secondary_code"])
-            let i1 = accountCodeZeroBasedIndex(c1)
-            let i2 = accountCodeZeroBasedIndex(c2)
-            if i1 >= 0, i1 < nAccounts { balances[i1] += amount }
-            if isGirocontoRecord(rec), i2 >= 0, i2 < nAccounts { balances[i2] -= amount }
-        }
-        return balances
-    }
-
-    private static func computeFutureDatedOnly(db: [String: Any], latestYear: Int, nAccounts: Int, today: String) -> [Decimal] {
-        var pool: [[String: Any]] = []
-        if let years = db["years"] as? [[String: Any]] {
-            for yd in years {
-                let y = intFromJSON(yd["year"])
-                if y > latestYear { continue }
-                pool.append(contentsOf: coerceToArrayOfStringKeyedDicts(yd["records"]))
-            }
-        }
-        pool.sort { recordMergeSortKey($0) < recordMergeSortKey($1) }
-        var balances = Array(repeating: Decimal.zero, count: nAccounts)
-        for rec in pool {
-            if boolFromJSON(rec["is_cancelled"]) { continue }
-            if boolFromJSON(rec["is_virtuale_discharge"]) { continue }
-            let y = intFromJSON(rec["year"])
-            if isDotazioneRecord(rec), y != legacyDotazioneYear { continue }
-            let rDate = stringFromJSON(rec["date_iso"])
-            if rDate.isEmpty || rDate <= today { continue }
-            let amount = parseLooseDecimal(stringFromJSON(rec["amount_eur"])) ?? .zero
-            let c1 = stringFromJSON(rec["account_primary_code"])
-            let c2 = stringFromJSON(rec["account_secondary_code"])
-            let i1 = accountCodeZeroBasedIndex(c1)
-            let i2 = accountCodeZeroBasedIndex(c2)
-            if i1 >= 0, i1 < nAccounts { balances[i1] += amount }
-            if isGirocontoRecord(rec), i2 >= 0, i2 < nAccounts { balances[i2] -= amount }
-        }
-        return balances
-    }
-
-    private static func computeNewRecordsEffectSwift(db: [String: Any], nAccounts: Int) -> [Decimal] {
+    /// Effetto delle sole righe **create in app** (``raw_record`` vuoto), inclusa ogni loro modifica/annullo.
+    private static func computeNewRecordsEffect(db: [String: Any], nAccounts: Int, chartAccounts: [[String: Any]]) -> [Decimal] {
         var balances = Array(repeating: Decimal.zero, count: nAccounts)
         guard let years = db["years"] as? [[String: Any]] else { return balances }
         for yd in years {
             for rec in coerceToArrayOfStringKeyedDicts(yd["records"]) {
                 if boolFromJSON(rec["is_cancelled"]) { continue }
-                if !(stringFromJSON(rec["raw_record"]).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) { continue }
+                if !stringFromJSON(rec["raw_record"]).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
                 if boolFromJSON(rec["is_virtuale_discharge"]) { continue }
                 let y = intFromJSON(rec["year"])
                 if isDotazioneRecord(rec), y != legacyDotazioneYear { continue }
                 let amount = parseLooseDecimal(stringFromJSON(rec["amount_eur"])) ?? .zero
-                let i1 = accountCodeZeroBasedIndex(stringFromJSON(rec["account_primary_code"]))
-                let i2 = accountCodeZeroBasedIndex(stringFromJSON(rec["account_secondary_code"]))
+                let i1 = accountColumnIndexInLatestChart(chartAccounts, stringFromJSON(rec["account_primary_code"]))
+                let i2 = accountColumnIndexInLatestChart(chartAccounts, stringFromJSON(rec["account_secondary_code"]))
                 if i1 >= 0, i1 < nAccounts { balances[i1] += amount }
                 if isGirocontoRecord(rec), i2 >= 0, i2 < nAccounts { balances[i2] -= amount }
             }
@@ -815,11 +890,13 @@ public enum ContiDatabase {
         return balances
     }
 
+    /// Compensa nel *sld* l’effetto delle righe **importate annullate** in app.
     private static func computeCancelledImportedAdjustment(
         db: [String: Any],
         latestYear: Int,
         nAccounts: Int,
-        cutoff: String
+        cutoff: String,
+        chartAccounts: [[String: Any]]
     ) -> [Decimal] {
         var adj = Array(repeating: Decimal.zero, count: nAccounts)
         guard let years = db["years"] as? [[String: Any]] else { return adj }
@@ -839,12 +916,222 @@ public enum ContiDatabase {
             let rDate = stringFromJSON(rec["date_iso"])
             if !rDate.isEmpty, rDate > cutoff { continue }
             let amount = -(parseLooseDecimal(stringFromJSON(rec["amount_eur"])) ?? .zero)
-            let i1 = accountCodeZeroBasedIndex(stringFromJSON(rec["account_primary_code"]))
-            let i2 = accountCodeZeroBasedIndex(stringFromJSON(rec["account_secondary_code"]))
+            let i1 = accountColumnIndexInLatestChart(chartAccounts, stringFromJSON(rec["account_primary_code"]))
+            let i2 = accountColumnIndexInLatestChart(chartAccounts, stringFromJSON(rec["account_secondary_code"]))
             if i1 >= 0, i1 < nAccounts { adj[i1] += amount }
             if isGirocontoRecord(rec), i2 >= 0, i2 < nAccounts { adj[i2] -= amount }
         }
         return adj
+    }
+
+    private static func parseAmountLegacyDatField(_ value: String) -> Decimal? {
+        let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "E", with: "")
+            .replacingOccurrences(of: "L", with: "")
+        if clean.isEmpty { return .zero }
+        let pattern = "[+-]?\\d[\\d\\.]*([,\\.]\\d+)?"
+        guard let re = try? NSRegularExpression(pattern: pattern, options: []),
+              let m = re.firstMatch(in: clean, options: [], range: NSRange(location: 0, length: clean.utf16.count)),
+              let sr = Range(m.range, in: clean) else { return nil }
+        let num = String(clean[sr])
+            .replacingOccurrences(of: ".", with: "")
+            .replacingOccurrences(of: ",", with: ".")
+        if num.isEmpty { return nil }
+        return Decimal(string: num)
+    }
+
+    private static func syntheticRecordFromLegacyDatRaw(_ rawLine: String, hostYear: Int) -> [String: Any]? {
+        let line = rawLine
+        guard line.count >= legacyDatRecordLen else { return nil }
+        let i23 = line.index(line.startIndex, offsetBy: 23)
+        let i37 = line.index(line.startIndex, offsetBy: 37)
+        let i39 = line.index(line.startIndex, offsetBy: 39)
+        let i40 = line.index(line.startIndex, offsetBy: 40)
+        let i42 = line.index(line.startIndex, offsetBy: 42)
+        let i43 = line.index(line.startIndex, offsetBy: 43)
+        guard let amt = parseAmountLegacyDatField(String(line[i23..<i37])) else { return nil }
+        let catRaw = String(line[i37..<i39]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let acc1 = String(line[i39..<i40]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let acc2 = String(line[i42..<i43]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let catStr = (!catRaw.isEmpty && catRaw.unicodeScalars.allSatisfy({ CharacterSet.decimalDigits.contains($0) })) ? catRaw : "0"
+        let acc1c = acc1.unicodeScalars.allSatisfy({ CharacterSet.decimalDigits.contains($0) }) ? acc1 : ""
+        let acc2c = acc2.unicodeScalars.allSatisfy({ CharacterSet.decimalDigits.contains($0) }) ? acc2 : ""
+        return [
+            "year": hostYear,
+            "amount_eur": decimalStringForLightJson(amt),
+            "category_code": catStr,
+            "category_name": "",
+            "account_primary_code": acc1c,
+            "account_secondary_code": acc2c,
+        ]
+    }
+
+    private static func recordContributionToBalanceVector(
+        _ rec: [String: Any], nAccounts: Int, chartAccounts: [[String: Any]]
+    ) -> [Decimal] {
+        var out = Array(repeating: Decimal.zero, count: nAccounts)
+        let y = intFromJSON(rec["year"])
+        if isDotazioneRecord(rec), y != legacyDotazioneYear { return out }
+        let amount = parseLooseDecimal(stringFromJSON(rec["amount_eur"])) ?? .zero
+        let i1 = accountColumnIndexInLatestChart(chartAccounts, stringFromJSON(rec["account_primary_code"]))
+        let i2 = accountColumnIndexInLatestChart(chartAccounts, stringFromJSON(rec["account_secondary_code"]))
+        if i1 >= 0, i1 < nAccounts { out[i1] += amount }
+        if isGirocontoRecord(rec), i2 >= 0, i2 < nAccounts { out[i2] -= amount }
+        return out
+    }
+
+    /// Differenza ``contrib(stato attuale) − contrib(blocco .dat originale)`` per ogni riga importata ancora attiva
+    /// e modificata in app: rende visibili nei saldi le modifiche su righe legacy senza ricalcolare il *sld*.
+    private static func computeImportedActiveEditAdjustment(
+        db: [String: Any], latestYear: Int, nAccounts: Int, chartAccounts: [[String: Any]]
+    ) -> [Decimal] {
+        var adj = Array(repeating: Decimal.zero, count: nAccounts)
+        guard let years = db["years"] as? [[String: Any]] else { return adj }
+        for yd in years {
+            let y = intFromJSON(yd["year"])
+            if y > latestYear { continue }
+            for rec in coerceToArrayOfStringKeyedDicts(yd["records"]) {
+                if boolFromJSON(rec["is_cancelled"]) { continue }
+                if boolFromJSON(rec["is_virtuale_discharge"]) { continue }
+                let raw = stringFromJSON(rec["raw_record"]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if raw.isEmpty { continue }
+                if raw.count < legacyDatRecordLen { continue }
+                guard let synth = syntheticRecordFromLegacyDatRaw(raw, hostYear: y) else { continue }
+                let v0 = recordContributionToBalanceVector(synth, nAccounts: nAccounts, chartAccounts: chartAccounts)
+                let v1 = recordContributionToBalanceVector(rec, nAccounts: nAccounts, chartAccounts: chartAccounts)
+                for i in 0 ..< nAccounts { adj[i] += v1[i] - v0[i] }
+            }
+        }
+        return adj
+    }
+
+    /// Saldo assoluto = ``*sld.aco`` + righe app + annulli su righe import + correzione modifiche su righe import.
+    /// Per le colonne con twin import (riga annullata + ancora attiva) si sostituisce col replay che esclude il duplicato.
+    private static func hybridAbsoluteBalancesForSaldi(db: [String: Any], todayCancelCutoff: String) -> [Decimal]? {
+        guard let years = db["years"] as? [[String: Any]], !years.isEmpty else { return nil }
+        let latestYear = years.map { intFromJSON($0["year"]) }.max() ?? 0
+        guard let yearData = years.first(where: { intFromJSON($0["year"]) == latestYear }) else { return nil }
+        let accounts = coerceToArrayOfStringKeyedDicts(yearData["accounts"])
+        let n = accounts.count
+        guard n > 0 else { return nil }
+        let todayC = String(todayCancelCutoff.prefix(10))
+
+        guard let la = legacyAbsoluteAmounts(db: db, nAccounts: n) else {
+            let tk = importCancelTwinBalanceKeys(db: db)
+            return computeBalancesAsOf(
+                db: db, latestYear: latestYear, nAccounts: n, cutoff: todayC,
+                excludeImportTwinActives: !tk.isEmpty, chartAccounts: accounts
+            )
+        }
+        let nfx = computeNewRecordsEffect(db: db, nAccounts: n, chartAccounts: accounts)
+        let canc = computeCancelledImportedAdjustment(
+            db: db, latestYear: latestYear, nAccounts: n, cutoff: todayC, chartAccounts: accounts
+        )
+        let editAdj = computeImportedActiveEditAdjustment(
+            db: db, latestYear: latestYear, nAccounts: n, chartAccounts: accounts
+        )
+        var out = (0 ..< n).map { i in
+            la[i]
+                + (i < nfx.count ? nfx[i] : .zero)
+                + (i < canc.count ? canc[i] : .zero)
+                + (i < editAdj.count ? editAdj[i] : .zero)
+        }
+        let twinTags = importCancelTwinBalanceKeys(db: db)
+        guard !twinTags.isEmpty else { return out }
+        let aff = indicesTouchedByImportTwinActives(db: db, twinTags: twinTags, nAccounts: n, chartAccounts: accounts)
+        guard !aff.isEmpty else { return out }
+        let replayExcl = computeBalancesAsOf(
+            db: db, latestYear: latestYear, nAccounts: n, cutoff: "9999-12-31",
+            excludeImportTwinActives: true, chartAccounts: accounts
+        )
+        for i in aff where i < out.count && i < replayExcl.count {
+            out[i] = replayExcl[i]
+        }
+        return out
+    }
+
+    private static func computeBalancesAsOf(
+        db: [String: Any],
+        latestYear: Int,
+        nAccounts: Int,
+        cutoff: String,
+        excludeImportTwinActives: Bool = false,
+        chartAccounts: [[String: Any]]
+    ) -> [Decimal] {
+        let twinTagSet: Set<String> = excludeImportTwinActives ? importCancelTwinBalanceKeys(db: db) : Set()
+        var pool: [[String: Any]] = []
+        if let years = db["years"] as? [[String: Any]] {
+            for yd in years {
+                let y = intFromJSON(yd["year"])
+                if y > latestYear { continue }
+                pool.append(contentsOf: coerceToArrayOfStringKeyedDicts(yd["records"]))
+            }
+        }
+        pool.sort { recordMergeSortKey($0) < recordMergeSortKey($1) }
+        var balances = Array(repeating: Decimal.zero, count: nAccounts)
+        for rec in pool {
+            if boolFromJSON(rec["is_cancelled"]) { continue }
+            if boolFromJSON(rec["is_virtuale_discharge"]) { continue }
+            if !twinTagSet.isEmpty,
+               !stringFromJSON(rec["raw_record"]).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               twinTagSet.contains(twinKeyTag(importedRecordBalanceTwinKey(rec))) {
+                continue
+            }
+            let y = intFromJSON(rec["year"])
+            if isDotazioneRecord(rec), y != legacyDotazioneYear { continue }
+            let rDate = stringFromJSON(rec["date_iso"])
+            if !rDate.isEmpty, rDate > cutoff { continue }
+            let amount = parseLooseDecimal(stringFromJSON(rec["amount_eur"])) ?? .zero
+            let c1 = stringFromJSON(rec["account_primary_code"])
+            let c2 = stringFromJSON(rec["account_secondary_code"])
+            let i1 = accountColumnIndexInLatestChart(chartAccounts, c1)
+            let i2 = accountColumnIndexInLatestChart(chartAccounts, c2)
+            if i1 >= 0, i1 < nAccounts { balances[i1] += amount }
+            if isGirocontoRecord(rec), i2 >= 0, i2 < nAccounts { balances[i2] -= amount }
+        }
+        return balances
+    }
+
+    private static func computeFutureDatedOnly(
+        db: [String: Any],
+        latestYear: Int,
+        nAccounts: Int,
+        today: String,
+        excludeImportTwinActives: Bool = false,
+        chartAccounts: [[String: Any]]
+    ) -> [Decimal] {
+        let twinTagSet: Set<String> = excludeImportTwinActives ? importCancelTwinBalanceKeys(db: db) : Set()
+        var pool: [[String: Any]] = []
+        if let years = db["years"] as? [[String: Any]] {
+            for yd in years {
+                let y = intFromJSON(yd["year"])
+                if y > latestYear { continue }
+                pool.append(contentsOf: coerceToArrayOfStringKeyedDicts(yd["records"]))
+            }
+        }
+        pool.sort { recordMergeSortKey($0) < recordMergeSortKey($1) }
+        var balances = Array(repeating: Decimal.zero, count: nAccounts)
+        for rec in pool {
+            if boolFromJSON(rec["is_cancelled"]) { continue }
+            if boolFromJSON(rec["is_virtuale_discharge"]) { continue }
+            if !twinTagSet.isEmpty,
+               !stringFromJSON(rec["raw_record"]).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               twinTagSet.contains(twinKeyTag(importedRecordBalanceTwinKey(rec))) {
+                continue
+            }
+            let y = intFromJSON(rec["year"])
+            if isDotazioneRecord(rec), y != legacyDotazioneYear { continue }
+            let rDate = stringFromJSON(rec["date_iso"])
+            if rDate.isEmpty || rDate <= today { continue }
+            let amount = parseLooseDecimal(stringFromJSON(rec["amount_eur"])) ?? .zero
+            let c1 = stringFromJSON(rec["account_primary_code"])
+            let c2 = stringFromJSON(rec["account_secondary_code"])
+            let i1 = accountColumnIndexInLatestChart(chartAccounts, c1)
+            let i2 = accountColumnIndexInLatestChart(chartAccounts, c2)
+            if i1 >= 0, i1 < nAccounts { balances[i1] += amount }
+            if isGirocontoRecord(rec), i2 >= 0, i2 < nAccounts { balances[i2] -= amount }
+        }
+        return balances
     }
 
     private static func accountChartIndexForReferenceCode(accs: [[String: Any]], refCode: String) -> Int? {
@@ -863,7 +1150,11 @@ public enum ContiDatabase {
         return nil
     }
 
-    private static func computeSpeseCcFooterAmounts(saldoAssoluti: [Decimal], accounts: [[String: Any]]) -> [Decimal] {
+    private static func computeSpeseCcFooterAmounts(
+        db: [String: Any],
+        saldoAssoluti: [Decimal],
+        accounts: [[String: Any]]
+    ) -> [Decimal] {
         let n = saldoAssoluti.count
         var out = (0 ..< n).map { _ in Decimal.zero }
         guard n > 0 else { return out }
@@ -872,6 +1163,8 @@ public enum ContiDatabase {
             let ref = stringFromJSON(accounts[i]["credit_card_reference_code"]).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !ref.isEmpty else { continue }
             guard let j = accountChartIndexForReferenceCode(accs: accounts, refCode: ref), j >= 0, j < n, j != i else { continue }
+            let cardCode = stringFromJSON(accounts[i]["code"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !accountHasNonCancelledMovementTouchingCode(db: db, accountCode: cardCode) { continue }
             out[j] = out[j] + saldoAssoluti[i]
         }
         return out
@@ -923,23 +1216,16 @@ public enum ContiDatabase {
         guard n > 0 else { return nil }
         let today = todayIsoLocal()
         let namesFull = accounts.map { stringFromJSON($0["name"]) }
-        let fut = computeFutureDatedOnly(db: db, latestYear: latestYear, nAccounts: n, today: today)
+        let twinTags = importCancelTwinBalanceKeys(db: db)
+        let excludeTwin = !twinTags.isEmpty
+        let fut = computeFutureDatedOnly(
+            db: db, latestYear: latestYear, nAccounts: n, today: today, excludeImportTwinActives: excludeTwin,
+            chartAccounts: accounts
+        )
         guard fut.count == n else { return nil }
+        guard let saldoAbsFull = hybridAbsoluteBalancesForSaldi(db: db, todayCancelCutoff: today), saldoAbsFull.count == n else { return nil }
 
-        let saldoAbsFull: [Decimal]
-        if let la = legacyAbsoluteAmounts(db: db, nAccounts: n) {
-            let nfx = computeNewRecordsEffectSwift(db: db, nAccounts: n)
-            let canc = computeCancelledImportedAdjustment(db: db, latestYear: latestYear, nAccounts: n, cutoff: today)
-            saldoAbsFull = (0 ..< n).map { i in
-                la[i] + (i < nfx.count ? nfx[i] : .zero) + (i < canc.count ? canc[i] : .zero)
-            }
-        } else {
-            let v = computeBalancesAsOf(db: db, latestYear: latestYear, nAccounts: n, cutoff: today)
-            saldoAbsFull = v
-        }
-        guard saldoAbsFull.count == n else { return nil }
-
-        let speseCcFull = computeSpeseCcFooterAmounts(saldoAssoluti: saldoAbsFull, accounts: accounts)
+        let speseCcFull = computeSpeseCcFooterAmounts(db: db, saldoAssoluti: saldoAbsFull, accounts: accounts)
         let ccFlags = (0 ..< n).map { i in i < accounts.count ? boolFromJSON(accounts[i]["credit_card"]) : false }
         let keep = saldiVisibleIndices(db: db, latestAccounts: accounts, namesFull: namesFull)
 
@@ -1221,15 +1507,6 @@ public enum ContiDatabase {
 
     private static func decimalStringForLightJson(_ value: Decimal) -> String {
         NSDecimalNumber(decimal: value).stringValue
-    }
-
-    /// Come `int(c1) - 1 if str(c1).isdigit() else -1` in `main_app.py`.
-    private static func accountCodeZeroBasedIndex(_ code: String) -> Int {
-        guard !code.isEmpty,
-              code.unicodeScalars.allSatisfy({ CharacterSet.decimalDigits.contains($0) }),
-              let v = Int(code)
-        else { return -1 }
-        return v - 1
     }
 
     private static func categoryCodeInt(_ r: [String: Any]) -> Int? {

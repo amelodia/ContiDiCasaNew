@@ -66,6 +66,7 @@ from import_legacy import (
     format_euro_it,
     format_money,
     normalize_euro_input,
+    parse_amount,
     run_import_legacy,
 )
 
@@ -773,6 +774,7 @@ def latest_year_bucket(db: dict) -> dict | None:
 PLAN_REFERENCE_YEAR = 2026
 # Dotazione iniziale (categoria 0) solo nell’anno legacy previsto; altre annate senza dotazione.
 LEGACY_DOTAZIONE_YEAR = 1990
+_LEGACY_DAT_RECORD_LEN = 121
 
 
 def year_bucket_for_calendar_year(db: dict, year: int) -> dict | None:
@@ -1165,48 +1167,51 @@ def account_code_used_any_year(db: dict, code: str) -> bool:
 
 
 def account_balance_for_code_latest_chart(db: dict, account_code: str) -> Decimal | None:
-    """Saldo footer: dopo import legacy = *sld* (2026) + variazioni in app; senza *sld* calcolo da movimenti."""
+    """Saldo **ibrido** come colonna «Saldi assoluti» nel footer Movimenti (stesso vettore di ``hybrid_absolute_balances_for_saldi``).
+
+    Il codice conto è confrontato come nel resto dell’app (es. ``6`` e ``06`` equivalenti), non con ``==`` stretto.
+    """
     if not db.get("years"):
         return Decimal("0")
-    y_ref = year_bucket_for_calendar_year(db, PLAN_REFERENCE_YEAR)
-    if y_ref:
-        ls = y_ref.get("legacy_saldi")
-        accs = y_ref.get("accounts") or []
-        amts = (ls or {}).get("amounts") if isinstance(ls, dict) else None
-        if isinstance(amts, list) and amts:
-            idx = next(
-                (i for i, a in enumerate(accs) if str(a.get("code", "")).strip() == str(account_code).strip()),
-                None,
-            )
-            if idx is not None and idx < len(amts):
-                try:
-                    legacy_val = Decimal(str(amts[idx]))
-                except InvalidOperation:
-                    legacy_val = None
-                if legacy_val is not None:
-                    new_fx = compute_new_records_effect(db)
-                    canc = compute_cancelled_imported_records_balance_adjustment(
-                        db, cutoff_date_iso="9999-12-31"
-                    )
-                    return legacy_val + (new_fx[idx] if idx < len(new_fx) else Decimal("0")) + (
-                        canc[idx] if idx < len(canc) else Decimal("0")
-                    )
-    _ly, _names, bals = compute_balances_from_2022_asof(db, cutoff_date_iso="9999-12-31")
     yb = latest_year_bucket(db)
     if not yb:
         return None
     accs = yb.get("accounts", []) or []
-    idx = next(
-        (i for i, a in enumerate(accs) if str(a.get("code", "")).strip() == str(account_code).strip()),
-        None,
-    )
-    if idx is None or idx >= len(bals):
+    ref = str(account_code).strip()
+    if not ref:
         return None
-    return bals[idx]
+    matches = [
+        i
+        for i, a in enumerate(accs)
+        if _account_codes_equal_for_records(str(a.get("code", "")), ref)
+    ]
+    if len(matches) != 1:
+        return None
+    idx_lat = matches[0]
+    today = date.today().isoformat()[:10]
+    vec = hybrid_absolute_balances_for_saldi(db, today_cancel_cutoff_iso=today)
+    if vec is None or idx_lat >= len(vec):
+        return None
+    return vec[idx_lat]
+
+
+def _canonical_legacy_saldo_code_key(ck: str) -> str:
+    """Chiave per mappare *sld* per codice conto: ``06`` e ``6`` coincidono (come nel resto del piano)."""
+    s = str(ck or "").strip()
+    if not s:
+        return ""
+    if s.isdigit():
+        return str(int(s))
+    return s
 
 
 def legacy_absolute_account_amounts(db: dict, n_accounts: int) -> list[Decimal] | None:
-    """Saldi assoluti da *sld.aco (import 2026), allineati per indice al piano conti corrente; None se assenti."""
+    """Saldi assoluti da *sld.aco (import 2026), allineati al **codice conto** dell'ultimo anno; None se assenti.
+
+    ``legacy_saldi.amounts[j]`` è parallelo all'ordine dei conti nel bucket 2026 all'import; l'ultimo anno può
+    avere stessi codici ma **ordine diverso** (inserimenti, riordino). Non usare ``raw[i]`` con ``i`` indice colonna
+    dell'ultimo anno senza mappare per ``code``.
+    """
     y_ref = year_bucket_for_calendar_year(db, PLAN_REFERENCE_YEAR)
     if not y_ref:
         return None
@@ -1216,15 +1221,35 @@ def legacy_absolute_account_amounts(db: dict, n_accounts: int) -> list[Decimal] 
     raw = ls.get("amounts")
     if not isinstance(raw, list) or not raw:
         return None
+    accs_ref = y_ref.get("accounts") or []
+    legacy_by_code: dict[str, Decimal] = {}
+    for j, a in enumerate(accs_ref):
+        if j >= len(raw):
+            break
+        ck = str(a.get("code", "")).strip()
+        if not ck:
+            continue
+        key = _canonical_legacy_saldo_code_key(ck)
+        if not key:
+            continue
+        try:
+            legacy_by_code[key] = Decimal(str(raw[j]))
+        except InvalidOperation:
+            legacy_by_code[key] = Decimal("0")
+
+    yb = latest_year_bucket(db)
+    if not yb:
+        return None
+    accounts_latest = yb.get("accounts") or []
     out: list[Decimal] = []
     for i in range(n_accounts):
-        if i < len(raw):
-            try:
-                out.append(Decimal(str(raw[i])))
-            except InvalidOperation:
-                out.append(Decimal("0"))
-        else:
+        if i >= len(accounts_latest):
             out.append(Decimal("0"))
+            continue
+        ck = str(accounts_latest[i].get("code", "")).strip()
+        if not ck:
+            ck = str(i + 1)
+        out.append(legacy_by_code.get(_canonical_legacy_saldo_code_key(ck), Decimal("0")))
     return out
 
 
@@ -1296,7 +1321,7 @@ def apply_amount_to_record(rec: dict, amount: Decimal) -> None:
         rec["amount_lire_original"] = format_money(Decimal(li))
         rec["amount_eur"] = format_money((Decimal(li) / EURO_CONVERSION_RATE).quantize(Decimal("0.01")))
     else:
-        rec["amount_eur"] = format_money(amount.quantize(Decimal("0.01")))
+        rec["amount_eur"] = format_money(amount)
 
 
 def year_accounts_map(db: dict) -> dict[int, list[dict[str, str]]]:
@@ -1492,13 +1517,20 @@ def _ver_summary_row_definitions(
     )
 
 
-def compute_balances_from_2022_asof(db: dict, *, cutoff_date_iso: str) -> tuple[int, list[str], list[Decimal]]:
+def compute_balances_from_2022_asof(
+    db: dict,
+    *,
+    cutoff_date_iso: str,
+    exclude_import_twin_actives: bool = False,
+) -> tuple[int, list[str], list[Decimal]]:
     """
     Ricalcolo saldi da tutte le registrazioni (fallback senza *sld*). Non coincide col file *sld* salvo
     replicare esattamente le regole legacy (finestra anni, dotazioni solo 2022, ecc.): per DB post-import
     si usano *sld* + ``compute_new_records_effect`` + eventuale ``compute_cancelled_imported_records_balance_adjustment``.
     Esclude annullate e scarichi virtuali. Dotazione (cat. 0) solo nel 1990. Piano conti = ultimo anno.
     Per saldo totale senza limiti di data usare cutoff_date_iso="9999-12-31".
+    Se ``exclude_import_twin_actives`` è True, esclude dal replay le righe importate ancora attive che hanno
+    una gemella annullata (stessa data/conti/importo), per evitare doppioni rispetto al saldo *sld* + annulli.
     """
     if not db.get("years"):
         return (date.today().year, [], [])
@@ -1506,6 +1538,8 @@ def compute_balances_from_2022_asof(db: dict, *, cutoff_date_iso: str) -> tuple[
     year_data = next(y for y in db["years"] if y["year"] == latest_year)
     accounts = year_data["accounts"]
     n_accounts = len(accounts)
+
+    twin_keys = import_cancel_twin_balance_keys(db) if exclude_import_twin_actives else set()
 
     pool: list[dict] = []
     for yd in db["years"]:
@@ -1521,6 +1555,12 @@ def compute_balances_from_2022_asof(db: dict, *, cutoff_date_iso: str) -> tuple[
             continue
         if rec.get("is_virtuale_discharge"):
             continue
+        if (
+            twin_keys
+            and (rec.get("raw_record") or "").strip()
+            and _imported_record_balance_twin_key(rec) in twin_keys
+        ):
+            continue
         y = int(rec["year"])
         if is_dotazione_record(rec) and y != LEGACY_DOTAZIONE_YEAR:
             continue
@@ -1532,8 +1572,8 @@ def compute_balances_from_2022_asof(db: dict, *, cutoff_date_iso: str) -> tuple[
         c1 = rec.get("account_primary_code", "")
         c2 = rec.get("account_secondary_code", "")
 
-        c1_idx = int(c1) - 1 if str(c1).isdigit() else -1
-        c2_idx = int(c2) - 1 if str(c2).isdigit() else -1
+        c1_idx = account_column_index_in_latest_chart(accounts, c1)
+        c2_idx = account_column_index_in_latest_chart(accounts, c2)
 
         if 0 <= c1_idx < n_accounts:
             balances[c1_idx] += amount
@@ -1570,8 +1610,8 @@ def compute_new_records_effect(db: dict) -> list[Decimal]:
             amount = to_decimal(rec["amount_eur"])
             c1 = rec.get("account_primary_code", "")
             c2 = rec.get("account_secondary_code", "")
-            c1_idx = int(c1) - 1 if str(c1).isdigit() else -1
-            c2_idx = int(c2) - 1 if str(c2).isdigit() else -1
+            c1_idx = account_column_index_in_latest_chart(accounts, c1)
+            c2_idx = account_column_index_in_latest_chart(accounts, c2)
             if 0 <= c1_idx < n_accounts:
                 balances[c1_idx] += amount
             if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts:
@@ -1619,8 +1659,8 @@ def compute_cancelled_imported_records_balance_adjustment(
         amount = -to_decimal(rec["amount_eur"])
         c1 = rec.get("account_primary_code", "")
         c2 = rec.get("account_secondary_code", "")
-        c1_idx = int(c1) - 1 if str(c1).isdigit() else -1
-        c2_idx = int(c2) - 1 if str(c2).isdigit() else -1
+        c1_idx = account_column_index_in_latest_chart(accounts, c1)
+        c2_idx = account_column_index_in_latest_chart(accounts, c2)
         if 0 <= c1_idx < n_accounts:
             adj[c1_idx] += amount
         if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts:
@@ -1628,7 +1668,242 @@ def compute_cancelled_imported_records_balance_adjustment(
     return adj
 
 
-def compute_balances_future_dated_only(db: dict, *, today_iso: str) -> tuple[int, list[str], list[Decimal]]:
+def _record_contribution_to_balance_vector(
+    rec: dict, accounts: list[dict], n_accounts: int
+) -> list[Decimal]:
+    """Effetto della singola registrazione sulle colonne conto (stesse regole di ``compute_balances_from_2022_asof``)."""
+    out = [Decimal("0") for _ in range(n_accounts)]
+    y = int(rec.get("year", 0))
+    if is_dotazione_record(rec) and y != LEGACY_DOTAZIONE_YEAR:
+        return out
+    amount = to_decimal(rec["amount_eur"])
+    c1 = rec.get("account_primary_code", "")
+    c2 = rec.get("account_secondary_code", "")
+    c1_idx = account_column_index_in_latest_chart(accounts, c1)
+    c2_idx = account_column_index_in_latest_chart(accounts, c2)
+    if 0 <= c1_idx < n_accounts:
+        out[c1_idx] += amount
+    if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts:
+        out[c2_idx] -= amount
+    return out
+
+
+def _synthetic_record_from_legacy_dat_raw(raw_line: str, host_year: int) -> dict | None:
+    """Ricostruisce i campi contabili minimi dalla riga .dat originale (121 caratteri) come in ``parse_dat``."""
+    line = raw_line if isinstance(raw_line, str) else str(raw_line)
+    if len(line) < _LEGACY_DAT_RECORD_LEN:
+        return None
+    try:
+        importo_euro_raw = line[23:37]
+        amount_eur = parse_amount(importo_euro_raw)
+        amount_str = format_money(amount_eur)
+    except Exception:
+        return None
+    cat_code_raw = line[37:39].strip()
+    acc1_code = line[39:40].strip()
+    acc2_code = line[42:43].strip()
+    cat_str = cat_code_raw if cat_code_raw.isdigit() else "0"
+    return {
+        "year": host_year,
+        "amount_eur": amount_str,
+        "category_code": cat_str,
+        "category_name": "",
+        "account_primary_code": acc1_code if acc1_code.isdigit() else "",
+        "account_secondary_code": acc2_code if acc2_code.isdigit() else "",
+    }
+
+
+def compute_imported_active_records_edit_balance_adjustment(db: dict) -> list[Decimal]:
+    """Correzione ai saldi *sld*: differenza tra effetto contabile attuale e quello del blocco ``raw_record`` importato.
+
+    Quando si modificano importo o conti (o categoria) su una registrazione ancora legata all'origine .dat,
+    ``compute_new_records_effect`` non la vede (``raw_record`` pieno) e il saldo legacy resterebbe sbagliato:
+    qui si aggiunge ``contrib(attuale) − contrib(originale_file)`` per ogni riga importata non annullata.
+    """
+    if not db.get("years"):
+        return []
+    latest_year = max(y["year"] for y in db["years"])
+    year_data = next(y for y in db["years"] if y["year"] == latest_year)
+    accounts = year_data["accounts"]
+    n_accounts = len(accounts)
+    adj = [Decimal("0") for _ in range(n_accounts)]
+    for yd in db["years"]:
+        y = int(yd["year"])
+        if y > latest_year:
+            continue
+        for rec in yd.get("records") or []:
+            if rec.get("is_cancelled"):
+                continue
+            if rec.get("is_virtuale_discharge"):
+                continue
+            raw = str(rec.get("raw_record") or "").strip()
+            if not raw:
+                continue
+            if len(raw) < _LEGACY_DAT_RECORD_LEN:
+                continue
+            synth = _synthetic_record_from_legacy_dat_raw(raw, y)
+            if synth is None:
+                continue
+            v0 = _record_contribution_to_balance_vector(synth, accounts, n_accounts)
+            v1 = _record_contribution_to_balance_vector(rec, accounts, n_accounts)
+            for i in range(n_accounts):
+                adj[i] += v1[i] - v0[i]
+    return adj
+
+
+def _imported_record_balance_twin_key(rec: dict) -> tuple[str, str, str, str]:
+    """Chiave per confrontare righe importate (stessa data/conti/importo = stesso movimento economico)."""
+    amt_s = str(rec.get("amount_eur") or "").strip()
+    if not amt_s:
+        amt_s = str(to_decimal(rec["amount_eur"]))
+    return (
+        str(rec.get("date_iso", ""))[:10],
+        str(rec.get("account_primary_code", "")).strip(),
+        str(rec.get("account_secondary_code", "")).strip(),
+        amt_s,
+    )
+
+
+def import_cancel_twin_balance_keys(db: dict) -> set[tuple[str, str, str, str]]:
+    """Righe importate (raw_record) presenti sia come annullata sia come ancora attiva: duplicato da escludere nel replay."""
+    imp: list[dict] = []
+    for yb in db.get("years") or []:
+        for rec in yb.get("records") or []:
+            if (rec.get("raw_record") or "").strip():
+                imp.append(rec)
+    c_keys = {_imported_record_balance_twin_key(r) for r in imp if r.get("is_cancelled")}
+    a_keys = {_imported_record_balance_twin_key(r) for r in imp if not r.get("is_cancelled")}
+    return c_keys & a_keys
+
+
+def _indices_touched_by_import_twin_actives(
+    db: dict, twin_keys: set[tuple[str, str, str, str]]
+) -> set[int]:
+    if not twin_keys or not db.get("years"):
+        return set()
+    latest_year = max(y["year"] for y in db["years"])
+    year_data = next(y for y in db["years"] if y["year"] == latest_year)
+    accounts = year_data["accounts"]
+    n_accounts = len(accounts)
+    out: set[int] = set()
+    for yb in db.get("years") or []:
+        for rec in yb.get("records") or []:
+            if rec.get("is_cancelled") or not (rec.get("raw_record") or "").strip():
+                continue
+            if _imported_record_balance_twin_key(rec) not in twin_keys:
+                continue
+            amount = to_decimal(rec["amount_eur"])
+            c1 = rec.get("account_primary_code", "")
+            c2 = rec.get("account_secondary_code", "")
+            c1_idx = account_column_index_in_latest_chart(accounts, c1)
+            c2_idx = account_column_index_in_latest_chart(accounts, c2)
+            if 0 <= c1_idx < n_accounts and amount != 0:
+                out.add(c1_idx)
+            if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts and amount != 0:
+                out.add(c2_idx)
+    return out
+
+
+def _ledger_replay_balances_for_latest_chart(db: dict, *, cutoff_date_iso: str) -> list[Decimal] | None:
+    """Saldi per colonna solo dal replay dei movimenti in archivio (nessun *sld*), con correzione twin import.
+
+    ``cutoff_date_iso``: esclude dal replay le registrazioni con ``date_iso`` successiva (come
+    ``compute_balances_from_2022_asof``). Per l’intero libro usare ``9999-12-31`` (include anche le date future).
+    """
+    if not db.get("years"):
+        return None
+    latest_year = max(y["year"] for y in db["years"])
+    year_data = next(y for y in db["years"] if y["year"] == latest_year)
+    n_accounts = len(year_data.get("accounts") or [])
+    if n_accounts == 0:
+        return None
+    c = (cutoff_date_iso or "9999-12-31")[:10]
+    _, _, replay_incl = compute_balances_from_2022_asof(
+        db, cutoff_date_iso=c, exclude_import_twin_actives=False
+    )
+    if len(replay_incl) != n_accounts:
+        return None
+    tk = import_cancel_twin_balance_keys(db)
+    if not tk:
+        return replay_incl
+    aff = _indices_touched_by_import_twin_actives(db, tk)
+    if not aff:
+        return replay_incl
+    _, _, replay_excl = compute_balances_from_2022_asof(
+        db, cutoff_date_iso=c, exclude_import_twin_actives=True
+    )
+    if len(replay_excl) != n_accounts:
+        return replay_incl
+    out = list(replay_incl)
+    for i in aff:
+        if i < len(out) and i < len(replay_excl):
+            out[i] = replay_excl[i]
+    return out
+
+
+def hybrid_absolute_balances_for_saldi(db: dict, *, today_cancel_cutoff_iso: str) -> list[Decimal] | None:
+    """Saldo assoluto per colonna: **base = saldi *sld.aco*** dell'import (snapshot) + variazioni successive.
+
+    Modello ibrido voluto dall'utente:
+
+    - dopo l'import legacy il saldo coincide con ``*sld.aco`` (``legacy_absolute_account_amounts``);
+    - ogni nuova riga creata in app modifica il saldo (``compute_new_records_effect``);
+    - annullare una riga importata toglie il suo effetto dal *sld* (``compute_cancelled_imported_records_balance_adjustment``);
+    - modificare una riga importata ancora attiva (importo, conti, categoria) corregge il *sld* per la differenza
+      tra effetto attuale e blocco ``raw_record`` originale (``compute_imported_active_records_edit_balance_adjustment``);
+    - se esistono **twin import** (stessa riga importata sia annullata sia ancora attiva), le colonne coinvolte
+      sono sostituite dal replay movimenti che esclude il duplicato attivo, per evitare doppioni rispetto al *sld*.
+
+    Se ``*sld`` non è in archivio (nessun import legacy), si usa il replay completo come fallback.
+    """
+    if not db.get("years"):
+        return None
+    latest_year = max(y["year"] for y in db["years"])
+    year_data = next(y for y in db["years"] if y["year"] == latest_year)
+    n_accounts = len(year_data.get("accounts") or [])
+    if n_accounts == 0:
+        return None
+    today_c = (today_cancel_cutoff_iso or date.today().isoformat())[:10]
+
+    la = legacy_absolute_account_amounts(db, n_accounts)
+    if la is None:
+        _, _, replay = compute_balances_from_2022_asof(
+            db,
+            cutoff_date_iso=today_c,
+            exclude_import_twin_actives=bool(import_cancel_twin_balance_keys(db)),
+        )
+        return replay
+
+    new_fx = compute_new_records_effect(db)
+    canc = compute_cancelled_imported_records_balance_adjustment(db, cutoff_date_iso=today_c)
+    edit_adj = compute_imported_active_records_edit_balance_adjustment(db)
+
+    out = [
+        la[i]
+        + (new_fx[i] if i < len(new_fx) else Decimal("0"))
+        + (canc[i] if i < len(canc) else Decimal("0"))
+        + (edit_adj[i] if i < len(edit_adj) else Decimal("0"))
+        for i in range(n_accounts)
+    ]
+
+    tk = import_cancel_twin_balance_keys(db)
+    if not tk:
+        return out
+    aff = _indices_touched_by_import_twin_actives(db, tk)
+    if not aff:
+        return out
+    _, _, replay_excl = compute_balances_from_2022_asof(
+        db, cutoff_date_iso="9999-12-31", exclude_import_twin_actives=True
+    )
+    for i in aff:
+        if i < len(out) and i < len(replay_excl):
+            out[i] = replay_excl[i]
+    return out
+
+
+def compute_balances_future_dated_only(
+    db: dict, *, today_iso: str, exclude_import_twin_actives: bool = False
+) -> tuple[int, list[str], list[Decimal]]:
     """
     Effetto netto sui conti delle sole registrazioni con `date_iso` > `today_iso`.
     «Saldi alla data di oggi» = saldi assoluti − questi effetti (registrazioni future).
@@ -1639,6 +1914,8 @@ def compute_balances_future_dated_only(db: dict, *, today_iso: str) -> tuple[int
     year_data = next(y for y in db["years"] if y["year"] == latest_year)
     accounts = year_data["accounts"]
     n_accounts = len(accounts)
+
+    twin_keys = import_cancel_twin_balance_keys(db) if exclude_import_twin_actives else set()
 
     pool: list[dict] = []
     for yd in db["years"]:
@@ -1654,6 +1931,12 @@ def compute_balances_future_dated_only(db: dict, *, today_iso: str) -> tuple[int
             continue
         if rec.get("is_virtuale_discharge"):
             continue
+        if (
+            twin_keys
+            and (rec.get("raw_record") or "").strip()
+            and _imported_record_balance_twin_key(rec) in twin_keys
+        ):
+            continue
         y = int(rec["year"])
         if is_dotazione_record(rec) and y != LEGACY_DOTAZIONE_YEAR:
             continue
@@ -1665,8 +1948,8 @@ def compute_balances_future_dated_only(db: dict, *, today_iso: str) -> tuple[int
         c1 = rec.get("account_primary_code", "")
         c2 = rec.get("account_secondary_code", "")
 
-        c1_idx = int(c1) - 1 if str(c1).isdigit() else -1
-        c2_idx = int(c2) - 1 if str(c2).isdigit() else -1
+        c1_idx = account_column_index_in_latest_chart(accounts, c1)
+        c2_idx = account_column_index_in_latest_chart(accounts, c2)
 
         if 0 <= c1_idx < n_accounts:
             balances[c1_idx] += amount
@@ -1707,12 +1990,55 @@ def _account_chart_index_for_code(accs: list[dict], ref_code: str) -> int | None
     return None
 
 
+def account_column_index_in_latest_chart(accounts: list[dict], code_raw: object) -> int:
+    """Indice colonna (0..n-1) nel piano ``accounts`` per codice conto registrazione; -1 se assente.
+
+    Non usare ``int(codice) - 1``: l'ordine dei conti nell'ultimo anno può non coincidere con la numerazione,
+    mentre ``legacy_absolute_account_amounts`` e l'header Saldi sono allineati al **codice**."""
+    j = _account_chart_index_for_code(accounts, str(code_raw or "").strip())
+    return j if j is not None else -1
+
+
+def _account_codes_equal_for_records(a: str, b: str) -> bool:
+    x, y = str(a or "").strip(), str(b or "").strip()
+    if not x or not y:
+        return False
+    if x == y:
+        return True
+    if x.isdigit() and y.isdigit():
+        return int(x) == int(y)
+    return False
+
+
+def account_has_non_cancelled_movement_touching_code(db: dict, account_code: str) -> bool:
+    """True se esiste almeno una registrazione non annullata (esclusi scarichi virtuali) che coinvolge il codice."""
+    code = str(account_code or "").strip()
+    if not code:
+        return False
+    for yd in db.get("years") or []:
+        for rec in yd.get("records") or []:
+            if rec.get("is_cancelled"):
+                continue
+            if rec.get("is_virtuale_discharge"):
+                continue
+            c1 = str(rec.get("account_primary_code", "") or "").strip()
+            if _account_codes_equal_for_records(c1, code):
+                return True
+            if is_giroconto_record(rec):
+                c2 = str(rec.get("account_secondary_code", "") or "").strip()
+                if _account_codes_equal_for_records(c2, code):
+                    return True
+    return False
+
+
 def compute_spese_cc_footer_amounts(db: dict, saldo_assoluti: list[Decimal]) -> list[Decimal]:
     """Riga «Spese per carte di credito» per colonna conto (ordine = saldi / piano ultimo anno).
 
-    Parte da ``compute_credit_card_impegni_by_account_index``; per ogni conto con ``credit_card``,
-    somma il **saldo assoluto** della carta nella colonna del conto di riferimento
-    (``credit_card_reference_code``), non nella colonna della carta.
+    Parte da ``compute_credit_card_impegni_by_account_index``; per ogni conto con ``credit_card`` che ha
+    **almeno una registrazione** (non annullata) che lo coinvolge, somma il **saldo assoluto** della carta
+    nella colonna del conto di riferimento (``credit_card_reference_code``), non nella colonna della carta.
+    Colonne carta senza movimenti in libro (solo residui *sld*/piano) non contribuiscono, così non alterano
+    il conto di appoggio.
 
     Più carte collegate allo **stesso** conto ordinario contribuiscono in **somma** a quella colonna;
     il valore è ricalcolato a ogni aggiornamento dei saldi (nessuna cache).
@@ -1735,6 +2061,9 @@ def compute_spese_cc_footer_amounts(db: dict, saldo_assoluti: list[Decimal]) -> 
         j = _account_chart_index_for_code(accs, ref)
         if j is None or j < 0 or j >= n or j == i:
             continue
+        card_code = str(acc.get("code", "") or "").strip()
+        if not account_has_non_cancelled_movement_touching_code(db, card_code):
+            continue
         out[j] = out[j] + saldo_assoluti[i]
     return out
 
@@ -1747,27 +2076,21 @@ def saldi_footer_amount_vectors(db: dict, *, today_iso: str | None = None) -> di
     if not db.get("years"):
         return None
     today = (today_iso or date.today().isoformat())[:10]
-    _, names_full, amts_future_full = compute_balances_future_dated_only(db, today_iso=today)
     latest_year = max(int(y["year"]) for y in db["years"])
     year_data = next(y for y in db["years"] if int(y["year"]) == latest_year)
     accounts = year_data.get("accounts") or []
     n_accounts = len(accounts)
-    if n_accounts == 0 or len(names_full) != n_accounts or len(amts_future_full) != n_accounts:
+    if n_accounts == 0:
         return None
-    la = legacy_absolute_account_amounts(db, n_accounts)
-    if la is not None:
-        new_fx = compute_new_records_effect(db)
-        canc = compute_cancelled_imported_records_balance_adjustment(db, cutoff_date_iso=today)
-        saldo_abs_full = [
-            la[i]
-            + (new_fx[i] if i < len(new_fx) else Decimal("0"))
-            + (canc[i] if i < len(canc) else Decimal("0"))
-            for i in range(n_accounts)
-        ]
-    else:
-        _, _, saldo_abs_full = compute_balances_from_2022_asof(db, cutoff_date_iso=today)
-        if len(saldo_abs_full) != n_accounts:
-            return None
+    tk_flag = bool(import_cancel_twin_balance_keys(db))
+    _, names_full, amts_future_full = compute_balances_future_dated_only(
+        db, today_iso=today, exclude_import_twin_actives=tk_flag
+    )
+    if len(names_full) != n_accounts or len(amts_future_full) != n_accounts:
+        return None
+    saldo_abs_full = hybrid_absolute_balances_for_saldi(db, today_cancel_cutoff_iso=today)
+    if saldo_abs_full is None or len(saldo_abs_full) != n_accounts:
+        return None
     cc_full = account_is_credit_card_column_flags(db, n_accounts)
     spese_cc_full = compute_spese_cc_footer_amounts(db, saldo_abs_full)
     _keep = saldi_visible_account_column_indices(db, list(names_full))
@@ -7099,21 +7422,17 @@ th {{ background:#efefef; text-align:left; }}
 
     def _saldi_snapshot_for_print() -> dict:
         today_iso = date.today().isoformat()
-        _, names, amts_future = compute_balances_future_dated_only(cur_db(), today_iso=today_iso)
-        la = legacy_absolute_account_amounts(cur_db(), len(names))
-        if la is not None:
-            new_fx = compute_new_records_effect(cur_db())
-            canc = compute_cancelled_imported_records_balance_adjustment(
-                cur_db(), cutoff_date_iso=today_iso
+        tk_flag = bool(import_cancel_twin_balance_keys(cur_db()))
+        _, names, amts_future = compute_balances_future_dated_only(
+            cur_db(), today_iso=today_iso, exclude_import_twin_actives=tk_flag
+        )
+        saldo_h = hybrid_absolute_balances_for_saldi(cur_db(), today_cancel_cutoff_iso=today_iso)
+        if saldo_h is None or len(saldo_h) != len(names):
+            _, _, saldo_abs_full = compute_balances_from_2022_asof(
+                cur_db(), cutoff_date_iso=today_iso, exclude_import_twin_actives=tk_flag
             )
-            saldo_abs_full = [
-                la[i]
-                + (new_fx[i] if i < len(new_fx) else Decimal("0"))
-                + (canc[i] if i < len(canc) else Decimal("0"))
-                for i in range(len(names))
-            ]
         else:
-            _, _, saldo_abs_full = compute_balances_from_2022_asof(cur_db(), cutoff_date_iso=today_iso)
+            saldo_abs_full = saldo_h
         cc_full = account_is_credit_card_column_flags(cur_db(), len(names))
         spese_cc_full = compute_spese_cc_footer_amounts(cur_db(), saldo_abs_full)
         _keep_sp = saldi_visible_account_column_indices(cur_db(), names)
@@ -7818,21 +8137,17 @@ th {{ background:#efefef; text-align:left; }}
     def refresh_balance_footer() -> None:
         balance_center_canvas.delete("all")
         today_iso = date.today().isoformat()
-        _, names, amts_future = compute_balances_future_dated_only(cur_db(), today_iso=today_iso)
-        la = legacy_absolute_account_amounts(cur_db(), len(names))
-        if la is not None:
-            new_fx = compute_new_records_effect(cur_db())
-            canc = compute_cancelled_imported_records_balance_adjustment(
-                cur_db(), cutoff_date_iso=today_iso
+        tk_flag = bool(import_cancel_twin_balance_keys(cur_db()))
+        _, names, amts_future = compute_balances_future_dated_only(
+            cur_db(), today_iso=today_iso, exclude_import_twin_actives=tk_flag
+        )
+        saldo_h = hybrid_absolute_balances_for_saldi(cur_db(), today_cancel_cutoff_iso=today_iso)
+        if saldo_h is None or len(saldo_h) != len(names):
+            _, _, saldo_abs_full = compute_balances_from_2022_asof(
+                cur_db(), cutoff_date_iso=today_iso, exclude_import_twin_actives=tk_flag
             )
-            saldo_abs_full = [
-                la[i]
-                + (new_fx[i] if i < len(new_fx) else Decimal("0"))
-                + (canc[i] if i < len(canc) else Decimal("0"))
-                for i in range(len(names))
-            ]
         else:
-            _, _, saldo_abs_full = compute_balances_from_2022_asof(cur_db(), cutoff_date_iso=today_iso)
+            saldo_abs_full = saldo_h
         cc_full = account_is_credit_card_column_flags(cur_db(), len(names))
         spese_cc_full = compute_spese_cc_footer_amounts(cur_db(), saldo_abs_full)
         _keep_saldi = saldi_visible_account_column_indices(cur_db(), names)
@@ -8340,28 +8655,17 @@ th {{ background:#efefef; text-align:left; }}
 
     def _cassa_balance_euro_asof(d_iso: str) -> Decimal | None:
         try:
-            _, names, balances = compute_balances_from_2022_asof(cur_db(), cutoff_date_iso=d_iso)
+            d_cut = (d_iso or "")[:10]
+            combined = hybrid_absolute_balances_for_saldi(cur_db(), today_cancel_cutoff_iso=d_cut)
+            if combined is None:
+                return None
+            yb = latest_year_bucket(cur_db())
+            names = [str(a.get("name", "") or "").strip() for a in (yb or {}).get("accounts", []) or []]
+            for i, n in enumerate(names):
+                if n.strip().lower() == "cassa" and i < len(combined):
+                    return combined[i]
         except Exception:
             return None
-        la = legacy_absolute_account_amounts(cur_db(), len(names))
-        if la is not None:
-            new_fx = compute_new_records_effect(cur_db())
-            canc = compute_cancelled_imported_records_balance_adjustment(
-                cur_db(), cutoff_date_iso=d_iso
-            )
-            combined = [
-                la[i]
-                + (new_fx[i] if i < len(new_fx) else Decimal("0"))
-                + (canc[i] if i < len(canc) else Decimal("0"))
-                for i in range(len(names))
-            ]
-            for i, n in enumerate(names):
-                if n.strip().lower() == "cassa":
-                    return combined[i]
-        else:
-            for i, n in enumerate(names):
-                if n.strip().lower() == "cassa":
-                    return balances[i]
         return None
 
     def _is_consumi_ordinari_e_cassa_selection() -> bool:
@@ -15527,22 +15831,18 @@ th {{ background:#efefef; text-align:left; }}
             else:
                 unverified_after.append((reg_n, rec, side))
         latest_yb = latest_year_bucket(d)
-        names = [a["name"] for a in (latest_yb or {}).get("accounts", [])] if latest_yb else []
-        acc_idx = int(ac) - 1 if ac.isdigit() else -1
-        la = legacy_absolute_account_amounts(d, len(names))
-        if la is not None:
-            new_fx = compute_new_records_effect(d)
-            canc = compute_cancelled_imported_records_balance_adjustment(
-                d, cutoff_date_iso="9999-12-31"
-            )
-            saldo_assoluti = [
-                la[i]
-                + (new_fx[i] if i < len(new_fx) else Decimal("0"))
-                + (canc[i] if i < len(canc) else Decimal("0"))
-                for i in range(len(names))
-            ]
+        accs_latest = (latest_yb or {}).get("accounts", []) or []
+        names = [a["name"] for a in accs_latest] if latest_yb else []
+        acc_idx = account_column_index_in_latest_chart(accs_latest, ac)
+        today_v = date.today().isoformat()[:10]
+        vec = hybrid_absolute_balances_for_saldi(d, today_cancel_cutoff_iso=today_v)
+        if vec is not None and len(vec) == len(names):
+            saldo_assoluti = vec
         else:
-            _, _, saldo_assoluti = compute_balances_from_2022_asof(d, cutoff_date_iso="9999-12-31")
+            tk = bool(import_cancel_twin_balance_keys(d))
+            _, _, saldo_assoluti = compute_balances_from_2022_asof(
+                d, cutoff_date_iso="9999-12-31", exclude_import_twin_actives=tk
+            )
         current_balance = saldo_assoluti[acc_idx] if 0 <= acc_idx < len(saldo_assoluti) else Decimal("0")
         projected = current_balance - sum_unverified
         count_unverified = len(unverified_before) + len(unverified_after)
@@ -16599,13 +16899,14 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         _plan_acc_red_dis_bg = "#bdbdbd"
         _plan_acc_red_dis_fg = "#e0e0e0"
         for ri, a in enumerate(merged_acc, start=1):
-            code = str(a.get("code", str(ri))).strip()
+            raw_code = a.get("code")
+            code = str(raw_code).strip() if raw_code is not None else ""
             raw_nm = str(a.get("name", "") or "")
             locked_acc = plan_conti_account_is_cassa(raw_nm)
             is_frozen = bool(a.get("frozen"))
             stem_raw = str(a.get("estratti_pdf_stem") or "").strip()
             stem_v = tk.StringVar(value=stem_raw)
-            bal = account_balance_for_code_latest_chart(d, code)
+            bal = None if not code else account_balance_for_code_latest_chart(d, code)
             bal_s = "—" if bal is None else format_euro_it(bal)
             is_cc_row = bool(a.get("credit_card"))
             ref_cd = str(a.get("credit_card_reference_code") or "").strip()
@@ -16624,7 +16925,7 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                     "frozen_acc": is_frozen,
                 }
             )
-            ttk.Label(plan_acc_grid, text=code).grid(row=ri, column=0, sticky="w", padx=2, pady=1)
+            ttk.Label(plan_acc_grid, text=(code or "—")).grid(row=ri, column=0, sticky="w", padx=2, pady=1)
             row_locked = locked_acc or is_frozen
             ttk.Label(plan_acc_grid, text=raw_nm, wraplength=360).grid(row=ri, column=1, sticky="we", padx=2, pady=1)
             if is_frozen:
@@ -17348,7 +17649,6 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                 except Exception as ex:
                     err.configure(text=str(ex))
                     return
-                amt = amt.quantize(Decimal("0.01"))
                 if amt == Decimal("0") or amt == Decimal("0.00"):
                     _append_account_all_years(_base_new_acc(name_stored))
                     if not _save_db_after_change():
@@ -18815,11 +19115,8 @@ def main() -> None:
             pass
         return
 
-    try:
-        root.deiconify()
-        root.lift()
-    except Exception:
-        pass
+    # Non mostrare la root qui: evita il flash di una cornice vuota prima del dialogo cartella dati / login
+    # (i Toplevel usano ``parent`` anche con root ``withdraw()``).
 
     if not data_workspace.configure_data_workspace_interactive(root):
         print("Avvio annullato: cartella dati non configurata.", file=sys.stderr)
@@ -18852,14 +19149,7 @@ def main() -> None:
                 pass
             return
 
-    # Root ridotta al minimo: serve come master per lo splash Dropbox; evita la cornice vuota grande.
-    try:
-        root.deiconify()
-        root.minsize(1, 1)
-        root.geometry("1x1+0+0")
-        root.update_idletasks()
-    except Exception:
-        pass
+    # Root resta nascosta: lo splash Dropbox è un Toplevel; ``deiconify`` qui causava un flash visivo.
 
     db, resolved_path = load_database_at_startup(sync_ui_parent=root)
 

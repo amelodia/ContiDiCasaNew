@@ -292,7 +292,10 @@ def run_first_access_wizard_if_needed(
         win.transient(parent)
     except Exception:
         pass
-    win.grab_set()
+    try:
+        win.withdraw()
+    except Exception:
+        pass
     frm = ttk.Frame(win, padding=16)
     frm.pack(fill=tk.BOTH, expand=True)
 
@@ -412,6 +415,15 @@ def run_first_access_wizard_if_needed(
         except Exception:
             pass
 
+    try:
+        win.deiconify()
+    except Exception:
+        pass
+    try:
+        win.grab_set()
+    except Exception:
+        pass
+
     _present_modal_dialog(win, parent)
     parent.wait_window(win)
     return result[0] is True
@@ -436,7 +448,11 @@ def run_login_dialog(
     except Exception:
         pass
     win.resizable(False, False)
-    win.grab_set()
+    # Evita il flash su macOS: la finestra non va mappata finché layout e geometria non sono pronti.
+    try:
+        win.withdraw()
+    except Exception:
+        pass
 
     _login_style = ttk.Style()
     try:
@@ -716,6 +732,15 @@ def run_login_dialog(
         h = min(rh, int(sh * 0.88))
         win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 3}")
         win.minsize(w, h)
+    except Exception:
+        pass
+
+    try:
+        win.deiconify()
+    except Exception:
+        pass
+    try:
+        win.grab_set()
     except Exception:
         pass
 
