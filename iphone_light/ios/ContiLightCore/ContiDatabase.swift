@@ -760,7 +760,7 @@ public enum ContiDatabase {
     }
 
     /// Allineato a ``account_column_index_in_latest_chart`` in ``main_app.py``: colonna = codice nel piano, non posizione ``codice-1``.
-    private static func accountColumnIndexInLatestChart(_ chartAccounts: [[String: Any]], codeRaw: String) -> Int {
+    private static func accountColumnIndexInLatestChart(_ chartAccounts: [[String: Any]], _ codeRaw: String) -> Int {
         let r = codeRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !r.isEmpty else { return -1 }
         return accountChartIndexForReferenceCode(accs: chartAccounts, refCode: r) ?? -1
@@ -1030,11 +1030,14 @@ public enum ContiDatabase {
         let editAdj = computeImportedActiveEditAdjustment(
             db: db, latestYear: latestYear, nAccounts: n, chartAccounts: accounts
         )
-        var out = (0 ..< n).map { i in
-            la[i]
-                + (i < nfx.count ? nfx[i] : .zero)
-                + (i < canc.count ? canc[i] : .zero)
-                + (i < editAdj.count ? editAdj[i] : .zero)
+        var out: [Decimal] = []
+        out.reserveCapacity(n)
+        for i in 0 ..< n {
+            var v: Decimal = la[i]
+            if i < nfx.count { v += nfx[i] }
+            if i < canc.count { v += canc[i] }
+            if i < editAdj.count { v += editAdj[i] }
+            out.append(v)
         }
         let twinTags = importCancelTwinBalanceKeys(db: db)
         guard !twinTags.isEmpty else { return out }
