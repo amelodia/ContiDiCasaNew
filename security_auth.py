@@ -20,10 +20,9 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any, Callable
 
-SaveFn = Callable[[], None]
+from app_version import APP_VERSION
 
-# Versione mostrata nella finestra di accesso (allineare al rilascio).
-APP_VERSION = "1.0.0"
+SaveFn = Callable[[], None]
 
 # Sfondo azzurro chiaro (login, pagina Movimenti e altre UI allineate).
 CDC_AZZURRO_CHIARO_BG = "#d8ecf5"

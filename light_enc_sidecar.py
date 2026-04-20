@@ -7,7 +7,7 @@ Sidecar cifrato per l'app iOS light: ``*_light.enc`` nella stessa cartella del f
 - All'avvio il desktop importa dal file light le righe create sul telefono, riconosciute
   dal campo ``conti_light_record_id`` (UUID), e le fonde nel DB principale.
 - Il JSON light include ``light_saldi`` (saldi allineati al **footer Saldi** del desktop: assoluti, alla data,
-  spese future, spese per carte di credito sulle colonne di riferimento, disponibilità; conti congelati esclusi)
+  di cui spese future, spese per carte di credito sulle colonne di riferimento, disponibilità (assoluti+CC, senza spese future); conti congelati esclusi)
   calcolati sul **DB completo**, così l'app iOS non ricostruisce i saldi dai soli movimenti nella finestra mobile.
 
 L'app light usa la stessa **cartella dati** scelta sul desktop: ``.key``, ``conti_utente_<hash>.enc`` e
@@ -31,8 +31,17 @@ LIGHT_RECORD_ID_KEY = "conti_light_record_id"
 
 
 def light_enc_path_for_primary(primary_enc: Path) -> Path:
-    """Es. ``…/conti_utente_<hash>.enc`` → ``…/conti_utente_<hash>_light.enc`` nella stessa cartella."""
-    return primary_enc.parent / f"{primary_enc.stem}_light.enc"
+    """Es. ``…/conti_utente_<hash>.enc`` → ``…/conti_utente_<hash>_light.enc`` nella stessa cartella.
+
+    Se si passa per errore un path che è già ``*_light.enc`` (o con più ``_light`` nel nome, es. dopo
+    copie o impostazione errata in Opzioni), i suffissi ``_light`` finali nello *stem* vengono tolti
+    **prima** di aggiungerne uno solo, così non si generano ``*_light_light_light.enc`` in serie.
+    """
+    stem = primary_enc.stem
+    _suf = "_light"
+    while stem.endswith(_suf) and len(stem) > len(_suf):
+        stem = stem[: -len(_suf)]
+    return primary_enc.parent / f"{stem}{_suf}.enc"
 
 
 def light_window_start_iso(*, today: date | None = None) -> str:

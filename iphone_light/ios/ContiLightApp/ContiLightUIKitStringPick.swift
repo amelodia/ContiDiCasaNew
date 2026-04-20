@@ -134,6 +134,44 @@ final class ContiLightCodePickTableVC: UITableViewController {
         clearsSelectionOnViewWillAppear = false
     }
 
+    override var canBecomeFirstResponder: Bool { true }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        _ = becomeFirstResponder()
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        resignFirstResponder()
+    }
+
+    /// Allineato al desktop: tasto lettera → prima riga il cui nome inizia con quella lettera (se esiste).
+    override var keyCommands: [UIKeyCommand]? {
+        var cmds: [UIKeyCommand] = []
+        for ch in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" {
+            cmds.append(UIKeyCommand(input: String(ch), modifierFlags: [], action: #selector(onLetterKey(_:))))
+        }
+        return cmds
+    }
+
+    @objc private func onLetterKey(_ sender: UIKeyCommand) {
+        guard let inp = sender.input, let ch = inp.first, ch.isLetter else { return }
+        let want = String(ch).lowercased()
+        let offset = includeNone ? 1 : 0
+        for (i, r) in rows.enumerated() {
+            let trimmed = r.label.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let firstChar = trimmed.first else { continue }
+            if String(firstChar).lowercased() == want {
+                let row = i + offset
+                let ip = IndexPath(row: row, section: 0)
+                tableView.scrollToRow(at: ip, at: .middle, animated: true)
+                onPick?(r.code)
+                return
+            }
+        }
+    }
+
     override func tableView(_: UITableView, numberOfRowsInSection _: Int) -> Int {
         (includeNone ? 1 : 0) + rows.count
     }

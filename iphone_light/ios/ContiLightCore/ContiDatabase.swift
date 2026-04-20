@@ -44,6 +44,8 @@ public struct ContiSaldRiga: Identifiable, Hashable, Sendable {
 public struct ContiImmissioneCategoria: Hashable, Sendable {
     public let code: String
     public let displayName: String
+    /// Nome categoria così com’è nel piano JSON (prefisso segno `+`/`-`/`=` incluso), come ``category_name`` sul desktop.
+    public let storageName: String
     public let planNote: String
 }
 
@@ -62,6 +64,17 @@ public enum ContiDBError: Error {
     case cannotDecrypt
     case cannotEncrypt
     case invalidJSON
+}
+
+/// Validazione / salvataggio immissione da app light.
+public enum ContiLightImmissioneError: Error, LocalizedError {
+    case message(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .message(let s): return s
+        }
+    }
 }
 
 extension ContiDBError: LocalizedError {
@@ -459,6 +472,7 @@ public enum ContiDatabase {
             guard let recs = yd["records"] as? [[String: Any]] else { continue }
             for r in recs {
                 if isDotazioneRecord(r) { continue }
+                if boolFromJSON(r["is_cancelled"]) { continue }
                 let si = intFromJSON(r["source_index"])
                 let key = (r["legacy_registration_key"] as? String) ?? ""
                 let id = key.isEmpty ? "\(year)-\(si)-\(rows.count)" : "\(year)-\(key)"
@@ -1184,7 +1198,7 @@ public enum ContiDatabase {
             m["spese_future"] = decimalStringForLightJson(sf)
             let isCc = boolFromJSON(m["credit_card"])
             let scc = parseLooseDecimal(stringFromJSON(m["spese_cc"])) ?? .zero
-            let disp = isCc ? Decimal.zero : (a + sf + scc)
+            let disp = isCc ? Decimal.zero : (a + scc)
             m["disponibilita"] = decimalStringForLightJson(disp)
             newRows.append(m)
         }
@@ -1206,7 +1220,7 @@ public enum ContiDatabase {
             "saldo_assoluti_non_cc": decimalStringForLightJson(tAbs),
             "spese_future_non_cc": decimalStringForLightJson(tSf),
             "spese_cc_non_cc": decimalStringForLightJson(tScc),
-            "disponibilita_non_cc": decimalStringForLightJson(tAbs + tSf + tScc),
+            "disponibilita_non_cc": decimalStringForLightJson(tAbs + tScc),
         ]
     }
 
@@ -1239,7 +1253,7 @@ public enum ContiDatabase {
             let scc = i < speseCcFull.count ? speseCcFull[i] : .zero
             let cc = i < ccFlags.count ? ccFlags[i] : false
             let oggi = a - sf
-            let disp = cc ? Decimal.zero : (a + sf + scc)
+            let disp = cc ? Decimal.zero : (a + scc)
             let code = stringFromJSON(accounts[i]["code"]).trimmingCharacters(in: .whitespacesAndNewlines)
             rows.append([
                 "account_code": code.isEmpty ? String(i + 1) : code,
@@ -1270,7 +1284,7 @@ public enum ContiDatabase {
                 "saldo_assoluti_non_cc": decimalStringForLightJson(tAbs),
                 "spese_future_non_cc": decimalStringForLightJson(tSf),
                 "spese_cc_non_cc": decimalStringForLightJson(tScc),
-                "disponibilita_non_cc": decimalStringForLightJson(tAbs + tSf + tScc),
+                "disponibilita_non_cc": decimalStringForLightJson(tAbs + tScc),
             ],
         ]
     }
@@ -1421,6 +1435,321 @@ public enum ContiDatabase {
         return added
     }
 
+    // MARK: - Immissione light → .enc (merge completo + saldi)
+
+    private static let maxRecordNoteLen = 100
+    private static let maxChequeLen = 12
+
+    /// Copia profonda del dizionario DB (mutazioni sicure).
+    public static func deepCopyDb(_ db: [String: Any]) throws -> [String: Any] {
+        let data = try JSONSerialization.data(withJSONObject: db, options: [])
+        guard let copy = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ContiDBError.invalidJSON
+        }
+        return copy
+    }
+
+    /// Come ``immissione_date_bounds`` / ``format_money`` sul desktop.
+    public static func immissioneDateBoundsIso() -> (minIso: String, maxIso: String) {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = .current
+        let today = Date()
+        let dMin = cal.date(byAdding: .year, value: -1, to: today) ?? today
+        let dMax = cal.date(byAdding: .year, value: 1, to: today) ?? today
+        func iso(_ d: Date) -> String {
+            let c = cal.dateComponents([.year, .month, .day], from: d)
+            guard let y = c.year, let m = c.month, let da = c.day else { return todayIsoLocal() }
+            return String(format: "%04d-%02d-%02d", y, m, da)
+        }
+        return (iso(dMin), iso(dMax))
+    }
+
+    /// Calendario immissione: da stringa `yyyy-MM-dd` a mezzanotte nel fuso locale.
+    public static func dateFromIsoCalendarLocal(_ iso: String) -> Date? {
+        let p = String(iso.prefix(10))
+        let parts = p.split(separator: "-")
+        guard parts.count == 3,
+              let y = Int(parts[0]), let m = Int(parts[1]), let d = Int(parts[2])
+        else { return nil }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = .current
+        return cal.date(from: DateComponents(year: y, month: m, day: d))
+    }
+
+    public static func isoDateStringFromDateLocal(_ date: Date) -> String {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = .current
+        let c = cal.dateComponents([.year, .month, .day], from: date)
+        guard let y = c.year, let m = c.month, let d = c.day else { return todayIsoLocal() }
+        return String(format: "%04d-%02d-%02d", y, m, d)
+    }
+
+    /// True se l’importo è valido per il salvataggio (non zero, formato accettato).
+    public static func lightImmissioneAmountIsValidNonZero(amountText: String, girataSelected: Bool) -> Bool {
+        (try? parseAmountForNewRecordImmissione(amountText: amountText, girata: girataSelected)) != nil
+    }
+
+    /// Serializzazione importo: due decimali, punto (stesso schema JSON del desktop).
+    public static func formatMoneyForDb(_ value: Decimal) -> String {
+        let n = NSDecimalNumber(decimal: value)
+        let h = NSDecimalNumberHandler(
+            roundingMode: .plain,
+            scale: 2,
+            raiseOnExactness: false,
+            raiseOnOverflow: false,
+            raiseOnUnderflow: false,
+            raiseOnDivideByZero: false
+        )
+        let r = n.rounding(accordingToBehavior: h)
+        let f = NumberFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.numberStyle = .decimal
+        f.minimumFractionDigits = 2
+        f.maximumFractionDigits = 2
+        return f.string(from: r) ?? "0.00"
+    }
+
+    private static func sanitizeLightImmissioneLine(_ raw: String, maxLen: Int) -> String {
+        let t = raw
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.count <= maxLen { return t }
+        return String(t.prefix(maxLen))
+    }
+
+    private static func accountCodeFrozenInDb(db: [String: Any], accountCode: String) -> Bool {
+        let code = accountCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        if code.isEmpty { return false }
+        guard let years = db["years"] as? [[String: Any]], !years.isEmpty else { return false }
+        let yMax = years.map { intFromJSON($0["year"]) }.max() ?? 0
+        guard let yd = years.first(where: { intFromJSON($0["year"]) == yMax }) else { return false }
+        let accs = coerceToArrayOfStringKeyedDicts(yd["accounts"])
+        for a in accs {
+            let c = stringFromJSON(a["code"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if accountCodesEqualForRecords(c, code) {
+                return boolFromJSON(a["frozen"])
+            }
+        }
+        return false
+    }
+
+    /// Importo: girata → sempre negativa in modulo; altrimenti segno da prefisso `+` / `−` / `-` sul testo.
+    private static func parseAmountForNewRecordImmissione(amountText: String, girata: Bool) throws -> Decimal {
+        var s = amountText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var signNeg = false
+        if let f = s.first {
+            if f == "-" || f == "−" {
+                signNeg = true
+                s.removeFirst()
+            } else if f == "+" {
+                s.removeFirst()
+            }
+        }
+        guard let mag = parseLooseDecimal(s), mag != .zero else {
+            throw ContiLightImmissioneError.message("Importo non valido o a zero.")
+        }
+        let a = abs(mag)
+        if girata { return -a }
+        return signNeg ? -a : a
+    }
+
+    /**
+     Costruisce il dizionario registrazione (prima dell’append in sessione): ``conti_light_record_id`` UUID,
+     campi allineati a ``_collect_new_record_payload`` in ``main_app.py``.
+     */
+    public static func buildNewLightRecordTemplate(
+        db: [String: Any],
+        catCode: String,
+        acc1Code: String,
+        acc2Code: String,
+        dateText: String,
+        amountText: String,
+        chequeText: String,
+        noteText: String,
+        lightRecordId: String
+    ) throws -> [String: Any] {
+        let rid = lightRecordId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rid.isEmpty else {
+            throw ContiLightImmissioneError.message("Identificativo interno mancante.")
+        }
+        guard let lists = immissionePickLists(from: db) else {
+            throw ContiLightImmissioneError.message("Dati piano (categorie/conti) non disponibili.")
+        }
+        let catTrim = catCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let cat = lists.categorie.first(where: { $0.code == catTrim }) else {
+            throw ContiLightImmissioneError.message("Seleziona una categoria.")
+        }
+        let acc1Trim = acc1Code.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let acc1 = lists.conti.first(where: { $0.code == acc1Trim }) else {
+            throw ContiLightImmissioneError.message("Seleziona un conto.")
+        }
+        let girata = isGirataContoContoDisplayName(cat.displayName)
+        let acc2Trim = acc2Code.trimmingCharacters(in: .whitespacesAndNewlines)
+        let acc2 = girata ? lists.conti.first(where: { $0.code == acc2Trim }) : nil
+        if girata {
+            guard let a2 = acc2 else {
+                throw ContiLightImmissioneError.message("Nel giroconto serve il secondo conto.")
+            }
+            if a2.code == acc1.code {
+                throw ContiLightImmissioneError.message("Il secondo conto deve essere diverso dal primo.")
+            }
+        }
+        guard let dIsoFull = parseItalianOrIsoDateToIso(dateText) else {
+            throw ContiLightImmissioneError.message("Data non valida (gg/mm/aaaa).")
+        }
+        let dIso = String(dIsoFull.prefix(10))
+        let bounds = immissioneDateBoundsIso()
+        if dIso < bounds.minIso || dIso > bounds.maxIso {
+            throw ContiLightImmissioneError.message("Data fuori intervallo consentito (da −1 anno a +1 anno da oggi).")
+        }
+        if accountCodeFrozenInDb(db: db, accountCode: acc1.code) {
+            throw ContiLightImmissioneError.message("Uno dei conti selezionati è congelato: non è possibile registrare su quel conto.")
+        }
+        if girata, let a2f = acc2, accountCodeFrozenInDb(db: db, accountCode: a2f.code) {
+            throw ContiLightImmissioneError.message("Uno dei conti selezionati è congelato: non è possibile registrare su quel conto.")
+        }
+        let amt = try parseAmountForNewRecordImmissione(amountText: amountText, girata: girata)
+        let acc1IsCassa = acc1.name.trimmingCharacters(in: .whitespacesAndNewlines).localizedCaseInsensitiveCompare("cassa") == .orderedSame
+        let chqOut: String = {
+            if acc1IsCassa { return "-" }
+            if acc1.isCreditCard { return sanitizeLightImmissioneLine("ccarta", maxLen: maxChequeLen) }
+            let t = sanitizeLightImmissioneLine(chequeText, maxLen: maxChequeLen).trimmingCharacters(in: .whitespacesAndNewlines)
+            return t.isEmpty ? "-" : t
+        }()
+        let noteSan = sanitizeLightImmissioneLine(noteText, maxLen: maxRecordNoteLen)
+        let noteOut = noteSan.isEmpty ? "-" : noteSan
+        guard let targetYear = Int(String(dIso.prefix(4))), (1500 ... 3000).contains(targetYear) else {
+            throw ContiLightImmissioneError.message("Data non valida.")
+        }
+        let amtStr = formatMoneyForDb(amt)
+        let acc2Name: String
+        let acc2CodeOut: String
+        if girata, let g2 = acc2 {
+            acc2Name = g2.name
+            acc2CodeOut = g2.code
+        } else {
+            acc2Name = ""
+            acc2CodeOut = ""
+        }
+        var rec: [String: Any] = [
+            "year": targetYear,
+            "source_folder": "APP",
+            "source_file": "conti_light",
+            "source_index": 0,
+            "legacy_registration_number": 0,
+            "legacy_registration_key": "",
+            "registration_number": 0,
+            "date_iso": dIso,
+            "category_code": cat.code,
+            "category_name": cat.storageName,
+            "category_note": cat.planNote == "-" ? "" : cat.planNote,
+            "account_primary_code": acc1.code,
+            "account_primary_flags": "",
+            "account_primary_with_flags": acc1.code,
+            "account_primary_name": acc1.name,
+            "account_secondary_code": acc2CodeOut,
+            "account_secondary_flags": "",
+            "account_secondary_with_flags": acc2CodeOut,
+            "account_secondary_name": acc2Name,
+            "amount_eur": amtStr,
+            "amount_lire_original": NSNull(),
+            "note": noteOut,
+            "cheque": chqOut,
+            "raw_flags": "",
+            "is_cancelled": false,
+            "source_currency": "E",
+            "display_currency": "E",
+            "display_amount": amtStr,
+            "raw_record": "",
+            "is_virtuale_discharge": false,
+            contiLightRecordIdKey: rid,
+        ]
+        return rec
+    }
+
+    /// Aggiunge la registrazione all’albero ``years`` della sessione (indici e numerazione coerenti con il merge desktop).
+    @discardableResult
+    public static func appendLightSessionRecord(db: inout [String: Any], recordTemplate: [String: Any]) throws -> [String: Any] {
+        guard let data = try? JSONSerialization.data(withJSONObject: recordTemplate, options: []),
+              var rec = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ContiDBError.invalidJSON
+        }
+        let y = intFromJSON(rec["year"])
+        _ = try ensureYearBucketForMerge(db: &db, targetYear: y)
+        guard var allYears = db["years"] as? [[String: Any]],
+              let idx = allYears.firstIndex(where: { intFromJSON($0["year"]) == y }) else {
+            throw ContiDBError.invalidJSON
+        }
+        var yb = allYears[idx]
+        var recs = coerceToArrayOfStringKeyedDicts(yb["records"])
+        let nextSi = (recs.map { intFromJSON($0["source_index"]) }.max() ?? 0) + 1
+        rec["source_index"] = nextSi
+        rec["legacy_registration_number"] = nextSi
+        let rid = stringFromJSON(rec[contiLightRecordIdKey]).trimmingCharacters(in: .whitespacesAndNewlines)
+        rec["legacy_registration_key"] = "APP:conti_light:\(y):\(rid)"
+        rec["registration_number"] = maxRegistrationNumber(db) + 1
+        recs.append(rec)
+        yb["records"] = recs
+        allYears[idx] = yb
+        db["years"] = allYears
+        return rec
+    }
+
+    /**
+     Scrive su disco ``*_light.enc`` e, se presente e autenticabile, anche ``conti_utente_*.enc`` completo.
+     ``sessionDb`` deve già contenere la nuova riga; ``recordForSaldi`` è la stessa riga dopo ``appendLightSessionRecord`` (per ``applyNewRecordToLightSaldi`` se manca il completo).
+     */
+    public static func persistSessionDbToEncryptedFiles(
+        sessionDb: [String: Any],
+        recordForSaldi: [String: Any],
+        lightEncURL: URL,
+        keyURL: URL,
+        email: String,
+        password: String
+    ) throws -> (sessionLight: [String: Any], mergedIntoFull: Int, note: String) {
+        let em = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let fullURL = perUserEncURL(primaryEnc: lightEncURL, email: em)
+        var waitPaths = [keyURL, lightEncURL]
+        if FileManager.default.fileExists(atPath: fullURL.path) {
+            waitPaths.append(fullURL)
+        }
+        _ = waitForPathsStableIfDropbox(waitPaths)
+        let keyString = try String(contentsOf: keyURL, encoding: .utf8)
+        if FileManager.default.fileExists(atPath: fullURL.path) {
+            var main = try loadEncryptedDBFull(encURL: fullURL, keyURL: keyURL)
+            guard tryLogin(db: main, email: em, password: password) != nil else {
+                throw ContiLightImmissioneError.message(
+                    "Il file database completo è presente ma l’accesso è fallito. Verifica la password o apri prima sul desktop."
+                )
+            }
+            let n = mergeLightNewRecordsIntoMain(main: &main, light: sessionDb)
+            recomputeLightSaldiFromFullDb(&main)
+            let lightExport = try buildLightDatabaseForExport(from: main)
+            try saveEncryptedDbToDisk(db: main, encURL: fullURL, keyString: keyString)
+            try saveEncryptedDbToDisk(db: lightExport, encURL: lightEncURL, keyString: keyString)
+            var msg = "Salvati file completo e light nella cartella dati; saldi ricalcolati come sul desktop."
+            if n > 0 {
+                msg = "Importate \(n) nuove registrazione/i nel database completo. " + msg
+            }
+            return (lightExport, n, msg)
+        }
+        var lightOnly = try deepCopyDb(sessionDb)
+        guard dictionaryFromAnyRoot(lightOnly["light_saldi"]) != nil else {
+            throw ContiLightImmissioneError.message(
+                "Nel file light manca il blocco «light_saldi». Copia nella cartella anche il database completo .enc (consigliato) oppure rigenera il file *_light.enc salvando sul desktop, poi riprova."
+            )
+        }
+        applyNewRecordToLightSaldi(db: &lightOnly, record: recordForSaldi, cutoffDateIso: todayIsoLocal())
+        try saveEncryptedDbToDisk(db: lightOnly, encURL: lightEncURL, keyString: keyString)
+        let msg = """
+        Salvato solo il file light (nessun database completo trovato accanto). \
+        I saldi sono stati aggiornati in modo approssimativo: per allineamento completo copia anche il file .enc completo nella stessa cartella e salva di nuovo o apri sul desktop.
+        """
+        return (lightOnly, 0, msg)
+    }
+
     /// Scrive un database cifrato (stesso formato del desktop).
     public static func saveEncryptedDbToDisk(db: [String: Any], encURL: URL, keyString: String) throws {
         guard let enc = FernetEncryptor(keyFileContents: keyString) else {
@@ -1493,7 +1822,7 @@ public enum ContiDatabase {
             let isCc = boolFromJSON(r["credit_card"])
             let sf = parseLooseDecimal(stringFromJSON(r["spese_future"])) ?? (abs - alla)
             let scc = parseLooseDecimal(stringFromJSON(r["spese_cc"])) ?? .zero
-            let disp = parseLooseDecimal(stringFromJSON(r["disponibilita"])) ?? (isCc ? .zero : (abs + sf + scc))
+            let disp = parseLooseDecimal(stringFromJSON(r["disponibilita"])) ?? (isCc ? .zero : (abs + scc))
             let id = code.isEmpty ? "acc-\(i)" : "acc-\(code)"
             return ContiSaldRiga(
                 id: id,
@@ -1537,6 +1866,19 @@ public enum ContiDatabase {
             return String(base.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return base
+    }
+
+    /// Chiave di confronto allineata a ``_norm_cat`` in ``main_app.py`` (ordinamento categorie immissione).
+    public static func normalizedCategorySortKey(_ displayName: String) -> String {
+        let low = displayName.lowercased().replacingOccurrences(of: ".", with: " ")
+        return low.replacingOccurrences(of: "/", with: " / ")
+            .split { $0.isWhitespace }.map(String.init).joined(separator: " ")
+    }
+
+    /// True se la categoria (nome piano già «display») è «Girata conto/conto», come sul desktop.
+    public static func isGirataContoContoDisplayName(_ displayName: String) -> Bool {
+        let nn = normalizedCategorySortKey(displayName)
+        return nn.contains("girata conto / conto") || nn.contains("girata conto conto")
     }
 
     /// Come `is_hidden_dotazione_category_name` in `main_app.py`: mai mostrare «dotazione iniziale».
@@ -1599,15 +1941,17 @@ public enum ContiDatabase {
                 ContiImmissioneCategoria(
                     code: code,
                     displayName: categoryPlanDisplayName(rawName),
+                    storageName: rawName,
                     planNote: planNote
                 )
             )
         }
 
+        /// Come ``_cat_rank`` in ``main_app.py``: Consumi ordinari e Girata conto/conto in testa, poi alfabetico.
         func catRank(_ name: String) -> Int {
-            let n = name.lowercased()
-            if n.contains("consumi ordinari") { return 0 }
-            if n.contains("girata"), n.contains("conto") { return 1 }
+            let nn = Self.normalizedCategorySortKey(name)
+            if nn.contains("consumi ordinari") { return 0 }
+            if Self.isGirataContoContoDisplayName(name) { return 1 }
             return 2
         }
         categorie.sort { a, b in

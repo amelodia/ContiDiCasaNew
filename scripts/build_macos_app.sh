@@ -22,7 +22,14 @@ python3 -c "import PyInstaller" 2>/dev/null || {
 
 python3 -m pip install -r "$ROOT/requirements.txt"
 
+python3 "$ROOT/scripts/bump_version_build.py"
+
 rm -rf "$ROOT/build" "$ROOT/dist/ContiDiCasa" "$ROOT/dist/ContiDiCasa.app"
+
+mkdir -p "$ROOT/build"
+if ! python3 "$ROOT/scripts/build_euro_icns.py" "$ROOT/build/ContiDiCasa.icns"; then
+  echo "Avviso: generazione .icns non riuscita; il bundle userà l'icona predefinita." >&2
+fi
 
 python3 -m PyInstaller --noconfirm "$ROOT/ContiDiCasa.spec"
 

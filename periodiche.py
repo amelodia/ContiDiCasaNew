@@ -129,6 +129,16 @@ def _sanitize_line(value: str, *, max_len: int | None = None) -> str:
     return out[:max_len] if max_len is not None else out
 
 
+def _periodic_auto_note_suffix(cadence: str, year: int, movement_date_iso: str) -> str | None:
+    """Suffisso data da aggiungere alla nota per alcune cadenze (anno/mese o solo anno)."""
+    c = str(cadence or "")
+    if c in {"monthly", "bimonthly", "quarterly"}:
+        return f"{year:04d}/{int(movement_date_iso[5:7]):02d}"
+    if c == "annual":
+        return f"{year:04d}"
+    return None
+
+
 def build_periodic_record(
     db: dict,
     rule: dict,
@@ -148,9 +158,15 @@ def build_periodic_record(
     chq = _sanitize_line(str(tpl.get("cheque") or ""), max_len=MAX_CHEQUE_LEN) or "-"
     note = _sanitize_line(str(tpl.get("note") or ""), max_len=MAX_RECORD_NOTE_LEN) or "-"
     cadence = str(rule.get("cadence") or "")
-    if cadence in {"monthly", "bimonthly"}:
-        # Mensile/Bimensile: nota preimpostata anno/mese della singola istanza creata.
-        note = f"{y:04d}/{int(movement_date_iso[5:7]):02d}"
+    suffix = _periodic_auto_note_suffix(cadence, y, movement_date_iso)
+    if suffix:
+        # Suffisso data dell’istanza; se c’è testo manuale nella nota modello, si concatena (non si sostituisce).
+        base = (note or "").strip()
+        if not base or base == "-":
+            note = suffix
+        else:
+            merged = f"{base.rstrip()} {suffix}"
+            note = _sanitize_line(merged, max_len=MAX_RECORD_NOTE_LEN) or suffix
     amt_eur = str(tpl.get("amount_eur") or "0.00")
     amt_dec = Decimal(str(amt_eur.replace(",", ".")))
     return {

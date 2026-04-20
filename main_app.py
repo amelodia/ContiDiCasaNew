@@ -7,7 +7,6 @@ import html as html_module
 import json
 import os
 import re
-from difflib import SequenceMatcher
 import shutil
 import calendar
 import platform
@@ -29,6 +28,7 @@ except Exception:  # pragma: no cover - runtime optional dependency check
     Fernet = None
     InvalidToken = Exception
 
+import app_help_text
 import cloud_sync_wait
 import email_client
 import os_boot_time
@@ -36,6 +36,11 @@ import data_workspace
 import mail_gate
 import periodiche
 import security_auth
+
+try:
+    from app_version import APP_VERSION
+except ImportError:  # pragma: no cover - esecuzione da sorgente senza modulo
+    APP_VERSION = "—"
 from estratto_conto_pdf import extract_estratto_conto_movements_from_pdf
 
 # Verifica — estratto PDF: se True, non si escludono movimenti con data operazione oltre la data di chiusura.
@@ -92,6 +97,43 @@ COLOR_AMOUNT_POS = "#006400"
 COLOR_AMOUNT_NEG = "#b22222"
 
 
+def _darwin_prepare_stdin_for_tk_aqua() -> None:
+    """Su macOS, se lo stdin (fd 0) non è un tty, Tk Aqua può aprire ``Tk_CreateConsoleWindow``; quel
+    percorso costruisce la menu bar nativa e su build .app senza console ha causato SIGABRT in
+    ``-[NSMenuItem initWithTitle:action:keyEquivalent:]`` (stack: ``TkpSetMainMenubar`` → ``Tk_Init``).
+
+    Rendere fd 0 un terminale (pty) evita l'apertura della console Tcl senza impattare l'uso normale
+    da terminale (lasci invariato se ``isatty(0)``).
+    """
+    if platform.system() != "Darwin":
+        return
+    try:
+        if os.isatty(0):
+            return
+    except (ValueError, OSError, AttributeError):
+        return
+    try:
+        import pty
+
+        master_fd, slave_fd = pty.openpty()
+        try:
+            os.dup2(slave_fd, 0)
+        finally:
+            try:
+                os.close(slave_fd)
+            except OSError:
+                pass
+        # Mantenere il master aperto: chiusura lascerebbe stdin (slave) senza peer.
+        setattr(sys.modules[__name__], "_CDC_TK_STDIN_PTY_MASTER_FD", master_fd)
+    except OSError:
+        try:
+            tty_fd = os.open("/dev/tty", os.O_RDONLY)
+            os.dup2(tty_fd, 0)
+            os.close(tty_fd)
+        except OSError:
+            pass
+
+
 def app_title_text() -> str:
     return f"Conti di casa - {date.today().strftime('%d/%m/%Y')}"
 
@@ -100,15 +142,21 @@ def app_title_text() -> str:
 GUEST_DISPLAY_SUBTITLE = "di capitan Uncino"
 
 
-def window_title_for_session(db: dict, session: security_auth.AppSession) -> str:
+def window_title_for_session(
+    db: dict, session: security_auth.AppSession, *, show_clock: bool = False
+) -> str:
     """Titolo finestra principale: «di capitan Uncino» se registrazione non verificata; altrimenti suffisso utente."""
     security_auth.ensure_security(db)
     d = date.today().strftime("%d/%m/%Y")
     up = db.get("user_profile") or {}
     if not bool(up.get("registration_verified")):
-        return f"Conti di casa {GUEST_DISPLAY_SUBTITLE} — {d}"
-    suf = (up.get("display_name_suffix") or "").strip()
-    return f"Conti di casa {suf} — {d}" if suf else f"Conti di casa — {d}"
+        base = f"Conti di casa {GUEST_DISPLAY_SUBTITLE} — {d}"
+    else:
+        suf = (up.get("display_name_suffix") or "").strip()
+        base = f"Conti di casa {suf} — {d}" if suf else f"Conti di casa — {d}"
+    if show_clock:
+        return f"{base} · {datetime.now().strftime('%H.%M.%S')}"
+    return base
 
 
 def print_user_header_text(db: dict, session: security_auth.AppSession | None = None) -> str:
@@ -149,6 +197,9 @@ def title_banner_font() -> tuple[str, int, str]:
     return ("TkDefaultFont", 20, "bold")
 
 
+_BANNER_CLOCK_LABELS: list[tk.Label] = []
+
+
 def pack_centered_page_title(
     parent: tk.Widget,
     *,
@@ -156,8 +207,13 @@ def pack_centered_page_title(
     banner_style: str | None = None,
     title_bg: str | None = None,
     banner_tk_bg: str | None = None,
+    include_live_clock: bool = True,
 ) -> None:
-    """Titolo app ripetuto in cima a ogni scheda, centrato e ben visibile."""
+    """Titolo app ripetuto in cima a ogni scheda, centrato e ben visibile.
+
+    Con ``include_live_clock`` (default), l'etichetta viene aggiornata ogni secondo con l'ora
+    (formato ``hh.mm.ss``) accanto a data e suffisso utente, in linea con la barra titolo finestra.
+    """
     if banner_tk_bg is not None:
         bar = tk.Frame(parent, bg=banner_tk_bg, highlightthickness=0)
     elif banner_style:
@@ -175,7 +231,10 @@ def pack_centered_page_title(
     lbl_bg = title_bg if title_bg is not None else banner_tk_bg
     if lbl_bg is not None:
         lab_kw["bg"] = lbl_bg
-    tk.Label(**lab_kw).pack(fill=tk.X)
+    lab = tk.Label(**lab_kw)
+    lab.pack(fill=tk.X)
+    if include_live_clock:
+        _BANNER_CLOCK_LABELS.append(lab)
 
 
 def to_decimal(value: str) -> Decimal:
@@ -239,6 +298,50 @@ def bind_entry_first_char_uppercase(var: tk.StringVar, entry: tk.Misc) -> None:
     var.trace_add("write", _on_write)
 
 
+def bind_entry_all_chars_uppercase(var: tk.StringVar, entry: tk.Misc) -> None:
+    """Forza in maiuscolo tutto il testo immesso mantenendo il cursore."""
+    lock: list[bool] = [False]
+
+    def _on_write(*_args: object) -> None:
+        if lock[0]:
+            return
+        s = var.get()
+        up = s.upper()
+        if s == up:
+            return
+        try:
+            pos = entry.index(tk.INSERT)
+        except Exception:
+            pos = None
+        lock[0] = True
+        try:
+            var.set(up)
+            if pos is not None:
+                entry.icursor(min(pos, len(var.get())))
+        finally:
+            lock[0] = False
+
+    var.trace_add("write", _on_write)
+
+
+_EURO_TYPABLE_MINUS_CHARS = frozenset({"-", "\u2212", "\u2013"})
+
+
+def _euro_typed_char_is_sign(ch: str) -> bool:
+    return ch == "+" or ch in _EURO_TYPABLE_MINUS_CHARS
+
+
+def _euro_sign_char_to_ascii(ch: str) -> str:
+    return "-" if ch in _EURO_TYPABLE_MINUS_CHARS else "+"
+
+
+def _euro_strip_leading_signs(s: str) -> str:
+    t = s or ""
+    while t and (t[0] == "+" or t[0] in _EURO_TYPABLE_MINUS_CHARS):
+        t = t[1:]
+    return t
+
+
 def bind_euro_amount_entry_validation(
     entry: tk.Misc, var: tk.StringVar, *, allow_leading_sign: bool = True
 ) -> None:
@@ -283,14 +386,18 @@ def bind_euro_amount_entry_validation(
             pos = 0
         s = var.get() or ""
 
-        if ch in "+-":
+        if _euro_typed_char_is_sign(ch):
             if not allow_leading_sign:
                 return "break"
-            body = s.lstrip("+-")
+            sig = _euro_sign_char_to_ascii(ch)
+            body = _euro_strip_leading_signs(s)
             if not body:
-                var.set(ch)
-            elif s[:1] != ch:
-                var.set(ch + body)
+                var.set(sig)
+            else:
+                lead = s[:1]
+                lead_sig = _euro_sign_char_to_ascii(lead) if lead and _euro_typed_char_is_sign(lead) else None
+                if lead_sig is None or lead_sig != sig:
+                    var.set(sig + body)
             try:
                 w.icursor(tk.END)
             except Exception:
@@ -298,7 +405,7 @@ def bind_euro_amount_entry_validation(
             return "break"
 
         if ch.isdigit() or ch in ",.":
-            if allow_leading_sign and pos == 0 and s and s[0] in "+-":
+            if allow_leading_sign and pos == 0 and s and (s[0] == "+" or s[0] in _EURO_TYPABLE_MINUS_CHARS):
                 try:
                     w.icursor(1)
                 except Exception:
@@ -311,7 +418,7 @@ def bind_euro_amount_entry_validation(
             clip = event.widget.clipboard_get()
         except tk.TclError:
             return "break"
-        t = clip.strip().replace(" ", "")
+        t = clip.strip().replace(" ", "").replace("\u2212", "-").replace("\u2013", "-")
         if not t:
             return "break"
         pat = r"[+-]?[0-9.,]*" if allow_leading_sign else r"[0-9.,]*"
@@ -332,7 +439,7 @@ def bind_euro_amount_entry_validation(
             except tk.TclError:
                 return "break"
             a = b = p
-        merged = s[:a] + t + s[b:]
+        merged = (s[:a] + t + s[b:]).replace("\u2212", "-").replace("\u2013", "-")
         if merged.strip():
             try:
                 normalize_euro_input(merged.replace(" ", ""))
@@ -347,6 +454,113 @@ def bind_euro_amount_entry_validation(
 
     entry.bind("<KeyPress>", _keypress, add="+")
     entry.bind("<<Paste>>", _paste, add="+")
+
+
+def _ttk_combobox_collect_listboxes(w: tk.Misc, acc: list[tk.Misc]) -> None:
+    try:
+        cls = str(w.winfo_class())
+    except tk.TclError:
+        return
+    if cls == "Listbox":
+        acc.append(w)
+    try:
+        kids = w.tk.splitlist(w.tk.call("winfo", "children", w))
+    except tk.TclError:
+        return
+    for ch in kids:
+        try:
+            child = w.nametowidget(ch)
+        except KeyError:
+            continue
+        _ttk_combobox_collect_listboxes(child, acc)
+
+
+def bind_ttk_combobox_letter_jump_with_popdown(
+    cb: ttk.Combobox,
+    *,
+    on_letter: Callable[[str], bool],
+) -> Callable[[], None]:
+    """
+    Salto alla prima voce che inizia con la lettera (case-insensitive), anche con il menu aperto.
+    Ogni pressione è una lettera singola (nessun prefisso cumulativo): on_letter viene chiamata con quella sola lettera.
+    on_letter(letter_lower) → True se il tasto è stato gestito.
+    Ritorna una funzione cleanup (chiusura dialog o smontaggio widget).
+    """
+    popdown_listbox_binds: list[tuple[tk.Misc, str, str]] = []
+    combo_script_ids: list[tuple[str, str]] = []
+
+    def _letter_keypress(ev: tk.Event) -> str | None:
+        try:
+            if int(getattr(ev, "state", 0) or 0) & 0x14:
+                return None
+        except Exception:
+            pass
+        ch = str(getattr(ev, "char", "") or "")
+        keysym = str(getattr(ev, "keysym", "") or "")
+        letter = ""
+        if len(ch) == 1 and ch.isalpha():
+            letter = ch.lower()
+        elif len(keysym) == 1 and keysym.isalpha():
+            letter = keysym.lower()
+        if not letter:
+            return None
+        return "break" if on_letter(letter) else None
+
+    def _cleanup_popdown_binds() -> None:
+        for lb, seq, bid in popdown_listbox_binds:
+            try:
+                lb.unbind(seq, bid)
+            except tk.TclError:
+                pass
+        popdown_listbox_binds.clear()
+
+    def _on_combobox_dropdown(_e: tk.Event | None = None) -> None:
+        _cleanup_popdown_binds()
+
+        def _attach() -> None:
+            try:
+                pop_path = str(cb.tk.call("ttk::combobox::PopdownWindow", cb))
+                pop_root = cb.nametowidget(pop_path)
+            except (tk.TclError, KeyError):
+                return
+            boxes: list[tk.Misc] = []
+            _ttk_combobox_collect_listboxes(pop_root, boxes)
+            for lb in boxes:
+
+                def _lb_key(e: tk.Event) -> str | None:
+                    return _letter_keypress(e)
+
+                try:
+                    bid = lb.bind("<KeyPress>", _lb_key, add="+")
+                    popdown_listbox_binds.append((lb, "<KeyPress>", bid))
+                except tk.TclError:
+                    pass
+
+        try:
+            cb.after_idle(_attach)
+        except tk.TclError:
+            pass
+
+    def _on_combobox_close(_e: tk.Event | None = None) -> None:
+        _cleanup_popdown_binds()
+
+    try:
+        combo_script_ids.append(("<KeyPress>", cb.bind("<KeyPress>", _letter_keypress, add="+")))
+        combo_script_ids.append(("<<ComboboxDropdown>>", cb.bind("<<ComboboxDropdown>>", _on_combobox_dropdown, add="+")))
+        combo_script_ids.append(("<<ComboboxClose>>", cb.bind("<<ComboboxClose>>", _on_combobox_close, add="+")))
+    except tk.TclError:
+        pass
+
+    def _full_cleanup() -> None:
+        _cleanup_popdown_binds()
+        for seq, bid in reversed(combo_script_ids):
+            try:
+                cb.unbind(seq, bid)
+            except tk.TclError:
+                pass
+        combo_script_ids.clear()
+
+    return _full_cleanup
 
 
 def to_italian_date(date_iso: str) -> str:
@@ -740,11 +954,26 @@ def format_category_note_stored(note: str) -> str:
     return t[0].upper() + t[1:]
 
 
-def sync_record_category_names_if_identical_old(db: dict, code: str, old_name: str, new_canonical: str) -> None:
-    """Aggiorna solo le registrazioni con `category_name` identico al nome precedente."""
+def sync_record_category_names_if_identical_old(
+    db: dict,
+    code: str,
+    old_name: str,
+    new_canonical: str,
+    *,
+    min_year: int | None = None,
+) -> None:
+    """Aggiorna le registrazioni con `category_name` identico al nome precedente (e stesso codice), opz. da un anno in poi.
+
+    `min_year` (es. 2022) evita toccare registrazioni legacy pre-2022, coerentemente con l’export JSON in ``legacy_import``."""
     sc = str(code).strip()
     old_s = (old_name or "").strip()
     for yb in db.get("years", []) or []:
+        if min_year is not None:
+            try:
+                if int(yb.get("year", 0) or 0) < int(min_year):
+                    continue
+            except (TypeError, ValueError):
+                continue
         for r in yb.get("records", []) or []:
             if str(r.get("category_code", "")).strip() != sc:
                 continue
@@ -772,6 +1001,9 @@ def latest_year_bucket(db: dict) -> dict | None:
 
 # Piano categorie/conti per Nuove registrazioni e pagina «Categorie e conti»: anno di riferimento legacy.
 PLAN_REFERENCE_YEAR = 2026
+# Categorie: modifiche da «Categorie e conti» si applicano a piano e registrazioni da questo anno in poi
+# (gli anni pre-2022 restano allineabili all’export JSON legacy; non forzare il piano su quel periodo).
+CATEGORY_PLAN_MUTATE_MIN_YEAR = 2022
 # Dotazione iniziale (categoria 0) solo nell’anno legacy previsto; altre annate senza dotazione.
 LEGACY_DOTAZIONE_YEAR = 1990
 _LEGACY_DAT_RECORD_LEN = 121
@@ -876,26 +1108,46 @@ def plan_conti_account_is_cassa(name_raw: str) -> bool:
 
 
 def plan_conti_names_have_attinenza(old_raw: str, new_raw: str) -> bool:
-    """True se nome nuovo è «vicino» al vecchio (SequenceMatcher >= 0.55, inclusione >= 4 char, o stessa etichetta con testo memorizzato diverso)."""
+    """True se tra vecchio e nuovo esiste almeno una sequenza comune di 4 lettere consecutive."""
     na = category_display_name(old_raw).strip().lower()
     nb = category_display_name(new_raw).strip().lower()
     if not na or not nb:
         return False
     if na == nb:
         return (old_raw or "").strip() != (new_raw or "").strip()
-    if SequenceMatcher(None, na, nb).ratio() >= 0.55:
-        return True
-    if len(nb) >= 4 and (nb in na or na in nb):
-        return True
-    if len(na) >= 4 and (nb in na or na in nb):
-        return True
+    sa = "".join(ch for ch in na if ch.isalpha())
+    sb = "".join(ch for ch in nb if ch.isalpha())
+    if len(sa) < 4 or len(sb) < 4:
+        return False
+    for i in range(0, len(sa) - 3):
+        if sa[i : i + 4] in sb:
+            return True
     return False
 
 
-def propagate_category_chart_by_code(db: dict, code: str, name: str, note: str | None) -> None:
+def propagate_category_chart_by_code(
+    db: dict,
+    code: str,
+    name: str,
+    note: str | None,
+    *,
+    min_year_inclusive: int | None = None,
+) -> None:
+    """Allinea il nome/nota categoria nel piano (tutti gli anni o, con ``min_year_inclusive``, da quell’anno in poi).
+
+    I bucket pre-2022 vanno lasciati coerenti con l’export legacy: da «Categorie e conti» si passa
+    ``min_year_inclusive=CATEGORY_PLAN_MUTATE_MIN_YEAR`` così le registrazioni legacy e il piano
+    sotto quell’anno non vengono alterati per un rinomina pensata per l’esercizio corrente.
+    """
     nt = note if (note or "").strip() else None
     sc = str(code).strip()
     for yb in db.get("years", []) or []:
+        if min_year_inclusive is not None:
+            try:
+                if int(yb.get("year", 0) or 0) < int(min_year_inclusive):
+                    continue
+            except (TypeError, ValueError):
+                continue
         found = False
         for c in yb.get("categories", []) or []:
             if str(c.get("code", "")).strip() == sc:
@@ -1152,20 +1404,6 @@ def category_code_used_any_year(db: dict, code: str) -> bool:
     return False
 
 
-def account_code_used_any_year(db: dict, code: str) -> bool:
-    """True se esiste almeno una registrazione non annullata che coinvolge il conto."""
-    c = str(code).strip()
-    for yb in db.get("years", []) or []:
-        for r in yb.get("records", []) or []:
-            if r.get("is_cancelled"):
-                continue
-            if str(r.get("account_primary_code", "")).strip() == c:
-                return True
-            if str(r.get("account_secondary_code", "")).strip() == c:
-                return True
-    return False
-
-
 def account_balance_for_code_latest_chart(db: dict, account_code: str) -> Decimal | None:
     """Saldo **ibrido** come colonna «Saldi assoluti» nel footer Movimenti (stesso vettore di ``hybrid_absolute_balances_for_saldi``).
 
@@ -1257,12 +1495,6 @@ def remove_category_from_all_years(db: dict, code: str) -> None:
     cc = str(code).strip()
     for yb in db.get("years", []) or []:
         yb["categories"] = [c for c in (yb.get("categories") or []) if str(c.get("code", "")) != cc]
-
-
-def remove_account_from_all_years(db: dict, code: str) -> None:
-    c = str(code).strip()
-    for yb in db.get("years", []) or []:
-        yb["accounts"] = [a for a in (yb.get("accounts") or []) if str(a.get("code", "")) != c]
 
 
 def sync_record_category_from_plan(rec: dict, year_categories: list[dict[str, str]], code_str: str) -> None:
@@ -2071,6 +2303,8 @@ def compute_spese_cc_footer_amounts(db: dict, saldo_assoluti: list[Decimal]) -> 
 def saldi_footer_amount_vectors(db: dict, *, today_iso: str | None = None) -> dict[str, object] | None:
     """Vettori allineati a ``refresh_balance_footer`` / ``_saldi_snapshot_for_print`` (dopo filtro conti congelati).
 
+    La colonna ``disponibilita`` nel JSON light è la riga «Disponibilità» desktop: saldo assoluto + spese CC (senza spese future).
+
     Usato dal sidecar ``*_light.enc`` (``compute_light_saldi_snapshot``) e dall’app iOS per coerenza con i Saldi desktop.
     """
     if not db.get("years"):
@@ -2113,7 +2347,7 @@ def saldi_footer_amount_vectors(db: dict, *, today_iso: str | None = None) -> di
         scc = spese_cc_full[i] if i < len(spese_cc_full) else Decimal("0")
         cc = bool(cc_full[i]) if i < len(cc_full) else False
         oggi = a - sf
-        disp = Decimal("0") if cc else (a + sf + scc)
+        disp = Decimal("0") if cc else (a + scc)
         saldo_assoluti.append(a)
         saldo_oggi.append(oggi)
         spese_future.append(sf)
@@ -2123,7 +2357,7 @@ def saldi_footer_amount_vectors(db: dict, *, today_iso: str | None = None) -> di
     total_abs = sum((saldo_assoluti[i] for i in range(len(is_cc)) if not is_cc[i]), Decimal("0"))
     total_sf = sum((spese_future[i] for i in range(len(is_cc)) if not is_cc[i]), Decimal("0"))
     total_scc = sum((spese_cc[i] for i in range(len(is_cc)) if not is_cc[i]), Decimal("0"))
-    total_disp = total_abs + total_sf + total_scc
+    total_disp = total_abs + total_scc
     return {
         "year_basis": latest_year,
         "names": out_names,
@@ -2231,6 +2465,48 @@ def credit_card_reference_code_str(db: dict, acc_code: str) -> str:
 def balance_amount_fg(value: Decimal) -> str:
     """Rosso / verde come colonna Importo (zero trattato come non negativo)."""
     return COLOR_AMOUNT_NEG if value < 0 else COLOR_AMOUNT_POS
+
+
+def apply_macos_dock_icon_from_login_euro_jpeg(*, tk_anchor: tk.Misc | None = None) -> None:
+    """Icona applicazione nel Dock macOS: stesso JPEG del login (``euro_login_asset``).
+
+    Non chiamare da subito dopo ``deiconify``: su Tk/Cocoa può causare SIGABRT intermittente.
+    Preferire ``root.after(...)`` (vedi ``_present_main_window``). JPEG → PNG via Pillow prima di
+    ``NSImage`` per evitare percorsi fragili del decoder AppKit su JPEG.
+    """
+    if platform.system() != "Darwin":
+        return
+    if os.environ.get("CONTI_SKIP_DOCK_NATIVE", "").strip().lower() in ("1", "true", "yes", "on", "si"):
+        return
+    try:
+        import base64
+        from io import BytesIO
+
+        from AppKit import NSApplication, NSImage
+        from Foundation import NSData
+        from PIL import Image
+
+        from euro_login_asset import EURO_JPEG_B64
+    except Exception:
+        return
+    try:
+        raw = base64.standard_b64decode(EURO_JPEG_B64)
+        if not raw:
+            return
+        im = Image.open(BytesIO(raw)).convert("RGBA")
+        png_io = BytesIO()
+        im.save(png_io, format="PNG")
+        png_bytes = png_io.getvalue()
+        buf = NSData.dataWithBytes_length_(png_bytes, len(png_bytes))
+        img = NSImage.alloc().initWithData_(buf)
+        if img is None:
+            return
+        NSApplication.sharedApplication().setApplicationIconImage_(img)
+        if tk_anchor is not None:
+            # Ancora riferimento su oggetto Tcl: evita finalizzazione PyObjC precoce del NSImage.
+            tk_anchor._cdc_appkit_dock_icon = img  # type: ignore[attr-defined]
+    except Exception:
+        return
 
 
 def _print_balances_native_macos(build_html: Callable[[float], str]) -> bool:
@@ -2571,7 +2847,7 @@ def _print_balances_fpdf(snap: dict) -> bool:
         pdf.set_font("Helvetica", "B", fs_head)
         pdf.cell(w_amt, line_h * 1.3, "Saldi assol.", border=1, align="C")
         pdf.set_font("Helvetica", "B", fs_head)
-        pdf.cell(w_amt, line_h * 1.3, "Spese fut.", border=1, align="C")
+        pdf.cell(w_amt, line_h * 1.3, "Di cui sp.fut.", border=1, align="C")
         pdf.set_font("Helvetica", "B", fs_head)
         pdf.cell(w_amt, line_h * 1.3, "Spese CC", border=1, align="C")
         pdf.set_font("Helvetica", "", fs_head)
@@ -3579,6 +3855,7 @@ def build_ui(
     key_path_holder: list[Path],
 ) -> None:
     # Riferimento mutabile: dopo import legacy da Opzioni, griglia e saldi devono usare il nuovo DB.
+    _BANNER_CLOCK_LABELS.clear()
     db_holder: list[dict] = [db]
     session_holder: list[security_auth.AppSession] = [session]
     periodiche.ensure_periodic_registrations(db_holder[0])
@@ -3599,7 +3876,7 @@ def build_ui(
         return db_holder[0]
 
     def refresh_window_title() -> None:
-        root.title(window_title_for_session(cur_db(), session_holder[0]))
+        root.title(window_title_for_session(cur_db(), session_holder[0], show_clock=True))
 
     def _page_banner_title() -> str:
         return window_title_for_session(cur_db(), session_holder[0])
@@ -3624,7 +3901,7 @@ def build_ui(
         root.withdraw()
     except Exception:
         pass
-    root.title(window_title_for_session(db_holder[0], session_holder[0]))
+    root.title(window_title_for_session(db_holder[0], session_holder[0], show_clock=True))
 
     main_nb_shell = tk.Frame(root, bg=MOVIMENTI_PAGE_BG)
     main_nb_shell.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -4388,7 +4665,7 @@ def build_ui(
         acc = (text_account_applied_var.get() or "").strip()
         chq = (text_cheque_applied_var.get() or "").strip()
         note = (text_note_applied_var.get() or "").strip()
-        if mode == "date" and cat and cat != _ALL_CATEGORIES_LABEL:
+        if cat and cat != _ALL_CATEGORIES_LABEL:
             parts.append(f"per la categoria {cat}")
         if acc and acc != _ALL_ACCOUNTS_LABEL:
             parts.append(f"per il conto {acc}")
@@ -4772,6 +5049,16 @@ def build_ui(
         relief=tk.RAISED,
         bd=1,
     )
+    saldo_parziale_categoria_ricerca_text: list[str] = [""]
+    lbl_saldo_parziale_categoria = tk.Label(
+        correzione_row,
+        text="",
+        font=("TkDefaultFont", 12, "bold"),
+        fg="#1a3a1a",
+        bg=MOVIMENTI_PAGE_BG,
+        anchor="e",
+        justify=tk.RIGHT,
+    )
 
     correzione_forza_revealed: list[bool] = [False]
     _correzione_bar_prev_sel_key: list[str | None] = [None]
@@ -4851,6 +5138,21 @@ def build_ui(
             btn_elimina_reg.grid(row=0, column=col, sticky="w", padx=(0, 12))
         else:
             btn_elimina_reg.grid_remove()
+
+        sp_txt = (saldo_parziale_categoria_ricerca_text[0] or "").strip()
+        if sp_txt:
+            try:
+                correzione_row.columnconfigure(98, weight=1)
+            except tk.TclError:
+                pass
+            lbl_saldo_parziale_categoria.configure(text=sp_txt)
+            lbl_saldo_parziale_categoria.grid(row=0, column=99, sticky="e", padx=(4, 0))
+        else:
+            try:
+                correzione_row.columnconfigure(98, weight=0)
+            except tk.TclError:
+                pass
+            lbl_saldo_parziale_categoria.grid_remove()
 
     def persist_db_after_edit(reselect_key: str | None) -> None:
         try:
@@ -4966,6 +5268,7 @@ def build_ui(
             return
         year_categories = year_categories_map(cur_db()).get(rec.get("year"), [])
         choices: list[tuple[str, str]] = []
+        disp_to_raw: dict[str, str] = {}
         for i, c in enumerate(year_categories):
             code = str(c.get("code", str(i)))
             if code == "0":
@@ -4973,29 +5276,74 @@ def build_ui(
             if is_hidden_dotazione_category_name(str(c.get("name", ""))):
                 continue
             disp = category_display_name(c.get("name", ""))
+            raw_nm = str(c.get("name", "") or "")
             choices.append((disp, code))
-        cat_freq, _acc_freq = _latest_year_frequency_maps()
-        choices.sort(
-            key=lambda it: (
-                0 if it[0].lower() == "consumi ordinari" else (1 if it[0].lower() == "girata conto/conto" else 2),
-                -cat_freq.get(it[0], 0),
-                it[0].lower(),
-            )
-        )
+            disp_to_raw.setdefault(disp, raw_nm)
+
         if not choices:
             messagebox.showerror("Categoria", "Nessuna categoria disponibile per questo anno.")
             return
+
+        def _norm_cat_mov_label(s: str) -> str:
+            return " ".join((s or "").strip().lower().replace(".", " ").replace("/", " / ").split())
+
+        consumi_disp = next((d for d, _c in choices if _norm_cat_mov_label(d) == "consumi ordinari"), None)
+        girata_disp = next(
+            (
+                d
+                for d, _c in choices
+                if ("girata conto / conto" in _norm_cat_mov_label(d))
+                or ("girata conto conto" in _norm_cat_mov_label(d))
+            ),
+            None,
+        )
+        locked_heads = [x for x in (consumi_disp, girata_disp) if x]
+        others = [(d, c) for d, c in choices if d not in locked_heads]
+        others.sort(key=lambda it: it[0].lower())
+        values_list = locked_heads + [d for d, _c in others]
         top = tk.Toplevel(root)
         top.title("Modifica categoria")
         top.transient(root)
         frm = ttk.Frame(top, padding=12)
         frm.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frm, text="Categoria:").grid(row=0, column=0, sticky="w")
-        cb = ttk.Combobox(frm, state="readonly", width=32, values=[c[0] for c in choices])
+        cb = ttk.Combobox(frm, state="readonly", width=32, values=values_list)
         cc = str(rec.get("category_code", ""))
-        cur_disp = next((d for d, code in choices if code == cc), choices[0][0])
-        cb.set(cur_disp)
+        initial_disp = next((d for d, code in choices if code == cc), choices[0][0])
+
+        def _edit_cat_skip_letter_jump(disp: str) -> bool:
+            """Consumi ordinari e Girata: non preselezionabili con la lettera; restano selezionabili col mouse."""
+            raw = disp_to_raw.get(disp, "")
+            return plan_conti_category_name_locked(raw)
+
+        cb.set(initial_disp)
+        try:
+            cb.current(values_list.index(initial_disp))
+        except ValueError:
+            pass
         cb.grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+        def _jump_first_letter(letter: str) -> bool:
+            for nm in values_list:
+                if not nm or str(nm[0]).lower() != letter:
+                    continue
+                if _edit_cat_skip_letter_jump(nm):
+                    continue
+                cb.set(nm)
+                try:
+                    cb.current(values_list.index(nm))
+                except ValueError:
+                    pass
+                return True
+            return False
+
+        _combo_cleanup = bind_ttk_combobox_letter_jump_with_popdown(cb, on_letter=_jump_first_letter)
+
+        def _on_cat_dialog_destroy(e: tk.Event) -> None:
+            if getattr(e, "widget", None) is top:
+                _combo_cleanup()
+
+        top.bind("<Destroy>", _on_cat_dialog_destroy)
 
         def on_ok() -> None:
             picked = cb.get()
@@ -5174,12 +5522,61 @@ def build_ui(
             cur = int(to_decimal(rec["amount_lire_original"]).quantize(Decimal("1")))
             v = tk.StringVar(value=str(cur))
         else:
-            ttk.Label(frm, text="Importo (€, usa . o , come decimale):").grid(row=0, column=0, sticky="w")
+            ttk.Label(frm, text="Importo (€, usa . o , come decimale):").grid(row=0, column=0, sticky="nw")
             v = tk.StringVar(value=format_euro_it(to_decimal(rec["amount_eur"])))
-        ent_edit_amt = ttk.Entry(frm, textvariable=v, width=18)
-        ent_edit_amt.grid(row=0, column=1, sticky="w", padx=(8, 0))
-        if not use_lire:
+        if use_lire:
+            ent_edit_amt = ttk.Entry(frm, textvariable=v, width=18)
+            ent_edit_amt.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        else:
+            row_amt_edit = tk.Frame(frm)
+            row_amt_edit.grid(row=0, column=1, sticky="w", padx=(8, 0))
+            ent_edit_amt = ttk.Entry(row_amt_edit, textvariable=v, width=18)
+            ent_edit_amt.pack(side=tk.LEFT)
+            try:
+                _amt_ui_font = tkfont.nametofont("TkDefaultFont")
+                _amt_font_t = (_amt_ui_font.actual("family"), _amt_ui_font.actual("size"))
+            except Exception:
+                _amt_font_t = ("TkDefaultFont", 11)
+            btn_amt_plus = tk.Label(
+                row_amt_edit,
+                text="+",
+                cursor="hand2",
+                font=_amt_font_t,
+                padx=6,
+                pady=2,
+                bg="#e0f2f1",
+                relief=tk.RAISED,
+                bd=1,
+            )
+            btn_amt_minus = tk.Label(
+                row_amt_edit,
+                text="−",
+                cursor="hand2",
+                font=_amt_font_t,
+                padx=6,
+                pady=2,
+                bg="#ffebee",
+                relief=tk.RAISED,
+                bd=1,
+            )
+            btn_amt_plus.pack(side=tk.LEFT, padx=(6, 2))
+            btn_amt_minus.pack(side=tk.LEFT, padx=(2, 0))
             bind_euro_amount_entry_validation(ent_edit_amt, v)
+
+            def _apply_edit_amount_sign(sign: str) -> None:
+                raw = (v.get() or "").strip()
+                if not raw or (len(raw) == 1 and _euro_typed_char_is_sign(raw)):
+                    v.set("-" if sign == "-" else "+")
+                else:
+                    body = _euro_strip_leading_signs(raw)
+                    v.set(("-" if sign == "-" else "+") + body)
+                try:
+                    ent_edit_amt.icursor(tk.END)
+                except tk.TclError:
+                    pass
+
+            btn_amt_plus.bind("<Button-1>", lambda _e: _apply_edit_amount_sign("+"))
+            btn_amt_minus.bind("<Button-1>", lambda _e: _apply_edit_amount_sign("-"))
 
         def on_ok() -> None:
             try:
@@ -5622,13 +6019,7 @@ th {{ background:#efefef; text-align:left; }}
     movements_population_seq = 0
     _movements_dirty: list[bool] = [False]
 
-    def _movement_rows_from_pool(
-        pool: list[dict],
-        reg_seq_map: dict,
-        accounts_by_year: dict,
-        categories_by_year: dict,
-    ) -> list[tuple[str, str, tuple[object, ...], str, str, str, str]]:
-        """Stessa logica della griglia: (iid, reg#, mov_vals×7, importo, tag colore, nota, stripe)."""
+    def _build_movement_search_filter_state() -> dict[str, object]:
         q_cat_raw = text_category_applied_var.get().strip()
         q_acc_raw = text_account_applied_var.get().strip()
         q_cat = "" if q_cat_raw in ("", _ALL_CATEGORIES_LABEL) else q_cat_raw.lower()
@@ -5642,9 +6033,8 @@ th {{ background:#efefef; text-align:left; }}
                 q_amt = normalize_euro_input(q_amt_raw)
             except Exception:
                 q_amt = None
-        row_i = 0
-        reg_from_n = None
-        reg_to_n = None
+        reg_from_n: int | None = None
+        reg_to_n: int | None = None
         if filter_order_applied_var.get() == "registration":
             try:
                 reg_from_n = int(str(reg_from_applied_var.get()).strip())
@@ -5652,49 +6042,95 @@ th {{ background:#efefef; text-align:left; }}
             except Exception:
                 reg_from_n = None
                 reg_to_n = None
+        return {
+            "mode": filter_order_applied_var.get(),
+            "q_cat": q_cat,
+            "q_acc": q_acc,
+            "q_chq": q_chq,
+            "q_note": q_note,
+            "q_amt": q_amt,
+            "reg_from_n": reg_from_n,
+            "reg_to_n": reg_to_n,
+        }
+
+    def _record_passes_movement_search_filters(
+        r: dict,
+        st: dict[str, object],
+        reg_seq_map: dict,
+        accounts_by_year: dict,
+        categories_by_year: dict,
+    ) -> tuple[bool, str, str, str, str, str]:
+        """True se la rispetta i filtri applicati; restituisce anche nomi conti/categoria per la griglia."""
+        if not show_record_in_movements_grid(r):
+            return (False, "", "", "", "", "")
+        year = r.get("year")
+        year_accounts = accounts_by_year.get(year, [])
+        year_categories = categories_by_year.get(year, [])
+        account_1_name = account_name_for_record(r, year_accounts, "primary")
+        account_2_name = account_name_for_record(r, year_accounts, "secondary")
+        acc1_norm = (account_1_name or "").strip().lower()
+        acc2_norm = (account_2_name or "").strip().lower()
+        category_name = category_name_for_record(r, year_categories)
+        stars_1 = r.get("account_primary_flags", "")
+        stars_2 = r.get("account_secondary_flags", "")
+        mode = st["mode"]
+        q_cat = str(st["q_cat"] or "")
+        q_acc = str(st["q_acc"] or "")
+        q_chq = str(st["q_chq"] or "")
+        q_note = str(st["q_note"] or "")
+        q_amt = st.get("q_amt")
+        if mode == "date":
+            if q_cat and q_cat != (category_name or "").lower():
+                return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
+            if q_acc and q_acc != acc1_norm and q_acc != acc2_norm:
+                return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
+            if q_amt is not None:
+                try:
+                    if to_decimal(r.get("amount_eur", "0")) != q_amt:
+                        return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
+                except Exception:
+                    return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
+            if q_chq and q_chq not in str(r.get("cheque") or "").lower():
+                return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
+            if q_note and q_note not in str(r.get("note") or "").casefold():
+                return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
+        elif mode == "registration":
+            nreg = reg_seq_map[record_legacy_stable_key(r)]
+            reg_from_n = st.get("reg_from_n")
+            reg_to_n = st.get("reg_to_n")
+            if reg_from_n is not None and reg_to_n is not None:
+                if filter_direction_applied_var.get() == "backward":
+                    if nreg > reg_from_n or nreg < reg_to_n:
+                        return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
+                else:
+                    if nreg < reg_from_n or nreg > reg_to_n:
+                        return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
+            if q_cat and q_cat != (category_name or "").lower():
+                return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
+            if q_acc and q_acc != acc1_norm and q_acc != acc2_norm:
+                return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
+            if q_note and q_note not in str(r.get("note") or "").casefold():
+                return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
+        else:
+            return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
+        return (True, category_name, account_1_name, stars_1, account_2_name, stars_2)
+
+    def _movement_rows_from_pool(
+        pool: list[dict],
+        reg_seq_map: dict,
+        accounts_by_year: dict,
+        categories_by_year: dict,
+    ) -> list[tuple[str, str, tuple[object, ...], str, str, str, str]]:
+        """Stessa logica della griglia: (iid, reg#, mov_vals×7, importo, tag colore, nota, stripe)."""
+        st = _build_movement_search_filter_state()
+        row_i = 0
         out: list[tuple[str, str, tuple[object, ...], str, str, str, str]] = []
         for r in pool:
-            if not show_record_in_movements_grid(r):
+            ok, category_name, account_1_name, stars_1, account_2_name, stars_2 = (
+                _record_passes_movement_search_filters(r, st, reg_seq_map, accounts_by_year, categories_by_year)
+            )
+            if not ok:
                 continue
-            year = r.get("year")
-            year_accounts = accounts_by_year.get(year, [])
-            year_categories = categories_by_year.get(year, [])
-            account_1_name = account_name_for_record(r, year_accounts, "primary")
-            account_2_name = account_name_for_record(r, year_accounts, "secondary")
-            acc1_norm = (account_1_name or "").strip().lower()
-            acc2_norm = (account_2_name or "").strip().lower()
-            category_name = category_name_for_record(r, year_categories)
-            stars_1 = r.get("account_primary_flags", "")
-            stars_2 = r.get("account_secondary_flags", "")
-            if filter_order_applied_var.get() == "date":
-                if q_cat and q_cat != (category_name or "").lower():
-                    continue
-                if q_acc and q_acc != acc1_norm and q_acc != acc2_norm:
-                    continue
-                if q_amt is not None:
-                    try:
-                        if to_decimal(r.get("amount_eur", "0")) != q_amt:
-                            continue
-                    except Exception:
-                        continue
-                if q_chq and q_chq not in str(r.get("cheque") or "").lower():
-                    continue
-                if q_note and q_note not in str(r.get("note") or "").casefold():
-                    continue
-            elif filter_order_applied_var.get() == "registration":
-                nreg = reg_seq_map[record_legacy_stable_key(r)]
-                if reg_from_n is not None and reg_to_n is not None:
-                    if filter_direction_applied_var.get() == "backward":
-                        if nreg > reg_from_n or nreg < reg_to_n:
-                            continue
-                    else:
-                        if nreg < reg_from_n or nreg > reg_to_n:
-                            continue
-                if q_acc and q_acc != acc1_norm and q_acc != acc2_norm:
-                    continue
-                if q_note and q_note not in str(r.get("note") or "").casefold():
-                    continue
-
             amount_text, amount_tag = format_amount_for_output(r)
             stripe = f"stripe{row_i % 2}"
             rid = record_legacy_stable_key(r)
@@ -5711,6 +6147,42 @@ th {{ background:#efefef; text-align:left; }}
             out.append((rid, reg_text, mov_vals, amount_text, amount_tag, r.get("note") or "", stripe))
             row_i += 1
         return out
+
+    def _recompute_saldo_parziale_categoria_ricerca_text(
+        pool: list[dict],
+        reg_seq_map: dict,
+        accounts_by_year: dict,
+        categories_by_year: dict,
+    ) -> None:
+        cat_raw = (text_category_applied_var.get() or "").strip()
+        if not cat_raw or cat_raw == _ALL_CATEGORIES_LABEL:
+            saldo_parziale_categoria_ricerca_text[0] = ""
+            return
+        st = _build_movement_search_filter_state()
+        tot = Decimal("0")
+        for r in pool:
+            ok, *_rest = _record_passes_movement_search_filters(
+                r, st, reg_seq_map, accounts_by_year, categories_by_year
+            )
+            if not ok:
+                continue
+            try:
+                tot += to_decimal(r.get("amount_eur", "0"))
+            except Exception:
+                pass
+        if filter_order_applied_var.get() == "date":
+            df = (date_from_applied_var.get() or "").strip()
+            dt = (date_to_applied_var.get() or "").strip()
+        else:
+            df, dt = _scope_dates_for_registration(reg_preset_applied_var.get())
+        if not df or not dt:
+            saldo_parziale_categoria_ricerca_text[0] = ""
+            return
+        di = to_italian_date(df)
+        al = to_italian_date(dt)
+        saldo_parziale_categoria_ricerca_text[0] = (
+            f"Saldo parziale della categoria «{cat_raw}» dal {di} al {al}: {format_saldo_cell('E', tot)}"
+        )
 
     def populate_movements_trees(reselect_stable_key: str | None = None) -> None:
         nonlocal movements_population_seq
@@ -5774,6 +6246,16 @@ th {{ background:#efefef; text-align:left; }}
         pending_movement_rows.extend(
             _movement_rows_from_pool(pool, reg_seq_map, accounts_by_year, categories_by_year)
         )
+        try:
+            _recompute_saldo_parziale_categoria_ricerca_text(
+                pool, reg_seq_map, accounts_by_year, categories_by_year
+            )
+        except Exception:
+            saldo_parziale_categoria_ricerca_text[0] = ""
+        try:
+            refresh_correction_bar()
+        except Exception:
+            pass
 
         def flush_movement_batch(start: int) -> None:
             # Evita race condition: se nel frattempo viene lanciato un nuovo populate,
@@ -5996,6 +6478,86 @@ th {{ background:#efefef; text-align:left; }}
         except Exception:
             pass
 
+    def _movement_preview_matches_applied_snapshot(
+        o: str,
+        f: str,
+        d: str,
+        dp_preview: str,
+        df_preview: str,
+        dt_preview: str,
+        rp_preview: str,
+        rf_preview: str,
+        rt_preview: str,
+        cat_preview: str,
+        acc_preview: str,
+        chq_preview: str,
+        amt_preview: str,
+        note_preview: str,
+    ) -> bool:
+        """True se questi valori (tipicamente l'anteprima filtri) coincidono con l'ultimo «Cerca» applicato."""
+        return (
+            o == filter_order_applied_var.get()
+            and f == filter_future_applied_var.get()
+            and d == filter_direction_applied_var.get()
+            and dp_preview == date_preset_applied_var.get()
+            and df_preview == date_from_applied_var.get()
+            and dt_preview == date_to_applied_var.get()
+            and rp_preview == reg_preset_applied_var.get()
+            and rf_preview == reg_from_applied_var.get()
+            and rt_preview == reg_to_applied_var.get()
+            and cat_preview == text_category_applied_var.get()
+            and acc_preview == text_account_applied_var.get()
+            and chq_preview == text_cheque_applied_var.get()
+            and amt_preview == (text_amount_applied_var.get() or "").strip()
+            and note_preview == text_note_applied_var.get()
+        )
+
+    def _movement_search_preview_differs_from_applied() -> bool:
+        """Anteprima filtri diversa dall'ultima ricerca applicata (es. importo non ancora normalizzabile → diverso)."""
+        o = filter_order_preview_var.get()
+        f = filter_future_preview_var.get()
+        d = filter_direction_preview_var.get()
+        df_preview = date_from_preview_var.get()
+        dt_preview = date_to_preview_var.get()
+        dp_preview = date_preset_preview_var.get()
+        cat_preview = text_category_preview_var.get()
+        acc_preview = text_account_preview_var.get()
+        chq_preview = text_cheque_preview_var.get()
+        note_preview = text_note_preview_var.get()
+        amt_preview_raw = (text_amount_preview_var.get() or "").strip()
+        amt_preview = ""
+        if amt_preview_raw and amt_preview_raw not in ("+", "-"):
+            try:
+                amt_chk = normalize_euro_input(amt_preview_raw)
+                if amount_filter_sign_var.get() == "-":
+                    amt_chk = -abs(amt_chk)
+                else:
+                    amt_chk = abs(amt_chk)
+                amt_preview = format_euro_it(amt_chk)
+            except Exception:
+                return True
+        elif amt_preview_raw in ("+", "-"):
+            amt_preview = "-" if amount_filter_sign_var.get() == "-" else "+"
+        rp_preview = reg_preset_preview_var.get()
+        rf_preview = reg_from_preview_var.get()
+        rt_preview = reg_to_preview_var.get()
+        return not _movement_preview_matches_applied_snapshot(
+            o,
+            f,
+            d,
+            dp_preview,
+            df_preview,
+            dt_preview,
+            rp_preview,
+            rf_preview,
+            rt_preview,
+            cat_preview,
+            acc_preview,
+            chq_preview,
+            amt_preview,
+            note_preview,
+        )
+
     def apply_movement_search(_event: tk.Event | None = None) -> None:
         o = filter_order_preview_var.get()
         f = filter_future_preview_var.get()
@@ -6092,21 +6654,21 @@ th {{ background:#efefef; text-align:left; }}
                     pass
                 return
 
-        if (
-            o == filter_order_applied_var.get()
-            and f == filter_future_applied_var.get()
-            and d == filter_direction_applied_var.get()
-            and dp_preview == date_preset_applied_var.get()
-            and df_preview == date_from_applied_var.get()
-            and dt_preview == date_to_applied_var.get()
-            and rp_preview == reg_preset_applied_var.get()
-            and rf_preview == reg_from_applied_var.get()
-            and rt_preview == reg_to_applied_var.get()
-            and cat_preview == text_category_applied_var.get()
-            and acc_preview == text_account_applied_var.get()
-            and chq_preview == text_cheque_applied_var.get()
-            and amt_preview == (text_amount_applied_var.get() or "").strip()
-            and note_preview == text_note_applied_var.get()
+        if _movement_preview_matches_applied_snapshot(
+            o,
+            f,
+            d,
+            dp_preview,
+            df_preview,
+            dt_preview,
+            rp_preview,
+            rf_preview,
+            rt_preview,
+            cat_preview,
+            acc_preview,
+            chq_preview,
+            amt_preview,
+            note_preview,
         ):
             return
         filter_order_applied_var.set(o)
@@ -6124,6 +6686,36 @@ th {{ background:#efefef; text-align:left; }}
         text_amount_applied_var.set(amt_preview)
         text_note_applied_var.set(note_preview)
         populate_movements_trees()
+
+    def _on_movement_search_preview_trace(*_args: object) -> None:
+        try:
+            if not _movement_search_preview_differs_from_applied():
+                return
+            if not (saldo_parziale_categoria_ricerca_text[0] or "").strip():
+                return
+            saldo_parziale_categoria_ricerca_text[0] = ""
+            refresh_correction_bar()
+        except Exception:
+            pass
+
+    for _pref_var in (
+        filter_order_preview_var,
+        filter_future_preview_var,
+        filter_direction_preview_var,
+        date_preset_preview_var,
+        date_from_preview_var,
+        date_to_preview_var,
+        reg_preset_preview_var,
+        reg_from_preview_var,
+        reg_to_preview_var,
+        text_category_preview_var,
+        text_account_preview_var,
+        text_cheque_preview_var,
+        text_amount_preview_var,
+        text_note_preview_var,
+        amount_filter_sign_var,
+    ):
+        _pref_var.trace_add("write", _on_movement_search_preview_trace)
 
     # Enter nei filtri testuali = esegui Cerca
     for _w in (category_entry, account_entry, amount_filter_entry, cheque_entry, note_entry):
@@ -7341,7 +7933,7 @@ th {{ background:#efefef; text-align:left; }}
     ).grid(row=1, column=0, sticky="e", pady=(0, 1))
     tk.Label(
         balance_lbl_col,
-        text="Spese future",
+        text="Di cui, spese future",
         font=_saldo_title_col_font,
         anchor="e",
         bg=MOVIMENTI_PAGE_BG,
@@ -7444,13 +8036,13 @@ th {{ background:#efefef; text-align:left; }}
         saldo_oggi = [saldo_assoluti[j] - amts_future[j] for j in range(len(names))]
         spese_future = [saldo_assoluti[j] - saldo_oggi[j] for j in range(len(names))]
         disponibilita = [
-            (a + sf + sc) if not is_cc[i] else Decimal("0")
+            (a + sc) if not is_cc[i] else Decimal("0")
             for i, (a, sf, sc) in enumerate(zip(saldo_assoluti, spese_future, spese_cc))
         ]
         total_abs = sum((saldo_assoluti[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
         total_spese_future = sum((spese_future[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
         total_spese_cc = sum((spese_cc[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
-        total_disponibilita = total_abs + total_spese_future + total_spese_cc
+        total_disponibilita = total_abs + total_spese_cc
         return {
             "valuta": "E",
             "names": [n.strip() for n in names],
@@ -7473,7 +8065,7 @@ th {{ background:#efefef; text-align:left; }}
         for_native: bool = False,
         native_text_width_pt: float | None = None,
     ) -> str:
-        """Stampa A4: tabella trasposta — righe = conti, colonne = saldi assoluti / spese future / spese CC / disponibilità + TOTALE.
+        """Stampa A4: tabella trasposta — righe = conti, colonne = saldi assoluti / di cui spese future / spese CC / disponibilità + TOTALE.
 
         Con ``native_text_width_pt=iw`` (solo macOS) colgroup e larghezza tabella sono in **punti** (Conti 14%, quattro colonne importo).
         """
@@ -7590,7 +8182,7 @@ th {{ background:#efefef; text-align:left; }}
         header_cells = (
             '<th class="hdr-name">Conti</th>'
             '<th class="col-hdr col-hdr-b"><strong>Saldi assoluti</strong></th>'
-            '<th class="col-hdr col-hdr-b"><strong>Spese future</strong></th>'
+            '<th class="col-hdr col-hdr-b"><strong>Di cui, spese future</strong></th>'
             '<th class="col-hdr col-hdr-b"><strong>Spese per carte<br/>di credito</strong></th>'
             '<th class="col-hdr col-hdr-n">Disponibilità</th>'
         )
@@ -8134,129 +8726,157 @@ th {{ background:#efefef; text-align:left; }}
 
     root.after_idle(_align_stampa_saldi_to_middle_row)
 
+    _saldi_footer_in_refresh: list[bool] = [False]
+    _saldi_footer_last_date_iso: list[str] = [""]
+
     def refresh_balance_footer() -> None:
-        balance_center_canvas.delete("all")
-        today_iso = date.today().isoformat()
-        tk_flag = bool(import_cancel_twin_balance_keys(cur_db()))
-        _, names, amts_future = compute_balances_future_dated_only(
-            cur_db(), today_iso=today_iso, exclude_import_twin_actives=tk_flag
-        )
-        saldo_h = hybrid_absolute_balances_for_saldi(cur_db(), today_cancel_cutoff_iso=today_iso)
-        if saldo_h is None or len(saldo_h) != len(names):
-            _, _, saldo_abs_full = compute_balances_from_2022_asof(
-                cur_db(), cutoff_date_iso=today_iso, exclude_import_twin_actives=tk_flag
-            )
-        else:
-            saldo_abs_full = saldo_h
-        cc_full = account_is_credit_card_column_flags(cur_db(), len(names))
-        spese_cc_full = compute_spese_cc_footer_amounts(cur_db(), saldo_abs_full)
-        _keep_saldi = saldi_visible_account_column_indices(cur_db(), names)
-        names = [names[i] for i in _keep_saldi]
-        saldo_assoluti = [saldo_abs_full[i] for i in _keep_saldi]
-        amts_future = [amts_future[i] for i in _keep_saldi]
-        is_cc = [cc_full[i] for i in _keep_saldi]
-        spese_cc = [spese_cc_full[i] for i in _keep_saldi]
-        saldo_oggi = [saldo_assoluti[j] - amts_future[j] for j in range(len(names))]
-        spese_future = [saldo_assoluti[j] - saldo_oggi[j] for j in range(len(names))]
-        disponibilita = [
-            (a + sf + sc) if not is_cc[i] else Decimal("0")
-            for i, (a, sf, sc) in enumerate(zip(saldo_assoluti, spese_future, spese_cc))
-        ]
-        total_assoluti = sum((saldo_assoluti[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
-        total_spese_future = sum((spese_future[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
-        total_spese_cc = sum((spese_cc[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
-        total_disponibilita = total_assoluti + total_spese_future + total_spese_cc
-
-        # Riga 1 assoluti; 2 spese future; 3 spese CC; 4 disponibilità = somma algebrica (1+2+3). Colonna TOTALE senza conti carta.
-        table = tk.Frame(balance_center_canvas, highlightthickness=0, bd=0)
-        balance_center_canvas.create_window((0, 0), window=table, anchor="nw")
-
-        header_font = ("TkDefaultFont", 12, "bold")
-        amount_font = ("TkDefaultFont", 12, "bold")
-        AMT_CELL_WIDTH = 18
-
-        def header_cell(col: int, text: str) -> None:
-            pl, pr = (0, 2) if col == 0 else (0, 6)
-            tk.Label(
-                table,
-                text=text,
-                font=header_font,
-                width=AMT_CELL_WIDTH,
-                anchor="e",
-            ).grid(row=0, column=col, sticky="e", padx=(pl, pr), pady=(0, 1))
-
-        def amount_cell(row: int, col: int, amt: Decimal) -> None:
-            pl, pr = (0, 2) if col == 0 else (0, 6)
-            tk.Label(
-                table,
-                text=format_saldo_cell("E", amt),
-                font=amount_font,
-                fg=balance_amount_fg(amt),
-                width=AMT_CELL_WIDTH,
-                anchor=tk.E,
-            ).grid(row=row, column=col, sticky="e", padx=(pl, pr), pady=(0, 1))
-
-        def dash_cell(row: int, col: int) -> None:
-            pl, pr = (0, 2) if col == 0 else (0, 6)
-            tk.Label(
-                table,
-                text="—",
-                font=amount_font,
-                fg="#888888",
-                width=AMT_CELL_WIDTH,
-                anchor=tk.E,
-            ).grid(row=row, column=col, sticky="e", padx=(pl, pr), pady=(0, 1))
-
-        # Solo TOTALE + conti nello scroll orizzontale; etichette righe fisse in balance_lbl_col.
-        header_cell(0, "TOTALE")
-        for i, name in enumerate(names):
-            header_cell(i + 1, name.strip())
-
-        amount_cell(1, 0, total_assoluti)
-        for i, amt in enumerate(saldo_assoluti):
-            amount_cell(1, i + 1, amt)
-
-        amount_cell(2, 0, total_spese_future)
-        for i, amt in enumerate(spese_future):
-            if is_cc[i]:
-                dash_cell(2, i + 1)
-            else:
-                amount_cell(2, i + 1, amt)
-
-        amount_cell(3, 0, total_spese_cc)
-        for i, amt in enumerate(spese_cc):
-            if is_cc[i]:
-                dash_cell(3, i + 1)
-            else:
-                amount_cell(3, i + 1, amt)
-
-        amount_cell(4, 0, total_disponibilita)
-        for i, amt in enumerate(disponibilita):
-            if is_cc[i]:
-                dash_cell(4, i + 1)
-            else:
-                amount_cell(4, i + 1, amt)
-        for _sr in range(5):
-            table.grid_rowconfigure(_sr, minsize=_saldo_grid_row_h)
-        table.update_idletasks()
-        # Altezza viewport canvas = tabella reale (pady delle celle + minsize possono superare 5*row_h).
+        if _saldi_footer_in_refresh[0]:
+            return
+        _saldi_footer_in_refresh[0] = True
         try:
-            _tbl_h = max(1, table.winfo_reqheight())
-            balance_center_canvas.configure(height=_tbl_h + 4)
-        except tk.TclError:
+            today_iso = date.today().isoformat()
+            balance_center_canvas.delete("all")
+            tk_flag = bool(import_cancel_twin_balance_keys(cur_db()))
+            _, names, amts_future = compute_balances_future_dated_only(
+                cur_db(), today_iso=today_iso, exclude_import_twin_actives=tk_flag
+            )
+            saldo_h = hybrid_absolute_balances_for_saldi(cur_db(), today_cancel_cutoff_iso=today_iso)
+            if saldo_h is None or len(saldo_h) != len(names):
+                _, _, saldo_abs_full = compute_balances_from_2022_asof(
+                    cur_db(), cutoff_date_iso=today_iso, exclude_import_twin_actives=tk_flag
+                )
+            else:
+                saldo_abs_full = saldo_h
+            cc_full = account_is_credit_card_column_flags(cur_db(), len(names))
+            spese_cc_full = compute_spese_cc_footer_amounts(cur_db(), saldo_abs_full)
+            _keep_saldi = saldi_visible_account_column_indices(cur_db(), names)
+            names = [names[i] for i in _keep_saldi]
+            saldo_assoluti = [saldo_abs_full[i] for i in _keep_saldi]
+            amts_future = [amts_future[i] for i in _keep_saldi]
+            is_cc = [cc_full[i] for i in _keep_saldi]
+            spese_cc = [spese_cc_full[i] for i in _keep_saldi]
+            saldo_oggi = [saldo_assoluti[j] - amts_future[j] for j in range(len(names))]
+            spese_future = [saldo_assoluti[j] - saldo_oggi[j] for j in range(len(names))]
+            disponibilita = [
+                (a + sc) if not is_cc[i] else Decimal("0")
+                for i, (a, sf, sc) in enumerate(zip(saldo_assoluti, spese_future, spese_cc))
+            ]
+            total_assoluti = sum((saldo_assoluti[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
+            total_spese_future = sum((spese_future[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
+            total_spese_cc = sum((spese_cc[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
+            total_disponibilita = total_assoluti + total_spese_cc
+
+            # Riga 1 assoluti; 2 di cui spese future (solo informativa); 3 spese CC; 4 Disponibilità = riga 1 + riga 3 (senza riga 2). TOTALE senza conti carta.
+            table = tk.Frame(balance_center_canvas, highlightthickness=0, bd=0)
+            balance_center_canvas.create_window((0, 0), window=table, anchor="nw")
+
+            header_font = ("TkDefaultFont", 12, "bold")
+            amount_font = ("TkDefaultFont", 12, "bold")
+            AMT_CELL_WIDTH = 18
+
+            def header_cell(col: int, text: str) -> None:
+                pl, pr = (0, 2) if col == 0 else (0, 6)
+                tk.Label(
+                    table,
+                    text=text,
+                    font=header_font,
+                    width=AMT_CELL_WIDTH,
+                    anchor="e",
+                ).grid(row=0, column=col, sticky="e", padx=(pl, pr), pady=(0, 1))
+
+            def amount_cell(row: int, col: int, amt: Decimal) -> None:
+                pl, pr = (0, 2) if col == 0 else (0, 6)
+                tk.Label(
+                    table,
+                    text=format_saldo_cell("E", amt),
+                    font=amount_font,
+                    fg=balance_amount_fg(amt),
+                    width=AMT_CELL_WIDTH,
+                    anchor=tk.E,
+                ).grid(row=row, column=col, sticky="e", padx=(pl, pr), pady=(0, 1))
+
+            def dash_cell(row: int, col: int) -> None:
+                pl, pr = (0, 2) if col == 0 else (0, 6)
+                tk.Label(
+                    table,
+                    text="—",
+                    font=amount_font,
+                    fg="#888888",
+                    width=AMT_CELL_WIDTH,
+                    anchor=tk.E,
+                ).grid(row=row, column=col, sticky="e", padx=(pl, pr), pady=(0, 1))
+
+            # Solo TOTALE + conti nello scroll orizzontale; etichette righe fisse in balance_lbl_col.
+            header_cell(0, "TOTALE")
+            for i, name in enumerate(names):
+                header_cell(i + 1, name.strip())
+
+            amount_cell(1, 0, total_assoluti)
+            for i, amt in enumerate(saldo_assoluti):
+                amount_cell(1, i + 1, amt)
+
+            amount_cell(2, 0, total_spese_future)
+            for i, amt in enumerate(spese_future):
+                if is_cc[i]:
+                    dash_cell(2, i + 1)
+                else:
+                    amount_cell(2, i + 1, amt)
+
+            amount_cell(3, 0, total_spese_cc)
+            for i, amt in enumerate(spese_cc):
+                if is_cc[i]:
+                    dash_cell(3, i + 1)
+                else:
+                    amount_cell(3, i + 1, amt)
+
+            amount_cell(4, 0, total_disponibilita)
+            for i, amt in enumerate(disponibilita):
+                if is_cc[i]:
+                    dash_cell(4, i + 1)
+                else:
+                    amount_cell(4, i + 1, amt)
+            for _sr in range(5):
+                table.grid_rowconfigure(_sr, minsize=_saldo_grid_row_h)
+            table.update_idletasks()
+            # Altezza viewport canvas = tabella reale (pady delle celle + minsize possono superare 5*row_h).
+            try:
+                _tbl_h = max(1, table.winfo_reqheight())
+                balance_center_canvas.configure(height=_tbl_h + 4)
+            except tk.TclError:
+                pass
+            balance_lbl_col.update_idletasks()
+            balance_scroll_block.update_idletasks()
+            balance_center.update_idletasks()
+            balance_center_canvas.update_idletasks()
+            bbox = balance_center_canvas.bbox("all")
+            if bbox is not None:
+                balance_center_canvas.configure(scrollregion=bbox)
+            balance_center_canvas.update_idletasks()
+            _bind_balance_saldi_horizontal_scroll_recursive(table)
+            root.after_idle(_align_stampa_saldi_to_middle_row)
+            _saldi_footer_last_date_iso[0] = today_iso
+        finally:
+            _saldi_footer_in_refresh[0] = False
+
+    def _saldi_footer_on_app_focus_in(_e: tk.Event) -> None:
+        if _saldi_footer_in_refresh[0]:
+            return
+        try:
+            w = _e.widget
+            top = w.winfo_toplevel()
+            if top is not root:
+                return
+        except (tk.TclError, AttributeError, RuntimeError, TypeError):
+            return
+        try:
+            if date.today().isoformat() != _saldi_footer_last_date_iso[0]:
+                refresh_balance_footer()
+        except Exception:
             pass
-        balance_lbl_col.update_idletasks()
-        balance_scroll_block.update_idletasks()
-        balance_center.update_idletasks()
-        balance_center_canvas.update_idletasks()
-        bbox = balance_center_canvas.bbox("all")
-        if bbox is not None:
-            balance_center_canvas.configure(scrollregion=bbox)
-        balance_center_canvas.update_idletasks()
-        _bind_balance_saldi_horizontal_scroll_recursive(table)
-        root.after_idle(_align_stampa_saldi_to_middle_row)
 
     refresh_balance_footer()
+
+    root.bind_all("<FocusIn>", _saldi_footer_on_app_focus_in, add="+")
 
     # Pagina Nuove registrazioni
     pack_centered_page_title(
@@ -8481,14 +9101,15 @@ th {{ background:#efefef; text-align:left; }}
         def _norm_cat(s: str) -> str:
             return " ".join((s or "").strip().lower().replace(".", " ").replace("/", " / ").split())
 
-        def _cat_rank(item: tuple[str, str]) -> tuple[int, int, str]:
+        def _cat_rank(item: tuple[str, str]) -> tuple[int, str]:
             n, c = item
             nn = _norm_cat(n)
             if "consumi ordinari" in nn:
-                return (0, 0, n)
+                return (0, "")
             if ("girata conto / conto" in nn) or ("girata conto conto" in nn):
-                return (1, 0, n)
-            return (2, -cat_freq.get(c, 0), n.lower())
+                return (1, "")
+            return (2, n.lower())
+
         cat_opts.sort(key=_cat_rank)
         if not cat_opts:
             cat_opts = [
@@ -9010,6 +9631,13 @@ th {{ background:#efefef; text-align:left; }}
     def _is_cassa_first_account() -> bool:
         return (newreg_acc1_var.get() or "").strip().lower() == "cassa"
 
+    def _is_primary_account_credit_card() -> bool:
+        acc1_name = (newreg_acc1_var.get() or "").strip()
+        acc1_code = next((c for n, c in acc_opts_cache if n == acc1_name), "")
+        if not acc1_code:
+            return False
+        return account_is_credit_card_by_code(cur_db(), acc1_code)
+
     def _is_second_account_cassa() -> bool:
         return (newreg_acc2_var.get() or "").strip().lower() == "cassa"
 
@@ -9210,6 +9838,8 @@ th {{ background:#efefef; text-align:left; }}
             lbl_acc2.grid_remove()
             row_acc2_outer.grid_remove()
             newreg_acc2_var.set("")
+            if (newreg_note_var.get() or "").strip() == "Giroconto":
+                newreg_note_var.set("")
 
         # Annulla procedura saldo se si cambia categoria/conto.
         if saldo_aggiorna_active[0] or saldo_aggiorna_locked[0]:
@@ -9226,11 +9856,19 @@ th {{ background:#efefef; text-align:left; }}
             _cancel_saldo_procedure()
         _show_aggiorna_saldo_btn_if_needed()
 
-        # Cassa o Virtuale: nessun assegno; ripristina la riga se si cambia conto.
+        # Cassa o Virtuale: nessun assegno; carta di credito: niente campo assegno, valore fisso «ccarta».
         if _is_cassa_first_account() or _is_virtuale_account(newreg_acc1_var.get()):
             lbl_assegno.grid_remove()
             ent_chq.grid_remove()
             newreg_cheque_var.set("")
+            try:
+                ent_chq.configure(takefocus=False)
+            except Exception:
+                pass
+        elif _is_primary_account_credit_card():
+            lbl_assegno.grid_remove()
+            ent_chq.grid_remove()
+            newreg_cheque_var.set("ccarta")
             try:
                 ent_chq.configure(takefocus=False)
             except Exception:
@@ -9502,6 +10140,8 @@ th {{ background:#efefef; text-align:left; }}
             return None
         if _is_cassa_first_account():
             chq = "-"
+        elif _is_primary_account_credit_card():
+            chq = sanitize_single_line_text("ccarta", max_len=MAX_CHEQUE_LEN)
         else:
             chq = sanitize_single_line_text(newreg_cheque_var.get() or "", max_len=MAX_CHEQUE_LEN)
             if not chq:
@@ -10766,6 +11406,33 @@ th {{ background:#efefef; text-align:left; }}
     cb_per_cat.bind("<<ComboboxSelected>>", lambda _e: _per_sync_cat_and_second())
     cb_per_acc1.bind("<<ComboboxSelected>>", lambda _e: _per_sync_cat_and_second())
     cb_per_acc2.bind("<<ComboboxSelected>>", lambda _e: _per_sync_cat_and_second())
+
+    def _per_cat_letter_jump(letter: str) -> bool:
+        try:
+            vals = list(cb_per_cat.cget("values") or ())
+        except tk.TclError:
+            return False
+        if not vals:
+            return False
+        for nm in vals:
+            if not nm:
+                continue
+            try:
+                first = str(nm[0]).lower()
+            except Exception:
+                continue
+            if first != letter:
+                continue
+            per_cat_var.set(nm)
+            try:
+                cb_per_cat.current(vals.index(nm))
+            except Exception:
+                pass
+            _per_sync_cat_and_second()
+            return True
+        return False
+
+    bind_ttk_combobox_letter_jump_with_popdown(cb_per_cat, on_letter=_per_cat_letter_jump)
     ent_per_amt.bind("<FocusOut>", lambda _e: _per_format_amount_entry())
     bind_euro_amount_entry_validation(ent_per_amt, per_amount_var)
 
@@ -10992,6 +11659,36 @@ th {{ background:#efefef; text-align:left; }}
     cb_cat.bind("<<ComboboxSelected>>", _on_cat_selected)
     cb_acc1.bind("<<ComboboxSelected>>", _on_acc1_combo)
     cb_acc2.bind("<<ComboboxSelected>>", _on_acc2_combo)
+
+    def _newreg_cat_letter_jump(letter: str) -> bool:
+        """Preselezione: ogni lettera sostituisce la precedente; prima categoria che inizia con quella lettera (anche col menu aperto)."""
+        try:
+            vals = list(cb_cat.cget("values") or ())
+        except tk.TclError:
+            return False
+        if not vals:
+            return False
+        for nm in vals:
+            if not nm:
+                continue
+            try:
+                first = str(nm[0]).lower()
+            except Exception:
+                continue
+            if first != letter:
+                continue
+            newreg_cat_var.set(nm)
+            code = next((c for n, c in cat_opts_cache if n == nm), "")
+            newreg_cat_code_var.set(code)
+            try:
+                cb_cat.current(vals.index(nm))
+            except Exception:
+                pass
+            _on_cat_selected()
+            return True
+        return False
+
+    bind_ttk_combobox_letter_jump_with_popdown(cb_cat, on_letter=_newreg_cat_letter_jump)
     ent_date.bind("<KeyPress>", _newreg_date_keypress)
     ent_date.bind("<FocusOut>", lambda _e: _normalize_newreg_date_display())
     ent_date.bind("<Button-1>", lambda _e: (_toggle_newreg_date_calendar(), "break")[1])
@@ -11133,7 +11830,11 @@ th {{ background:#efefef; text-align:left; }}
         _format_amount_entry()
         _hide_aggiorna_saldo_btn()
         try:
-            if _is_cassa_first_account() or _is_virtuale_account(newreg_acc1_var.get()):
+            if (
+                _is_cassa_first_account()
+                or _is_virtuale_account(newreg_acc1_var.get())
+                or _is_primary_account_credit_card()
+            ):
                 ent_note.focus_set()
             else:
                 ent_chq.focus_set()
@@ -12135,6 +12836,30 @@ th {{ background:#efefef; text-align:left; }}
     ver_btn_minus.grid(row=0, column=3, padx=(0, 16), pady=2)
     bind_euro_amount_entry_validation(ver_ent_amt, ver_inp_amt_var)
 
+    def _ver_amt_set_cursor_after_sign() -> None:
+        """Verifica manuale: dopo il segno +/− preimpostato (solo segno → cursore in posizione 1)."""
+        raw = (ver_inp_amt_var.get() or "").strip()
+        try:
+            if raw in ("+", "-"):
+                ver_ent_amt.icursor(1)
+            else:
+                ver_ent_amt.icursor(tk.END)
+        except tk.TclError:
+            pass
+
+    def _ver_on_amt_focusin(_e: object | None = None) -> None:
+        if _ver_candidate_pick_ui_active():
+            return
+        if not ver_session_active[0]:
+            return
+        if not (
+            bool(str(ver_work_frame.winfo_manager() or "").strip()) or _ver_ui_on_results_page()
+        ):
+            return
+        _ver_amt_set_cursor_after_sign()
+
+    ver_ent_amt.bind("<FocusIn>", _ver_on_amt_focusin, add="+")
+
     ver_amt_focusout_guard: list[bool] = [False]
     ver_amt_focusout_suppress_once: list[bool] = [False]
     _VER_AMT_FOCUS_MSG = (
@@ -12168,7 +12893,7 @@ th {{ background:#efefef; text-align:left; }}
             messagebox.showwarning("Verifica", _VER_AMT_FOCUS_MSG, parent=verifica_frame)
             try:
                 ver_ent_amt.focus_set()
-                ver_ent_amt.icursor(tk.END)
+                _ver_amt_set_cursor_after_sign()
             except tk.TclError:
                 pass
             return "break"
@@ -12182,7 +12907,7 @@ th {{ background:#efefef; text-align:left; }}
             messagebox.showerror("Verifica", _VER_AMT_FOCUS_MSG, parent=verifica_frame)
             try:
                 ver_ent_amt.focus_set()
-                ver_ent_amt.icursor(tk.END)
+                _ver_amt_set_cursor_after_sign()
             except tk.TclError:
                 pass
             return "break"
@@ -12190,7 +12915,7 @@ th {{ background:#efefef; text-align:left; }}
             messagebox.showerror("Verifica", "Importo non valido.", parent=verifica_frame)
             try:
                 ver_ent_amt.focus_set()
-                ver_ent_amt.icursor(tk.END)
+                _ver_amt_set_cursor_after_sign()
             except tk.TclError:
                 pass
             return "break"
@@ -12257,7 +12982,7 @@ th {{ background:#efefef; text-align:left; }}
                 ver_amt_focusout_guard[0] = False
             try:
                 ver_ent_amt.focus_set()
-                ver_ent_amt.icursor(tk.END)
+                _ver_amt_set_cursor_after_sign()
             except tk.TclError:
                 pass
 
@@ -12277,10 +13002,7 @@ th {{ background:#efefef; text-align:left; }}
             if raw.startswith(("+", "-")):
                 raw = raw[1:]
             ver_inp_amt_var.set(sign + raw)
-        try:
-            ver_ent_amt.icursor(tk.END)
-        except Exception:
-            pass
+        _ver_amt_set_cursor_after_sign()
 
     ver_btn_plus.bind("<Button-1>", lambda _e: _ver_apply_sign("+"))
     ver_btn_minus.bind("<Button-1>", lambda _e: _ver_apply_sign("-"))
@@ -14710,7 +15432,6 @@ th {{ background:#efefef; text-align:left; }}
         except Exception:
             pass
         _ver_place_pending_host(force_immissione_layout=True)
-        _ver_pack_ver_input_in_work_frame()
 
         _q0 = ver_bancoposta_queue[0]
         _i0 = ver_bancoposta_idx[0]
@@ -14735,6 +15456,8 @@ th {{ background:#efefef; text-align:left; }}
                     ver_setup_frame.pack(fill=tk.X)
                     _ver_setup_start_buttons_state()
                 return
+
+        _ver_pack_ver_input_in_work_frame()
 
         if resuming_manual_batch or defer_memory_resume_ok:
             if defer_memory_resume_ok:
@@ -15533,58 +16256,112 @@ th {{ background:#efefef; text-align:left; }}
                     _ver_save_pending_to_db()
                 except Exception:
                     pass
-            else:
-                acc_e = ver_account_code_var.get().strip()
-                if acc_e:
-                    saved_disk = _ver_load_pending_from_db(acc_e)
-                    if not _ver_saved_has_verification_in_sospeso(saved_disk):
-                        try:
-                            _ver_clear_pending_from_db(acc_e)
-                            persist_db_after_edit(None)
-                        except Exception:
-                            pass
-            ver_session_active[0] = False
-            ver_session_account_code[0] = ""
-            ver_manual_any_amount_submitted[0] = False
-            ver_verifica_used_pdf_coda[0] = False
-            ver_pending_items[0] = []
-            ver_bancoposta_queue[0] = []
-            ver_bancoposta_idx[0] = -1
-            ver_bancoposta_closing[0] = None
-            ver_pdf_closing_balance_hint[0] = None
-            ver_bancoposta_pdf_var.set("")
-            try:
-                ver_bancoposta_entry.configure(state="normal")
-            except tk.TclError:
-                pass
-            _ver_set_bancoposta_browse_enabled(True)
-            ver_cand_frame.pack_forget()
-            ver_cand_candidates[0] = []
-            ver_cand_pending_item[0] = None
-            try:
-                ver_pending_host.pack_forget()
-            except tk.TclError:
-                pass
-            try:
-                ver_input_frame.pack_forget()
-            except tk.TclError:
-                pass
-            ver_work_frame.pack_forget()
-            ver_results_frame.pack_forget()
-            ver_account_name_var.set("")
-            ver_cutoff_date_var.set("")
-            ver_account_code_var.set("")
-            ver_stmt_balance_var.set("")
-            ver_status_var.set("")
-            ver_inp_amt_var.set("-")
-            ver_inp_chq_var.set("")
-            ver_inp_note_var.set("")
-            ver_setup_saved_var.set("")
-            ver_setup_pdf_path_after_auto_fail[0] = False
-            ver_setup_frame.pack(fill=tk.X, anchor=tk.W, pady=(0, 4), in_=ver_body)
-            _ver_populate_account_combo()
-            _ver_update_pending_action_buttons_visibility()
-            return
+                ver_session_active[0] = False
+                ver_session_account_code[0] = ""
+                ver_manual_any_amount_submitted[0] = False
+                ver_verifica_used_pdf_coda[0] = False
+                ver_pending_items[0] = []
+                ver_bancoposta_queue[0] = []
+                ver_bancoposta_idx[0] = -1
+                ver_bancoposta_closing[0] = None
+                ver_pdf_closing_balance_hint[0] = None
+                ver_bancoposta_pdf_var.set("")
+                try:
+                    ver_bancoposta_entry.configure(state="normal")
+                except tk.TclError:
+                    pass
+                _ver_set_bancoposta_browse_enabled(True)
+                ver_cand_frame.pack_forget()
+                ver_cand_candidates[0] = []
+                ver_cand_pending_item[0] = None
+                try:
+                    ver_pending_host.pack_forget()
+                except tk.TclError:
+                    pass
+                try:
+                    ver_input_frame.pack_forget()
+                except tk.TclError:
+                    pass
+                ver_work_frame.pack_forget()
+                ver_results_frame.pack_forget()
+                ver_account_name_var.set("")
+                ver_cutoff_date_var.set("")
+                ver_account_code_var.set("")
+                ver_stmt_balance_var.set("")
+                ver_status_var.set("")
+                ver_inp_amt_var.set("-")
+                ver_inp_chq_var.set("")
+                ver_inp_note_var.set("")
+                ver_setup_saved_var.set("")
+                ver_setup_pdf_path_after_auto_fail[0] = False
+                ver_setup_frame.pack(fill=tk.X, anchor=tk.W, pady=(0, 4), in_=ver_body)
+                _ver_populate_account_combo()
+                _ver_update_pending_action_buttons_visibility()
+                return
+            acc_e2 = ver_account_code_var.get().strip()
+            if acc_e2:
+                saved_disk2 = _ver_load_pending_from_db(acc_e2)
+                if not _ver_saved_has_verification_in_sospeso(saved_disk2):
+                    try:
+                        _ver_clear_pending_from_db(acc_e2)
+                        persist_db_after_edit(None)
+                    except Exception:
+                        pass
+            allow_stmt_report_no_session_input = False
+            if acc_e2:
+                try:
+                    pd_chk, _, _, _, _ = _ver_verification_summary(
+                        cur_db(),
+                        acc_e2,
+                        cutoff_raw=(ver_cutoff_date_var.get() or "").strip(),
+                        stmt_balance=Decimal("0"),
+                    )
+                    allow_stmt_report_no_session_input = int(pd_chk.get("count_unverified") or 0) > 0
+                except Exception:
+                    allow_stmt_report_no_session_input = False
+            if not allow_stmt_report_no_session_input:
+                ver_session_active[0] = False
+                ver_session_account_code[0] = ""
+                ver_manual_any_amount_submitted[0] = False
+                ver_verifica_used_pdf_coda[0] = False
+                ver_pending_items[0] = []
+                ver_bancoposta_queue[0] = []
+                ver_bancoposta_idx[0] = -1
+                ver_bancoposta_closing[0] = None
+                ver_pdf_closing_balance_hint[0] = None
+                ver_bancoposta_pdf_var.set("")
+                try:
+                    ver_bancoposta_entry.configure(state="normal")
+                except tk.TclError:
+                    pass
+                _ver_set_bancoposta_browse_enabled(True)
+                ver_cand_frame.pack_forget()
+                ver_cand_candidates[0] = []
+                ver_cand_pending_item[0] = None
+                try:
+                    ver_pending_host.pack_forget()
+                except tk.TclError:
+                    pass
+                try:
+                    ver_input_frame.pack_forget()
+                except tk.TclError:
+                    pass
+                ver_work_frame.pack_forget()
+                ver_results_frame.pack_forget()
+                ver_account_name_var.set("")
+                ver_cutoff_date_var.set("")
+                ver_account_code_var.set("")
+                ver_stmt_balance_var.set("")
+                ver_status_var.set("")
+                ver_inp_amt_var.set("-")
+                ver_inp_chq_var.set("")
+                ver_inp_note_var.set("")
+                ver_setup_saved_var.set("")
+                ver_setup_pdf_path_after_auto_fail[0] = False
+                ver_setup_frame.pack(fill=tk.X, anchor=tk.W, pady=(0, 4), in_=ver_body)
+                _ver_populate_account_combo()
+                _ver_update_pending_action_buttons_visibility()
+                return
 
         existing = ver_stmt_balance_var.get().strip()
         if not existing:
@@ -16560,39 +17337,66 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
     pack_centered_page_title(
         aiuto_frame, title=_page_banner_title(), banner_style="MovCdc.TFrame", title_bg=MOVIMENTI_PAGE_BG
     )
-    ttk.Label(aiuto_frame, text="Pagina in preparazione").pack(anchor=tk.W)
+    ttk.Label(
+        aiuto_frame,
+        text=f"Conti di casa — versione {APP_VERSION}",
+        font=("TkDefaultFont", 13, "bold"),
+        background=MOVIMENTI_PAGE_BG,
+        foreground="#0d47a1",
+    ).pack(anchor=tk.W, pady=(0, 4))
+    ttk.Label(
+        aiuto_frame,
+        text="Manuale d’uso e regole principali (scorri il testo).",
+        font=("TkDefaultFont", 10),
+        background=MOVIMENTI_PAGE_BG,
+        foreground="#333333",
+    ).pack(anchor=tk.W, pady=(0, 8))
+    _aiuto_outer = ttk.Frame(aiuto_frame, style="MovCdc.TFrame")
+    _aiuto_outer.pack(fill=tk.BOTH, expand=True)
+    _aiuto_outer.rowconfigure(0, weight=1)
+    _aiuto_outer.columnconfigure(0, weight=1)
+    _aiuto_txt = tk.Text(
+        _aiuto_outer,
+        wrap="word",
+        height=12,
+        font=("TkDefaultFont", 11),
+        background=CDC_ENTRY_FIELD_BG,
+        foreground="#1a1a1a",
+        relief=tk.FLAT,
+        padx=10,
+        pady=10,
+        highlightthickness=1,
+        highlightbackground="#90caf9",
+        highlightcolor="#42a5f5",
+        state=tk.NORMAL,
+    )
+    _aiuto_vsb = ttk.Scrollbar(_aiuto_outer, orient="vertical", command=_aiuto_txt.yview)
+    _aiuto_txt.configure(yscrollcommand=_aiuto_vsb.set)
+    _aiuto_txt.grid(row=0, column=0, sticky="nsew")
+    _aiuto_vsb.grid(row=0, column=1, sticky="ns")
+
+    def _aiuto_mousewheel(event: tk.Event) -> str | None:
+        d = int(getattr(event, "delta", 0) or 0)
+        if not d:
+            return None
+        if platform.system() == "Darwin":
+            n = max(-14, min(14, -d))
+        else:
+            n = int(-d / 120)
+            if n == 0:
+                n = -1 if d > 0 else 1
+            n = max(-12, min(12, n))
+        _aiuto_txt.yview_scroll(n, "units")
+        return "break"
+
+    _aiuto_txt.bind("<MouseWheel>", _aiuto_mousewheel)
+    _aiuto_txt.insert("1.0", app_help_text.CDC_HELP_BODY)
+    _aiuto_txt.configure(state=tk.DISABLED)
 
     # --- Schede Categorie e Conti (due pagine; piano unico = ultimo anno) ---
-    _PLAN_INTRO_CAT = (
-        "Qui vedi l’elenco unificato delle categorie (per codice) su tutti gli anni del database, più eventuali codici che compaiono solo nei movimenti "
-        "se in un anno manca ancora la riga nel piano: sono gli stessi nomi usabili nei filtri di ricerca. "
-        f"Limite: {MAX_CATEGORIES_COUNT} categorie. Puoi aggiungerne di nuove con il pulsante sotto l’elenco. "
-        "Non puoi eliminare una categoria. Il nome si può correggere solo con modifiche piccole e riconducibili al testo attuale; "
-        "se cambi il nome, le registrazioni già inserite vengono aggiornate solo dove il nome categoria salvato coincide esattamente con quello precedente. "
-        "La nota di categoria non entra nelle registrazioni: puoi cambiarla quando vuoi (tranne la nota predefinita della «Girata conto/conto», fissa da qui). "
-        "I nomi di «Consumi ordinari» e «Girata conto/conto» non si modificano da questa pagina. "
-        "Non esiste la categoria «dotazione iniziale»: la prima immissione si gestisce con una registrazione di tipo girata nel piano. "
-        "Per salvare nel file cifrato usa «Correggi» sulla riga interessata oppure «Salva categorie» nella barra in alto a questa scheda."
-    )
-    _PLAN_INTRO_ACC = (
-        f"Elenco unificato dei conti (massimo {MAX_ACCOUNTS_COUNT}). "
-        "Con «Aggiungi conto» immetti il nome (tutto maiuscolo, nei limiti di lunghezza), poi un importo: "
-        "se è zero non viene creata alcuna registrazione; se è diverso da zero servono data, categoria (non girata) e nota per la prima registrazione. "
-        "I nomi conto già in elenco non si modificano da questa pagina. "
-        "Puoi impostare il «Nome base file PDF» per la verifica con estratto. "
-        "Usa «Salva conti (PDF)» per scrivere nel file cifrato i nomi base PDF. "
-        "Il conto «Cassa» e il conto «VIRTUALE» non sono rimovibili da qui. "
-        "La colonna Saldo coincide con i valori del pie di pagina Movimenti. "
-        "«Congela» è consentito solo se il saldo assoluto attuale è zero e non ci sono movimenti con data contabile "
-        f"negli ultimi ~{ACCOUNT_IDLE_MIN_DAYS} giorni; le registrazioni restano consultabili in Movimenti ma non modificabili, "
-        "il conto non compare nei Saldi e non è selezionabile in nuove registrazioni. "
-        "«Rimuovi» è consentito solo con le stesse condizioni di quiete e se il conto non è usato da registrazioni."
-    )
-
     pack_centered_page_title(
         plan_categorie_frame, title=_page_banner_title(), banner_style="MovCdc.TFrame", title_bg=MOVIMENTI_PAGE_BG
     )
-    ttk.Label(plan_categorie_frame, text=_PLAN_INTRO_CAT, wraplength=760).pack(anchor=tk.W, pady=(0, 6))
     ttk.Button(
         plan_categorie_frame,
         text="Vai alla scheda Conti…",
@@ -16602,19 +17406,6 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
     pack_centered_page_title(
         plan_conti_frame, title=_page_banner_title(), banner_style="MovCdc.TFrame", title_bg=MOVIMENTI_PAGE_BG
     )
-    ttk.Label(plan_conti_frame, text=_PLAN_INTRO_ACC, wraplength=760).pack(anchor=tk.W, pady=(0, 6))
-    ttk.Label(
-        plan_conti_frame,
-        text=(
-            "Estratti PDF (verifica conto): in «Opzioni» una sola cartella radice (nessuna sottocartella anno); qui il "
-            "«Nome base file PDF» è ciò che precede suffisso e .pdf (mese 01…12 o trimestre T1…T4, con o senza spazio "
-            "prima del suffisso). La ricerca automatica elenca solo quella cartella e carica il PDF con suffisso più alto "
-            "ancora compatibile con la data di chiusura."
-        ),
-        wraplength=760,
-        font=("TkDefaultFont", 9),
-        foreground="#444444",
-    ).pack(anchor=tk.W, pady=(0, 6))
     ttk.Button(
         plan_conti_frame,
         text="Vai alla scheda Categorie…",
@@ -16622,7 +17413,6 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
     ).pack(anchor=tk.W, pady=(0, 8))
 
     plan_conti_status_var = tk.StringVar(value="")
-    plan_cat_summary_var = tk.StringVar(value="")
     plan_cat_rows: list[dict] = []
     plan_acc_rows: list[dict] = []
 
@@ -16701,8 +17491,6 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
     lf_cat.pack(fill=tk.BOTH, expand=True)
     plan_cat_grid = ttk.Frame(lf_cat)
     plan_cat_grid.pack(fill=tk.BOTH, expand=True)
-    cat_btns = ttk.Frame(lf_cat)
-    cat_btns.pack(fill=tk.X, pady=(8, 0))
 
     # --- Scheda Conti (solo griglia conti) ---
     plan_acc_scroll_wrap = ttk.Frame(plan_conti_frame, style="MovCdc.TFrame")
@@ -16737,8 +17525,6 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
     ).pack(fill=tk.X, anchor="w", pady=(0, 6))
     plan_acc_grid = ttk.Frame(lf_acc)
     plan_acc_grid.pack(fill=tk.BOTH, expand=True)
-    acc_btns = ttk.Frame(lf_acc)
-    acc_btns.pack(fill=tk.X, pady=(8, 0))
 
     def _plan_latest_bucket() -> dict | None:
         return plan_conti_reference_bucket(cur_db())
@@ -16753,6 +17539,189 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         for yb in d.get("years") or []:
             yb.setdefault("accounts", []).append(copy.deepcopy(new_acc))
 
+    def _pre_2022_category_fingerprint(d: dict) -> tuple[object, ...]:
+        """Snapshot (anni < 2022) di piano categorie e campi categoria sulle righe, per verifiche di non-intervento su legacy."""
+        parts: list[object] = []
+        for yb in sorted((d.get("years") or []), key=lambda x: int(x.get("year", 0) or 0)):
+            y = int(yb.get("year", 0) or 0)
+            if y >= 2022:
+                continue
+            c_rows: list[tuple[str, str, str]] = []
+            for c in (yb.get("categories") or []):
+                c_rows.append(
+                    (
+                        str(c.get("code", "") or "").strip(),
+                        str(c.get("name", "") or ""),
+                        str(c.get("note", "") or c.get("category_note", "") or ""),
+                    )
+                )
+            c_rows.sort(key=lambda t: t[0])
+            rec_rows: list[tuple[str, str, str]] = []
+            for r in (yb.get("records") or []):
+                rec_rows.append(
+                    (
+                        str(r.get("category_code", "") or ""),
+                        str(r.get("category_name", "") or ""),
+                        str(r.get("legacy_registration_key", "") or "").strip(),
+                    )
+                )
+            rec_rows.sort()
+            parts.append((y, tuple(c_rows), tuple(rec_rows)))
+        return tuple(parts)
+
+    def _plan_legacy_categories_consistency_guard(
+        context_label: str, *, pre2022_unchanged_if_matches_db: dict | None = None
+    ) -> bool:
+        """Blocco diagnostico: evita salvataggi quando i dati legacy categorie risultano incoerenti.
+
+        Se ``pre2022_unchanged_if_matches_db`` è il DB **prima** di un'operazione che, per design, non tocca
+        l'esercizio < 2022 (es. rinomina categoria solo da 2022 in poi), e lo snapshot pre-2022 del DB
+        attuale coincide, non confrontiamo con l'export JSON: evitiamo blocchi dovuti a drift preesistente
+        rispetto al file o a falsi allarmi, senza però omettere il controllo quando sì modifica il pre-2022.
+        """
+        d = cur_db()
+        if pre2022_unchanged_if_matches_db is not None:
+            if _pre_2022_category_fingerprint(d) == _pre_2022_category_fingerprint(pre2022_unchanged_if_matches_db):
+                return True
+        legacy_json = data_workspace.default_legacy_json_output()
+        if not legacy_json.is_file():
+            return True
+        try:
+            legacy_obj = json.loads(legacy_json.read_text(encoding="utf-8"))
+        except Exception:
+            return True
+        legacy_years = {int(y.get("year", 0) or 0): y for y in (legacy_obj.get("years") or [])}
+        legacy_by_key: dict[str, tuple[str, str]] = {}
+        for y in legacy_obj.get("years") or []:
+            yy = int(y.get("year", 0) or 0)
+            if yy >= 2022:
+                continue
+            for r in y.get("records") or []:
+                lk = str(r.get("legacy_registration_key") or "").strip()
+                if lk:
+                    legacy_by_key[lk] = (str(r.get("category_code") or ""), str(r.get("category_name") or ""))
+        rec_mismatch = 0
+        chart_mismatch_years: list[int] = []
+        mismatch_records: list[dict[str, object]] = []
+        chart_samples: list[dict[str, str | int]] = []
+        for y in d.get("years") or []:
+            yy = int(y.get("year", 0) or 0)
+            if yy >= 2022:
+                continue
+            ly = legacy_years.get(yy)
+            if ly is None:
+                continue
+            cur_map: dict[str, tuple[str, str]] = {}
+            for c in y.get("categories") or []:
+                code = str(c.get("code", "")).strip()
+                if code:
+                    cur_map[code] = (str(c.get("name") or ""), str(c.get("note") or c.get("category_note") or ""))
+            leg_map: dict[str, tuple[str, str]] = {}
+            for c in ly.get("categories") or []:
+                code = str(c.get("code", "")).strip()
+                if code:
+                    leg_map[code] = (str(c.get("name") or ""), str(c.get("note") or c.get("category_note") or ""))
+            if cur_map != leg_map:
+                chart_mismatch_years.append(yy)
+                if len(chart_samples) < 20:
+                    for code in sorted(set(cur_map) | set(leg_map)):
+                        if cur_map.get(code) == leg_map.get(code):
+                            continue
+                        chart_samples.append(
+                            {
+                                "year": yy,
+                                "code": code,
+                                "current_name": (cur_map.get(code) or ("", ""))[0],
+                                "legacy_name": (leg_map.get(code) or ("", ""))[0],
+                            }
+                        )
+                        if len(chart_samples) >= 20:
+                            break
+            for r in y.get("records") or []:
+                lk = str(r.get("legacy_registration_key") or "").strip()
+                if not lk:
+                    continue
+                expect = legacy_by_key.get(lk)
+                if expect is None:
+                    continue
+                cur_code = str(r.get("category_code") or "")
+                cur_name = str(r.get("category_name") or "")
+                if cur_code == expect[0] and cur_name == expect[1]:
+                    continue
+                rec_mismatch += 1
+                sk = record_legacy_stable_key(r)
+                mismatch_records.append(
+                    {
+                        "year": yy,
+                        "date_iso": str(r.get("date_iso") or ""),
+                        "stable_key": sk,
+                        "legacy_registration_key": lk,
+                        "current_category_code": cur_code,
+                        "legacy_category_code": expect[0],
+                        "current_category_name": cur_name,
+                        "legacy_category_name": expect[1],
+                    }
+                )
+        records_all = [r for y in (d.get("years") or []) for r in (y.get("records") or [])]
+        records_all.sort(key=record_merge_sort_key)
+        reg_seq_map = unified_registration_sequence_map(records_all)
+        for mr in mismatch_records:
+            sk0 = str(mr.get("stable_key") or "")
+            ng = reg_seq_map.get(sk0)
+            mr["registration_number_global"] = int(ng) if ng is not None else None
+        rec_samples = mismatch_records[:40]
+        _MAX_MISMATCH_JSON_ROWS = 2500
+        rec_details = mismatch_records[:_MAX_MISMATCH_JSON_ROWS]
+        rec_details_truncated = len(mismatch_records) > _MAX_MISMATCH_JSON_ROWS
+        if rec_mismatch == 0 and not chart_mismatch_years:
+            return True
+        diag_dir = data_workspace.legacy_import_dir() / "diagnostics"
+        try:
+            diag_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = diag_dir / f"legacy_category_guard_{ts}.json"
+        report = {
+            "context": context_label,
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "legacy_source": str(legacy_json),
+            "record_mismatch_count_pre2022": rec_mismatch,
+            "chart_mismatch_years_pre2022": sorted(chart_mismatch_years),
+            "record_samples": rec_samples,
+            "record_mismatch_details": rec_details,
+            "record_mismatch_details_truncated": rec_details_truncated,
+            "record_mismatch_details_omitted_count": max(0, len(mismatch_records) - len(rec_details)),
+            "chart_samples": chart_samples,
+            "guidance_it": [
+                "Ogni voce in record_mismatch_details è una registrazione pre-2022 il cui codice/nome categoria nel database "
+                "non coincide con l’export JSON legacy (stesso legacy_registration_key).",
+                "registration_number_global corrisponde al «Reg.#» globale della pagina Movimenti (ricerca per registrazione o elenco). "
+                "date_iso è la data contabile; stable_key è la chiave interna del record.",
+                "Per intervenire: ripristinare codice e nome categoria come nel file legacy (re-import da Opzioni se opportuno), "
+                "oppure correggere manualmente le registrazioni indicate usando Movimenti / Modifica registrazione.",
+                "Se chart_mismatch_years_pre2022 non è vuoto, il piano categorie di quell’anno nel DB differisce dal legacy: "
+                "va riallineato anche il piano oltre alle singole riglie.",
+            ],
+        }
+        try:
+            report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            report_s = str(report_path)
+        except Exception:
+            report_s = "(report non scrivibile)"
+        messagebox.showerror(
+            "Controllo coerenza legacy",
+            "Operazione annullata: rilevate incoerenze legacy sulle categorie "
+            f"(contesto: {context_label}).\n\n"
+            f"Registrazioni pre-2022 con mismatch: {rec_mismatch}\n"
+            f"Anni pre-2022 con piano categorie disallineato: {len(chart_mismatch_years)}\n\n"
+            "Nel report JSON trovi record_mismatch_details: per ogni riga, registration_number_global "
+            "è lo stesso «Reg.#» della pagina Movimenti; date_iso e legacy vs attuale categoria spiegano la divergenza.\n\n"
+            f"Report: {report_s}",
+            parent=root,
+        )
+        return False
+
     def _correct_plan_category(cd: str) -> None:
         row = next((r for r in plan_cat_rows if str(r["code"]) == str(cd)), None)
         if row is None:
@@ -16761,6 +17730,7 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         if not d.get("years"):
             messagebox.showwarning("Categorie", "Nessun anno contabile nel database.", parent=root)
             return
+        d_before = copy.deepcopy(d)
         on = str(row.get("orig_name", "") or "")
         on_fmt = format_category_chart_name_stored(on)
         orig_note = str(row.get("orig_note", "") or "")
@@ -16779,21 +17749,43 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         row["note"].set(nt)
         nt_or_none = nt if nt else None
         nt0 = format_category_note_stored(orig_note)
-        if nm == on_fmt and nt == nt0:
+        raw_name_changed = (row["name"].get() or "") != str(row.get("orig_display_name", "") or "")
+        raw_note_changed = (row["note"].get() or "") != str(row.get("orig_display_note", "") or "")
+        if nm == on_fmt and nt == nt0 and not (raw_name_changed or raw_note_changed):
             messagebox.showinfo("Categorie", "Nessuna modifica da applicare.", parent=root)
+            return
+        disp_name = category_display_name(nm).strip() or category_display_name(on_fmt).strip() or str(cd)
+        if not messagebox.askokcancel(
+            "Categorie",
+            "Confermando: il piano categorie (nome e nota) si aggiorna negli anni da "
+            f"{CATEGORY_PLAN_MUTATE_MIN_YEAR} in avanti. Le registrazioni coinvolte sono solo quelle con stesso "
+            f"codice categoria e nome identico al testo attuale (come in griglia), sempre dal {CATEGORY_PLAN_MUTATE_MIN_YEAR} in avanti; "
+            "gli esercizi precedenti, coerenti con l’import legacy, non vengono alterati.",
+            parent=root,
+        ):
             return
         if not name_locked and nm != on_fmt:
             if not plan_conti_names_have_attinenza(on_fmt, nm):
                 messagebox.showwarning(
                     "Categorie",
-                    "Il nuovo nome deve essere una correzione parziale rispetto al nome attuale.",
+                    "Il nuovo nome deve condividere almeno 4 lettere consecutive con il nome attuale.",
                     parent=root,
                 )
                 row["name"].set(on_fmt)
                 return
-        propagate_category_chart_by_code(d, cd, nm, nt_or_none)
+        propagate_category_chart_by_code(
+            d, cd, nm, nt_or_none, min_year_inclusive=CATEGORY_PLAN_MUTATE_MIN_YEAR
+        )
         if not name_locked and nm != on:
-            sync_record_category_names_if_identical_old(d, cd, on, nm)
+            sync_record_category_names_if_identical_old(
+                d, cd, on, nm, min_year=CATEGORY_PLAN_MUTATE_MIN_YEAR
+            )
+        if not _plan_legacy_categories_consistency_guard(
+            "correzione singola categoria", pre2022_unchanged_if_matches_db=d_before
+        ):
+            db_holder[0] = d_before
+            _reload_plan_conti_form()
+            return
         try:
             save_encrypted_db_dual(
                 d,
@@ -16821,16 +17813,11 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         plan_acc_rows.clear()
         d = cur_db()
         if not d.get("years"):
-            plan_cat_summary_var.set("")
             plan_conti_status_var.set(
                 "Nessun anno contabile nel database: usa Import legacy oppure crea l’anno con la prima registrazione "
                 "(anno contabile scelto in immissione; il programma aggiunge l’anno al bisogno)."
             )
             return
-        n_cat = len(merged_categories_for_plan_editor(d))
-        plan_cat_summary_var.set(
-            f"Elenco unificato: {n_cat} categorie (valide per tutti gli anni del database)."
-        )
         plan_conti_status_var.set("")
         ttk.Label(plan_cat_grid, text="Cod.", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=0, sticky="w", padx=2, pady=2)
         ttk.Label(plan_cat_grid, text="Nome categoria", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=1, sticky="w", padx=2, pady=2)
@@ -16862,19 +17849,40 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                     "note": vv,
                     "orig_name": raw_nm,
                     "orig_note": raw_nt,
+                    "orig_display_name": disp_nm,
+                    "orig_display_note": disp_nt,
                     "locked": name_locked,
                 }
             )
             ttk.Label(plan_cat_grid, text=code).grid(row=ri, column=0, sticky="w", padx=2, pady=1)
             est_nm = "readonly" if name_locked else "normal"
             est_nt = "readonly" if note_locked else "normal"
-            ttk.Entry(plan_cat_grid, textvariable=nv, width=28, state=est_nm).grid(row=ri, column=1, sticky="we", padx=2, pady=1)
-            ttk.Entry(plan_cat_grid, textvariable=vv, width=36, state=est_nt).grid(row=ri, column=2, sticky="we", padx=2, pady=1)
+            ent_nm = ttk.Entry(plan_cat_grid, textvariable=nv, width=28, state=est_nm)
+            ent_nt = ttk.Entry(plan_cat_grid, textvariable=vv, width=36, state=est_nt)
+            ent_nm.grid(row=ri, column=1, sticky="we", padx=2, pady=1)
+            ent_nt.grid(row=ri, column=2, sticky="we", padx=2, pady=1)
+            if not name_locked:
+                bind_entry_all_chars_uppercase(nv, ent_nm)
+            if not note_locked:
+                bind_entry_first_char_uppercase(vv, ent_nt)
 
             def _corr_cat(cd: str = code) -> None:
                 _correct_plan_category(cd)
 
-            ttk.Button(plan_cat_grid, text="Correggi", width=9, command=_corr_cat).grid(row=ri, column=3, sticky="w", padx=2, pady=1)
+            _corr_bg = "#b71c1c"
+            _corr_fg = "#ffffff"
+            corr_lbl = tk.Label(
+                plan_cat_grid,
+                text="Correggi",
+                font=("TkDefaultFont", 9, "bold"),
+                bg=_corr_bg,
+                fg=_corr_fg,
+                padx=10,
+                pady=3,
+                cursor="hand2",
+            )
+            corr_lbl.grid(row=ri, column=3, sticky="w", padx=2, pady=1)
+            corr_lbl.bind("<Button-1>", lambda _e, fn=_corr_cat: fn())
 
         ttk.Label(plan_acc_grid, text="Cod.", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=0, sticky="w", padx=2, pady=2)
         ttk.Label(plan_acc_grid, text="Nome conto", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=1, sticky="w", padx=2, pady=2)
@@ -16883,11 +17891,13 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
             row=0, column=3, sticky="w", padx=2, pady=2
         )
         ttk.Label(plan_acc_grid, text="Saldo", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=4, sticky="w", padx=2, pady=2)
-        ttk.Label(plan_acc_grid, text="Nome base file PDF", font=("TkDefaultFont", 10, "bold")).grid(
-            row=0, column=5, sticky="w", padx=2, pady=2
-        )
-        ttk.Label(plan_acc_grid, text="", width=9).grid(row=0, column=6, sticky="w")
-        ttk.Label(plan_acc_grid, text="", width=10).grid(row=0, column=7, sticky="w")
+        ttk.Label(
+            plan_acc_grid,
+            text="Nomi dei file pdf per le verifiche automatiche",
+            font=("TkDefaultFont", 10, "bold"),
+            wraplength=280,
+        ).grid(row=0, column=5, sticky="nw", padx=2, pady=2)
+        ttk.Label(plan_acc_grid, text="Congela", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=6, sticky="w", padx=2, pady=2)
         merged_acc = merge_account_charts_across_years(d)
         acc_name_by_code: dict[str, str] = {}
         for ax in merged_acc:
@@ -16946,6 +17956,7 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
 
             def _freeze_acc(cd: str = code, nm_chk: str = raw_nm, fr: bool = is_frozen) -> None:
                 dd = cur_db()
+                dd_before = copy.deepcopy(dd)
                 if plan_conti_account_is_cassa(nm_chk):
                     messagebox.showwarning("Conti", "Il conto Cassa non può essere congelato.", parent=root)
                     return
@@ -16962,13 +17973,17 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                     return
                 if not messagebox.askyesno(
                     "Congela conto",
-                    f"Congelare il conto «{acc_nm}» (codice {cd})?\n"
-                    "Le registrazioni restano in archivio e consultabili in Movimenti, ma non saranno più modificabili "
-                    "se coinvolgono questo conto; il conto non comparirà nei Saldi né in nuove registrazioni.",
+                    f"Congelare il conto «{acc_nm}» (codice {cd})?\n\n"
+                    "Le registrazioni di quel conto restano invariate e restano visibili nelle ricerche in Movimenti; "
+                    "il conto non comparirà più nei Saldi né nei menu delle nuove registrazioni.",
                     parent=root,
                 ):
                     return
                 propagate_account_frozen_by_code(dd, cd, frozen=True)
+                if not _plan_legacy_categories_consistency_guard("congelamento conto"):
+                    db_holder[0] = dd_before
+                    _reload_plan_conti_form()
+                    return
                 try:
                     save_encrypted_db_dual(
                         dd,
@@ -16988,96 +18003,12 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                     pass
                 _reload_plan_conti_form()
 
-            def _rm_acc(cd: str = code, fr: bool = is_frozen) -> None:
-                dd = cur_db()
-                acc_row = None
-                for yb in dd.get("years") or []:
-                    acc_row = next(
-                        (x for x in yb.get("accounts", []) if str(x.get("code", "")) == cd),
-                        None,
-                    )
-                    if acc_row is not None:
-                        break
-                if acc_row is None:
-                    messagebox.showwarning(
-                        "Categorie e conti",
-                        "Questo codice conto non è nel piano di nessun anno.",
-                        parent=root,
-                    )
-                    return
-                acc_name_str = str(acc_row.get("name", "") or "")
-                if plan_conti_account_is_cassa(acc_name_str):
-                    messagebox.showwarning("Categorie e conti", "Il conto Cassa non può essere rimosso.", parent=root)
-                    return
-                if _is_virtuale_account(acc_name_str):
-                    messagebox.showwarning("Categorie e conti", "Il conto VIRTUALE non può essere rimosso.", parent=root)
-                    return
-                if fr:
-                    messagebox.showwarning(
-                        "Conti",
-                        "Un conto congelato resta nel piano per la consultazione storica: non è rimuovibile da qui.",
-                        parent=root,
-                    )
-                    return
-                if account_code_used_any_year(dd, cd):
-                    messagebox.showwarning(
-                        "Categorie e conti",
-                        "Questo conto è usato da registrazioni: non può essere rimosso.",
-                        parent=root,
-                    )
-                    return
-                ok_idle, err_idle = account_meets_three_month_idle_for_freeze_or_remove(dd, cd)
-                if not ok_idle:
-                    messagebox.showwarning("Conti", err_idle, parent=root)
-                    return
-                if len(merge_account_charts_across_years(dd)) <= 1:
-                    messagebox.showwarning("Categorie e conti", "Serve almeno un conto.", parent=root)
-                    return
-                if not messagebox.askyesno(
-                    "Categorie e conti",
-                    f"Rimuovere il conto {cd} da tutti gli anni?",
-                    parent=root,
-                ):
-                    return
-                remove_account_from_all_years(dd, cd)
-                try:
-                    save_encrypted_db_dual(
-                        dd,
-                        Path(data_file_var.get()),
-                        Path(key_file_var.get()),
-                    )
-                except Exception as exc:
-                    messagebox.showerror("Categorie e conti", str(exc), parent=root)
-                    return
-                plan_conti_status_var.set("Conto rimosso e database salvato.")
-                _movements_dirty[0] = True
-                try:
-                    refresh_balance_footer()
-                    refresh_category_account_dropdowns()
-                except Exception:
-                    pass
-                _reload_plan_conti_form()
-
-            rm_active = not (locked_acc or is_frozen)
-            rm_lbl = tk.Label(
-                plan_acc_grid,
-                text="Rimuovi",
-                font=("TkDefaultFont", 9, "bold"),
-                bg=_plan_acc_red_bg if rm_active else _plan_acc_red_dis_bg,
-                fg=_plan_acc_red_fg if rm_active else _plan_acc_red_dis_fg,
-                padx=10,
-                pady=3,
-                cursor="hand2" if rm_active else "arrow",
-            )
-            rm_lbl.grid(row=ri, column=6, sticky="w", padx=2, pady=1)
-            if rm_active:
-                rm_lbl.bind("<Button-1>", lambda _e, fn=_rm_acc: fn())
+            fz_active = not (locked_acc or is_frozen)
             if is_frozen:
                 ttk.Label(plan_acc_grid, text="—", foreground="#888888", width=8).grid(
-                    row=ri, column=7, sticky="w", padx=2, pady=1
+                    row=ri, column=6, sticky="w", padx=2, pady=1
                 )
             else:
-                fz_active = rm_active
                 fz_lbl = tk.Label(
                     plan_acc_grid,
                     text="Congela",
@@ -17088,7 +18019,7 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                     pady=3,
                     cursor="hand2" if fz_active else "arrow",
                 )
-                fz_lbl.grid(row=ri, column=7, sticky="w", padx=2, pady=1)
+                fz_lbl.grid(row=ri, column=6, sticky="w", padx=2, pady=1)
                 if fz_active:
                     fz_lbl.bind("<Button-1>", lambda _e, fn=_freeze_acc: fn())
         plan_cat_grid.columnconfigure(1, weight=1)
@@ -17107,7 +18038,7 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
             pass
 
     def _discard_unsaved_plan_pdf_stems() -> None:
-        """Ripristina in griglia solo i campi «Nome base file PDF» dal DB in memoria (non tocca la scheda Categorie)."""
+        """Ripristina in griglia solo i nomi base PDF dal DB in memoria (non tocca la scheda Categorie)."""
         d = cur_db()
         if not plan_acc_rows:
             plan_conti_status_var.set("Nessun conto in elenco.")
@@ -17119,7 +18050,7 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                 continue
             stem_v.set(account_estratti_pdf_stem_for_code(d, code))
         plan_conti_status_var.set(
-            "Nomi base PDF ripristinati dal database in memoria (per salvarli nel file cifrato usa «Salva conti (PDF)»)."
+            "Nomi base PDF ripristinati dal database in memoria (per salvarli nel file cifrato usa «Salva nomi base pdf»)."
         )
 
     def _plan_category_form_is_dirty() -> bool:
@@ -17152,59 +18083,6 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                 return True
         return False
 
-    def _save_plan_categories_only() -> bool:
-        d = cur_db()
-        if not d.get("years"):
-            messagebox.showwarning("Categorie", "Nessun anno contabile nel database.", parent=root)
-            return False
-        for row in plan_cat_rows:
-            code = str(row["code"])
-            on = str(row.get("orig_name", "") or "")
-            name_locked = bool(row.get("locked"))
-            on_fmt = format_category_chart_name_stored(on)
-            orig_note = str(row.get("orig_note", "") or "")
-            nt0 = format_category_note_stored(orig_note)
-            if name_locked:
-                nm = on_fmt
-            else:
-                nm = format_category_chart_name_stored(row["name"].get() or "")
-            nt = format_category_note_stored(row["note"].get() or "")
-            nt_or_none = nt if nt else None
-            if nm == on_fmt and nt == nt0 and on.strip() == nm:
-                continue
-            if not name_locked and nm != on_fmt:
-                if not plan_conti_names_have_attinenza(on_fmt, nm):
-                    messagebox.showwarning(
-                        "Categorie",
-                        f"Categoria {code}: il nuovo nome deve essere una correzione parziale del nome attuale.",
-                        parent=root,
-                    )
-                    return False
-                propagate_category_chart_by_code(d, code, nm, nt_or_none)
-                sync_record_category_names_if_identical_old(d, code, on, nm)
-            else:
-                propagate_category_chart_by_code(d, code, nm, nt_or_none)
-                if not name_locked and nm != on.strip():
-                    sync_record_category_names_if_identical_old(d, code, on, nm)
-        try:
-            save_encrypted_db_dual(
-                d,
-                Path(data_file_var.get()),
-                Path(key_file_var.get()),
-            )
-        except Exception as exc:
-            messagebox.showerror("Categorie", str(exc), parent=root)
-            return False
-        plan_conti_status_var.set("Categorie: modifiche salvate nel file cifrato.")
-        _movements_dirty[0] = True
-        try:
-            refresh_balance_footer()
-            refresh_category_account_dropdowns()
-        except Exception:
-            pass
-        _reload_plan_conti_form()
-        return True
-
     def _save_plan_accounts_pdf_only() -> bool:
         d = cur_db()
         if not d.get("years"):
@@ -17226,7 +18104,7 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         except Exception as exc:
             messagebox.showerror("Conti", str(exc), parent=root)
             return False
-        plan_conti_status_var.set("Conti: modifiche ai PDF salvate nel file cifrato.")
+        plan_conti_status_var.set("Nomi base PDF salvati nel file cifrato.")
         _movements_dirty[0] = True
         try:
             refresh_balance_footer()
@@ -17239,22 +18117,21 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
     def _plan_tab_leave_before_navigate(old: tk.Widget, new: tk.Widget) -> bool:
         if old is plan_categorie_frame and new is not plan_categorie_frame:
             if plan_cat_rows and _plan_category_form_is_dirty():
-                r = messagebox.askyesnocancel(
+                r = messagebox.askyesno(
                     "Categorie",
-                    "Le modifiche alla scheda Categorie non sono state salvate sul file cifrato.\n\n"
-                    "Salvare prima di uscire?",
+                    "Le modifiche alla scheda Categorie non sono state confermate.\n\n"
+                    "Ogni riga va salvata con il tasto «Correggi».\n\n"
+                    "Vuoi uscire e scartare le modifiche non confermate?",
                     parent=root,
                 )
-                if r is None:
+                if not r:
                     return False
-                if r:
-                    return _save_plan_categories_only()
                 _reload_plan_conti_form()
         if old is plan_conti_frame and new is not plan_conti_frame:
             if plan_acc_rows and _plan_accounts_pdf_is_dirty():
                 r = messagebox.askyesnocancel(
                     "Conti",
-                    "Le modifiche ai «Nome base file PDF» non sono state salvate sul file cifrato.\n\n"
+                    "Le modifiche ai nomi base dei file PDF non sono state salvate sul file cifrato.\n\n"
                     "Salvare prima di uscire?",
                     parent=root,
                 )
@@ -17306,7 +18183,7 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         ttk.Label(frm, text=f"Codice assegnato: {nxt_s}").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
         ttk.Label(frm, text="Nome categoria (+ o - davanti, poi testo)").grid(row=1, column=0, sticky="nw", pady=2)
         ttk.Label(frm, text="Nota categoria").grid(row=2, column=0, sticky="nw", pady=2)
-        nm_var = tk.StringVar(value="+")
+        nm_var = tk.StringVar(value="-")
         nt_var = tk.StringVar()
         ent_nm = ttk.Entry(frm, textvariable=nm_var, width=42)
         ent_nt = ttk.Entry(frm, textvariable=nt_var, width=42)
@@ -17343,10 +18220,31 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                 err_lbl.configure(text="Esiste già una categoria con questo nome (dopo formattazione).")
                 return
             new_cat = {"code": nxt_s, "name": nm, "note": nt_or_none}
+            d_before = copy.deepcopy(d)
             _append_category_all_years(new_cat)
+            if not _plan_legacy_categories_consistency_guard("aggiunta categoria"):
+                db_holder[0] = d_before
+                _reload_plan_conti_form()
+                err_lbl.configure(text="Coerenza legacy non valida: modifica annullata.")
+                return
+            try:
+                save_encrypted_db_dual(
+                    d,
+                    Path(data_file_var.get()),
+                    Path(key_file_var.get()),
+                )
+            except Exception as exc:
+                err_lbl.configure(text=f"Salvataggio non riuscito: {exc}")
+                return
             top.destroy()
+            _movements_dirty[0] = True
+            try:
+                refresh_balance_footer()
+                refresh_category_account_dropdowns()
+            except Exception:
+                pass
             _reload_plan_conti_form()
-            plan_conti_status_var.set("Categoria aggiunta in memoria: usa «Salva categorie» per salvare nel file cifrato.")
+            plan_conti_status_var.set("Categoria aggiunta e salvata nel file cifrato.")
 
         btns = ttk.Frame(frm)
         btns.grid(row=5, column=0, columnspan=2, sticky="e", pady=(4, 0))
@@ -17414,6 +18312,9 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
             }
 
         def _save_db_after_change() -> bool:
+            if not _plan_legacy_categories_consistency_guard("aggiunta conto"):
+                _reload_plan_conti_form()
+                return False
             try:
                 save_encrypted_db_dual(
                     cur_db(),
@@ -17827,39 +18728,57 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         except Exception:
             pass
 
+    _plan_pc_yellow_bg = "#ffca28"
+    _plan_pc_yellow_fg = "#212121"
+    _plan_pc_red_bg = "#b71c1c"
+    _plan_pc_red_fg = "#ffffff"
+
     pc_tool_cat = ttk.Frame(plan_categorie_frame)
-    pc_tool_cat.pack(fill=tk.X, pady=(0, 6))
-    ttk.Label(pc_tool_cat, textvariable=plan_cat_summary_var).pack(side=tk.LEFT)
-    ttk.Button(
+    pc_tool_cat.pack(fill=tk.X, pady=(0, 8))
+    lbl_add_cat = tk.Label(
         pc_tool_cat,
-        text="Salva categorie",
-        command=_save_plan_categories_only,
-        style="NewReg.TButton",
-    ).pack(side=tk.LEFT, padx=(16, 10), pady=(2, 4))
+        text="Aggiungi categoria",
+        font=("TkDefaultFont", 10, "bold"),
+        bg=_plan_pc_yellow_bg,
+        fg=_plan_pc_yellow_fg,
+        padx=12,
+        pady=4,
+        cursor="hand2",
+    )
+    lbl_add_cat.pack(side=tk.LEFT, padx=(0, 8))
+    lbl_add_cat.bind("<Button-1>", lambda _e: _add_blank_category())
     ttk.Label(plan_categorie_frame, textvariable=plan_conti_status_var, foreground="#2e7d32").pack(anchor=tk.W, pady=(0, 6))
     plan_cat_scroll_wrap.pack(fill=tk.BOTH, expand=True)
-    ttk.Button(cat_btns, text="Aggiungi categoria", command=_add_blank_category).pack(side=tk.LEFT, padx=(0, 8))
     _plan_cat_bind_wheel_like_movimenti()
 
     pc_tool_acc = ttk.Frame(plan_conti_frame)
-    pc_tool_acc.pack(fill=tk.X, pady=(0, 6))
-    ttk.Button(pc_tool_acc, text="Annulla cambiamenti non salvati", command=_discard_unsaved_plan_pdf_stems).pack(
-        side=tk.LEFT, padx=(0, 8)
+    pc_tool_acc.pack(fill=tk.X, pady=(0, 8))
+    lbl_add_acc = tk.Label(
+        pc_tool_acc,
+        text="Aggiungi conto",
+        font=("TkDefaultFont", 10, "bold"),
+        bg=_plan_pc_yellow_bg,
+        fg=_plan_pc_yellow_fg,
+        padx=12,
+        pady=4,
+        cursor="hand2",
     )
-    ttk.Button(pc_tool_acc, text="Salva conti (PDF)", command=_save_plan_accounts_pdf_only).pack(side=tk.LEFT, padx=(0, 8))
-    ttk.Label(
-        plan_conti_frame,
-        text=(
-            "«Annulla cambiamenti non salvati» ripristina solo i campi «Nome base file PDF» dal database in memoria "
-            "(senza ricaricare l’elenco né la scheda Categorie)."
-        ),
-        wraplength=760,
-        font=("TkDefaultFont", 9),
-        foreground="#444444",
-    ).pack(anchor=tk.W, pady=(0, 4))
+    lbl_add_acc.pack(side=tk.LEFT, padx=(0, 8))
+    lbl_add_acc.bind("<Button-1>", lambda _e: _add_blank_account())
+    lbl_save_acc = tk.Label(
+        pc_tool_acc,
+        text="Salva nomi base pdf",
+        font=("TkDefaultFont", 10, "bold"),
+        bg=_plan_pc_red_bg,
+        fg=_plan_pc_red_fg,
+        padx=12,
+        pady=4,
+        cursor="hand2",
+    )
+    lbl_save_acc.pack(side=tk.LEFT, padx=(0, 8))
+    lbl_save_acc.bind("<Button-1>", lambda _e: _save_plan_accounts_pdf_only())
     ttk.Label(plan_conti_frame, textvariable=plan_conti_status_var, foreground="#2e7d32").pack(anchor=tk.W, pady=(0, 6))
     plan_acc_scroll_wrap.pack(fill=tk.BOTH, expand=True)
-    ttk.Button(acc_btns, text="Aggiungi conto", command=_add_blank_account).pack(side=tk.LEFT, padx=(0, 8))
 
     def _try_open_plan_conti_pending() -> None:
         security_auth.ensure_security(cur_db())
@@ -19062,6 +19981,19 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
             root.lift()
             root.focus_force()
             root.update_idletasks()
+
+            def _dock_icon_when_safe() -> None:
+                try:
+                    apply_macos_dock_icon_from_login_euro_jpeg(tk_anchor=root)
+                except Exception:
+                    pass
+
+            # Ritardo: subito dopo map/focus, ``setApplicationIconImage_`` su NSApplication condiviso
+            # con Tk-Aqua ha causato SIGABRT intermittente (crash reporter) su build PyInstaller.
+            try:
+                root.after(450, _dock_icon_when_safe)
+            except tk.TclError:
+                pass
         except Exception:
             pass
 
@@ -19090,6 +20022,30 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         except tk.TclError:
             pass
 
+    def _banner_clock_tick() -> None:
+        try:
+            full_title = window_title_for_session(cur_db(), session_holder[0], show_clock=True)
+            try:
+                root.title(full_title)
+            except tk.TclError:
+                pass
+            alive: list[tk.Label] = []
+            for lbl in list(_BANNER_CLOCK_LABELS):
+                try:
+                    lbl.configure(text=full_title)
+                    alive.append(lbl)
+                except tk.TclError:
+                    pass
+            _BANNER_CLOCK_LABELS[:] = alive
+        except Exception:
+            pass
+        try:
+            root.after(1000, _banner_clock_tick)
+        except tk.TclError:
+            pass
+
+    root.after(250, _banner_clock_tick)
+
     _present_main_window()
     root.mainloop()
 
@@ -19098,6 +20054,8 @@ def main() -> None:
     if Fernet is None:
         print("Installa cryptography: pip install cryptography", file=sys.stderr)
         sys.exit(1)
+
+    _darwin_prepare_stdin_for_tk_aqua()
 
     root = tk.Tk()
     root.title("Conti di casa")

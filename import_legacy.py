@@ -87,6 +87,8 @@ def normalize_euro_input(value: str) -> Decimal:
     Al massimo due cifre decimali: niente arrotondamento, valori non validi → ValueError.
     """
     s = value.strip().replace(" ", "")
+    # Segno meno «tipografico» (tastiera macOS / incolla da documenti).
+    s = s.replace("\u2212", "-").replace("\u2013", "-")
     if not s:
         raise ValueError("Importo vuoto")
     # Accept both separators in input and normalize to decimal dot.

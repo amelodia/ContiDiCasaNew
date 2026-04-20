@@ -80,8 +80,11 @@ struct ContentView: View {
     @State private var message = ""
     @State private var isBusy = false
     @State private var loggedInRecords: [ContiRecordRow] = []
-    /// DB sessione (solo lettura) per saldi e future immissioni; bridging `NSDictionary` per il passaggio dal thread di login.
+    /// DB sessione per saldi, immissioni e salvataggio; bridging `NSDictionary` dal thread di login.
     @State private var loggedInSessionDb: NSDictionary?
+    /// Percorsi risolti all’ultimo accesso riuscito (scrittura `.enc` dopo nuove registrazioni).
+    @State private var sessionKeyURL: URL?
+    @State private var sessionLightEncURL: URL?
     @State private var movimentiDisplayName = ""
     @State private var movimentiPath = NavigationPath()
     @State private var showFiltriSheet = false
@@ -102,7 +105,7 @@ struct ContentView: View {
     var body: some View {
         NavigationStack(path: $movimentiPath) {
             Group {
-                if loggedInRecords.isEmpty {
+                if loggedInSessionDb == nil {
                     loginForm
                 } else {
                     recordsList
@@ -113,14 +116,28 @@ struct ContentView: View {
                 case .saldi:
                     ContiLightSaldiSchedaView(sessionDb: loggedInSessionDb)
                 case .nuoviDati:
-                    ContiLightNuovoMovimentoSchedaView(sessionDb: loggedInSessionDb as? [String: Any])
+                    ContiLightNuovoMovimentoSchedaView(
+                        sessionDb: loggedInSessionDb as? [String: Any],
+                        dataFolderURL: dataFolderURL,
+                        keyURL: sessionKeyURL,
+                        lightEncURL: sessionLightEncURL,
+                        email: email,
+                        password: password,
+                        onPersisted: { updatedDb, rows, note in
+                            loggedInSessionDb = updatedDb as NSDictionary
+                            loggedInRecords = rows
+                            message = note
+                        }
+                    )
                 }
             }
         }
         .background(Color(uiColor: .systemGroupedBackground))
-        .onChange(of: loggedInRecords.isEmpty) { _, empty in
-            if empty {
+        .onChange(of: loggedInSessionDb == nil) { _, noSession in
+            if noSession {
                 movimentiPath = NavigationPath()
+                sessionKeyURL = nil
+                sessionLightEncURL = nil
                 applySavedLoginEmailIfNeeded()
             }
         }
@@ -442,14 +459,6 @@ struct ContentView: View {
                                 Text(row.dateDisplay)
                                     .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(rowPrimaryText)
-                                if row.isCancelled {
-                                    Text("Annullata")
-                                        .font(.caption2)
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 2)
-                                        .background(Color.red.opacity(0.2))
-                                        .clipShape(Capsule())
-                                }
                                 Spacer(minLength: 8)
                                 Text(row.categoryDisplay)
                                     .font(.subheadline)
@@ -509,6 +518,16 @@ struct ContentView: View {
         .navigationTitle("Movimenti")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button("Esci", role: .none) {
+                    loggedInSessionDb = nil
+                    loggedInRecords = []
+                    movimentiDisplayName = ""
+                    sessionKeyURL = nil
+                    sessionLightEncURL = nil
+                    movimentiPath = NavigationPath()
+                }
+            }
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Button {
                     showFiltriSheet = true
@@ -686,7 +705,8 @@ struct ContentView: View {
         guard !emailTrim.isEmpty, !passwordTrim.isEmpty else { return }
 
         isBusy = true
-        message = "Accesso in corso…"
+        // Poi: lettura/decifratura `*_light.enc`, eventuale attesa file (es. Dropbox) e sync con il .enc completo.
+        message = "Attendere un momento, per favore"
         let folderURL = folder
 
         Task { @MainActor in
@@ -716,7 +736,8 @@ struct ContentView: View {
                 return
             }
             password = passwordTrim
-            message = "Accesso in corso…"
+            // Dopo Face ID: lettura/decifratura file, eventuale attesa sincronizzazione (Dropbox) e merge DB.
+            message = "Attendere un momento, per favore"
             let packet = await runLoginPacket(
                 emailTrim: emailTrim,
                 passwordTrim: passwordTrim,
@@ -746,7 +767,9 @@ struct ContentView: View {
                         returning: LoginResultPacket(
                             message: "Impossibile accedere alla cartella (permessi). Scegli di nuovo la cartella con «Scegli cartella…».",
                             records: [],
-                            sessionDb: nil
+                            sessionDb: nil,
+                            keyURL: nil,
+                            lightEncURL: nil
                         )
                     )
                     return
@@ -757,7 +780,9 @@ struct ContentView: View {
                     packet = LoginResultPacket(
                         message: "Nessun file .key nella cartella. Copia qui conti_di_casa.key (stesso del desktop).",
                         records: [],
-                        sessionDb: nil
+                        sessionDb: nil,
+                        keyURL: nil,
+                        lightEncURL: nil
                     )
                     cont.resume(returning: packet)
                     return
@@ -770,7 +795,9 @@ struct ContentView: View {
                         Dal desktop salva e controlla che esista \(stem)_light.enc nella stessa cartella del file .key.
                         """,
                         records: [],
-                        sessionDb: nil
+                        sessionDb: nil,
+                        keyURL: nil,
+                        lightEncURL: nil
                     )
                     cont.resume(returning: packet)
                     return
@@ -789,21 +816,11 @@ struct ContentView: View {
                         primaryEncURL: encRef
                     )
                     if ContiDatabase.tryLogin(db: db, email: emailTrim, password: passwordTrim) != nil {
-                        var sessionDb = db
-                        var syncNote = ""
-                        do {
-                            let r = try ContiDatabase.syncDualEncAtStartup(
-                                lightDb: db,
-                                lightEncURL: encRef,
-                                keyURL: keyRef,
-                                email: emailTrim,
-                                password: passwordTrim
-                            )
-                            sessionDb = r.sessionLight
-                            syncNote = r.note
-                        } catch {
-                            syncNote = "Avviso sincronizzazione file: \(error.localizedDescription)"
-                        }
+                        // Nessun sync al login: evita lettura/decifra del .enc completo qui.
+                        // Merge light→main, ricalcolo light_saldi e riscrittura full+light avvengono
+                        // in persistSessionDbToEncryptedFiles alla prima nuova registrazione (o salvataggio).
+                        let sessionDb = db
+                        let syncNote = ""
                         let rows = ContiDatabase.displayRecords(from: sessionDb)
                         let baseMsg = rows.isEmpty
                             ? "Accesso effettuato. Nessun movimento nel file light."
@@ -815,13 +832,17 @@ struct ContentView: View {
                         packet = LoginResultPacket(
                             message: msgOut,
                             records: rows,
-                            sessionDb: sessionDb as NSDictionary
+                            sessionDb: sessionDb as NSDictionary,
+                            keyURL: keyRef,
+                            lightEncURL: encRef
                         )
                     } else {
                         packet = LoginResultPacket(
                             message: "Accesso negato (email/password o profilo non valido).",
                             records: [],
-                            sessionDb: nil
+                            sessionDb: nil,
+                            keyURL: nil,
+                            lightEncURL: nil
                         )
                     }
                 } catch {
@@ -831,7 +852,13 @@ struct ContentView: View {
                     } else {
                         msg = "Lettura file o elaborazione: \(error.localizedDescription)"
                     }
-                    packet = LoginResultPacket(message: msg, records: [], sessionDb: nil)
+                    packet = LoginResultPacket(
+                        message: msg,
+                        records: [],
+                        sessionDb: nil,
+                        keyURL: nil,
+                        lightEncURL: nil
+                    )
                 }
                 cont.resume(returning: packet)
             }
@@ -856,25 +883,26 @@ struct ContentView: View {
             }
         }
         message = msg
-        if packet.sessionDb != nil {
-            if !packet.records.isEmpty {
-                movimentiPath = NavigationPath()
-                filterCategoryKey = ""
-                filterAccountKey = ""
-                loggedInRecords = packet.records
-                loggedInSessionDb = packet.sessionDb
-                if let d = packet.sessionDb as? [String: Any] {
-                    movimentiDisplayName = ContiDatabase.displayNameForHeader(db: d, email: emailTrim)
-                } else {
-                    movimentiDisplayName = emailTrim
-                }
+        if let dbObj = packet.sessionDb {
+            movimentiPath = NavigationPath()
+            filterCategoryKey = ""
+            filterAccountKey = ""
+            loggedInSessionDb = dbObj
+            sessionKeyURL = packet.keyURL
+            sessionLightEncURL = packet.lightEncURL
+            if let d = dbObj as? [String: Any] {
+                loggedInRecords = ContiDatabase.displayRecords(from: d)
+                movimentiDisplayName = ContiDatabase.displayNameForHeader(db: d, email: emailTrim)
             } else {
-                loggedInSessionDb = nil
-                movimentiDisplayName = ""
+                loggedInRecords = packet.records
+                movimentiDisplayName = emailTrim
             }
         } else {
             loggedInSessionDb = nil
+            loggedInRecords = []
             movimentiDisplayName = ""
+            sessionKeyURL = nil
+            sessionLightEncURL = nil
         }
     }
 }
@@ -884,6 +912,8 @@ private struct LoginResultPacket: @unchecked Sendable {
     let message: String
     let records: [ContiRecordRow]
     let sessionDb: NSDictionary?
+    let keyURL: URL?
+    let lightEncURL: URL?
 }
 
 private struct FolderPickRequest: Identifiable, Hashable {

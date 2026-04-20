@@ -1,11 +1,23 @@
 # PyInstaller — bundle macOS (.app). Uso: pyinstaller ContiDiCasa.spec
 # Dipendenze build: pip install pyinstaller (vedi scripts/build_macos_app.sh)
 
+import importlib.util
+import os
 import sys
+
+_vpath = os.path.join(SPECPATH, "app_version.py")
+_vspec = importlib.util.spec_from_file_location("cdc_app_version", _vpath)
+_vmod = importlib.util.module_from_spec(_vspec)
+_vspec.loader.exec_module(_vmod)
+_APP_VERSION = _vmod.APP_VERSION
+_ICNS_PATH = os.path.join(SPECPATH, "build", "ContiDiCasa.icns")
+_BUNDLE_ICON = _ICNS_PATH if os.path.isfile(_ICNS_PATH) else None
 
 block_cipher = None
 
 hidden = [
+    "app_help_text",
+    "app_version",
     "pypdf",
     "pypdf.generic",
     "pypdf._text_extraction",
@@ -61,7 +73,7 @@ exe = EXE(
     upx=True,
     console=False,
     disable_windowed_traceback=False,
-    argv_emulation=False,
+    argv_emulation=(sys.platform == "darwin"),
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
@@ -81,11 +93,15 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="ContiDiCasa.app",
-    icon=None,
+    icon=_BUNDLE_ICON,
     bundle_identifier="it.contidicasa.desktop",
     info_plist={
         "CFBundleName": "Conti di casa",
         "CFBundleDisplayName": "Conti di casa",
+        "CFBundleShortVersionString": _APP_VERSION,
+        "CFBundleVersion": _APP_VERSION,
+        "LSMinimumSystemVersion": "11.0",
+        "LSApplicationCategoryType": "public.app-category.finance",
         "NSHighResolutionCapable": True,
     },
 )
