@@ -343,18 +343,352 @@ def _euro_strip_leading_signs(s: str) -> str:
 
 
 def bind_euro_amount_entry_validation(
-    entry: tk.Misc, var: tk.StringVar, *, allow_leading_sign: bool = True
+    entry: tk.Misc,
+    var: tk.StringVar,
+    *,
+    allow_leading_sign: bool = True,
+    require_leading_sign: bool = False,
+    reject_zero: bool = False,
+    max_decimals: int = 2,
+    on_enter: Callable[[], object] | None = None,
+    cursor_after_sign_on_focus: bool = False,
+    external_focusout: bool = False,
 ) -> None:
     """
     Limita immissione e incolla a importi euro: cifre e separatori . e ,; + e − solo come primo carattere
     (sostituisce il segno esistente). Con allow_leading_sign=False (es. saldo cassa) non ammette segno.
     """
 
+    max_decimals_int = max(0, int(max_decimals))
+    _formatted_it_re = re.compile(r"^[+-]?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2}$")
+
+    def _clear_entry_selection() -> None:
+        try:
+            entry.selection_clear()
+        except Exception:
+            pass
+
+    def _focus_entry_select_all() -> None:
+        """Ripristina focus e selezione totale dopo un messagebox (Aqua: evitare icursor dopo selection)."""
+
+        def _apply() -> None:
+            try:
+                entry.focus_set()
+            except Exception:
+                return
+            try:
+                entry.update_idletasks()
+                entry.selection_range(0, tk.END)
+            except Exception:
+                pass
+            finally:
+                try:
+                    delattr(entry, "_cdc_euro_after_modal_refocus")
+                except Exception:
+                    pass
+
+        try:
+            # Doppio defer: dopo il dialog alcuni handler (es. FocusIn) alterano ancora insert/selection.
+            entry.after_idle(lambda: entry.after(1, _apply))
+        except Exception:
+            try:
+                entry.after(1, _apply)
+            except Exception:
+                _apply()
+
+    def _after_modal_refocus_select_all() -> None:
+        try:
+            setattr(entry, "_cdc_euro_after_modal_refocus", True)
+        except Exception:
+            pass
+        _focus_entry_select_all()
+
+    def _set_amount_text_and_cursor(text: str, *, cursor: int | None = None, select_all: bool = False) -> None:
+        var.set(text)
+        try:
+            if select_all:
+                entry.selection_range(0, tk.END)
+            elif cursor is None:
+                entry.icursor(tk.END)
+                _clear_entry_selection()
+            else:
+                entry.icursor(cursor)
+                _clear_entry_selection()
+        except Exception:
+            pass
+
+    def _msg_importo_non_valido() -> None:
+        try:
+            messagebox.showerror(
+                "Importo non valido",
+                "Inserisci un importo in euro valido (es. 1.234,56).",
+                parent=entry,
+            )
+        except Exception:
+            pass
+        _after_modal_refocus_select_all()
+
+    def _msg_importo_obbligatorio() -> None:
+        try:
+            messagebox.showwarning("Importo", "Importo obbligatorio.", parent=entry)
+        except Exception:
+            pass
+        _after_modal_refocus_select_all()
+
+    def _msg_zero_non_ammesso() -> None:
+        try:
+            messagebox.showerror("Importo", "Importo a zero non ammesso.", parent=entry)
+        except Exception:
+            pass
+        _after_modal_refocus_select_all()
+
+    def _normalize_on_enter() -> bool:
+        raw = (var.get() or "").strip().replace(" ", "")
+        if not raw or raw in ("+", "-"):
+            if reject_zero and require_leading_sign and allow_leading_sign:
+                _msg_zero_non_ammesso()
+                return False
+            if require_leading_sign and allow_leading_sign:
+                _msg_importo_obbligatorio()
+            return False
+        try:
+            val = normalize_euro_input(raw)
+        except Exception:
+            _msg_importo_non_valido()
+            return False
+        if reject_zero and val == Decimal("0.00"):
+            _msg_zero_non_ammesso()
+            return False
+        txt_abs = format_euro_it(abs(val))
+        if allow_leading_sign:
+            if val < 0:
+                _set_amount_text_and_cursor("-" + txt_abs)
+            elif require_leading_sign or raw.startswith("+"):
+                _set_amount_text_and_cursor("+" + txt_abs)
+            else:
+                _set_amount_text_and_cursor(txt_abs)
+        else:
+            _set_amount_text_and_cursor(txt_abs)
+        return True
+
+    def _format_on_focus_out(_e: tk.Event | None = None) -> None:
+        raw = (var.get() or "").strip().replace(" ", "")
+        if not raw:
+            if reject_zero and require_leading_sign and allow_leading_sign:
+                _set_amount_text_and_cursor("-", cursor=1)
+                _msg_zero_non_ammesso()
+            return
+        if raw in ("+", "-"):
+            if reject_zero:
+                _msg_zero_non_ammesso()
+            return
+        try:
+            val = normalize_euro_input(raw)
+        except Exception:
+            _msg_importo_non_valido()
+            return
+        if reject_zero and val == Decimal("0.00"):
+            txt_abs = format_euro_it(abs(val))
+            if allow_leading_sign:
+                if raw.startswith("-"):
+                    sign = "-"
+                elif raw.startswith("+"):
+                    sign = "+"
+                elif require_leading_sign:
+                    sign = "+"
+                else:
+                    sign = ""
+                _set_amount_text_and_cursor((sign + txt_abs) if sign else txt_abs, select_all=True)
+            else:
+                _set_amount_text_and_cursor(txt_abs, select_all=True)
+            _msg_zero_non_ammesso()
+            return
+        txt_abs = format_euro_it(abs(val))
+        if allow_leading_sign:
+            if raw.startswith("-"):
+                _set_amount_text_and_cursor("-" + txt_abs)
+            elif raw.startswith("+"):
+                _set_amount_text_and_cursor("+" + txt_abs)
+            elif require_leading_sign:
+                _set_amount_text_and_cursor("+" + txt_abs)
+            elif val < 0:
+                _set_amount_text_and_cursor("-" + txt_abs)
+            else:
+                _set_amount_text_and_cursor(txt_abs)
+        else:
+            _set_amount_text_and_cursor(txt_abs)
+
+    def _on_double_click_select(event: tk.Event) -> str | None:
+        w = event.widget
+        s = str(var.get() or "")
+        if not s:
+            return None
+        if _formatted_it_re.fullmatch(s):
+            try:
+                w.selection_range(0, tk.END)
+                w.icursor(tk.END)
+            except Exception:
+                pass
+            return "break"
+        sign_off = 1 if s[:1] in ("+", "-") else 0
+        body = s[sign_off:]
+        sep_pos_body = -1
+        if "," in body and "." in body:
+            sep_pos_body = body.rfind(",")
+        elif "," in body:
+            sep_pos_body = body.find(",")
+        elif "." in body:
+            sep_pos_body = body.find(".")
+        if sep_pos_body < 0:
+            try:
+                w.selection_range(0, tk.END)
+                w.icursor(tk.END)
+            except Exception:
+                pass
+            return "break"
+        sep_abs = sign_off + sep_pos_body
+        try:
+            click_pos = int(w.index(f"@{int(getattr(event, 'x', 0) or 0)}"))
+        except Exception:
+            try:
+                click_pos = int(w.index(tk.INSERT))
+            except Exception:
+                click_pos = len(s)
+        try:
+            if click_pos <= sep_abs:
+                w.selection_range(0, sep_abs)
+                w.icursor(sep_abs)
+            else:
+                w.selection_range(sep_abs + 1, tk.END)
+                w.icursor(tk.END)
+        except Exception:
+            pass
+        return "break"
+
+    def _merged_after_edit(event: tk.Event, *, ins_ch: str | None = None) -> str | None:
+        w = event.widget
+        s = var.get() or ""
+        try:
+            if not int(w.selection_present()):
+                raise tk.TclError("no selection")
+            a = int(w.index("sel.first"))
+            b = int(w.index("sel.last"))
+        except tk.TclError:
+            try:
+                p = int(w.index(tk.INSERT))
+            except tk.TclError:
+                p = len(s)
+            a = b = p
+        keysym = str(getattr(event, "keysym", "") or "")
+        ch = ins_ch if ins_ch is not None else str(getattr(event, "char", "") or "")
+        try:
+            p_ins = int(w.index(tk.INSERT))
+        except tk.TclError:
+            p_ins = len(s)
+        if keysym == "BackSpace":
+            if a != b:
+                return s[:a] + s[b:]
+            if p_ins <= 0:
+                return s
+            return s[: p_ins - 1] + s[p_ins:]
+        if keysym == "Delete":
+            if a != b:
+                return s[:a] + s[b:]
+            if p_ins >= len(s):
+                return s
+            return s[:p_ins] + s[p_ins + 1 :]
+        if ch and ord(ch) >= 32:
+            return s[:a] + ch + s[b:] if a != b else (s[:p_ins] + ch + s[p_ins:])
+        return None
+
+    def _typed_symbol_from_key_event(event: tk.Event) -> str | None:
+        ch = str(getattr(event, "char", "") or "")
+        if ch and ord(ch) >= 32:
+            return ch
+        keysym = str(getattr(event, "keysym", "") or "")
+        if len(keysym) == 1 and keysym.isdigit():
+            return keysym
+        kp_map = {
+            "KP_0": "0",
+            "KP_1": "1",
+            "KP_2": "2",
+            "KP_3": "3",
+            "KP_4": "4",
+            "KP_5": "5",
+            "KP_6": "6",
+            "KP_7": "7",
+            "KP_8": "8",
+            "KP_9": "9",
+            "KP_Decimal": ".",
+            "KP_separator": ",",
+            "KP_Add": "+",
+            "KP_Subtract": "-",
+        }
+        if keysym in kp_map:
+            return kp_map[keysym]
+        if keysym in ("period", "comma"):
+            return "." if keysym == "period" else ","
+        return None
+
+    def _is_partial_valid(text: str) -> bool:
+        t = (text or "").replace(" ", "")
+        if t == "":
+            return True
+        if not allow_leading_sign and (t.startswith("+") or t.startswith("-")):
+            return False
+        if require_leading_sign and allow_leading_sign and not t.startswith(("+", "-")):
+            return False
+        if not re.fullmatch(r"[0-9+\-.,]*", t):
+            return False
+        body = t
+        if allow_leading_sign and t.startswith(("+", "-")):
+            body = t[1:]
+        if "+" in body or "-" in body:
+            return False
+        if body.count(".") + body.count(",") > 1:
+            return False
+        if "." in body:
+            left, right = body.split(".", 1)
+            if left and not left.isdigit():
+                return False
+            if right and not right.isdigit():
+                return False
+            if len(right) > max_decimals_int:
+                return False
+        if "," in body:
+            left, right = body.split(",", 1)
+            if left and not left.isdigit():
+                return False
+            if right and not right.isdigit():
+                return False
+            if len(right) > max_decimals_int:
+                return False
+        if "." not in body and "," not in body and body and not body.isdigit():
+            return False
+        return True
+
+    def _ensure_require_leading_sign_on_edit(nxt: str, prev_s: str) -> str:
+        """Se serve +/- in testa e il merge ha perso il segno (es. selezione totale + cifra), ripristinalo."""
+        if not (require_leading_sign and allow_leading_sign) or not nxt:
+            return nxt
+        t = (nxt or "").replace("\u2212", "-").replace("\u2013", "-")
+        if t.startswith(("+", "-")):
+            return nxt
+        ps = prev_s or ""
+        lead = "-"
+        if ps.startswith("+"):
+            lead = "+"
+        elif ps.startswith("-"):
+            lead = "-"
+        return lead + t
+
     def _keypress(event: tk.Event) -> str | None:
         keysym = getattr(event, "keysym", "")
+        if keysym in ("Return", "KP_Enter"):
+            if _normalize_on_enter() and on_enter is not None:
+                on_enter()
+            return "break"
         if keysym in (
-            "BackSpace",
-            "Delete",
             "Left",
             "Right",
             "Up",
@@ -363,54 +697,76 @@ def bind_euro_amount_entry_validation(
             "End",
             "Tab",
             "ISO_Left_Tab",
-            "Return",
-            "KP_Enter",
             "Escape",
             "Prior",
             "Next",
         ):
             return None
-        ch = event.char or ""
-        if not ch:
+        if keysym in ("BackSpace", "Delete"):
+            nxt = _merged_after_edit(event)
+            if nxt is None or not _is_partial_valid(nxt):
+                return "break"
+            if require_leading_sign and allow_leading_sign:
+                if nxt == "":
+                    cur = var.get() or ""
+                    keep = "+"
+                    if cur.startswith("-"):
+                        keep = "-"
+                    elif cur.startswith("+"):
+                        keep = "+"
+                    var.set(keep)
+                    try:
+                        event.widget.icursor(1)
+                        _clear_entry_selection()
+                    except Exception:
+                        pass
+                    return "break"
+                if not nxt.startswith(("+", "-")):
+                    return "break"
+            return None
+        sym = _typed_symbol_from_key_event(event)
+        if not sym:
             return None
         st = int(getattr(event, "state", 0) or 0)
         if st & (0x0004 | 0x0008 | 0x20000 | 0x100000):
             return None
-        if ord(ch) < 32:
-            return None
 
         w = event.widget
-        try:
-            pos = int(w.index(tk.INSERT))
-        except (tk.TclError, ValueError, TypeError):
-            pos = 0
         s = var.get() or ""
 
-        if _euro_typed_char_is_sign(ch):
+        if _euro_typed_char_is_sign(sym):
             if not allow_leading_sign:
                 return "break"
-            sig = _euro_sign_char_to_ascii(ch)
+            sig = _euro_sign_char_to_ascii(sym)
             body = _euro_strip_leading_signs(s)
             if not body:
-                var.set(sig)
+                _set_amount_text_and_cursor(sig, cursor=1)
             else:
                 lead = s[:1]
                 lead_sig = _euro_sign_char_to_ascii(lead) if lead and _euro_typed_char_is_sign(lead) else None
                 if lead_sig is None or lead_sig != sig:
-                    var.set(sig + body)
-            try:
-                w.icursor(tk.END)
-            except Exception:
-                pass
+                    _set_amount_text_and_cursor(sig + body)
+                else:
+                    _set_amount_text_and_cursor(s)
             return "break"
 
-        if ch.isdigit() or ch in ",.":
-            if allow_leading_sign and pos == 0 and s and (s[0] == "+" or s[0] in _EURO_TYPABLE_MINUS_CHARS):
-                try:
-                    w.icursor(1)
-                except Exception:
-                    pass
-            return None
+        if sym.isdigit() or sym in ",.":
+            nxt = _merged_after_edit(event, ins_ch=sym)
+            if nxt is None:
+                return "break"
+            nxt = _ensure_require_leading_sign_on_edit(nxt, s)
+            if not _is_partial_valid(nxt):
+                return "break"
+            try:
+                if not int(w.selection_present()):
+                    raise tk.TclError("no selection")
+                a = int(w.index("sel.first"))
+                b = int(w.index("sel.last"))
+            except tk.TclError:
+                a = b = -1
+            new_pos = (a + len(sym)) if a != b and a >= 0 else None
+            _set_amount_text_and_cursor(nxt, cursor=new_pos)
+            return "break"
         return "break"
 
     def _paste(event: tk.Event) -> str:
@@ -420,13 +776,6 @@ def bind_euro_amount_entry_validation(
             return "break"
         t = clip.strip().replace(" ", "").replace("\u2212", "-").replace("\u2013", "-")
         if not t:
-            return "break"
-        pat = r"[+-]?[0-9.,]*" if allow_leading_sign else r"[0-9.,]*"
-        if not re.fullmatch(pat, t):
-            return "break"
-        try:
-            normalize_euro_input(t)
-        except Exception:
             return "break"
         w = event.widget
         s = var.get() or ""
@@ -439,21 +788,55 @@ def bind_euro_amount_entry_validation(
             except tk.TclError:
                 return "break"
             a = b = p
-        merged = (s[:a] + t + s[b:]).replace("\u2212", "-").replace("\u2013", "-")
-        if merged.strip():
-            try:
-                normalize_euro_input(merged.replace(" ", ""))
-            except Exception:
-                return "break"
-        var.set(merged)
-        try:
-            w.icursor(min(a + len(t), len(merged)))
-        except tk.TclError:
-            pass
+        merged = (s[:a] + t + s[b:]).replace("\u2212", "-").replace("\u2013", "-").replace(" ", "")
+        merged = _ensure_require_leading_sign_on_edit(merged, s)
+        if not _is_partial_valid(merged):
+            return "break"
+        _set_amount_text_and_cursor(merged, cursor=min(a + len(t), len(merged)))
         return "break"
 
-    entry.bind("<KeyPress>", _keypress, add="+")
-    entry.bind("<<Paste>>", _paste, add="+")
+    # Esegui validazione tasti prima dei binding di classe (es. TEntry), così
+    # return "break" impedisce davvero l'inserimento predefinito (sostituzione selezione).
+    try:
+        bind_tag = getattr(entry, "_cdc_euro_amount_bindtag", None)
+        if not bind_tag:
+            bind_tag = f"_cdc_euro_amt_{id(entry)}"
+            setattr(entry, "_cdc_euro_amount_bindtag", bind_tag)
+            tags = list(entry.bindtags())
+            if bind_tag not in tags:
+                ins_at = 1 if len(tags) > 1 else 0
+                tags.insert(ins_at, bind_tag)
+                entry.bindtags(tuple(tags))
+        root = entry.winfo_toplevel()
+        root.bind_class(bind_tag, "<KeyPress>", _keypress)
+        root.bind_class(bind_tag, "<<Paste>>", _paste)
+    except Exception:
+        entry.bind("<KeyPress>", _keypress, add="+")
+        entry.bind("<<Paste>>", _paste, add="+")
+    entry.bind("<Double-Button-1>", _on_double_click_select, add="+")
+    if not external_focusout:
+        entry.bind("<FocusOut>", _format_on_focus_out, add="+")
+    if cursor_after_sign_on_focus:
+        def _focus_set_cursor(_e: tk.Event | None = None) -> None:
+            if getattr(entry, "_cdc_euro_after_modal_refocus", False):
+                return
+            raw = (var.get() or "").strip()
+            if require_leading_sign and allow_leading_sign and raw == "":
+                try:
+                    var.set("-")
+                    raw = "-"
+                except Exception:
+                    pass
+            try:
+                if raw in ("+", "-"):
+                    entry.icursor(1)
+                else:
+                    entry.icursor(tk.END)
+                _clear_entry_selection()
+            except Exception:
+                pass
+
+        entry.bind("<FocusIn>", _focus_set_cursor, add="+")
 
 
 def _ttk_combobox_collect_listboxes(w: tk.Misc, acc: list[tk.Misc]) -> None:
@@ -949,6 +1332,13 @@ def format_category_chart_name_stored(raw: str) -> str:
 
 def format_category_note_stored(note: str) -> str:
     t = clip_text((note or "").strip(), MAX_CATEGORY_NOTE_LEN)
+    if not t:
+        return t
+    return t[0].upper() + t[1:]
+
+
+def format_record_note_stored(note: str) -> str:
+    t = clip_text((note or "").strip(), MAX_RECORD_NOTE_LEN)
     if not t:
         return t
     return t[0].upper() + t[1:]
@@ -4289,41 +4679,7 @@ def build_ui(
         style="MovCdc.TEntry",
     )
     amount_filter_entry.pack(side=tk.LEFT)
-    btn_amt_f_plus = tk.Label(
-        amount_filter_row,
-        text="+",
-        cursor="hand2",
-        font=filter_ui_font,
-        padx=6,
-        pady=2,
-        bg="#e0f2f1",
-        relief=tk.RAISED,
-        bd=1,
-    )
-    btn_amt_f_minus = tk.Label(
-        amount_filter_row,
-        text="-",
-        cursor="hand2",
-        font=filter_ui_font,
-        padx=6,
-        pady=2,
-        bg="#ffebee",
-        relief=tk.RAISED,
-        bd=1,
-    )
-    btn_amt_f_plus.pack(side=tk.LEFT, padx=(6, 2))
-    btn_amt_f_minus.pack(side=tk.LEFT, padx=(2, 0))
     amount_filter_row.pack(side=tk.LEFT, padx=(0, 8))
-
-    def _apply_amount_filter_sign(sign: str) -> None:
-        amount_filter_sign_var.set(sign)
-        raw = (text_amount_preview_var.get() or "").strip().replace(" ", "")
-        if not raw or raw in ("+", "-"):
-            text_amount_preview_var.set("-" if sign == "-" else "+")
-            return
-        if raw.startswith(("+", "-")):
-            raw = raw[1:]
-        text_amount_preview_var.set(("-" if sign == "-" else "+") + raw)
 
     def _format_movement_amount_filter_entry(_e: tk.Event | None = None) -> None:
         raw = (text_amount_preview_var.get() or "").strip()
@@ -4341,10 +4697,15 @@ def build_ui(
         except Exception:
             pass
 
-    btn_amt_f_plus.bind("<Button-1>", lambda _e: _apply_amount_filter_sign("+"))
-    btn_amt_f_minus.bind("<Button-1>", lambda _e: _apply_amount_filter_sign("-"))
     amount_filter_entry.bind("<FocusOut>", _format_movement_amount_filter_entry)
-    bind_euro_amount_entry_validation(amount_filter_entry, text_amount_preview_var)
+    bind_euro_amount_entry_validation(
+        amount_filter_entry,
+        text_amount_preview_var,
+        allow_leading_sign=True,
+        require_leading_sign=True,
+        reject_zero=True,
+        external_focusout=True,
+    )
 
     ttk.Label(filters_text_inner, text="Assegno", style="MovCdc.TLabel").pack(side=tk.LEFT, padx=(0, 6))
     cheque_entry = ttk.Entry(
@@ -5621,7 +5982,8 @@ def build_ui(
             v = tk.StringVar(value=str(cur))
         else:
             ttk.Label(frm, text="Importo (€, usa . o , come decimale):").grid(row=0, column=0, sticky="nw")
-            v = tk.StringVar(value=format_euro_it(to_decimal(rec["amount_eur"])))
+            _edit_amt_dec = to_decimal(rec["amount_eur"])
+            v = tk.StringVar(value=("-" if _edit_amt_dec < 0 else "+") + format_euro_it(abs(_edit_amt_dec)))
         if use_lire:
             ent_edit_amt = ttk.Entry(frm, textvariable=v, width=18)
             ent_edit_amt.grid(row=0, column=1, sticky="w", padx=(8, 0))
@@ -5630,58 +5992,28 @@ def build_ui(
             row_amt_edit.grid(row=0, column=1, sticky="w", padx=(8, 0))
             ent_edit_amt = ttk.Entry(row_amt_edit, textvariable=v, width=18)
             ent_edit_amt.pack(side=tk.LEFT)
-            try:
-                _amt_ui_font = tkfont.nametofont("TkDefaultFont")
-                _amt_font_t = (_amt_ui_font.actual("family"), _amt_ui_font.actual("size"))
-            except Exception:
-                _amt_font_t = ("TkDefaultFont", 11)
-            btn_amt_plus = tk.Label(
-                row_amt_edit,
-                text="+",
-                cursor="hand2",
-                font=_amt_font_t,
-                padx=6,
-                pady=2,
-                bg="#e0f2f1",
-                relief=tk.RAISED,
-                bd=1,
+            bind_euro_amount_entry_validation(
+                ent_edit_amt,
+                v,
+                allow_leading_sign=True,
+                require_leading_sign=True,
+                reject_zero=True,
+                cursor_after_sign_on_focus=True,
             )
-            btn_amt_minus = tk.Label(
-                row_amt_edit,
-                text="−",
-                cursor="hand2",
-                font=_amt_font_t,
-                padx=6,
-                pady=2,
-                bg="#ffebee",
-                relief=tk.RAISED,
-                bd=1,
-            )
-            btn_amt_plus.pack(side=tk.LEFT, padx=(6, 2))
-            btn_amt_minus.pack(side=tk.LEFT, padx=(2, 0))
-            bind_euro_amount_entry_validation(ent_edit_amt, v)
-
-            def _apply_edit_amount_sign(sign: str) -> None:
-                raw = (v.get() or "").strip()
-                if not raw or (len(raw) == 1 and _euro_typed_char_is_sign(raw)):
-                    v.set("-" if sign == "-" else "+")
-                else:
-                    body = _euro_strip_leading_signs(raw)
-                    v.set(("-" if sign == "-" else "+") + body)
-                try:
-                    ent_edit_amt.icursor(tk.END)
-                except tk.TclError:
-                    pass
-
-            btn_amt_plus.bind("<Button-1>", lambda _e: _apply_edit_amount_sign("+"))
-            btn_amt_minus.bind("<Button-1>", lambda _e: _apply_edit_amount_sign("-"))
 
         def on_ok() -> None:
             try:
                 if use_lire:
                     amt = parse_lire_amount_input(v.get())
                 else:
-                    amt = normalize_euro_input(v.get())
+                    raw_amt = (v.get() or "").strip()
+                    if not raw_amt or raw_amt in ("+", "-"):
+                        messagebox.showwarning("Importo", "Importo obbligatorio.", parent=top)
+                        return
+                    amt = normalize_euro_input(raw_amt)
+                    if amt == Decimal("0.00"):
+                        messagebox.showerror("Importo", "Importo a zero non ammesso.", parent=top)
+                        return
             except Exception as exc:
                 messagebox.showerror("Importo", str(exc), parent=top)
                 return
@@ -5693,6 +6025,8 @@ def build_ui(
         bf.grid(row=1, column=0, columnspan=2, pady=(12, 0))
         ttk.Button(bf, text="Annulla", command=top.destroy).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(bf, text="Salva", command=on_ok).pack(side=tk.LEFT)
+        if not use_lire:
+            bind_return_and_kp_enter(ent_edit_amt, lambda _e: (on_ok(), "break")[1])
 
     def open_edit_note(stable_key: str) -> None:
         pair = find_record_year_and_ref(cur_db(), stable_key)
@@ -5719,7 +6053,9 @@ def build_ui(
         tx.insert("1.0", str(rec.get("note") or ""))
 
         def on_ok() -> None:
-            rec["note"] = sanitize_single_line_text(tx.get("1.0", "end-1c") or "", max_len=MAX_RECORD_NOTE_LEN)
+            rec["note"] = format_record_note_stored(
+                sanitize_single_line_text(tx.get("1.0", "end-1c") or "", max_len=MAX_RECORD_NOTE_LEN)
+            )
             top.destroy()
             persist_db_after_edit(stable_key)
 
@@ -9151,7 +9487,7 @@ th {{ background:#efefef; text-align:left; }}
     newreg_cat_note_var = tk.StringVar(value="-")
     newreg_acc1_var = tk.StringVar(value="")
     newreg_acc2_var = tk.StringVar(value="")
-    newreg_amount_var = tk.StringVar(value="")
+    newreg_amount_var = tk.StringVar(value="-")
     newreg_sign_var = tk.StringVar(value="+")
     newreg_cheque_var = tk.StringVar(value="")
     newreg_note_var = tk.StringVar(value="")
@@ -9411,10 +9747,6 @@ th {{ background:#efefef; text-align:left; }}
     row_amt = tk.Frame(nuova_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     ent_amt = ttk.Entry(row_amt, textvariable=newreg_amount_var, width=_NR_W_AMT, style="NewReg.TEntry")
     ent_amt.pack(side=tk.LEFT)
-    btn_plus = tk.Label(row_amt, text="+", cursor="hand2", font=newreg_ui_font, padx=6, pady=2, bg="#e0f2f1", relief=tk.RAISED, bd=1)
-    btn_minus = tk.Label(row_amt, text="-", cursor="hand2", font=newreg_ui_font, padx=6, pady=2, bg="#ffebee", relief=tk.RAISED, bd=1)
-    btn_plus.pack(side=tk.LEFT, padx=(6, 2))
-    btn_minus.pack(side=tk.LEFT, padx=(2, 0))
     newreg_saldo_cassa_var = tk.StringVar(value="")
     ent_saldo = ttk.Entry(row_amt, textvariable=newreg_saldo_cassa_var, width=_NR_W_AMT, style="NewReg.TEntry")
     lbl_saldo_inline = ttk.Label(row_amt, text="Nuovo saldo di cassa (€)", style="NewReg.TLabel")
@@ -9519,7 +9851,7 @@ th {{ background:#efefef; text-align:left; }}
         saldo_aggiorna_locked[0] = False
         newreg_saldo_cassa_var.set("")
         if was_active:
-            newreg_amount_var.set("")
+            newreg_amount_var.set("-")
             newreg_note_var.set("")
         lbl_importo.configure(text="Importo (€)")
         lbl_importo.grid(row=6, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
@@ -9527,13 +9859,9 @@ th {{ background:#efefef; text-align:left; }}
             ent_saldo.pack_forget()
             lbl_saldo_inline.pack_forget()
             ent_amt.pack_forget()
-            btn_plus.pack_forget()
-            btn_minus.pack_forget()
         except Exception:
             pass
         ent_amt.pack(side=tk.LEFT)
-        btn_plus.pack(side=tk.LEFT, padx=(6, 2))
-        btn_minus.pack(side=tk.LEFT, padx=(2, 0))
         try:
             ent_amt.configure(state="normal")
             ent_saldo.configure(state="normal")
@@ -9570,20 +9898,18 @@ th {{ background:#efefef; text-align:left; }}
         if bal is None:
             messagebox.showerror("Aggiorna saldo di cassa", "Il conto Cassa non è stato trovato nel piano conti.")
             return
-        if bal <= 0:
+        if bal < 0:
             messagebox.showerror(
                 "Aggiorna saldo di cassa",
-                "Il saldo di cassa non è superiore a zero: impossibile aggiornare.",
+                "Saldo di cassa non valido (negativo): impossibile aggiornare.",
             )
             return
         saldo_aggiorna_active[0] = True
         saldo_aggiorna_locked[0] = False
         _hide_aggiorna_saldo_btn()
         lbl_importo.grid_remove()
-        newreg_amount_var.set("")
+        newreg_amount_var.set("-")
         try:
-            btn_plus.pack_forget()
-            btn_minus.pack_forget()
             ent_saldo.pack_forget()
             lbl_saldo_inline.pack_forget()
         except Exception:
@@ -10248,7 +10574,7 @@ th {{ background:#efefef; text-align:left; }}
             )
             newreg_acc1_var.set(next((n for n, _c in acc_opts_cache if n == "Cassa"), acc_opts_cache[0][0] if acc_opts_cache else ""))
             newreg_acc2_var.set("")
-        newreg_amount_var.set("")
+        newreg_amount_var.set("-")
         newreg_sign_var.set("+")
         newreg_cheque_var.set("")
         newreg_note_var.set("")
@@ -10308,7 +10634,7 @@ th {{ background:#efefef; text-align:left; }}
             amt = -abs(amt)
         else:
             amt = abs(amt)
-        if amt == Decimal("0.00"):
+        if amt == Decimal("0.00") and not saldo_aggiorna_locked[0]:
             messagebox.showerror("Nuova registrazione", "Importo a zero non ammesso.")
             return None
         if _is_cassa_first_account():
@@ -10319,7 +10645,9 @@ th {{ background:#efefef; text-align:left; }}
             chq = sanitize_single_line_text(newreg_cheque_var.get() or "", max_len=MAX_CHEQUE_LEN)
             if not chq:
                 chq = "-"
-        note = sanitize_single_line_text(newreg_note_var.get() or "", max_len=MAX_RECORD_NOTE_LEN)
+        note = format_record_note_stored(
+            sanitize_single_line_text(newreg_note_var.get() or "", max_len=MAX_RECORD_NOTE_LEN)
+        )
         if not note:
             note = "-"
 
@@ -10472,7 +10800,7 @@ th {{ background:#efefef; text-align:left; }}
     per_acc1_var = tk.StringVar()
     per_acc2_var = tk.StringVar()
     per_sign_var = tk.StringVar(value="+")
-    per_amount_var = tk.StringVar()
+    per_amount_var = tk.StringVar(value="-")
     per_note_var = tk.StringVar()
     per_status_var = tk.StringVar(value="")
 
@@ -11008,10 +11336,6 @@ th {{ background:#efefef; text-align:left; }}
     row_per_amt = tk.Frame(per_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     ent_per_amt = ttk.Entry(row_per_amt, textvariable=per_amount_var, width=_NR_W_AMT, style="NewReg.TEntry")
     ent_per_amt.pack(side=tk.LEFT)
-    btn_per_plus = tk.Label(row_per_amt, text="+", cursor="hand2", font=newreg_ui_font, padx=6, pady=2, bg="#e0f2f1", relief=tk.RAISED, bd=1)
-    btn_per_minus = tk.Label(row_per_amt, text="-", cursor="hand2", font=newreg_ui_font, padx=6, pady=2, bg="#ffebee", relief=tk.RAISED, bd=1)
-    btn_per_plus.pack(side=tk.LEFT, padx=(6, 2))
-    btn_per_minus.pack(side=tk.LEFT)
     row_per_amt.grid(row=6, column=1, sticky="w", pady=_per_py)
     ttk.Label(per_form, text="Nota", style="NewReg.TLabel").grid(row=7, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
     ent_per_note = ttk.Entry(per_form, textvariable=per_note_var, width=_NR_W_NOTE, style="NewReg.TEntry")
@@ -11276,7 +11600,7 @@ th {{ background:#efefef; text-align:left; }}
         except Exception:
             pass
         per_cadence_var.set("monthly")
-        per_amount_var.set("")
+        per_amount_var.set("-")
         per_sign_var.set("+")
         per_note_var.set("")
         _per_apply_periodic_creation_defaults()
@@ -11387,7 +11711,9 @@ th {{ background:#efefef; text-align:left; }}
             messagebox.showerror("Registrazioni periodiche", "Importo a zero non ammesso.")
             return None
         chq = sanitize_single_line_text("Periodica", max_len=MAX_CHEQUE_LEN)
-        note = sanitize_single_line_text(per_note_var.get() or "", max_len=MAX_RECORD_NOTE_LEN)
+        note = format_record_note_stored(
+            sanitize_single_line_text(per_note_var.get() or "", max_len=MAX_RECORD_NOTE_LEN)
+        )
         if not note:
             note = "-"
         tpl = {
@@ -11606,19 +11932,15 @@ th {{ background:#efefef; text-align:left; }}
         return False
 
     bind_ttk_combobox_letter_jump_with_popdown(cb_per_cat, on_letter=_per_cat_letter_jump)
-    ent_per_amt.bind("<FocusOut>", lambda _e: _per_format_amount_entry())
-    bind_euro_amount_entry_validation(ent_per_amt, per_amount_var)
-
-    def _per_plus_click(_e: tk.Event) -> str:
-        _per_apply_sign("+")
-        return "break"
-
-    def _per_minus_click(_e: tk.Event) -> str:
-        _per_apply_sign("-")
-        return "break"
-
-    btn_per_plus.bind("<Button-1>", _per_plus_click)
-    btn_per_minus.bind("<Button-1>", _per_minus_click)
+    bind_euro_amount_entry_validation(
+        ent_per_amt,
+        per_amount_var,
+        allow_leading_sign=True,
+        require_leading_sign=True,
+        reject_zero=True,
+        on_enter=lambda: _per_enter_from_amt(None),
+        cursor_after_sign_on_focus=True,
+    )
     def _per_oggi_click() -> None:
         dmin, dmax = immissione_date_bounds()
         tdy = max(dmin, min(date.today(), dmax))
@@ -11652,6 +11974,39 @@ th {{ background:#efefef; text-align:left; }}
         return "break"
 
     def _per_enter_from_amt(_e: tk.Event | None = None) -> str:
+        raw = (per_amount_var.get() or "").strip()
+        if not raw or raw in ("+", "-"):
+            messagebox.showwarning("Registrazioni periodiche", "Importo obbligatorio.")
+            try:
+                ent_per_amt.focus_set()
+            except Exception:
+                pass
+            return "break"
+        try:
+            amt_chk = normalize_euro_input(raw)
+            if _is_giro_label(per_cat_var.get()):
+                amt_chk = -abs(amt_chk)
+            elif per_sign_var.get() == "-":
+                amt_chk = -abs(amt_chk)
+            else:
+                amt_chk = abs(amt_chk)
+            if amt_chk == Decimal("0.00"):
+                messagebox.showerror("Registrazioni periodiche", "Importo a zero non ammesso.")
+                try:
+                    ent_per_amt.focus_set()
+                except Exception:
+                    pass
+                return "break"
+        except Exception:
+            messagebox.showerror(
+                "Importo non valido",
+                "Inserisci un importo in euro valido (es. 1.234,56).",
+            )
+            try:
+                ent_per_amt.focus_set()
+            except Exception:
+                pass
+            return "break"
         _per_format_amount_entry()
         ent_per_note.focus_set()
         return "break"
@@ -11976,7 +12331,8 @@ th {{ background:#efefef; text-align:left; }}
     bind_return_and_kp_enter(cb_acc2, _on_acc2_enter)
     def _on_amt_enter(_e: tk.Event) -> str:
         raw = (newreg_amount_var.get() or "").strip()
-        if not raw:
+        if not raw or raw in ("+", "-"):
+            messagebox.showwarning("Nuova registrazione", "Importo obbligatorio.")
             try:
                 ent_amt.focus_set()
             except Exception:
@@ -11989,12 +12345,17 @@ th {{ background:#efefef; text-align:left; }}
             else:
                 amt_chk = -abs(amt_chk) if newreg_sign_var.get() == "-" else abs(amt_chk)
             if amt_chk == Decimal("0.00"):
+                messagebox.showerror("Nuova registrazione", "Importo a zero non ammesso.")
                 try:
                     ent_amt.focus_set()
                 except Exception:
                     pass
                 return "break"
         except Exception:
+            messagebox.showerror(
+                "Importo non valido",
+                "Inserisci un importo in euro valido (es. 1.234,56).",
+            )
             try:
                 ent_amt.focus_set()
             except Exception:
@@ -12030,22 +12391,22 @@ th {{ background:#efefef; text-align:left; }}
         return "break"
 
     bind_return_and_kp_enter(ent_amt, _on_amt_enter)
-    bind_euro_amount_entry_validation(ent_amt, newreg_amount_var)
     def _on_amt_focusout(_e: tk.Event | None = None) -> None:
         raw = (newreg_amount_var.get() or "").strip()
         if raw:
-            try:
-                v = normalize_euro_input(raw)
-                if v != Decimal("0"):
-                    _format_amount_entry(omit_plus_for_positive_unless_typed=True)
-                    _hide_aggiorna_saldo_btn()
-            except Exception:
-                pass
-    ent_amt.bind("<FocusOut>", _on_amt_focusout)
+            _hide_aggiorna_saldo_btn()
+    bind_euro_amount_entry_validation(
+        ent_amt,
+        newreg_amount_var,
+        allow_leading_sign=True,
+        require_leading_sign=True,
+        reject_zero=True,
+        on_enter=lambda: _on_amt_enter(None),
+        cursor_after_sign_on_focus=True,
+    )
+    ent_amt.bind("<FocusOut>", _on_amt_focusout, add="+")
     bind_return_and_kp_enter(ent_chq, _on_chq_enter)
     bind_return_and_kp_enter(ent_note, _on_note_enter)
-    btn_plus.bind("<Button-1>", lambda _e: _apply_sign("+"))
-    btn_minus.bind("<Button-1>", lambda _e: _apply_sign("-"))
     btn_confirm.configure(command=lambda: _commit_new_record(finish=False))
     bind_return_and_kp_enter(btn_confirm, lambda _e: (_commit_new_record(finish=False), "break")[1])
     btn_finish.configure(command=lambda: _commit_new_record(finish=True))
@@ -12099,7 +12460,13 @@ th {{ background:#efefef; text-align:left; }}
 
     bind_return_and_kp_enter(ent_saldo, _on_saldo_cassa_enter)
     ent_saldo.bind("<FocusOut>", lambda _e: _on_saldo_cassa_focusout())
-    bind_euro_amount_entry_validation(ent_saldo, newreg_saldo_cassa_var, allow_leading_sign=False)
+    bind_euro_amount_entry_validation(
+        ent_saldo,
+        newreg_saldo_cassa_var,
+        allow_leading_sign=False,
+        reject_zero=False,
+        external_focusout=True,
+    )
     _show_mode("new")
 
     # ========================  PAGINA VERIFICA  ========================
@@ -12997,13 +13364,15 @@ th {{ background:#efefef; text-align:left; }}
     )
     ver_ent_amt = ttk.Entry(ver_input_frame, textvariable=ver_inp_amt_var, width=14, style="NewReg.TEntry")
     ver_ent_amt.grid(row=0, column=1, sticky="w", padx=(0, 4), pady=2)
-    ver_btn_plus = tk.Label(ver_input_frame, text="+", cursor="hand2", font=_ver_ui_font, padx=6, pady=2,
-                            bg="#e0f2f1", relief=tk.RAISED, bd=1)
-    ver_btn_minus = tk.Label(ver_input_frame, text="-", cursor="hand2", font=_ver_ui_font, padx=6, pady=2,
-                             bg="#ffebee", relief=tk.RAISED, bd=1)
-    ver_btn_plus.grid(row=0, column=2, padx=(0, 2), pady=2)
-    ver_btn_minus.grid(row=0, column=3, padx=(0, 16), pady=2)
-    bind_euro_amount_entry_validation(ver_ent_amt, ver_inp_amt_var)
+    bind_euro_amount_entry_validation(
+        ver_ent_amt,
+        ver_inp_amt_var,
+        allow_leading_sign=True,
+        require_leading_sign=True,
+        reject_zero=True,
+        on_enter=lambda: _ver_on_amt_enter(None),
+        cursor_after_sign_on_focus=True,
+    )
 
     def _ver_amt_set_cursor_after_sign() -> None:
         """Verifica manuale: dopo il segno +/− preimpostato (solo segno → cursore in posizione 1)."""
@@ -13132,7 +13501,7 @@ th {{ background:#efefef; text-align:left; }}
                 return
             if not _ver_widget_or_ancestor_is(fg, verifica_frame):
                 return
-            # Ancora nel blocco immissione (frame riga, +/−, Verifica, Termina, …): niente popup.
+            # Ancora nel blocco immissione (frame riga, Verifica, Termina, …): niente popup.
             # Copre anche il caso in cui after_idle vede il focus sul frame genitore prima che passi al Label.
             if _ver_widget_or_ancestor_is(fg, ver_input_frame):
                 return
@@ -13163,19 +13532,6 @@ th {{ background:#efefef; text-align:left; }}
     bind_return_and_kp_enter(ver_ent_amt, _ver_on_amt_enter)
     ver_ent_amt.bind("<FocusOut>", _ver_on_amt_focusout, add="+")
 
-    def _ver_apply_sign(sign: str) -> None:
-        raw = (ver_inp_amt_var.get() or "").strip()
-        if not raw or raw in ("+", "-"):
-            ver_inp_amt_var.set(sign)
-        else:
-            if raw.startswith(("+", "-")):
-                raw = raw[1:]
-            ver_inp_amt_var.set(sign + raw)
-        _ver_amt_set_cursor_after_sign()
-
-    ver_btn_plus.bind("<Button-1>", lambda _e: _ver_apply_sign("+"))
-    ver_btn_minus.bind("<Button-1>", lambda _e: _ver_apply_sign("-"))
-
     tk.Label(ver_input_frame, text="Assegno", font=_ver_ui_font, bg=_VER_BG).grid(
         row=0, column=4, sticky="w", padx=(0, 6), pady=2
     )
@@ -13187,6 +13543,7 @@ th {{ background:#efefef; text-align:left; }}
     )
     ver_ent_note = ttk.Entry(ver_input_frame, textvariable=ver_inp_note_var, width=28, style="NewReg.TEntry")
     ver_ent_note.grid(row=0, column=7, sticky="w", padx=(0, 8), pady=2)
+    bind_entry_first_char_uppercase(ver_inp_note_var, ver_ent_note)
 
     def _ver_on_chq_enter(_e: object = None) -> str | None:
         if _ver_candidate_pick_ui_active():
@@ -16268,7 +16625,7 @@ th {{ background:#efefef; text-align:left; }}
             bg=_VER_BG,
             justify=tk.LEFT,
         ).pack(padx=16, pady=(16, 8))
-        bal_var = tk.StringVar(value="")
+        bal_var = tk.StringVar(value="-")
         if eff_initial is not None:
             try:
                 ib = eff_initial.quantize(Decimal("0.01"))
@@ -16281,7 +16638,14 @@ th {{ background:#efefef; text-align:left; }}
         bal_entry = ttk.Entry(dlg, textvariable=bal_var, width=18, style="NewReg.TEntry",
                               font=("TkDefaultFont", 13))
         bal_entry.pack(padx=16, pady=(0, 4))
-        bind_euro_amount_entry_validation(bal_entry, bal_var, allow_leading_sign=True)
+        bind_euro_amount_entry_validation(
+            bal_entry,
+            bal_var,
+            allow_leading_sign=True,
+            require_leading_sign=True,
+            reject_zero=True,
+            cursor_after_sign_on_focus=True,
+        )
         if eff_initial is not None:
             try:
                 ib2 = eff_initial.quantize(Decimal("0.01"))
@@ -16300,13 +16664,16 @@ th {{ background:#efefef; text-align:left; }}
 
         def _on_ok(_e: object = None) -> None:
             raw = bal_var.get().strip()
-            if not raw:
+            if not raw or raw in ("+", "-"):
                 bal_err_var.set("Importo obbligatorio.")
                 return
             try:
                 val = normalize_euro_input(raw)
             except Exception:
                 bal_err_var.set("Importo non valido.")
+                return
+            if val == Decimal("0.00"):
+                bal_err_var.set("Importo a zero non ammesso.")
                 return
             result[0] = val
             dlg.destroy()
@@ -18343,6 +18710,8 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         ent_nt = ttk.Entry(frm, textvariable=nt_var, width=42)
         ent_nm.grid(row=1, column=1, sticky="we", padx=(8, 0), pady=2)
         ent_nt.grid(row=2, column=1, sticky="we", padx=(8, 0), pady=2)
+        bind_entry_all_chars_uppercase(nm_var, ent_nm)
+        bind_entry_first_char_uppercase(nt_var, ent_nt)
         frm.columnconfigure(1, weight=1)
         hint = (
             f"Massimo {MAX_CATEGORY_NAME_LEN} caratteri per il nome e {MAX_CATEGORY_NOTE_LEN} per la nota; "
@@ -18353,6 +18722,91 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         )
         err_lbl = ttk.Label(frm, text="", foreground="#b00020", wraplength=520)
         err_lbl.grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        def _cat_name_clip_live(*_args: object) -> None:
+            cur = nm_var.get() or ""
+            clipped = clip_text(cur, MAX_CATEGORY_NAME_LEN)
+            if clipped != cur:
+                try:
+                    pos = ent_nm.index(tk.INSERT)
+                except Exception:
+                    pos = None
+                nm_var.set(clipped)
+                if pos is not None:
+                    try:
+                        ent_nm.icursor(min(pos, len(clipped)))
+                    except Exception:
+                        pass
+
+        def _cat_name_keypress_limit(event: tk.Event) -> str | None:
+            keysym = str(getattr(event, "keysym", "") or "")
+            if keysym in (
+                "BackSpace",
+                "Delete",
+                "Left",
+                "Right",
+                "Up",
+                "Down",
+                "Home",
+                "End",
+                "Tab",
+                "ISO_Left_Tab",
+                "Return",
+                "KP_Enter",
+                "Escape",
+            ):
+                return None
+            ch = str(getattr(event, "char", "") or "")
+            if not ch or ord(ch) < 32:
+                return None
+            w = event.widget
+            cur = nm_var.get() or ""
+            try:
+                a = int(w.index("sel.first"))
+                b = int(w.index("sel.last"))
+            except tk.TclError:
+                try:
+                    p = int(w.index(tk.INSERT))
+                except tk.TclError:
+                    return None
+                a = b = p
+            if len(cur) - (b - a) >= MAX_CATEGORY_NAME_LEN:
+                return "break"
+            return None
+
+        def _cat_name_paste_limit(event: tk.Event) -> str:
+            try:
+                clip = event.widget.clipboard_get()
+            except tk.TclError:
+                return "break"
+            if not clip:
+                return "break"
+            w = event.widget
+            cur = nm_var.get() or ""
+            try:
+                a = int(w.index("sel.first"))
+                b = int(w.index("sel.last"))
+            except tk.TclError:
+                try:
+                    p = int(w.index(tk.INSERT))
+                except tk.TclError:
+                    return "break"
+                a = b = p
+            room = max(0, MAX_CATEGORY_NAME_LEN - (len(cur) - (b - a)))
+            if room <= 0:
+                return "break"
+            ins = clip_text(str(clip), room)
+            merged = cur[:a] + ins + cur[b:]
+            nm_var.set(clip_text(merged, MAX_CATEGORY_NAME_LEN))
+            try:
+                w.icursor(min(a + len(ins), len(nm_var.get() or "")))
+            except tk.TclError:
+                pass
+            return "break"
+
+        nm_var.trace_add("write", _cat_name_clip_live)
+        ent_nm.bind("<KeyPress>", _cat_name_keypress_limit, add="+")
+        ent_nm.bind("<<Paste>>", _cat_name_paste_limit, add="+")
 
         def _try_add() -> None:
             err_lbl.configure(text="")
@@ -18466,9 +18920,6 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
             }
 
         def _save_db_after_change() -> bool:
-            if not _plan_legacy_categories_consistency_guard("aggiunta conto"):
-                _reload_plan_conti_form()
-                return False
             try:
                 save_encrypted_db_dual(
                     cur_db(),
@@ -18532,7 +18983,7 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                     date_var.set(to_italian_date(dsel.isoformat()))
 
                 cal = build_immissione_calendar_toplevel(
-                    root,
+                    top_c,
                     title="Data registrazione",
                     anchor=ent_dt,
                     field_min=dmin,
@@ -18543,6 +18994,18 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                 )
                 try:
                     cal.transient(top_c)
+                except Exception:
+                    pass
+                try:
+                    top_c.grab_release()
+                except Exception:
+                    pass
+                try:
+                    cal.grab_set()
+                except Exception:
+                    pass
+                try:
+                    cal.bind("<Destroy>", lambda _e: top_c.grab_set(), add="+")
                 except Exception:
                     pass
 
@@ -18557,6 +19020,7 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
             ttk.Label(fc, text="Nota registrazione").grid(row=3, column=0, sticky="nw", pady=2)
             ent_nt = ttk.Entry(fc, textvariable=nt_var, width=40)
             ent_nt.grid(row=3, column=1, sticky="we", padx=(8, 0), pady=2)
+            bind_entry_first_char_uppercase(nt_var, ent_nt)
             fc.columnconfigure(1, weight=1)
             er2 = ttk.Label(fc, text="", foreground="#b00020", wraplength=440)
             er2.grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 6))
@@ -18580,7 +19044,9 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                 if not cc:
                     er2.configure(text="Selezionare una categoria.")
                     return
-                note = sanitize_single_line_text(nt_var.get() or "", max_len=MAX_RECORD_NOTE_LEN)
+                note = format_record_note_stored(
+                    sanitize_single_line_text(nt_var.get() or "", max_len=MAX_RECORD_NOTE_LEN)
+                )
                 if not note.strip():
                     er2.configure(text="La nota è obbligatoria.")
                     return
@@ -18680,12 +19146,179 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                 ),
                 wraplength=440,
             ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-            amt_var = tk.StringVar(value="")
+            amt_var = tk.StringVar(value="-")
             ent_am = ttk.Entry(fr, textvariable=amt_var, width=24)
             ent_am.grid(row=1, column=0, sticky="w", pady=4)
-            bind_euro_amount_entry_validation(ent_am, amt_var, allow_leading_sign=True)
             err = ttk.Label(fr, text="", foreground="#b00020", wraplength=440)
             err.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+            def _amount_validate_on_focus_out(_e: tk.Event | None = None) -> None:
+                raw_live = (amt_var.get() or "").strip()
+                if raw_live in ("+", "-"):
+                    return
+                try:
+                    normalized = normalize_euro_input(raw_live)
+                except Exception:
+                    err.configure(text="Importo non valido: usa formato euro (es. -1.234,56).")
+                    return
+                err.configure(text="")
+                amt_var.set(format_euro_it(normalized))
+
+            ent_am.bind("<FocusOut>", _amount_validate_on_focus_out, add="+")
+
+            _amt_partial_re = re.compile(r"^[+-](?:\d+)?(?:[.,]\d{0,2})?$")
+
+            def _amt_next_text_for_keypress(event: tk.Event) -> str | None:
+                w = event.widget
+                cur = amt_var.get() or ""
+                try:
+                    a = int(w.index("sel.first"))
+                    b = int(w.index("sel.last"))
+                except tk.TclError:
+                    a = b = -1
+                keysym = str(getattr(event, "keysym", "") or "")
+                ch = str(getattr(event, "char", "") or "")
+                try:
+                    pos = int(w.index(tk.INSERT))
+                except tk.TclError:
+                    pos = len(cur)
+
+                if keysym == "BackSpace":
+                    if a >= 0 and b >= 0:
+                        return cur[:a] + cur[b:]
+                    if pos <= 0:
+                        return cur
+                    return cur[: pos - 1] + cur[pos:]
+                if keysym == "Delete":
+                    if a >= 0 and b >= 0:
+                        return cur[:a] + cur[b:]
+                    if pos >= len(cur):
+                        return cur
+                    return cur[:pos] + cur[pos + 1 :]
+                if ch and ord(ch) >= 32:
+                    if a >= 0 and b >= 0:
+                        return cur[:a] + ch + cur[b:]
+                    return cur[:pos] + ch + cur[pos:]
+                return None
+
+            def _strict_amt_keypress(event: tk.Event) -> str | None:
+                keysym = str(getattr(event, "keysym", "") or "")
+                if keysym in ("Return", "KP_Enter"):
+                    _am_ok()
+                    return "break"
+                if keysym in (
+                    "Left",
+                    "Right",
+                    "Up",
+                    "Down",
+                    "Home",
+                    "End",
+                    "Tab",
+                    "ISO_Left_Tab",
+                    "Escape",
+                ):
+                    return None
+                st = int(getattr(event, "state", 0) or 0)
+                if st & (0x0004 | 0x0008 | 0x20000 | 0x100000):
+                    return None
+                ch = str(getattr(event, "char", "") or "")
+                cur = amt_var.get() or ""
+                w = event.widget
+
+                if keysym in ("BackSpace", "Delete"):
+                    nxt = _amt_next_text_for_keypress(event) or cur
+                    if not nxt or nxt[0] not in "+-":
+                        return "break"
+                    if nxt in ("+", "-"):
+                        amt_var.set(nxt)
+                        try:
+                            w.icursor(1)
+                        except Exception:
+                            pass
+                        err.configure(text="")
+                        return "break"
+                    if not _amt_partial_re.fullmatch(nxt):
+                        return "break"
+                    return None
+
+                if not ch or ord(ch) < 32:
+                    return None
+
+                if _euro_typed_char_is_sign(ch):
+                    sig = _euro_sign_char_to_ascii(ch)
+                    body = cur[1:] if cur.startswith(("+", "-")) else cur
+                    amt_var.set(sig + body)
+                    try:
+                        w.icursor(1)
+                    except Exception:
+                        pass
+                    err.configure(text="")
+                    return "break"
+
+                if ch not in "0123456789.,":
+                    return "break"
+                nxt = _amt_next_text_for_keypress(event)
+                if nxt is None:
+                    return "break"
+                if not nxt or nxt[0] not in "+-":
+                    return "break"
+                if nxt in ("+", "-"):
+                    return "break"
+                if not _amt_partial_re.fullmatch(nxt):
+                    return "break"
+                body = nxt[1:]
+                if body.count(".") + body.count(",") > 1:
+                    return "break"
+                if "." in body:
+                    dec = body.split(".", 1)[1]
+                    if len(dec) > 2:
+                        return "break"
+                if "," in body:
+                    dec = body.split(",", 1)[1]
+                    if len(dec) > 2:
+                        return "break"
+                err.configure(text="")
+                return None
+
+            def _strict_amt_paste(event: tk.Event) -> str:
+                try:
+                    clip = str(event.widget.clipboard_get() or "").strip().replace(" ", "")
+                except tk.TclError:
+                    return "break"
+                clip = clip.replace("\u2212", "-").replace("\u2013", "-")
+                if not clip:
+                    return "break"
+                w = event.widget
+                cur = amt_var.get() or ""
+                try:
+                    a = int(w.index("sel.first"))
+                    b = int(w.index("sel.last"))
+                except tk.TclError:
+                    try:
+                        p = int(w.index(tk.INSERT))
+                    except tk.TclError:
+                        return "break"
+                    a = b = p
+                merged = cur[:a] + clip + cur[b:]
+                if not _amt_partial_re.fullmatch(merged):
+                    return "break"
+                body = merged[1:]
+                if body.count(".") + body.count(",") > 1:
+                    return "break"
+                if "." in body and len(body.split(".", 1)[1]) > 2:
+                    return "break"
+                if "," in body and len(body.split(",", 1)[1]) > 2:
+                    return "break"
+                amt_var.set(merged)
+                try:
+                    w.icursor(min(a + len(clip), len(merged)))
+                except tk.TclError:
+                    pass
+                err.configure(text="")
+                return "break"
+
+            ent_am.bind("<KeyPress>", _strict_amt_keypress, add="+")
+            ent_am.bind("<<Paste>>", _strict_amt_paste, add="+")
 
             def _am_close() -> None:
                 try:
@@ -18727,6 +19360,7 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
             ttk.Button(bf, text="Continua", command=_am_ok).pack(side=tk.RIGHT)
             try:
                 ent_am.focus_set()
+                ent_am.icursor(1)
             except Exception:
                 pass
 
@@ -18747,8 +19381,88 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         nm_var = tk.StringVar()
         ent_nm = ttk.Entry(frm, textvariable=nm_var, width=36)
         ent_nm.grid(row=1, column=0, columnspan=2, sticky="we", pady=4)
+        bind_entry_all_chars_uppercase(nm_var, ent_nm)
         err_lbl = ttk.Label(frm, text="", foreground="#b00020", wraplength=440)
         err_lbl.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        def _sanitize_account_name_live(raw_text: str) -> str:
+            txt = (raw_text or "").upper()
+            return "".join(ch for ch in txt if ch.isalpha())
+
+        def _nm_keypress_filter(event: tk.Event) -> str | None:
+            keysym = str(getattr(event, "keysym", "") or "")
+            if keysym in (
+                "BackSpace",
+                "Delete",
+                "Left",
+                "Right",
+                "Up",
+                "Down",
+                "Home",
+                "End",
+                "Tab",
+                "ISO_Left_Tab",
+                "Return",
+                "KP_Enter",
+                "Escape",
+            ):
+                return None
+            st = int(getattr(event, "state", 0) or 0)
+            if st & (0x0004 | 0x0008 | 0x20000 | 0x100000):
+                return None
+            ch = str(getattr(event, "char", "") or "")
+            if not ch:
+                return None
+            if ch.isalpha():
+                return None
+            return "break"
+
+        def _nm_paste_filter(event: tk.Event) -> str:
+            try:
+                clip = event.widget.clipboard_get()
+            except tk.TclError:
+                return "break"
+            filtered = _sanitize_account_name_live(clip)
+            if not filtered:
+                return "break"
+            w = event.widget
+            cur = nm_var.get() or ""
+            try:
+                a = int(w.index("sel.first"))
+                b = int(w.index("sel.last"))
+            except tk.TclError:
+                try:
+                    p = int(w.index(tk.INSERT))
+                except tk.TclError:
+                    return "break"
+                a = b = p
+            merged = cur[:a] + filtered + cur[b:]
+            merged = clip_text(merged, MAX_ACCOUNT_NAME_LEN)
+            nm_var.set(merged)
+            try:
+                w.icursor(min(a + len(filtered), len(merged)))
+            except tk.TclError:
+                pass
+            return "break"
+
+        def _nm_live_cleanup(*_args: object) -> None:
+            current = nm_var.get() or ""
+            cleaned = clip_text(_sanitize_account_name_live(current), MAX_ACCOUNT_NAME_LEN)
+            if cleaned != current:
+                try:
+                    pos = ent_nm.index(tk.INSERT)
+                except Exception:
+                    pos = None
+                nm_var.set(cleaned)
+                if pos is not None:
+                    try:
+                        ent_nm.icursor(min(pos, len(cleaned)))
+                    except Exception:
+                        pass
+
+        ent_nm.bind("<KeyPress>", _nm_keypress_filter, add="+")
+        ent_nm.bind("<<Paste>>", _nm_paste_filter, add="+")
+        nm_var.trace_add("write", _nm_live_cleanup)
 
         def _nm_dismiss() -> None:
             wiz["credit_card"] = False
