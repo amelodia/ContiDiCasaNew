@@ -3878,9 +3878,6 @@ def build_ui(
     def refresh_window_title() -> None:
         root.title(window_title_for_session(cur_db(), session_holder[0], show_clock=True))
 
-    def _page_banner_title() -> str:
-        return window_title_for_session(cur_db(), session_holder[0])
-
     data_file_var = tk.StringVar(value=str(path_holder[0].resolve()))
     key_file_var = tk.StringVar(value=str(key_path_holder[0].resolve()))
     # Se aperta la pagina risultati verifica, dopo ogni salvataggio DB si ricalcolano griglie/riepilogo.
@@ -3943,7 +3940,16 @@ def build_ui(
     movimenti_frame = ttk.Frame(cdc_content, padding=8, style="MovCdc.TFrame")
     movimenti_frame.columnconfigure(0, weight=1)
     movimenti_frame.rowconfigure(0, weight=1)
-    movimenti_body = ttk.Frame(movimenti_frame, style="MovCdc.TFrame")
+    # Stack unico: ``tk.Frame`` (non ttk) per coerenza di stacking/disegno su macOS con figli ttk + tk.
+    movimenti_main_stack = tk.Frame(
+        movimenti_frame, bg=MOVIMENTI_PAGE_BG, highlightthickness=0, takefocus=0
+    )
+    movimenti_main_stack.grid(row=0, column=0, sticky="nsew")
+    movimenti_main_stack.columnconfigure(0, weight=1)
+    movimenti_main_stack.rowconfigure(0, weight=1)
+    movimenti_main_stack.rowconfigure(1, weight=0)
+
+    movimenti_body = ttk.Frame(movimenti_main_stack, style="MovCdc.TFrame")
     movimenti_body.grid(row=0, column=0, sticky="nsew")
     nuovi_dati_frame = tk.Frame(cdc_content, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     verifica_frame = ttk.Frame(cdc_content, padding=8, style="MovCdc.TFrame")
@@ -4165,13 +4171,6 @@ def build_ui(
     movimenti_frame.grid(row=0, column=0, sticky="nsew")
     _cdc_current[0] = movimenti_frame
     _cdc_sync_tab_style()
-
-    pack_centered_page_title(
-        movimenti_body,
-        title=_page_banner_title(),
-        banner_style="MovCdc.TFrame",
-        title_bg=MOVIMENTI_PAGE_BG,
-    )
 
     # Preselezione (sei controlli) vs valori applicati alla griglia (solo con «Cerca»).
     filter_order_preview_var = tk.StringVar(value="date")
@@ -4721,7 +4720,29 @@ def build_ui(
             ln.place(x=x + x_offset, y=0, relheight=1.0)
             ln.lift()
 
-    mov_tree.bind("<Configure>", _position_mov_tree_vlines, add=True)
+    # ``place`` sulle linee verticali può rilanciare <Configure> sul Treeview: senza debounce si accumulano
+    # ``after`` e il ritardo cresce a ogni espansione (macOS).
+    _mov_tree_vline_after: list[str | None] = [None]
+
+    def _schedule_mov_tree_vlines_on_configure(_e: tk.Event | None = None) -> None:
+        jid = _mov_tree_vline_after[0]
+        if jid is not None:
+            try:
+                root.after_cancel(jid)
+            except (tk.TclError, ValueError, TypeError):
+                pass
+            _mov_tree_vline_after[0] = None
+
+        def _fire() -> None:
+            _mov_tree_vline_after[0] = None
+            try:
+                _position_mov_tree_vlines()
+            except Exception:
+                pass
+
+        _mov_tree_vline_after[0] = root.after(50, _fire)
+
+    mov_tree.bind("<Configure>", _schedule_mov_tree_vlines_on_configure, add=True)
     root.after(0, _position_mov_tree_vlines)
 
     # Importo (colori) prima di Nota: Treeview separato perché i tag colore valgono per riga intera.
@@ -4832,7 +4853,27 @@ def build_ui(
             ln.place(x=x + x_offset, y=0, relheight=1.0)
             ln.lift()
 
-    mov_hdr.bind("<Configure>", _position_mov_hdr_vlines, add=True)
+    _mov_hdr_vline_after: list[str | None] = [None]
+
+    def _schedule_mov_hdr_vlines_on_configure(_e: tk.Event | None = None) -> None:
+        jid = _mov_hdr_vline_after[0]
+        if jid is not None:
+            try:
+                root.after_cancel(jid)
+            except (tk.TclError, ValueError, TypeError):
+                pass
+            _mov_hdr_vline_after[0] = None
+
+        def _fire() -> None:
+            _mov_hdr_vline_after[0] = None
+            try:
+                _position_mov_hdr_vlines()
+            except Exception:
+                pass
+
+        _mov_hdr_vline_after[0] = root.after(50, _fire)
+
+    mov_hdr.bind("<Configure>", _schedule_mov_hdr_vlines_on_configure, add=True)
     root.after(0, _position_mov_hdr_vlines)
 
     amt_hdr.grid_columnconfigure(0, weight=1, minsize=128)
@@ -4988,10 +5029,38 @@ def build_ui(
 
     # Correzione: solo righe presenti in griglia = già filtrate da «Cerca»; nessuna ricerca fuori dai filtri.
     # Stessa riga del tasto Modifica (col. 0) così l’altezza della barra non cambia al primo clic.
+    _movimenti_elenco_expanded: list[bool] = [False]
     _CORREZIONE_BLUE = "#1565c0"
     correzione_row = tk.Frame(records_frame, bg=MOVIMENTI_PAGE_BG)
+    corr_left_btns = tk.Frame(correzione_row, bg=MOVIMENTI_PAGE_BG)
+    _RIPRISTINA_LAYOUT_BG = "#1565c0"
+    _RIPRISTINA_LAYOUT_BG_ACT = "#0d47a1"
+    btn_mov_griglia_ripristina = tk.Label(
+        corr_left_btns,
+        text="Torna a filtri e saldi",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=12,
+        pady=4,
+        bg=_RIPRISTINA_LAYOUT_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    btn_mov_griglia_ripristina.pack_forget()
+
+    def _ripristina_btn_enter(_e: tk.Event | None = None) -> None:
+        btn_mov_griglia_ripristina.configure(bg=_RIPRISTINA_LAYOUT_BG_ACT)
+
+    def _ripristina_btn_leave(_e: tk.Event | None = None) -> None:
+        btn_mov_griglia_ripristina.configure(bg=_RIPRISTINA_LAYOUT_BG)
+
+    btn_mov_griglia_ripristina.bind("<Enter>", _ripristina_btn_enter)
+    btn_mov_griglia_ripristina.bind("<Leave>", _ripristina_btn_leave)
+
     btn_stampa_ricerca = tk.Label(
-        correzione_row,
+        corr_left_btns,
         text="Stampa ricerca",
         cursor="hand2",
         highlightthickness=0,
@@ -5003,6 +5072,35 @@ def build_ui(
         relief=tk.RAISED,
         bd=1,
     )
+    _ESPANDI_ELENCO_BG = "#00695c"
+    _ESPANDI_ELENCO_BG_ACT = "#004d40"
+    btn_espandi_elenco_mov = tk.Label(
+        corr_left_btns,
+        text="Espandi ricerca",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=12,
+        pady=4,
+        bg=_ESPANDI_ELENCO_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    btn_espandi_elenco_mov.pack(side=tk.LEFT, padx=(0, 8))
+    btn_stampa_ricerca.pack(side=tk.LEFT, padx=(0, 10))
+
+    def _espandi_btn_enter(_e: tk.Event | None = None) -> None:
+        if _movimenti_elenco_expanded[0]:
+            return
+        btn_espandi_elenco_mov.configure(bg=_ESPANDI_ELENCO_BG_ACT)
+
+    def _espandi_btn_leave(_e: tk.Event | None = None) -> None:
+        btn_espandi_elenco_mov.configure(bg=_ESPANDI_ELENCO_BG)
+
+    btn_espandi_elenco_mov.bind("<Enter>", _espandi_btn_enter)
+    btn_espandi_elenco_mov.bind("<Leave>", _espandi_btn_leave)
+
     btn_modifica_reg = tk.Label(
         correzione_row,
         text="Modifica registrazione",
@@ -5984,7 +6082,7 @@ th {{ background:#efefef; text-align:left; }}
     records_frame.grid_rowconfigure(3, weight=1)
     search_title_row.grid(row=0, column=0, columnspan=6, sticky="ew", pady=(0, 6))
     correzione_row.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(0, 4))
-    btn_stampa_ricerca.grid(row=0, column=0, sticky="w", padx=(0, 10))
+    corr_left_btns.grid(row=0, column=0, sticky="w", padx=(0, 10))
     header_row.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(0, 2))
     mov_hdr.grid(row=0, column=0, sticky="ew")
     hdr_sep_1.grid(row=0, column=1, sticky="nsw")
@@ -6012,6 +6110,85 @@ th {{ background:#efefef; text-align:left; }}
 
     sep_1_line.place(x=-3, y=0, relheight=1.0)
     sep_2_line.place(x=-3, y=0, relheight=1.0)
+
+    def _set_movimenti_elenco_expanded(want: bool) -> None:
+        if bool(_movimenti_elenco_expanded[0]) == bool(want):
+            return
+        for _lj in (_mov_tree_vline_after, _mov_hdr_vline_after):
+            _jid = _lj[0]
+            if _jid is not None:
+                try:
+                    root.after_cancel(_jid)
+                except (tk.TclError, ValueError, TypeError):
+                    pass
+                _lj[0] = None
+        _movimenti_elenco_expanded[0] = bool(want)
+        if want:
+            balance_footer.grid_remove()
+            filters_row.pack_forget()
+            filters_search_row.pack_forget()
+            filters_text_row.pack_forget()
+            records_frame.pack(fill=tk.BOTH, expand=True)
+            try:
+                btn_espandi_elenco_mov.pack_forget()
+            except tk.TclError:
+                pass
+            try:
+                btn_mov_griglia_ripristina.pack(side=tk.LEFT, padx=(0, 10), before=btn_stampa_ricerca)
+            except tk.TclError:
+                pass
+
+            def _post_expand_layout() -> None:
+                if not _movimenti_elenco_expanded[0]:
+                    return
+                try:
+                    movimenti_body.update_idletasks()
+                    records_frame.update_idletasks()
+                    _position_mov_tree_vlines()
+                    _position_mov_hdr_vlines()
+                except Exception:
+                    pass
+
+            root.after_idle(_post_expand_layout)
+        else:
+            try:
+                btn_mov_griglia_ripristina.pack_forget()
+            except tk.TclError:
+                pass
+            movimenti_main_stack.rowconfigure(0, weight=1, minsize=0)
+            movimenti_main_stack.rowconfigure(1, weight=0, minsize=0)
+            filters_row.pack(fill=tk.X, pady=(0, 2), before=records_frame)
+            filters_search_row.pack(fill=tk.X, pady=(0, 4), before=records_frame)
+            filters_text_row.pack(fill=tk.X, pady=(0, 6), before=records_frame)
+            balance_footer.grid(row=1, column=0, sticky="ew")
+            records_frame.pack(fill=tk.BOTH, expand=True)
+            try:
+                refresh_date_controls_visibility()
+            except Exception:
+                pass
+            try:
+                btn_espandi_elenco_mov.pack(side=tk.LEFT, padx=(0, 8), before=btn_stampa_ricerca)
+            except tk.TclError:
+                pass
+        root.update_idletasks()
+        try:
+            _position_mov_tree_vlines()
+            _position_mov_hdr_vlines()
+        except Exception:
+            pass
+        try:
+            refresh_correction_bar()
+        except Exception:
+            pass
+
+    def _on_espandi_elenco_mov_click(_event: tk.Event | None = None) -> None:
+        _set_movimenti_elenco_expanded(True)
+
+    def _on_mov_griglia_ripristina_click(_event: tk.Event | None = None) -> None:
+        _set_movimenti_elenco_expanded(False)
+
+    btn_espandi_elenco_mov.bind("<Button-1>", _on_espandi_elenco_mov_click)
+    btn_mov_griglia_ripristina.bind("<Button-1>", _on_mov_griglia_ripristina_click)
 
     pending_movement_rows: list[
         tuple[str, str, tuple[object, ...], str, str, str, str]
@@ -7303,6 +7480,8 @@ th {{ background:#efefef; text-align:left; }}
         return top
 
     def refresh_date_controls_visibility() -> None:
+        if _movimenti_elenco_expanded[0]:
+            return
         mode = filter_order_preview_var.get()
         if mode == "date":
             reg_controls_row.pack_forget()
@@ -7890,7 +8069,7 @@ th {{ background:#efefef; text-align:left; }}
 
     populate_movements_trees()
 
-    balance_footer = ttk.Frame(movimenti_frame, padding=(0, 2, 0, 0), style="MovCdc.TFrame")
+    balance_footer = ttk.Frame(movimenti_main_stack, padding=(0, 2, 0, 0), style="MovCdc.TFrame")
     balance_footer.grid(row=1, column=0, sticky="ew")
     balance_footer_row = tk.Frame(balance_footer, bg=MOVIMENTI_PAGE_BG)
     balance_footer_row.pack(fill=tk.X, anchor=tk.W)
@@ -8879,12 +9058,6 @@ th {{ background:#efefef; text-align:left; }}
     root.bind_all("<FocusIn>", _saldi_footer_on_app_focus_in, add="+")
 
     # Pagina Nuove registrazioni
-    pack_centered_page_title(
-        nuovi_dati_frame,
-        title=_page_banner_title(),
-        banner_tk_bg=MOVIMENTI_PAGE_BG,
-        title_bg=MOVIMENTI_PAGE_BG,
-    )
     nuovi_top = tk.Frame(nuovi_dati_frame, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     nuovi_top.pack(fill=tk.X, pady=(0, 10))
     nuovi_top_inner = tk.Frame(nuovi_top, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
@@ -11928,10 +12101,6 @@ th {{ background:#efefef; text-align:left; }}
     ent_saldo.bind("<FocusOut>", lambda _e: _on_saldo_cassa_focusout())
     bind_euro_amount_entry_validation(ent_saldo, newreg_saldo_cassa_var, allow_leading_sign=False)
     _show_mode("new")
-
-    pack_centered_page_title(
-        verifica_frame, title=_page_banner_title(), banner_style="MovCdc.TFrame", title_bg=MOVIMENTI_PAGE_BG
-    )
 
     # ========================  PAGINA VERIFICA  ========================
     _VER_BG = MOVIMENTI_PAGE_BG
@@ -17325,18 +17494,9 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
     _ver_setup_start_buttons_state()
     _ver_apply_bancoposta_pdf_lock_for_setup()
     # ========================  FINE PAGINA VERIFICA  ========================
-    pack_centered_page_title(
-        statistiche_frame, title=_page_banner_title(), banner_style="MovCdc.TFrame", title_bg=MOVIMENTI_PAGE_BG
-    )
     ttk.Label(statistiche_frame, text="Pagina in preparazione").pack(anchor=tk.W)
-    pack_centered_page_title(
-        budget_frame, title=_page_banner_title(), banner_style="MovCdc.TFrame", title_bg=MOVIMENTI_PAGE_BG
-    )
     ttk.Label(budget_frame, text="Pagina in preparazione").pack(anchor=tk.W)
 
-    pack_centered_page_title(
-        aiuto_frame, title=_page_banner_title(), banner_style="MovCdc.TFrame", title_bg=MOVIMENTI_PAGE_BG
-    )
     ttk.Label(
         aiuto_frame,
         text=f"Conti di casa — versione {APP_VERSION}",
@@ -17394,18 +17554,12 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
     _aiuto_txt.configure(state=tk.DISABLED)
 
     # --- Schede Categorie e Conti (due pagine; piano unico = ultimo anno) ---
-    pack_centered_page_title(
-        plan_categorie_frame, title=_page_banner_title(), banner_style="MovCdc.TFrame", title_bg=MOVIMENTI_PAGE_BG
-    )
     ttk.Button(
         plan_categorie_frame,
         text="Vai alla scheda Conti…",
         command=lambda: (notebook.select(plan_conti_frame),),
     ).pack(anchor=tk.W, pady=(0, 8))
 
-    pack_centered_page_title(
-        plan_conti_frame, title=_page_banner_title(), banner_style="MovCdc.TFrame", title_bg=MOVIMENTI_PAGE_BG
-    )
     ttk.Button(
         plan_conti_frame,
         text="Vai alla scheda Categorie…",
@@ -18829,10 +18983,6 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
     opz_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     opz_vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
-    pack_centered_page_title(
-        opz_scrollable, title=_page_banner_title(), banner_style="MovCdc.TFrame", title_bg=MOVIMENTI_PAGE_BG
-    )
-
     opz_plan_row = ttk.Frame(opz_scrollable, style="MovCdc.TFrame")
     opz_plan_row.pack(fill=tk.X, pady=(0, 10))
     ttk.Label(
@@ -20010,6 +20160,15 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
             except Exception:
                 pass
             return
+        try:
+            if not messagebox.askyesno(
+                "Conti di casa",
+                "Chiudere l'applicazione?",
+                parent=root,
+            ):
+                return
+        except Exception:
+            pass
         try:
             root.destroy()
         except Exception:
