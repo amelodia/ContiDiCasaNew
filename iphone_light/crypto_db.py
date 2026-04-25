@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 
 try:
@@ -35,16 +37,43 @@ def load_encrypted_db(output_path: Path, key_path: Path) -> dict | None:
     return json.loads(raw.decode("utf-8"))
 
 
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _has_dropbox_conflicted_enc(data_dir: Path) -> bool:
+    for p in data_dir.glob("*.enc"):
+        name = p.name.lower()
+        if p.is_file() and ("conflicted copy" in name or "copia in conflitto" in name):
+            return True
+    return False
+
+
 def save_encrypted_db_single(db: dict, output_path: Path, key_path: Path) -> None:
     """Salva solo su ``output_path`` (nessuna copia di backup locale)."""
     if Fernet is None:
         raise RuntimeError("Installa cryptography: pip install cryptography")
     if not key_path.exists():
         raise FileNotFoundError(f"File chiave mancante: {key_path}")
+    if _has_dropbox_conflicted_enc(output_path.parent):
+        raise RuntimeError("Salvataggio bloccato: ci sono copie Dropbox in conflitto nella cartella dati.")
     key = key_path.read_bytes()
     token = Fernet(key).encrypt(json.dumps(db, ensure_ascii=True, indent=2).encode("utf-8"))
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(token)
+    _atomic_write_bytes(output_path, token)
 
 
 def resolve_per_user_enc_path_if_present(db: dict, *, primary_enc_path: Path) -> Path | None:

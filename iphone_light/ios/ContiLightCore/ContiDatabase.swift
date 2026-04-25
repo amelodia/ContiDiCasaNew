@@ -6,6 +6,12 @@ public struct ContiSession {
     public let userEmail: String
 }
 
+/// Come ordinare l’elenco movimenti (scheda home).
+public enum ContiMovimentiListSort: String, CaseIterable, Sendable {
+    case dateNewestFirst
+    case registrationNewestFirst
+}
+
 /// Una riga lista per la UI (movimenti da `years[].records[]`).
 public struct ContiRecordRow: Identifiable, Hashable, Sendable {
     public let id: String
@@ -23,6 +29,14 @@ public struct ContiRecordRow: Identifiable, Hashable, Sendable {
     public let note: String
     public let isCancelled: Bool
     public let sourceIndex: Int
+    /// `registration_number` globale; 0 se assente.
+    public let registrationNumber: Int
+    /// Chiave fissa `legacy_registration_key` (match nel JSON).
+    public let legacyRegistrationKey: String
+    /// Stesso campo sessione; vuoto se non da app light.
+    public let contiLightRecordId: String
+    /// Con `false` in casi rari; in genere ogni riga in elenco è modificabile o annullabile (desktop o iPhone).
+    public let canEditOnLight: Bool
 }
 
 /// Saldi per conto: stesse colonne del footer «Saldi» desktop (carte di credito: spese CC sulla colonna di riferimento).
@@ -100,6 +114,49 @@ public enum ContiDatabase {
     /// Oltre questa soglia (JSON in chiaro) il login usa solo `user_profile` (file .enc molto grande).
     /// Il file **sidecar** ``*_light.enc`` del desktop è piccolo: resta sotto soglia e si fa parse completo (Movimenti).
     private static let fullJSONParseThresholdBytes = 25 * 1024 * 1024
+
+    public static let contiLightRecordIdKey = "conti_light_record_id"
+
+    private static let movimentiListSyntheticRowKeyPrefix = "__row__:"
+
+    private static let contiLightEditSupersedesYearKey = "conti_light_edit_supersedes_year"
+    private static let contiLightEditSupersedesLegacyKeyKey = "conti_light_edit_supersedes_legacy_key"
+    private static let contiLightEditSupersedesSourceIndexKey = "conti_light_edit_supersedes_source_index"
+
+    /// Chiave usata in lista se manca `legacy_registration_key` nel JSON: `__row__:<anno>:<source_index>`.
+    public static func movimentiListKeyForSessionRecord(_ r: [String: Any], year: Int) -> String {
+        let k = (r["legacy_registration_key"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !k.isEmpty { return k }
+        let si = intFromJSON(r["source_index"])
+        return "\(movimentiListSyntheticRowKeyPrefix)\(year):\(si)"
+    }
+
+    /// `listKey` come in ``ContiRecordRow.legacyRegistrationKey`` (chiave reale o sintetica `__row__:`).
+    public static func findSessionRecordIndicesByListKey(
+        _ db: [String: Any],
+        listKey: String
+    ) -> (yIdx: Int, rIdx: Int)? {
+        let k0 = listKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !k0.isEmpty, let allYears = db["years"] as? [[String: Any]] else { return nil }
+        if k0.hasPrefix(movimentiListSyntheticRowKeyPrefix) {
+            let rest = String(k0.dropFirst(movimentiListSyntheticRowKeyPrefix.count))
+            let parts = rest.split(separator: ":")
+            guard parts.count == 2, let y = Int(parts[0]), let si = Int(parts[1]) else { return nil }
+            for (yi, yd) in allYears.enumerated() {
+                if intFromJSON(yd["year"]) != y { continue }
+                for (ri, r) in coerceToArrayOfStringKeyedDicts(yd["records"]).enumerated() {
+                    if intFromJSON(r["source_index"]) == si { return (yi, ri) }
+                }
+            }
+            return nil
+        }
+        for (yi, yd) in allYears.enumerated() {
+            for (ri, r) in coerceToArrayOfStringKeyedDicts(yd["records"]).enumerated() {
+                if stringFromJSON(r["legacy_registration_key"]) == k0 { return (yi, ri) }
+            }
+        }
+        return nil
+    }
 
     /*
      Stima memoria (ordine di grandezza) se in futuro l’app iOS caricasse/aggiornasse anche il `.enc` **completo**
@@ -345,6 +402,117 @@ public enum ContiDatabase {
         return total
     }
 
+    private static let dataLockFilename = "conti_di_casa_app.lock.json"
+    private static let dataLockStaleSeconds: TimeInterval = 15 * 60
+    private static let dataLockSessionId = UUID().uuidString
+
+    private static func dataLockURL(in folder: URL) -> URL {
+        folder.standardizedFileURL.appendingPathComponent(dataLockFilename, isDirectory: false)
+    }
+
+    private static func readDataLock(_ url: URL) -> [String: Any]? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        guard let obj = try? JSONSerialization.jsonObject(with: data, options: []) else { return nil }
+        return obj as? [String: Any]
+    }
+
+    private static func lockLastHeartbeatTs(_ lock: [String: Any]) -> TimeInterval {
+        if let n = lock["last_heartbeat_ts"] as? NSNumber { return n.doubleValue }
+        if let d = lock["last_heartbeat_ts"] as? Double { return d }
+        if let s = lock["last_heartbeat_ts"] as? String, let d = Double(s) { return d }
+        return 0
+    }
+
+    private static func isoNow() -> String {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f.string(from: Date())
+    }
+
+    private static func isActiveForeignDataLock(_ lock: [String: Any]?) -> Bool {
+        guard let lock else { return false }
+        let sid = stringFromJSON(lock["session_id"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if sid.isEmpty || sid == dataLockSessionId { return false }
+        let hbTs = lockLastHeartbeatTs(lock)
+        return (Date().timeIntervalSince1970 - hbTs) < dataLockStaleSeconds
+    }
+
+    private static func assertNoDropboxConflictedEncFiles(in folder: URL) throws {
+        let fm = FileManager.default
+        guard let urls = try? fm.contentsOfDirectory(
+            at: folder.standardizedFileURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        let conflicts = urls.filter { u in
+            guard u.pathExtension.lowercased() == "enc" else { return false }
+            let n = u.lastPathComponent.lowercased()
+            return n.contains("conflicted copy") || n.contains("copia in conflitto")
+        }.sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
+        if conflicts.isEmpty { return }
+        let shown = conflicts.prefix(8).map { "- \($0.lastPathComponent)" }.joined(separator: "\n")
+        let more = conflicts.count > 8 ? "\n... altri \(conflicts.count - 8) file" : ""
+        throw ContiLightImmissioneError.message(
+            "Salvataggio bloccato: nella cartella dati sono presenti copie Dropbox in conflitto.\n\n\(shown)\(more)\n\nArchivia prima le conflicted copies e riprova."
+        )
+    }
+
+    private static func assertNoActiveForeignDataLock(in folder: URL) throws {
+        let p = dataLockURL(in: folder)
+        if FileManager.default.fileExists(atPath: p.path) {
+            _ = waitForFileStableIfDropbox(p, maxWaitSeconds: 25)
+        }
+        let lock = readDataLock(p)
+        guard isActiveForeignDataLock(lock) else { return }
+        let app = stringFromJSON(lock?["app"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let dev = stringFromJSON(lock?["device"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let hb = stringFromJSON(lock?["last_heartbeat"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        throw ContiLightImmissioneError.message(
+            "Salvataggio bloccato: un'altra copia dell'app risulta aperta sulla cartella dati.\n\nApp: \(app)\nDispositivo: \(dev)\nUltimo segnale: \(hb)"
+        )
+    }
+
+    private static func writeLockPayload(to lockURL: URL, appKind: String = "ios_light") throws {
+        let host = ProcessInfo.processInfo.hostName
+        let now = Date().timeIntervalSince1970
+        let payload: [String: Any] = [
+            "app": appKind,
+            "session_id": dataLockSessionId,
+            "device": host,
+            "opened_at": isoNow(),
+            "last_heartbeat": isoNow(),
+            "last_heartbeat_ts": now
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted])
+        try data.write(to: lockURL, options: .atomic)
+    }
+
+    private static func acquireDataWorkspaceLockForWrite(
+        in folder: URL,
+        appKind: String = "ios_light"
+    ) throws -> (lockURL: URL, releaseOnScopeExit: Bool) {
+        let p = dataLockURL(in: folder)
+        let lock = readDataLock(p)
+        if isActiveForeignDataLock(lock) {
+            try assertNoActiveForeignDataLock(in: folder)
+        }
+        try writeLockPayload(to: p, appKind: appKind)
+        return (p, true)
+    }
+
+    private static func releaseDataWorkspaceLockIfOwned(_ lockURL: URL) {
+        let lock = readDataLock(lockURL)
+        let sid = stringFromJSON(lock?["session_id"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard sid == dataLockSessionId else { return }
+        try? FileManager.default.removeItem(at: lockURL)
+    }
+
+    private static func assertSafeToSave(_ encURL: URL) throws {
+        let folder = encURL.deletingLastPathComponent().standardizedFileURL
+        try assertNoDropboxConflictedEncFiles(in: folder)
+        try assertNoActiveForeignDataLock(in: folder)
+    }
+
     /// Legge `.key` come UTF-8 (stringa Base64), `.enc` come dati del token Fernet.
     public static func loadEncryptedDB(encURL: URL, keyURL: URL) throws -> [String: Any] {
         let keyString: String
@@ -463,47 +631,241 @@ public enum ContiDatabase {
         }
     }
 
-    /// Appiattisce `years` → righe ordinate dalla **data più recente** alla più vecchia.
-    public static func displayRecords(from db: [String: Any]) -> [ContiRecordRow] {
+    private static func contiRecordRowFromMovementDict(
+        _ r: [String: Any],
+        year: Int
+    ) -> ContiRecordRow? {
+        if isDotazioneRecord(r) { return nil }
+        if boolFromJSON(r["is_cancelled"]) { return nil }
+        let si = intFromJSON(r["source_index"])
+        let listKey = movimentiListKeyForSessionRecord(r, year: year)
+        let clid = stringFromJSON(r[contiLightRecordIdKey]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let regNum = intFromJSON(r["registration_number"])
+        let id = "\(year)-\(listKey)"
+        let dateIso = String(stringFromJSON(r["date_iso"]).prefix(10))
+        let amountEur = stringFromJSON(r["amount_eur"])
+        let rawAmount = amountEur.isEmpty ? stringFromJSON(r["display_amount"]) : amountEur
+        let catRaw = stripLeadingSignAndSpace(stringFromJSON(r["category_name"]))
+        let catShow = Self.isHiddenDotazioneCategoryName(catRaw) ? "" : catRaw
+        return ContiRecordRow(
+            id: id,
+            year: year,
+            dateIso: dateIso,
+            dateDisplay: italianDateDisplay(fromIsoDate: dateIso),
+            categoryDisplay: catShow,
+            accountPrimary: stringFromJSON(r["account_primary_name"]),
+            accountSecondary: stringFromJSON(r["account_secondary_name"]),
+            amountValue: parseLooseDecimal(rawAmount),
+            amountRawFallback: rawAmount,
+            note: stringFromJSON(r["note"]),
+            isCancelled: boolFromJSON(r["is_cancelled"]),
+            sourceIndex: si,
+            registrationNumber: regNum,
+            legacyRegistrationKey: listKey,
+            contiLightRecordId: clid,
+            canEditOnLight: true
+        )
+    }
+
+    /// Appiattisce `years` → righe visibili; ordinamento: **data** (default) o **numero di registrazione** globale.
+    public static func displayRecords(
+        from db: [String: Any],
+        sort: ContiMovimentiListSort = .dateNewestFirst
+    ) -> [ContiRecordRow] {
         guard let years = db["years"] as? [[String: Any]] else { return [] }
         var rows: [ContiRecordRow] = []
         for yd in years {
             let year = intFromJSON(yd["year"])
-            guard let recs = yd["records"] as? [[String: Any]] else { continue }
-            for r in recs {
-                if isDotazioneRecord(r) { continue }
-                if boolFromJSON(r["is_cancelled"]) { continue }
-                let si = intFromJSON(r["source_index"])
-                let key = (r["legacy_registration_key"] as? String) ?? ""
-                let id = key.isEmpty ? "\(year)-\(si)-\(rows.count)" : "\(year)-\(key)"
-                let dateIso = String(stringFromJSON(r["date_iso"]).prefix(10))
-                let rawAmount = stringFromJSON(r["display_amount"]).isEmpty ? stringFromJSON(r["amount_eur"]) : stringFromJSON(r["display_amount"])
-                let catRaw = stripLeadingSignAndSpace(stringFromJSON(r["category_name"]))
-                let catShow = Self.isHiddenDotazioneCategoryName(catRaw) ? "" : catRaw
-                rows.append(
-                    ContiRecordRow(
-                        id: id,
-                        year: year,
-                        dateIso: dateIso,
-                        dateDisplay: italianDateDisplay(fromIsoDate: dateIso),
-                        categoryDisplay: catShow,
-                        accountPrimary: stringFromJSON(r["account_primary_name"]),
-                        accountSecondary: stringFromJSON(r["account_secondary_name"]),
-                        amountValue: parseLooseDecimal(rawAmount),
-                        amountRawFallback: rawAmount,
-                        note: stringFromJSON(r["note"]),
-                        isCancelled: boolFromJSON(r["is_cancelled"]),
-                        sourceIndex: si
-                    )
-                )
+            for r in coerceToArrayOfStringKeyedDicts(yd["records"]) {
+                if let row = contiRecordRowFromMovementDict(r, year: year) {
+                    rows.append(row)
+                }
             }
         }
-        rows.sort {
-            if $0.dateIso != $1.dateIso { return $0.dateIso > $1.dateIso }
-            if $0.sourceIndex != $1.sourceIndex { return $0.sourceIndex > $1.sourceIndex }
-            return $0.id > $1.id
+        switch sort {
+        case .dateNewestFirst:
+            rows.sort {
+                if $0.dateIso != $1.dateIso { return $0.dateIso > $1.dateIso }
+                if $0.sourceIndex != $1.sourceIndex { return $0.sourceIndex > $1.sourceIndex }
+                return $0.id > $1.id
+            }
+        case .registrationNewestFirst:
+            rows.sort {
+                if $0.registrationNumber != $1.registrationNumber { return $0.registrationNumber > $1.registrationNumber }
+                if $0.dateIso != $1.dateIso { return $0.dateIso > $1.dateIso }
+                if $0.sourceIndex != $1.sourceIndex { return $0.sourceIndex > $1.sourceIndex }
+                return $0.id > $1.id
+            }
         }
         return rows
+    }
+
+    /// Dizionario `years[].records[]` individuato da `legacyKey` (stesso testo di ``ContiRecordRow.legacyRegistrationKey``): chiave reale o `__row__:<anno>:<source_index>`.
+    public static func recordDictionaryForLegacyKey(_ db: [String: Any], legacyKey: String) -> [String: Any]? {
+        let k0 = legacyKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !k0.isEmpty else { return nil }
+        guard let years = db["years"] as? [[String: Any]] else { return nil }
+        if k0.hasPrefix(movimentiListSyntheticRowKeyPrefix) {
+            let rest = String(k0.dropFirst(movimentiListSyntheticRowKeyPrefix.count))
+            let parts = rest.split(separator: ":")
+            guard parts.count == 2, let y = Int(parts[0]), let si = Int(parts[1]) else { return nil }
+            guard let yd = years.first(where: { intFromJSON($0["year"]) == y }) else { return nil }
+            for r in coerceToArrayOfStringKeyedDicts(yd["records"]) {
+                if intFromJSON(r["source_index"]) == si { return r }
+            }
+            return nil
+        }
+        for yd in years {
+            for r in coerceToArrayOfStringKeyedDicts(yd["records"]) {
+                if stringFromJSON(r["legacy_registration_key"]) == k0 { return r }
+            }
+        }
+        return nil
+    }
+
+    /// Valori iniziali per la scheda immissione in modalità modifica (stessa logica importo della nuova registrazione).
+    public static func immissioneEditPrefill(
+        db: [String: Any],
+        legacyKey: String
+    ) throws -> (
+        date: Date,
+        catCode: String,
+        acc1: String,
+        acc2: String,
+        amountText: String,
+        cheque: String,
+        note: String,
+        contiLightId: String
+    ) {
+        guard let rec = recordDictionaryForLegacyKey(db, legacyKey: legacyKey) else {
+            throw ContiLightImmissioneError.message("Registrazione non trovata.")
+        }
+        let clid = stringFromJSON(rec[contiLightRecordIdKey]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if boolFromJSON(rec["is_cancelled"]) {
+            throw ContiLightImmissioneError.message("Questa registrazione risulta già annullata.")
+        }
+        let giro = isGirocontoRecord(rec)
+        let iso = String(stringFromJSON(rec["date_iso"]).prefix(10))
+        let dateD: Date
+        if let d = dateFromIsoCalendarLocal(iso) {
+            let b = immissioneDateBoundsIso()
+            let s = min(max(d, dateFromIsoCalendarLocal(b.minIso) ?? d), dateFromIsoCalendarLocal(b.maxIso) ?? d)
+            dateD = s
+        } else {
+            dateD = Date()
+        }
+        let catCode = stringFromJSON(rec["category_code"])
+        let a1 = stringFromJSON(rec["account_primary_code"])
+        let a2 = stringFromJSON(rec["account_secondary_code"])
+        let amtE = stringFromJSON(rec["amount_eur"])
+        let dAmt = parseLooseDecimal(amtE) ?? .zero
+        // Stesso formato che avrebbe il campo dopo l’editing (segno ASCII, virgola decimale, 2 cifre) come in nuova immissione.
+        let rawDisplay = giro ? formatEuroTwoDecimals(abs(dAmt)) : formatEuroTwoDecimals(dAmt)
+        let amountText = formatEuroImmissioneOnExit(amountText: rawDisplay, girataSelected: giro)
+        var chq = stringFromJSON(rec["cheque"])
+        if chq == "-" { chq = "" }
+        var noteR = stringFromJSON(rec["note"])
+        if noteR == "-" { noteR = "" }
+        return (dateD, catCode, a1, a2, amountText, chq, noteR, clid)
+    }
+
+    /// Imposta ``is_cancelled`` (stesso significato dell’«annulla registrazione» sul desktop). Dopo ``persistSessionDbToEncryptedFiles``,
+    /// ``upsertLightSessionRecordsInMain`` copia il record aggiornato nel ``.enc`` completo, quindi il programma per PC vede l’annullamento.
+    public static func setSessionRecordCancelled(
+        db: inout [String: Any],
+        legacyKey: String,
+        isCancelled: Bool
+    ) throws {
+        let k0 = legacyKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !k0.isEmpty else { throw ContiLightImmissioneError.message("Chiave mancante.") }
+        guard let (yi0, ri0) = findSessionRecordIndicesByListKey(db, listKey: k0) else {
+            throw ContiLightImmissioneError.message("Registrazione non trovata.")
+        }
+        guard var allYears = db["years"] as? [[String: Any]] else { throw ContiDBError.invalidJSON }
+        var recs0 = coerceToArrayOfStringKeyedDicts(allYears[yi0]["records"])
+        var r = recs0[ri0]
+        r["is_cancelled"] = isCancelled
+        recs0[ri0] = r
+        allYears[yi0]["records"] = recs0
+        db["years"] = allYears
+    }
+
+    /// Sostituisce o sposta in un altro anno la registrazione; `recordFromTemplate` = output di ``buildNewLightRecordTemplate`` (stesso ``conti_light_record_id`` se già assegnato, altrimenti nuovo UUID per la prima modifica da iOS su record desktop).
+    public static func applyLightImmissioneUpdateInSession(
+        db: inout [String: Any],
+        legacyKey: String,
+        recordFromTemplate: [String: Any]
+    ) throws {
+        let k0 = legacyKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !k0.isEmpty else { throw ContiLightImmissioneError.message("Chiave mancante.") }
+        guard let (yi0, ri0) = findSessionRecordIndicesByListKey(db, listKey: k0) else {
+            throw ContiLightImmissioneError.message("Registrazione non trovata.")
+        }
+        guard var allYears = db["years"] as? [[String: Any]] else { throw ContiDBError.invalidJSON }
+        var recs0 = coerceToArrayOfStringKeyedDicts(allYears[yi0]["records"])
+        let old = recs0[ri0]
+        let oldClid = stringFromJSON(old[contiLightRecordIdKey]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let idNew = stringFromJSON(recordFromTemplate[contiLightRecordIdKey]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !idNew.isEmpty else {
+            throw ContiLightImmissioneError.message("Identificativo interno mancante nel modello di salvataggio.")
+        }
+        if !oldClid.isEmpty, oldClid != idNew { throw ContiDBError.invalidJSON }
+        if boolFromJSON(old["is_cancelled"]) {
+            throw ContiLightImmissioneError.message("Non è possibile modificare una registrazione annullata.")
+        }
+        let oldY = intFromJSON(old["year"])
+        let newY = intFromJSON(recordFromTemplate["year"])
+        let preservedReg = intFromJSON(old["registration_number"])
+        if oldY == newY {
+            var m = recordFromTemplate
+            m["source_index"] = old["source_index"]
+            m["legacy_registration_number"] = old["legacy_registration_number"]
+            m["legacy_registration_key"] = old["legacy_registration_key"]
+            m["source_folder"] = stringFromJSON(old["source_folder"])
+            m["source_file"] = stringFromJSON(old["source_file"])
+            m[contiLightRecordIdKey] = idNew
+            if preservedReg > 0 {
+                m["registration_number"] = preservedReg
+            }
+            m.removeValue(forKey: contiLightEditSupersedesYearKey)
+            m.removeValue(forKey: contiLightEditSupersedesLegacyKeyKey)
+            m.removeValue(forKey: contiLightEditSupersedesSourceIndexKey)
+            recs0[ri0] = m
+            allYears[yi0]["records"] = recs0
+            db["years"] = allYears
+        } else {
+            recs0.remove(at: ri0)
+            allYears[yi0]["records"] = recs0
+            db["years"] = allYears
+            _ = try ensureYearBucketForMerge(db: &db, targetYear: newY)
+            guard var allY2 = db["years"] as? [[String: Any]],
+                  let yi1 = allY2.firstIndex(where: { intFromJSON($0["year"]) == newY })
+            else { throw ContiDBError.invalidJSON }
+            var yb1 = allY2[yi1]
+            var recs1 = coerceToArrayOfStringKeyedDicts(yb1["records"])
+            let nextSi = (recs1.map { intFromJSON($0["source_index"]) }.max() ?? 0) + 1
+            var m = recordFromTemplate
+            m["source_index"] = nextSi
+            m["legacy_registration_number"] = nextSi
+            m[contiLightRecordIdKey] = idNew
+            m["legacy_registration_key"] = "APP:conti_light:\(newY):\(idNew)"
+            m["registration_number"] = preservedReg > 0 ? preservedReg : maxRegistrationNumber(db) + 1
+            m["source_folder"] = stringFromJSON(old["source_folder"])
+            m["source_file"] = stringFromJSON(old["source_file"])
+            if oldClid.isEmpty {
+                m[contiLightEditSupersedesYearKey] = oldY
+                m[contiLightEditSupersedesLegacyKeyKey] = stringFromJSON(old["legacy_registration_key"])
+                m[contiLightEditSupersedesSourceIndexKey] = intFromJSON(old["source_index"])
+            } else {
+                m.removeValue(forKey: contiLightEditSupersedesYearKey)
+                m.removeValue(forKey: contiLightEditSupersedesLegacyKeyKey)
+                m.removeValue(forKey: contiLightEditSupersedesSourceIndexKey)
+            }
+            recs1.append(m)
+            yb1["records"] = recs1
+            allY2[yi1] = yb1
+            db["years"] = allY2
+        }
     }
 
     /// Data locale `yyyy-MM-dd` (stessa logica del cutoff «saldi oggi» sul desktop).
@@ -656,8 +1018,6 @@ public enum ContiDatabase {
     }
 
     // MARK: - Sync dual .enc + saldi (allineato a light_enc_sidecar.py / main_app)
-
-    public static let contiLightRecordIdKey = "conti_light_record_id"
 
     /// Finestra mobile: oggi − 365 giorni (come `light_window_start_iso`).
     public static func lightWindowStartIsoForExport() -> String {
@@ -1435,6 +1795,172 @@ public enum ContiDatabase {
         return added
     }
 
+    private static func recordWithoutIosSupersedesForMainWrite(_ rec: [String: Any]) -> [String: Any] {
+        var m = rec
+        m.removeValue(forKey: contiLightEditSupersedesYearKey)
+        m.removeValue(forKey: contiLightEditSupersedesLegacyKeyKey)
+        m.removeValue(forKey: contiLightEditSupersedesSourceIndexKey)
+        return m
+    }
+
+    /// Toglie dal completo la riga «vecchia» quando una modifica iOS sposta l’anno (prima: desktop senza `conti_light_id`).
+    private static func removeMainRecordForIosSupersede(
+        main: inout [String: Any],
+        year: Int,
+        legacyKey: String,
+        sourceIndex: Int
+    ) -> Bool {
+        let k = legacyKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard var allYears = main["years"] as? [[String: Any]],
+              let yi = allYears.firstIndex(where: { intFromJSON($0["year"]) == year })
+        else { return false }
+        var recs = coerceToArrayOfStringKeyedDicts(allYears[yi]["records"])
+        guard !recs.isEmpty else { return false }
+        let j: Int? = {
+            if !k.isEmpty {
+                return recs.firstIndex { stringFromJSON($0["legacy_registration_key"]) == k }
+            }
+            return recs.firstIndex { intFromJSON($0["source_index"]) == sourceIndex }
+        }()
+        guard let rj = j else { return false }
+        recs.remove(at: rj)
+        var yb = allYears[yi]
+        yb["records"] = recs
+        allYears[yi] = yb
+        main["years"] = allYears
+        return true
+    }
+
+    private static func findInMainIndexByContiLightId(
+        _ main: [String: Any],
+        contiId: String
+    ) -> (yi: Int, ri: Int)? {
+        let id = contiId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty, let allYears = main["years"] as? [[String: Any]] else { return nil }
+        for (yi, yd) in allYears.enumerated() {
+            for (ri, r) in coerceToArrayOfStringKeyedDicts(yd["records"]).enumerated() {
+                let m = stringFromJSON(r[contiLightRecordIdKey]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if m == id { return (yi, ri) }
+            }
+        }
+        return nil
+    }
+
+    private static func findInMainIndexByYearAndLegacy(
+        _ main: [String: Any],
+        year: Int,
+        legacyKey: String
+    ) -> (yi: Int, ri: Int)? {
+        let lk = legacyKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !lk.isEmpty, let allYears = main["years"] as? [[String: Any]],
+              let yi = allYears.firstIndex(where: { intFromJSON($0["year"]) == year })
+        else { return nil }
+        for (ri, r) in coerceToArrayOfStringKeyedDicts(allYears[yi]["records"]).enumerated() {
+            if stringFromJSON(r["legacy_registration_key"]) == lk { return (yi, ri) }
+        }
+        return nil
+    }
+
+    private static func appendRecordToMainYear(main: inout [String: Any], year: Int, rec: [String: Any]) throws {
+        _ = try ensureYearBucketForMerge(db: &main, targetYear: year)
+        guard var allY = main["years"] as? [[String: Any]],
+              let yi = allY.firstIndex(where: { intFromJSON($0["year"]) == year })
+        else { return }
+        var yb = allY[yi]
+        var recs = coerceToArrayOfStringKeyedDicts(yb["records"])
+        recs.append(rec)
+        yb["records"] = recs
+        allY[yi] = yb
+        main["years"] = allY
+    }
+
+    /// Sostituisce o sposta in main le righe del light (per `conti_light_record_id` e/o stessa `legacy_registration_key` nello stesso anno, anche record desktop), dopo eventuale rimozione con ``conti_light_edit_supersedes_*``.
+    public static func upsertLightSessionRecordsInMain(main: inout [String: Any], light: [String: Any]) -> Int {
+        guard let lightYears = light["years"] as? [[String: Any]] else { return 0 }
+        var flat: [[String: Any]] = []
+        for yl in lightYears {
+            for recL in coerceToArrayOfStringKeyedDicts(yl["records"]) {
+                if let d = try? JSONSerialization.data(withJSONObject: recL, options: []),
+                   let c = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+                    flat.append(c)
+                }
+            }
+        }
+        var updated = 0
+        for rec0 in flat where rec0[contiLightEditSupersedesYearKey] != nil {
+            let yS = intFromJSON(rec0[contiLightEditSupersedesYearKey])
+            let kS = stringFromJSON(rec0[contiLightEditSupersedesLegacyKeyKey])
+            let siS = intFromJSON(rec0[contiLightEditSupersedesSourceIndexKey])
+            if yS != 0, removeMainRecordForIosSupersede(main: &main, year: yS, legacyKey: kS, sourceIndex: siS) {
+                updated += 1
+            }
+        }
+        for rec0 in flat {
+            let recL = recordWithoutIosSupersedesForMainWrite(rec0)
+            let yNew = intFromJSON(recL["year"])
+            let rid = stringFromJSON(recL[contiLightRecordIdKey]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let legacy = stringFromJSON(recL["legacy_registration_key"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard yNew > 0 else { continue }
+            guard !rid.isEmpty || !legacy.isEmpty else { continue }
+            var found: (yi: Int, ri: Int)?
+            if !rid.isEmpty {
+                found = findInMainIndexByContiLightId(main, contiId: rid)
+            }
+            if found == nil, !legacy.isEmpty {
+                found = findInMainIndexByYearAndLegacy(main, year: yNew, legacyKey: legacy)
+            }
+            guard var allYears = main["years"] as? [[String: Any]] else { continue }
+            if let (fyi, fri) = found {
+                let yOld = intFromJSON(allYears[fyi]["year"])
+                if yOld == yNew {
+                    var recs = coerceToArrayOfStringKeyedDicts(allYears[fyi]["records"])
+                    recs[fri] = recL
+                    var yb = allYears[fyi]
+                    yb["records"] = recs
+                    allYears[fyi] = yb
+                    main["years"] = allYears
+                    updated += 1
+                } else {
+                    var recsOld = coerceToArrayOfStringKeyedDicts(allYears[fyi]["records"])
+                    recsOld.remove(at: fri)
+                    var ybOld = allYears[fyi]
+                    ybOld["records"] = recsOld
+                    allYears[fyi] = ybOld
+                    main["years"] = allYears
+                    do {
+                        _ = try ensureYearBucketForMerge(db: &main, targetYear: yNew)
+                    } catch {
+                        continue
+                    }
+                    guard var allY2 = main["years"] as? [[String: Any]],
+                          let yiN = allY2.firstIndex(where: { intFromJSON($0["year"]) == yNew })
+                    else { continue }
+                    var ybN = allY2[yiN]
+                    var recsN = coerceToArrayOfStringKeyedDicts(ybN["records"])
+                    if !rid.isEmpty, let j = recsN.firstIndex(where: {
+                        stringFromJSON($0[contiLightRecordIdKey]).trimmingCharacters(in: .whitespacesAndNewlines) == rid
+                    }) {
+                        recsN[j] = recL
+                    } else {
+                        recsN.append(recL)
+                    }
+                    ybN["records"] = recsN
+                    allY2[yiN] = ybN
+                    main["years"] = allY2
+                    updated += 1
+                }
+            } else if !rid.isEmpty {
+                do {
+                    try appendRecordToMainYear(main: &main, year: yNew, rec: recL)
+                    updated += 1
+                } catch {
+                    continue
+                }
+            }
+        }
+        return updated
+    }
+
     // MARK: - Immissione light → .enc (merge completo + saldi)
 
     private static let maxRecordNoteLen = 100
@@ -1489,6 +2015,92 @@ public enum ContiDatabase {
         (try? parseAmountForNewRecordImmissione(amountText: amountText, girata: girataSelected)) != nil
     }
 
+    /// Testo iniziale / dopo cancella: segno `−` (default uscite), come da convenzione immissione.
+    public static let lightImmissioneDefaultAmountText: String = "-"
+
+    /// Filtra l’immissione al volo: un solo `+`/`-` iniziale, cifre, una sola `,` decimale, al massimo 2 cifre frazionarie. `,` iniziale → `0,`. Rimuove i `.` migliaia se c’è già `,`.
+    public static func normalizedEuroImmissioneAmountFieldText(_ input: String) -> String {
+        var s0 = input.replacingOccurrences(of: "\u{2212}", with: "-")
+        s0 = s0.replacingOccurrences(of: "\u{00A0}", with: "")
+        s0 = s0.replacingOccurrences(of: " ", with: "")
+        if s0.isEmpty { return "" }
+        var sign: Character?
+        if let f = s0.first, f == "+" || f == "-" {
+            sign = f
+            s0 = String(s0.dropFirst())
+        }
+        var s = String()
+        s.reserveCapacity(s0.count)
+        for ch in s0 {
+            if ch == "+" || ch == "-" { continue }
+            s.append(ch)
+        }
+        if s.isEmpty { return sign.map { String($0) } ?? "" }
+        if s.contains(",") {
+            s = s.replacingOccurrences(of: ".", with: "")
+        } else {
+            let nDots = s.filter { $0 == "." }.count
+            if nDots == 1 { s = s.replacingOccurrences(of: ".", with: ",") } else if nDots > 1 { s = s.replacingOccurrences(of: ".", with: "") }
+        }
+        if s.first == "," { s = "0" + s }
+        if s.isEmpty, sign != nil { return String(sign!) }
+        var intB = String()
+        var fracB = String()
+        var hasComma = false
+        for ch in s {
+            if ("0"..."9").contains(ch) {
+                if !hasComma { intB.append(ch) } else if fracB.count < 2 { fracB.append(ch) }
+            } else if ch == "," {
+                if !hasComma { hasComma = true } else { break }
+            }
+        }
+        if hasComma, intB.isEmpty { intB = "0" }
+        var body = intB
+        if hasComma {
+            body += ","
+            body += fracB
+        }
+        if let sg = sign { return String(sg) + body }
+        return body
+    }
+
+    /// Dopo l’editing: formato italiano con 2 decimali (stesso criterio di ``formatEuroTwoDecimals``). Girata: modulo positivo. Campo «solo -» o vuoto: torna a ``lightImmissioneDefaultAmountText``.
+    public static func formatEuroImmissioneOnExit(amountText: String, girataSelected: Bool) -> String {
+        let t = normalizedEuroImmissioneAmountFieldText(amountText)
+        if t.isEmpty { return lightImmissioneDefaultAmountText }
+        if t == lightImmissioneDefaultAmountText { return lightImmissioneDefaultAmountText }
+        var s = t
+        var neg = false
+        if s.first == "-" {
+            neg = true
+            s.removeFirst()
+        } else if s.first == "+" {
+            neg = false
+            s.removeFirst()
+        } else {
+            neg = false
+        }
+        if s == "," { s = "0" }
+        guard let mag = parseLooseDecimal(s) else { return t }
+        if girataSelected { return formatEuroTwoDecimals(mag) }
+        let v = neg ? -mag : mag
+        return formatEuroTwoDecimals(v)
+    }
+
+    /// Ritorna `true` se la parte frazionaria (dopo l’ultima `,` o avendo normalizzato) ha almeno 2 cifre decimali, per chiudere la tastiera e passare al campo successivo.
+    public static func euroImmissioneAmountHasAtLeastTwoDecimalDigits(_ amountText: String) -> Bool {
+        let t = normalizedEuroImmissioneAmountFieldText(amountText)
+        var s = t
+        if let f = s.first, f == "+" || f == "-" {
+            s.removeFirst()
+        }
+        guard let idx = s.lastIndex(where: { $0 == "," || $0 == "." }) else { return false }
+        let frac = s[s.index(after: idx)...]
+        guard !frac.isEmpty else { return false }
+        return frac.count >= 2
+            && frac.unicodeScalars.allSatisfy { CharacterSet.decimalDigits.contains($0) }
+    }
+
     /// Serializzazione importo: due decimali, punto (stesso schema JSON del desktop).
     public static func formatMoneyForDb(_ value: Decimal) -> String {
         let n = NSDecimalNumber(decimal: value)
@@ -1537,7 +2149,7 @@ public enum ContiDatabase {
 
     /// Importo: girata → sempre negativa in modulo; altrimenti segno da prefisso `+` / `−` / `-` sul testo.
     private static func parseAmountForNewRecordImmissione(amountText: String, girata: Bool) throws -> Decimal {
-        var s = amountText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var s = normalizedEuroImmissioneAmountFieldText(amountText.trimmingCharacters(in: .whitespacesAndNewlines))
         var signNeg = false
         if let f = s.first {
             if f == "-" || f == "−" {
@@ -1699,7 +2311,7 @@ public enum ContiDatabase {
 
     /**
      Scrive su disco ``*_light.enc`` e, se presente e autenticabile, anche ``conti_utente_*.enc`` completo.
-     ``sessionDb`` deve già contenere la nuova riga; ``recordForSaldi`` è la stessa riga dopo ``appendLightSessionRecord`` (per ``applyNewRecordToLightSaldi`` se manca il completo).
+     ``recordForSaldi`` è usato in sola lettura come documentazione legata a ``appendLightSessionRecord``; i saldi sul file light vengono ricalcolati interamente da movimenti; sul completo: merge + upsert + ricalcolo.
      */
     public static func persistSessionDbToEncryptedFiles(
         sessionDb: [String: Any],
@@ -1709,6 +2321,7 @@ public enum ContiDatabase {
         email: String,
         password: String
     ) throws -> (sessionLight: [String: Any], mergedIntoFull: Int, note: String) {
+        _ = recordForSaldi
         let em = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let fullURL = perUserEncURL(primaryEnc: lightEncURL, email: em)
         var waitPaths = [keyURL, lightEncURL]
@@ -1724,16 +2337,21 @@ public enum ContiDatabase {
                     "Il file database completo è presente ma l’accesso è fallito. Verifica la password o apri prima sul desktop."
                 )
             }
-            let n = mergeLightNewRecordsIntoMain(main: &main, light: sessionDb)
+            let nUp = upsertLightSessionRecordsInMain(main: &main, light: sessionDb)
+            let nNew = mergeLightNewRecordsIntoMain(main: &main, light: sessionDb)
             recomputeLightSaldiFromFullDb(&main)
             let lightExport = try buildLightDatabaseForExport(from: main)
             try saveEncryptedDbToDisk(db: main, encURL: fullURL, keyString: keyString)
             try saveEncryptedDbToDisk(db: lightExport, encURL: lightEncURL, keyString: keyString)
             var msg = "Salvati file completo e light nella cartella dati; saldi ricalcolati come sul desktop."
-            if n > 0 {
-                msg = "Importate \(n) nuove registrazione/i nel database completo. " + msg
+            if nNew > 0, nUp > 0 {
+                msg = "Importate \(nNew) nuove registrazione/i, aggiornate \(nUp) esistenti nel database completo. " + msg
+            } else if nNew > 0 {
+                msg = "Importate \(nNew) nuove registrazione/i nel database completo. " + msg
+            } else if nUp > 0 {
+                msg = "Aggiornate \(nUp) registrazione/i (modifica/sospensione) nel database completo. " + msg
             }
-            return (lightExport, n, msg)
+            return (lightExport, nNew + nUp, msg)
         }
         var lightOnly = try deepCopyDb(sessionDb)
         guard dictionaryFromAnyRoot(lightOnly["light_saldi"]) != nil else {
@@ -1741,17 +2359,24 @@ public enum ContiDatabase {
                 "Nel file light manca il blocco «light_saldi». Copia nella cartella anche il database completo .enc (consigliato) oppure rigenera il file *_light.enc salvando sul desktop, poi riprova."
             )
         }
-        applyNewRecordToLightSaldi(db: &lightOnly, record: recordForSaldi, cutoffDateIso: todayIsoLocal())
+        recomputeLightSaldiFromFullDb(&lightOnly)
         try saveEncryptedDbToDisk(db: lightOnly, encURL: lightEncURL, keyString: keyString)
         let msg = """
         Salvato solo il file light (nessun database completo trovato accanto). \
-        I saldi sono stati aggiornati in modo approssimativo: per allineamento completo copia anche il file .enc completo nella stessa cartella e salva di nuovo o apri sul desktop.
+        I saldi sono stati ricalcolati a partire dai movimenti; per l’allineamento completo con la contabilità desktop copia il file .enc completo e salva o apri sul desktop.
         """
         return (lightOnly, 0, msg)
     }
 
     /// Scrive un database cifrato (stesso formato del desktop).
     public static func saveEncryptedDbToDisk(db: [String: Any], encURL: URL, keyString: String) throws {
+        try assertSafeToSave(encURL)
+        let lk = try acquireDataWorkspaceLockForWrite(in: encURL.deletingLastPathComponent())
+        defer {
+            if lk.releaseOnScopeExit {
+                releaseDataWorkspaceLockIfOwned(lk.lockURL)
+            }
+        }
         guard let enc = FernetEncryptor(keyFileContents: keyString) else {
             throw ContiDBError.cannotEncrypt
         }
@@ -1788,16 +2413,27 @@ public enum ContiDatabase {
         guard tryLogin(db: fullDb, email: em, password: password) != nil else {
             return (lightDb, 0, "File completo presente ma accesso non riuscito; uso solo il light.")
         }
-        let pwd = password.trimmingCharacters(in: .whitespacesAndNewlines)
         var main = fullDb
-        let n = mergeLightNewRecordsIntoMain(main: &main, light: lightDb)
+        let n2 = upsertLightSessionRecordsInMain(main: &main, light: lightDb)
+        let n1 = mergeLightNewRecordsIntoMain(main: &main, light: lightDb)
+        let n = n1 + n2
+        // Evita riscritture inutili su refresh/login: se non c'e' nulla da importare/aggiornare dal light,
+        // il passaggio resta read-only e riduce i conflicted copies Dropbox.
+        if n == 0 {
+            let alignedLight = try buildLightDatabaseForExport(from: fullDb)
+            return (alignedLight, 0, "Database gia' allineato: nessuna modifica da salvare.")
+        }
         recomputeLightSaldiFromFullDb(&main)
         let lightExport = try buildLightDatabaseForExport(from: main)
         try saveEncryptedDbToDisk(db: main, encURL: fullURL, keyString: keyString)
         try saveEncryptedDbToDisk(db: lightExport, encURL: lightEncURL, keyString: keyString)
         var msg = "Database allineato: saldi ricalcolati; salvati file completo e light."
-        if n > 0 {
-            msg = "Importate \(n) registrazioni dall’app light nel file completo. " + msg
+        if n1 > 0, n2 > 0 {
+            msg = "Sincronizzate \(n1) nuove e \(n2) modificate dell’app light con il file completo. " + msg
+        } else if n1 > 0 {
+            msg = "Importate \(n1) registrazioni dall’app light nel file completo. " + msg
+        } else if n2 > 0 {
+            msg = "Aggiornate \(n2) registrazioni (modifiche o sospensioni) da Conti light nel file completo. " + msg
         }
         return (lightExport, n, msg)
     }
@@ -2075,6 +2711,294 @@ public enum ContiDatabase {
         if let b = v as? Bool { return b }
         if let n = v as? NSNumber { return n.boolValue }
         return false
+    }
+
+    // MARK: - Registrazioni periodiche (allineato a ``periodiche.py`` / avvio ``main_app.py``)
+
+    private static let periodicCadenceIds: Set<String> = [
+        "daily", "weekly", "monthly", "bimonthly", "quarterly", "quadrimestral", "semiannual", "annual",
+    ]
+
+    /// Come ``ensure_periodic_registrations``.
+    public static func ensurePeriodicRegistrationsInDb(_ db: inout [String: Any]) {
+        if let arr = db["periodic_registrations"] as? [[String: Any]] {
+            var out: [[String: Any]] = []
+            for var r in arr {
+                if stringFromJSON(r["cadence"]) == "biweekly" {
+                    r["cadence"] = "weekly"
+                }
+                out.append(r)
+            }
+            db["periodic_registrations"] = out
+            return
+        }
+        if let anyArr = db["periodic_registrations"] as? [Any] {
+            let coerced = anyArr.compactMap { $0 as? [String: Any] }
+            db["periodic_registrations"] = coerced
+            ensurePeriodicRegistrationsInDb(&db)
+            return
+        }
+        db["periodic_registrations"] = [] as [[String: Any]]
+    }
+
+    private static func periodicCalendar() -> Calendar {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = .current
+        return c
+    }
+
+    private static func periodicStartOfDay(_ d: Date) -> Date {
+        periodicCalendar().startOfDay(for: d)
+    }
+
+    private static func periodicParseIsoDate(_ s: String?) -> Date? {
+        let t = (s ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard t.count >= 10 else { return nil }
+        return dateFromIsoCalendarLocal(String(t.prefix(10)))
+    }
+
+    private static func periodicAdvanceByCadence(from start: Date, cadence: String) -> Date? {
+        let cal = periodicCalendar()
+        let d0 = periodicStartOfDay(start)
+        switch cadence {
+        case "daily":
+            return cal.date(byAdding: .day, value: 1, to: d0)
+        case "weekly":
+            return cal.date(byAdding: .day, value: 7, to: d0)
+        case "monthly":
+            return cal.date(byAdding: .month, value: 1, to: d0)
+        case "bimonthly":
+            return cal.date(byAdding: .month, value: 2, to: d0)
+        case "quarterly":
+            return cal.date(byAdding: .month, value: 3, to: d0)
+        case "quadrimestral":
+            return cal.date(byAdding: .month, value: 4, to: d0)
+        case "semiannual":
+            return cal.date(byAdding: .month, value: 6, to: d0)
+        case "annual":
+            return cal.date(byAdding: .month, value: 12, to: d0)
+        default:
+            return cal.date(byAdding: .day, value: 1, to: d0)
+        }
+    }
+
+    /// Come ``rule.get("active", True)`` in Python: assenza del campo = attiva.
+    private static func periodicRuleIsActive(_ rule: [String: Any]) -> Bool {
+        if rule["active"] == nil { return true }
+        return boolFromJSON(rule["active"])
+    }
+
+    private static func periodicNextDueDate(rule: [String: Any]) -> Date? {
+        if !periodicRuleIsActive(rule) { return nil }
+        let cad = stringFromJSON(rule["cadence"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard periodicCadenceIds.contains(cad) else { return nil }
+        guard let anchor = periodicParseIsoDate(rule["start_anchor_iso"] as? String) else { return nil }
+        let lastM = periodicParseIsoDate(rule["last_materialized_iso"] as? String)
+        let next: Date
+        if lastM == nil {
+            next = periodicStartOfDay(anchor)
+        } else {
+            guard let adv = periodicAdvanceByCadence(from: lastM!, cadence: cad) else { return nil }
+            next = periodicStartOfDay(adv)
+        }
+        return next
+    }
+
+    private static func periodicCountAllRecords(_ db: [String: Any]) -> Int {
+        guard let years = db["years"] as? [[String: Any]] else { return 0 }
+        return years.reduce(0) { acc, y in
+            acc + coerceToArrayOfStringKeyedDicts(y["records"]).count
+        }
+    }
+
+    private static func periodicMaxSourceIndexForYear(_ db: [String: Any], year: Int) -> Int {
+        guard let years = db["years"] as? [[String: Any]],
+              let yd = years.first(where: { intFromJSON($0["year"]) == year })
+        else { return 0 }
+        return coerceToArrayOfStringKeyedDicts(yd["records"]).map { intFromJSON($0["source_index"]) }.max() ?? 0
+    }
+
+    private static func periodicSanitizeLine(_ s: String, maxLen: Int?) -> String {
+        var o = s.replacingOccurrences(of: "\r", with: " ").replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        if let m = maxLen, o.count > m { o = String(o.prefix(m)) }
+        return o
+    }
+
+    private static func periodicAutoNoteSuffix(cadence: String, year: Int, movementDateIso: String) -> String? {
+        let c = cadence
+        let head = String(movementDateIso.prefix(10))
+        guard head.count >= 7, let mo = Int(head.dropFirst(5).prefix(2)) else { return nil }
+        if ["monthly", "bimonthly", "quarterly"].contains(c) {
+            return String(format: "%04d/%02d", year, mo)
+        }
+        if c == "annual" { return String(format: "%04d", year) }
+        return nil
+    }
+
+    private static func periodicBuildRecord(
+        db: inout [String: Any],
+        rule: [String: Any],
+        movementDateIso: String,
+        registrationNumber: Int
+    ) throws -> [String: Any] {
+        let tpl = dictionaryFromAnyRoot(rule["template"]) ?? [:]
+        let y = Int(String(movementDateIso.prefix(4))) ?? 0
+        let si = periodicMaxSourceIndexForYear(db, year: y) + 1
+        let rid = stringFromJSON(rule["id"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let ridOut = rid.isEmpty ? UUID().uuidString : rid
+        let legacyKey = "APP:periodic:\(ridOut):\(String(movementDateIso.prefix(10))):\(si)"
+        let giro = boolFromJSON(tpl["is_giroconto"])
+        let acc2Code = giro ? stringFromJSON(tpl["account_secondary_code"]) : ""
+        let acc2Name = giro ? stringFromJSON(tpl["account_secondary_name"]) : ""
+        let acc2Flags = stringFromJSON(tpl["account_secondary_flags"])
+        var chq = periodicSanitizeLine(stringFromJSON(tpl["cheque"]), maxLen: maxChequeLen)
+        if chq.isEmpty { chq = "-" }
+        var note = periodicSanitizeLine(stringFromJSON(tpl["note"]), maxLen: maxRecordNoteLen)
+        if note.isEmpty { note = "-" }
+        let cad = stringFromJSON(rule["cadence"])
+        if let sfx = periodicAutoNoteSuffix(cadence: cad, year: y, movementDateIso: movementDateIso) {
+            let base = note.trimmingCharacters(in: .whitespacesAndNewlines)
+            if base.isEmpty || base == "-" {
+                note = sfx
+            } else {
+                let merged = "\(base) \(sfx)"
+                note = periodicSanitizeLine(merged, maxLen: maxRecordNoteLen)
+                if note.isEmpty { note = sfx }
+            }
+        }
+        let amtRaw = stringFromJSON(tpl["amount_eur"])
+        let amtDec = parseLooseDecimal(amtRaw.replacingOccurrences(of: ",", with: ".")) ?? .zero
+        let amtStr = formatMoneyForDb(amtDec)
+        let apw = stringFromJSON(tpl["account_primary_with_flags"])
+        let apc = stringFromJSON(tpl["account_primary_code"])
+        let acc2wf: String
+        if !acc2Code.isEmpty, !acc2Flags.isEmpty {
+            acc2wf = acc2Code + acc2Flags
+        } else {
+            acc2wf = acc2Code
+        }
+        return [
+            "year": y,
+            "source_folder": "APP",
+            "source_file": "periodic",
+            "source_index": si,
+            "legacy_registration_number": si,
+            "legacy_registration_key": legacyKey,
+            "registration_number": registrationNumber,
+            "periodic_rule_id": ridOut,
+            "date_iso": String(movementDateIso.prefix(10)),
+            "category_code": stringFromJSON(tpl["category_code"]),
+            "category_name": stringFromJSON(tpl["category_name"]),
+            "category_note": stringFromJSON(tpl["category_note"]),
+            "account_primary_code": stringFromJSON(tpl["account_primary_code"]),
+            "account_primary_flags": stringFromJSON(tpl["account_primary_flags"]),
+            "account_primary_with_flags": apw.isEmpty ? apc : apw,
+            "account_primary_name": stringFromJSON(tpl["account_primary_name"]),
+            "account_secondary_code": acc2Code,
+            "account_secondary_flags": acc2Flags,
+            "account_secondary_with_flags": acc2wf,
+            "account_secondary_name": acc2Name,
+            "amount_eur": amtStr,
+            "amount_lire_original": NSNull(),
+            "note": note,
+            "cheque": chq,
+            "raw_flags": "",
+            "is_cancelled": false,
+            "source_currency": "E",
+            "display_currency": "E",
+            "display_amount": amtStr,
+            "raw_record": "",
+        ]
+    }
+
+    private static func periodicMaterializeOneOccurrence(
+        db: inout [String: Any],
+        rule: inout [String: Any],
+        today: Date
+    ) throws -> [String: Any]? {
+        ensurePeriodicRegistrationsInDb(&db)
+        if !periodicRuleIsActive(rule) { return nil }
+        guard let nd = periodicNextDueDate(rule: rule) else { return nil }
+        let todayStart = periodicStartOfDay(today)
+        if nd > todayStart { return nil }
+        let iso = isoDateStringFromDateLocal(nd)
+        let regN = periodicCountAllRecords(db) + 1
+        let rec = try periodicBuildRecord(db: &db, rule: rule, movementDateIso: iso, registrationNumber: regN)
+        let yRec = intFromJSON(rec["year"])
+        _ = try ensureYearBucketForMerge(db: &db, targetYear: yRec)
+        guard var allYears = db["years"] as? [[String: Any]],
+              let yi = allYears.firstIndex(where: { intFromJSON($0["year"]) == yRec })
+        else { throw ContiDBError.invalidJSON }
+        var yb = allYears[yi]
+        var recs = coerceToArrayOfStringKeyedDicts(yb["records"])
+        recs.append(rec)
+        yb["records"] = recs
+        allYears[yi] = yb
+        db["years"] = allYears
+        rule["last_materialized_iso"] = iso
+        return rec
+    }
+
+    /// Come ``periodiche.materialize_all_due``: crea tutte le occorrenze in arretrato (max 2000), aggiorna le regole in ``db``.
+    public static func materializeAllPeriodicDue(db: inout [String: Any], today: Date) throws -> (count: Int, created: [[String: Any]]) {
+        ensurePeriodicRegistrationsInDb(&db)
+        guard var rules = db["periodic_registrations"] as? [[String: Any]], !rules.isEmpty else {
+            return (0, [])
+        }
+        var created: [[String: Any]] = []
+        let maxTotal = 2000
+        while created.count < maxTotal {
+            var progressed = false
+            for i in 0 ..< rules.count {
+                var rule = rules[i]
+                if let newRec = try periodicMaterializeOneOccurrence(db: &db, rule: &rule, today: today) {
+                    created.append(newRec)
+                    rules[i] = rule
+                    db["periodic_registrations"] = rules
+                    progressed = true
+                }
+            }
+            if !progressed { break }
+        }
+        return (created.count, created)
+    }
+
+    /// Testo dettaglio singola registrazione (come ``_periodic_created_record_detail_message`` in ``main_app.py``).
+    public static func periodicCreatedRecordDetailMessage(_ rec: [String: Any]) -> String {
+        let amtDec = parseLooseDecimal(stringFromJSON(rec["amount_eur"])) ?? .zero
+        let amt = formatEuroTwoDecimals(amtDec) + " €"
+        let cat = stringFromJSON(rec["category_name"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let catOut = cat.isEmpty ? "—" : cat
+        let conto: String
+        if isGirocontoRecord(rec) {
+            let a1 = stringFromJSON(rec["account_primary_name"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let a2 = stringFromJSON(rec["account_secondary_name"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            conto = "Dal conto: \(a1.isEmpty ? "—" : a1)\nAl conto:   \(a2.isEmpty ? "—" : a2)"
+        } else {
+            let a1 = stringFromJSON(rec["account_primary_name"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            conto = "Conto: \(a1.isEmpty ? "—" : a1)"
+        }
+        let notaRaw = stringFromJSON(rec["note"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let nota = notaRaw.isEmpty ? "—" : notaRaw
+        let regN = intFromJSON(rec["registration_number"])
+        let head = regN > 0 ? "Reg. n. \(regN)\n\n" : ""
+        return "\(head)Importo: \(amt)\nCategoria: \(catOut)\n\(conto)\nNota: \(nota)"
+    }
+
+    /// Riepilogo + dettagli per un solo alert (equivalente alla sequenza di ``showinfo`` sul desktop).
+    public static func periodicStartupUserMessage(created: [[String: Any]]) -> String {
+        let n = created.count
+        guard n > 0 else { return "" }
+        var parts: [String] = [
+            "Sono state create \(n) registrazioni da scadenze periodiche in sospeso.",
+            "",
+        ]
+        for rec in created {
+            parts.append("— Registrazione periodica creata —")
+            parts.append(periodicCreatedRecordDetailMessage(rec))
+            parts.append("")
+        }
+        return parts.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

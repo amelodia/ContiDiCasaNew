@@ -34,6 +34,8 @@ hidden = [
     "import_legacy",
     "estratto_conto_pdf",
     "light_enc_sidecar",
+    # Matplotlib PDF backend è importato dinamicamente da fig.savefig(..., format="pdf").
+    "matplotlib.backends.backend_pdf",
 ]
 
 if sys.platform == "darwin":

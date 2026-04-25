@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import tempfile
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -42,6 +44,24 @@ def light_enc_path_for_primary(primary_enc: Path) -> Path:
     while stem.endswith(_suf) and len(stem) > len(_suf):
         stem = stem[: -len(_suf)]
     return primary_enc.parent / f"{stem}{_suf}.enc"
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def light_window_start_iso(*, today: date | None = None) -> str:
@@ -215,8 +235,7 @@ def write_light_enc_sidecar(db: dict, primary_enc: Path, key_path: Path) -> None
         json.dumps(light_db, ensure_ascii=True, indent=2).encode("utf-8")
     )
     out = light_enc_path_for_primary(primary_enc)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_bytes(token)
+    _atomic_write_bytes(out, token)
 
 
 def load_light_enc_if_present(primary_enc: Path, key_path: Path) -> dict | None:

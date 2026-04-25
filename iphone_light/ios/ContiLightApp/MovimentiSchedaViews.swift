@@ -5,6 +5,7 @@ import UIKit
 enum MovimentiSchedaRoute: Hashable {
     case saldi
     case nuoviDati
+    case modifica(legacyKey: String)
 }
 
 // MARK: - Filtri: lista con tap immediato (evita Picker «a tendina» lento in Form)
@@ -270,6 +271,194 @@ private struct ImmissioneCodePickView: View {
     }
 }
 
+// MARK: - Campo importo € (decimal pad + logica allineata al desktop: segno, virgola, 2 decimali, formattazione in uscita)
+
+private struct ContiLightEuroAmountField: UIViewRepresentable {
+    @Binding var text: String
+    var girataSelected: Bool
+    var onRequestAdvance: () -> Void
+
+    func makeUIView(context: Context) -> UITextField {
+        let t = UITextField()
+        t.placeholder = "0,00"
+        t.keyboardType = .decimalPad
+        t.textAlignment = .right
+        t.autocorrectionType = .no
+        t.spellCheckingType = .no
+        t.font = UIFont.preferredFont(forTextStyle: .body)
+        t.delegate = context.coordinator
+        t.addTarget(context.coordinator, action: #selector(Coordinator.editingChanged(_:)), for: .editingChanged)
+        t.text = text
+        return t
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    func updateUIView(_ uiView: UITextField, context: Context) {
+        context.coordinator.parent = self
+        guard uiView.text != text else { return }
+        uiView.text = text
+        if uiView.isFirstResponder {
+            let b = uiView.beginningOfDocument
+            if let e = uiView.position(from: b, offset: (text as NSString).length) {
+                uiView.selectedTextRange = uiView.textRange(from: e, to: e)
+            }
+        }
+    }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var parent: ContiLightEuroAmountField
+
+        init(_ parent: ContiLightEuroAmountField) {
+            self.parent = parent
+        }
+
+        private static let unicodeMinus = Character("\u{2212}")
+
+        private func isLeadingSign(_ c: Character) -> Bool {
+            c == "+" || c == "-" || c == Self.unicodeMinus
+        }
+
+        /// Cursore subito dopo il segno iniziale (stesso criterio offset UTF-16 usato da UITextField).
+        private func placeCaretAfterLeadingSign(_ textField: UITextField) {
+            let t = textField.text ?? ""
+            guard let f = t.first, isLeadingSign(f) else { return }
+            let b = textField.beginningOfDocument
+            let u16 = (String(f) as NSString).length
+            if let p = textField.position(from: b, offset: u16) {
+                textField.selectedTextRange = textField.textRange(from: p, to: p)
+            }
+        }
+
+        /// Al focus: se c’è solo il segno, cursore subito dopo; altrimenti selezione del solo importo (senza segno) per correggere.
+        private func selectAmountBodyExcludingSign(_ textField: UITextField) {
+            var t = textField.text ?? ""
+            if t.isEmpty {
+                t = ContiDatabase.lightImmissioneDefaultAmountText
+                textField.text = t
+                parent.text = t
+            }
+            let n = ContiDatabase.normalizedEuroImmissioneAmountFieldText(t)
+            if n != t {
+                textField.text = n
+                parent.text = n
+            }
+            t = textField.text ?? ""
+            guard !t.isEmpty else { return }
+            let b = textField.beginningOfDocument
+            let u = t as NSString
+            let len = u.length
+            guard len > 0 else { return }
+            guard let fc = t.first, isLeadingSign(fc) else {
+                textField.selectAll(textField)
+                return
+            }
+            let signLen = (String(fc) as NSString).length
+            if signLen >= len {
+                placeCaretAfterLeadingSign(textField)
+                return
+            }
+            if let sPos = textField.position(from: b, offset: signLen),
+               let ePos = textField.position(from: b, offset: len) {
+                textField.selectedTextRange = textField.textRange(from: sPos, to: ePos)
+            }
+        }
+
+        @objc func editingChanged(_ textField: UITextField) {
+            var t = textField.text ?? ""
+            if t.isEmpty { t = ContiDatabase.lightImmissioneDefaultAmountText }
+            var n = ContiDatabase.normalizedEuroImmissioneAmountFieldText(t)
+            if n.isEmpty { n = ContiDatabase.lightImmissioneDefaultAmountText }
+            if n != t {
+                textField.text = n
+                parent.text = n
+            } else {
+                parent.text = t
+            }
+            if textField.isFirstResponder,
+               ContiDatabase.euroImmissioneAmountHasAtLeastTwoDecimalDigits(parent.text) {
+                parent.onRequestAdvance()
+            }
+        }
+
+        func textField(
+            _ textField: UITextField,
+            shouldChangeCharactersIn range: NSRange,
+            replacementString string: String
+        ) -> Bool {
+            let current = textField.text ?? ""
+            // Backspace / taglio che toglierebbe il solo segno: mantieni «-» e cursore dopo il segno.
+            if string.isEmpty, range.length > 0, range.location == 0, current.count == 1,
+               let c = current.first, isLeadingSign(c) {
+                let d = ContiDatabase.lightImmissioneDefaultAmountText
+                textField.text = d
+                parent.text = d
+                placeCaretAfterLeadingSign(textField)
+                return false
+            }
+            // Cancellazione del segno iniziale con cifre dopo: vietata (il tasto cancella non rimuove il segno).
+            if string.isEmpty, range.length == 1, range.location == 0, current.count > 1,
+               let c = current.first, isLeadingSign(c) {
+                return false
+            }
+            let rawNew = (current as NSString).replacingCharacters(in: range, with: string)
+            // Selezione intera e cancella: l’esito vuoto va forzato a «-» qui (altrimenti con return true iOS applica stringa vuota).
+            if rawNew.isEmpty {
+                let d = ContiDatabase.lightImmissioneDefaultAmountText
+                textField.text = d
+                parent.text = d
+                placeCaretAfterLeadingSign(textField)
+                return false
+            }
+            var new = rawNew
+            var norm = ContiDatabase.normalizedEuroImmissioneAmountFieldText(new)
+            if norm.isEmpty { norm = ContiDatabase.lightImmissioneDefaultAmountText }
+            if norm != new {
+                textField.text = norm
+                parent.text = norm
+                let b = textField.beginningOfDocument
+                if let p = textField.position(from: b, offset: (norm as NSString).length) {
+                    textField.selectedTextRange = textField.textRange(from: p, to: p)
+                }
+                return false
+            }
+            return true
+        }
+
+        func textFieldDidBeginEditing(_ textField: UITextField) {
+            if (textField.text ?? "").isEmpty {
+                textField.text = ContiDatabase.lightImmissioneDefaultAmountText
+                parent.text = ContiDatabase.lightImmissioneDefaultAmountText
+            }
+            selectAmountBodyExcludingSign(textField)
+            // Dopo il primo tocco iOS può ancora posizionare il cursore in base al punto toccato (es. prima del «-»).
+            // Ripetere la selezione sul run loop successivo allinea il comportamento a ogni apertura del campo.
+            DispatchQueue.main.async { [weak textField] in
+                guard let tf = textField, tf.isFirstResponder else { return }
+                self.selectAmountBodyExcludingSign(tf)
+            }
+        }
+
+        func textFieldDidEndEditing(_ textField: UITextField) {
+            let raw = textField.text ?? ""
+            if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let d = ContiDatabase.lightImmissioneDefaultAmountText
+                textField.text = d
+                parent.text = d
+                return
+            }
+            let f = ContiDatabase.formatEuroImmissioneOnExit(
+                amountText: raw,
+                girataSelected: parent.girataSelected
+            )
+            textField.text = f
+            parent.text = f
+        }
+    }
+}
+
 struct ContiLightNuovoMovimentoSchedaView: View {
     let sessionDb: [String: Any]?
     let dataFolderURL: URL?
@@ -278,12 +467,15 @@ struct ContiLightNuovoMovimentoSchedaView: View {
     let email: String
     let password: String
     let onPersisted: ([String: Any], [ContiRecordRow], String) -> Void
+    /// Se valorizzata, stessa form in modalità modifica (solo righe inserite da Conti light).
+    var editingLegacyKey: String? = nil
 
+    @Environment(\.dismiss) private var dismiss
     @State private var dateText = ""
     @State private var catCode = ""
     @State private var acc1Code = ""
     @State private var acc2Code = ""
-    @State private var amountText = ""
+    @State private var amountText: String = ContiDatabase.lightImmissioneDefaultAmountText
     @State private var chequeText = ""
     @State private var noteText = ""
     @State private var isSaving = false
@@ -295,12 +487,14 @@ struct ContiLightNuovoMovimentoSchedaView: View {
     @State private var errorAlertMessage = ""
     @State private var showSuccessAlert = false
     @State private var successAlertMessage = ""
+    @State private var showDeleteRecordConfirm = false
     @State private var pickedDate: Date = Date()
     @State private var didRunInitialDefaults = false
     @FocusState private var focusedField: ImmissioneField?
 
+    private var isEditMode: Bool { editingLegacyKey != nil }
+
     private enum ImmissioneField: Hashable {
-        case amount
         case cheque
         case note
     }
@@ -476,23 +670,37 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                     }
                     Section {
                         LabeledContent("Importo (€)") {
-                            TextField("0,00", text: $amountText)
-                                .keyboardType(.decimalPad)
-                                .multilineTextAlignment(.trailing)
-                                .focused($focusedField, equals: .amount)
+                            ContiLightEuroAmountField(
+                                text: $amountText,
+                                girataSelected: girataSelected,
+                                onRequestAdvance: {
+                                    dismissNumericKeyboard()
+                                    focusedField = showAssegnoSection ? .cheque : .note
+                                }
+                            )
                         }
                         HStack {
                             Spacer()
-                            Button("+") { prependSign("+") }
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 6)
-                                .background(Color(uiColor: .systemTeal).opacity(0.2))
-                                .clipShape(RoundedRectangle(cornerRadius: 8))
-                            Button("−") { prependSign("-") }
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 6)
-                                .background(Color.red.opacity(0.12))
-                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                            Button {
+                                setImmissioneSign(negative: false)
+                            } label: {
+                                Text("+")
+                            }
+                            .buttonStyle(.borderless)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color(uiColor: .systemTeal).opacity(0.2))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            Button {
+                                setImmissioneSign(negative: true)
+                            } label: {
+                                Text("−")
+                            }
+                            .buttonStyle(.borderless)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color.red.opacity(0.12))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
                         }
                     }
                     if showAssegnoSection {
@@ -512,16 +720,24 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                         }
                     }
                     Section {
-                        Button("Conferma immissione") {
+                        Button(isEditMode ? "Conferma modifiche" : "Conferma immissione") {
                             prepareCommitDialog()
                         }
                         .frame(maxWidth: .infinity)
                         .disabled(isSaving || !canAttemptSave || !formReadyForSave)
-                        Button("Cancella valori", role: .destructive) {
-                            clearForm()
+                        if isEditMode {
+                            Button("Annulla questa registrazione", role: .destructive) {
+                                showDeleteRecordConfirm = true
+                            }
+                            .frame(maxWidth: .infinity)
+                            .disabled(isSaving)
+                        } else {
+                            Button("Cancella valori", role: .destructive) {
+                                clearForm()
+                            }
+                            .frame(maxWidth: .infinity)
+                            .disabled(isSaving)
                         }
-                        .frame(maxWidth: .infinity)
-                        .disabled(isSaving)
                     }
                 }
             }
@@ -536,25 +752,22 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                 }
             }
         }
-        .navigationTitle("Nuove registrazioni")
+        .navigationTitle(isEditMode ? "Modifica registrazione" : "Nuove registrazioni")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             if !didRunInitialDefaults {
                 didRunInitialDefaults = true
-                applyDefaultCategoryAccountAndDate()
+                if isEditMode, let key = editingLegacyKey, let db = sessionDb {
+                    applyEditPrefill(legacyKey: key, db: db)
+                } else {
+                    applyDefaultCategoryAccountAndDate()
+                }
             }
             syncChequeFromAcc1()
             applyGiroDefaultNoteIfNeeded()
         }
         .onChange(of: pickedDate) { _, d in
             dateText = ContiDatabase.italianDateDisplayFromIso(ContiDatabase.isoDateStringFromDateLocal(d))
-        }
-        .onChange(of: amountText) { _, newVal in
-            guard focusedField == .amount else { return }
-            if amountFractionHasAtLeastTwoDecimalDigits(newVal) {
-                dismissNumericKeyboard()
-                focusedField = showAssegnoSection ? .cheque : .note
-            }
         }
         .onChange(of: catCode) { _, newVal in
             if let c = lists?.categorie.first(where: { $0.code == newVal }) {
@@ -586,9 +799,13 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                 noteText = ""
             }
         }
-        .confirmationDialog("Confermare l’inserimento?", isPresented: $showSaveConfirmDialog, titleVisibility: .visible) {
+        .confirmationDialog(
+            isEditMode ? "Confermare le modifiche?" : "Confermare l’inserimento?",
+            isPresented: $showSaveConfirmDialog,
+            titleVisibility: .visible
+        ) {
             Button("Annulla", role: .cancel) {}
-            Button("Inserisci") {
+            Button(isEditMode ? "Salva" : "Inserisci") {
                 if virtualeInvolved {
                     showVirtualeSecondConfirm = true
                 } else {
@@ -600,7 +817,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         }
         .alert("Registrazione con conto Virtuale", isPresented: $showVirtualeSecondConfirm) {
             Button("Annulla", role: .cancel) {}
-            Button("Inserisci comunque", role: .destructive) {
+            Button(isEditMode ? "Salva comunque" : "Inserisci comunque", role: .destructive) {
                 performSave()
             }
         } message: {
@@ -618,6 +835,39 @@ struct ContiLightNuovoMovimentoSchedaView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(successAlertMessage)
+        }
+        .confirmationDialog(
+            "Annullare questa registrazione? Verrà impostata come annullata (come sul desktop): non comparirà più in elenco né nei saldi, ma resterà nel database finché non la gestisci dal programma per PC.",
+            isPresented: $showDeleteRecordConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Non adesso", role: .cancel) {}
+            Button("Annulla registrazione", role: .destructive) {
+                performDeleteRecord()
+            }
+        }
+    }
+
+    private func applyEditPrefill(legacyKey: String, db: [String: Any]) {
+        do {
+            let p = try ContiDatabase.immissioneEditPrefill(db: db, legacyKey: legacyKey)
+            pickedDate = p.date
+            dateText = ContiDatabase.italianDateDisplayFromIso(ContiDatabase.isoDateStringFromDateLocal(p.date))
+            catCode = p.catCode
+            acc1Code = p.acc1
+            acc2Code = p.acc2
+            amountText = p.amountText
+            chequeText = p.cheque
+            noteText = p.note
+            let clid = p.contiLightId.trimmingCharacters(in: .whitespacesAndNewlines)
+            pendingLightRecordId = clid.isEmpty ? UUID().uuidString : clid
+        } catch {
+            if let ce = error as? ContiLightImmissioneError, case .message(let s) = ce {
+                errorAlertMessage = s
+            } else {
+                errorAlertMessage = error.localizedDescription
+            }
+            showErrorAlert = true
         }
     }
 
@@ -639,8 +889,17 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         _ = k
         _ = e
         dateText = ContiDatabase.italianDateDisplayFromIso(ContiDatabase.isoDateStringFromDateLocal(pickedDate))
-        pendingLightRecordId = UUID().uuidString
+        if isEditMode {
+            guard let lk = editingLegacyKey, !lk.isEmpty, !pendingLightRecordId.isEmpty else {
+                errorAlertMessage = "Dati per la modifica non disponibili. Torna all’elenco e riapri la registrazione."
+                showErrorAlert = true
+                return
+            }
+        } else {
+            pendingLightRecordId = UUID().uuidString
+        }
         do {
+            let rid = pendingLightRecordId
             let tpl = try ContiDatabase.buildNewLightRecordTemplate(
                 db: db,
                 catCode: catCode,
@@ -650,7 +909,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                 amountText: amountText,
                 chequeText: chequeText,
                 noteText: noteText,
-                lightRecordId: pendingLightRecordId
+                lightRecordId: rid
             )
             commitPreviewLine = commitPreview(from: tpl)
             showSaveConfirmDialog = true
@@ -670,7 +929,11 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         var lines = ["Data \(d), \(cat), \(a1)"]
         if girataSelected, !a2.isEmpty, a2 != "—" { lines[0] += ", \(a2)" }
         lines.append("Importo (JSON): \(amt) EUR")
-        lines.append("La registrazione sarà scritta nei file cifrati nella cartella dati (Dropbox / File).")
+        lines.append(
+            isEditMode
+                ? "Le modifiche saranno scritte nei file cifrati nella cartella dati (Dropbox / File)."
+                : "La registrazione sarà scritta nei file cifrati nella cartella dati (Dropbox / File)."
+        )
         return lines.joined(separator: "\n")
     }
 
@@ -685,6 +948,8 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         pendingLightRecordId = rid
         let emailTrim = email.trimmingCharacters(in: .whitespacesAndNewlines)
         let passwordTrim = password.trimmingCharacters(in: .whitespacesAndNewlines)
+        let optEdit = editingLegacyKey
+        let isNewForm = (optEdit == nil)
         isSaving = true
         DispatchQueue.global(qos: .userInitiated).async {
             let access = folder.startAccessingSecurityScopedResource()
@@ -710,10 +975,18 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                         lightRecordId: rid
                     )
                     var working = try ContiDatabase.deepCopyDb(db)
-                    let appended = try ContiDatabase.appendLightSessionRecord(db: &working, recordTemplate: tpl)
+                    if let lk = optEdit {
+                        try ContiDatabase.applyLightImmissioneUpdateInSession(
+                            db: &working,
+                            legacyKey: lk,
+                            recordFromTemplate: tpl
+                        )
+                    } else {
+                        _ = try ContiDatabase.appendLightSessionRecord(db: &working, recordTemplate: tpl)
+                    }
                     let out = try ContiDatabase.persistSessionDbToEncryptedFiles(
                         sessionDb: working,
-                        recordForSaldi: appended,
+                        recordForSaldi: tpl,
                         lightEncURL: e,
                         keyURL: k,
                         email: emailTrim,
@@ -732,7 +1005,9 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                     onPersisted(pair.sessionLight, rows, pair.note)
                     successAlertMessage = pair.note
                     showSuccessAlert = true
-                    clearForm()
+                    if isNewForm {
+                        clearForm()
+                    }
                 case .failure(let err):
                     if let ce = err as? ContiLightImmissioneError, case .message(let s) = ce {
                         errorAlertMessage = s
@@ -747,17 +1022,76 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         }
     }
 
-    private func prependSign(_ sign: String) {
-        var s = amountText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let f = s.first, f == "+" || f == "-" || f == "−" {
-            s.removeFirst()
+    private func performDeleteRecord() {
+        guard let db = sessionDb, let folder = dataFolderURL, let k = keyURL, let e = lightEncURL, let lk = editingLegacyKey else {
+            errorAlertMessage = "Operazione non disponibile."
+            showErrorAlert = true
+            return
         }
-        amountText = sign + s
+        let emailTrim = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let passwordTrim = password.trimmingCharacters(in: .whitespacesAndNewlines)
+        isSaving = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let access = folder.startAccessingSecurityScopedResource()
+            defer {
+                if access {
+                    folder.stopAccessingSecurityScopedResource()
+                }
+            }
+            let result: Result<(sessionLight: [String: Any], note: String), Error> = {
+                guard access else {
+                    return .failure(ContiLightImmissioneError.message("Impossibile accedere in scrittura alla cartella dati (permessi)."))
+                }
+                do {
+                    var working = try ContiDatabase.deepCopyDb(db)
+                    try ContiDatabase.setSessionRecordCancelled(db: &working, legacyKey: lk, isCancelled: true)
+                    let saldiPlaceholder: [String: Any] = ["is_cancelled": true]
+                    let out = try ContiDatabase.persistSessionDbToEncryptedFiles(
+                        sessionDb: working,
+                        recordForSaldi: saldiPlaceholder,
+                        lightEncURL: e,
+                        keyURL: k,
+                        email: emailTrim,
+                        password: passwordTrim
+                    )
+                    return .success((out.sessionLight, out.note))
+                } catch {
+                    return .failure(error)
+                }
+            }()
+            DispatchQueue.main.async {
+                isSaving = false
+                switch result {
+                case .success(let pair):
+                    let rows = ContiDatabase.displayRecords(from: pair.sessionLight)
+                    onPersisted(pair.sessionLight, rows, pair.note)
+                    dismiss()
+                case .failure(let err):
+                    if let ce = err as? ContiLightImmissioneError, case .message(let s) = ce {
+                        errorAlertMessage = s
+                    } else if let le = err as? LocalizedError, let d = le.errorDescription {
+                        errorAlertMessage = d
+                    } else {
+                        errorAlertMessage = err.localizedDescription
+                    }
+                    showErrorAlert = true
+                }
+            }
+        }
+    }
+
+    private func setImmissioneSign(negative: Bool) {
+        let t = ContiDatabase.normalizedEuroImmissioneAmountFieldText(amountText)
+        var body = t
+        if t.first == "+" || t.first == "-" {
+            body = String(t.dropFirst())
+        }
+        amountText = (negative ? "-" : "+") + body
     }
 
     private func clearForm() {
         acc2Code = ""
-        amountText = ""
+        amountText = ContiDatabase.lightImmissioneDefaultAmountText
         chequeText = ""
         noteText = ""
         applyDefaultCategoryAccountAndDate()
@@ -782,22 +1116,11 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         if let a = L.conti.first(where: { $0.name.trimmingCharacters(in: .whitespacesAndNewlines).localizedCaseInsensitiveCompare("cassa") == .orderedSame }) {
             acc1Code = a.code
         }
+        amountText = ContiDatabase.lightImmissioneDefaultAmountText
     }
 
     private func dismissNumericKeyboard() {
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-    }
-
-    private func amountFractionHasAtLeastTwoDecimalDigits(_ raw: String) -> Bool {
-        var t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let f = t.first, "+-−".contains(f) {
-            t.removeFirst()
-        }
-        guard let idx = t.lastIndex(where: { $0 == "," || $0 == "." }) else { return false }
-        let frac = t[t.index(after: idx)...]
-        guard !frac.isEmpty else { return false }
-        guard frac.unicodeScalars.allSatisfy({ CharacterSet.decimalDigits.contains($0) }) else { return false }
-        return frac.count >= 2
     }
 
     /// Allineato al desktop: carta → «ccarta» senza campo; Cassa/Virtuale → vuoto.

@@ -79,6 +79,7 @@ struct ContentView: View {
     /// Messaggi da login / scelta cartella; se vuoto si mostra `loginFootnoteText`.
     @State private var message = ""
     @State private var isBusy = false
+    @State private var isRefreshingSession = false
     @State private var loggedInRecords: [ContiRecordRow] = []
     /// DB sessione per saldi, immissioni e salvataggio; bridging `NSDictionary` dal thread di login.
     @State private var loggedInSessionDb: NSDictionary?
@@ -94,8 +95,13 @@ struct ContentView: View {
     @State private var folderPickRequest: FolderPickRequest?
     /// Navigazione interna alla sheet Filtri (tap → lista, senza NavigationLink lento).
     @State private var filtriNavigationPath = NavigationPath()
+    /// Elenco movimenti: per data o per numero di registrazione (globale).
+    @State private var movimentiListSort: ContiMovimentiListSort = .dateNewestFirst
     /// Se attivo, dopo un accesso con password riuscito la password viene salvata nel Keychain per Face ID / Touch ID.
     @AppStorage("ContiLight.savePasswordForBiometrics") private var savePasswordForBiometrics = false
+    /// Messaggio lungo (come più ``showinfo`` sul desktop) dopo materializzazione periodiche.
+    @State private var periodicStartupAlertText = ""
+    @State private var periodicStartupAlertPresented = false
 
     private enum MovimentiFiltriPick: Hashable {
         case category
@@ -123,11 +129,30 @@ struct ContentView: View {
                         lightEncURL: sessionLightEncURL,
                         email: email,
                         password: password,
-                        onPersisted: { updatedDb, rows, note in
+                        onPersisted: { updatedDb, _, note in
                             loggedInSessionDb = updatedDb as NSDictionary
-                            loggedInRecords = rows
+                            if let d = updatedDb as? [String: Any] {
+                                loggedInRecords = ContiDatabase.displayRecords(from: d, sort: movimentiListSort)
+                            }
                             message = note
                         }
+                    )
+                case .modifica(let legacyKey):
+                    ContiLightNuovoMovimentoSchedaView(
+                        sessionDb: loggedInSessionDb as? [String: Any],
+                        dataFolderURL: dataFolderURL,
+                        keyURL: sessionKeyURL,
+                        lightEncURL: sessionLightEncURL,
+                        email: email,
+                        password: password,
+                        onPersisted: { updatedDb, _, note in
+                            loggedInSessionDb = updatedDb as NSDictionary
+                            if let d = updatedDb as? [String: Any] {
+                                loggedInRecords = ContiDatabase.displayRecords(from: d, sort: movimentiListSort)
+                            }
+                            message = note
+                        },
+                        editingLegacyKey: legacyKey
                     )
                 }
             }
@@ -151,6 +176,11 @@ struct ContentView: View {
         .onChange(of: scenePhase) { _, phase in
             if phase == .active, dataFolderURL != nil {
                 refreshKeyStatus()
+                // La sessione resta in memoria dopo il login: senza questo passaggio le correzioni
+                // fatte sul desktop (nuovo *_light.enc su Dropbox) non compaiono finché non si riesce.
+                Task { @MainActor in
+                    await refreshLightSessionIfLoggedIn()
+                }
             }
         }
         .onChange(of: email) { _, _ in
@@ -167,6 +197,15 @@ struct ContentView: View {
             if !open {
                 filtriNavigationPath = NavigationPath()
             }
+        }
+        .onChange(of: movimentiListSort) { _, _ in
+            guard let d = loggedInSessionDb as? [String: Any] else { return }
+            loggedInRecords = ContiDatabase.displayRecords(from: d, sort: movimentiListSort)
+        }
+        .alert("Registrazioni periodiche", isPresented: $periodicStartupAlertPresented) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(periodicStartupAlertText)
         }
     }
 
@@ -419,6 +458,10 @@ struct ContentView: View {
         activeCategoryFilter != nil || activeAccountFilter != nil
     }
 
+    private var showMovimentiEditHint: Bool {
+        !filteredMovimentiRecords.isEmpty
+    }
+
     /// Filtro categoria effettivo (`nil` se disattivo o valore non più nella lista).
     private var activeCategoryFilter: String? {
         guard !filterCategoryKey.isEmpty, movimentiCategoryChoices.contains(filterCategoryKey) else { return nil }
@@ -440,6 +483,104 @@ struct ContentView: View {
         }
     }
 
+    @ViewBuilder
+    private func movimentiListRowView(
+        row: ContiRecordRow,
+        rowPrimaryText: Color,
+        amountColor: (Decimal) -> Color,
+        accountLine: (ContiRecordRow) -> String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(row.dateDisplay)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(rowPrimaryText)
+                Spacer(minLength: 8)
+                Text(row.categoryDisplay)
+                    .font(.subheadline)
+                    .foregroundStyle(.blue)
+                    .multilineTextAlignment(.trailing)
+            }
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(accountLine(row))
+                    .font(.subheadline)
+                    .foregroundStyle(rowPrimaryText)
+                    .multilineTextAlignment(.leading)
+                Spacer(minLength: 8)
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    Text("Importo €")
+                        .font(.subheadline)
+                        .foregroundStyle(Color.secondary)
+                    if let v = row.amountValue {
+                        Text(ContiDatabase.formatEuroTwoDecimals(v))
+                            .font(.subheadline.monospacedDigit())
+                            .foregroundStyle(amountColor(v))
+                    } else {
+                        Text(row.amountRawFallback)
+                            .font(.subheadline.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            if !row.note.isEmpty, row.note != "-" {
+                Text(row.note)
+                    .font(.caption)
+                    .foregroundStyle(rowPrimaryText.opacity(0.9))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func hapticMovimentiModifica() {
+        let g = UIImpactFeedbackGenerator(style: .medium)
+        g.prepare()
+        g.impactOccurred()
+    }
+
+    @ViewBuilder
+    private func movimentiRowConnect(row: ContiRecordRow) -> some View {
+        if !row.legacyRegistrationKey.isEmpty {
+            HStack(alignment: .top, spacing: 8) {
+                movimentiListRowView(
+                    row: row,
+                    rowPrimaryText: rowPrimaryText,
+                    amountColor: amountColor,
+                    accountLine: accountLine
+                )
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Image(systemName: "hand.point.up.left.fill")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .padding(.top, 2)
+                    .accessibilityHidden(true)
+            }
+            .contentShape(Rectangle())
+            .onLongPressGesture(minimumDuration: 0.5) {
+                hapticMovimentiModifica()
+                movimentiPath.append(MovimentiSchedaRoute.modifica(legacyKey: row.legacyRegistrationKey))
+            }
+            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                Button {
+                    hapticMovimentiModifica()
+                    movimentiPath.append(MovimentiSchedaRoute.modifica(legacyKey: row.legacyRegistrationKey))
+                } label: {
+                    Label("Modifica", systemImage: "pencil")
+                }
+                .tint(.indigo)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityHint("Tieni premuto mezzo secondo sulla riga, oppure scorri verso sinistra e tocca Modifica, per modificare o annullare.")
+        } else {
+            movimentiListRowView(
+                row: row,
+                rowPrimaryText: rowPrimaryText,
+                amountColor: amountColor,
+                accountLine: accountLine
+            )
+        }
+    }
+
     private var recordsList: some View {
         List {
             Section {
@@ -454,46 +595,7 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity)
                 } else {
                     ForEach(filteredMovimentiRecords) { row in
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                Text(row.dateDisplay)
-                                    .font(.subheadline.weight(.semibold))
-                                    .foregroundStyle(rowPrimaryText)
-                                Spacer(minLength: 8)
-                                Text(row.categoryDisplay)
-                                    .font(.subheadline)
-                                    .foregroundStyle(.blue)
-                                    .multilineTextAlignment(.trailing)
-                            }
-                            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                Text(accountLine(row))
-                                    .font(.subheadline)
-                                    .foregroundStyle(rowPrimaryText)
-                                    .multilineTextAlignment(.leading)
-                                Spacer(minLength: 8)
-                                HStack(alignment: .firstTextBaseline, spacing: 4) {
-                                    Text("Importo €")
-                                        .font(.subheadline)
-                                        .foregroundStyle(Color.secondary)
-                                    if let v = row.amountValue {
-                                        Text(ContiDatabase.formatEuroTwoDecimals(v))
-                                            .font(.subheadline.monospacedDigit())
-                                            .foregroundStyle(amountColor(v))
-                                    } else {
-                                        Text(row.amountRawFallback)
-                                            .font(.subheadline.monospacedDigit())
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
-                            if !row.note.isEmpty, row.note != "-" {
-                                Text(row.note)
-                                    .font(.caption)
-                                    .foregroundStyle(rowPrimaryText.opacity(0.9))
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        }
-                        .padding(.vertical, 4)
+                        movimentiRowConnect(row: row)
                     }
                 }
             } header: {
@@ -503,6 +605,14 @@ struct ContentView: View {
                     Text(italianLongToday())
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
+                    if showMovimentiEditHint {
+                        Text(
+                            "Tieni premuto su una riga (almeno ½ secondo) o scorri a sinistra → Modifica per correggere o annullare una registrazione (anche creata sul desktop). "
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
                     if let summary = movimentiFiltriSummaryLine {
                         Text(summary)
                             .font(.caption)
@@ -515,6 +625,9 @@ struct ContentView: View {
             }
         }
         .listStyle(.insetGrouped)
+        .refreshable {
+            await refreshLightSessionIfLoggedIn(forceReResolveEnc: true)
+        }
         .navigationTitle("Movimenti")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -529,21 +642,49 @@ struct ContentView: View {
                 }
             }
             ToolbarItemGroup(placement: .topBarTrailing) {
-                Button {
-                    showFiltriSheet = true
-                } label: {
-                    Image(systemName: movimentiFiltersActive ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
-                }
-                .accessibilityLabel("Filtri")
-                Button("Saldi") {
-                    movimentiPath.append(MovimentiSchedaRoute.saldi)
-                }
+                // Ordine pensato per iPhone verticale: prima immissione; filtri+ordinamento in un menu; Saldi; ricarica per ultima.
                 Button {
                     movimentiPath.append(MovimentiSchedaRoute.nuoviDati)
                 } label: {
-                    Image(systemName: "plus")
+                    Image(systemName: "plus.circle.fill")
                 }
                 .accessibilityLabel("Nuove registrazioni")
+                Menu {
+                    Button {
+                        showFiltriSheet = true
+                    } label: {
+                        Label("Filtri categoria e conto…", systemImage: "line.3.horizontal.decrease.circle")
+                    }
+                    Divider()
+                    Picker("Ordinamento elenco", selection: $movimentiListSort) {
+                        Text("Data (più recenti prima)").tag(ContiMovimentiListSort.dateNewestFirst)
+                        Text("N. registrazione (più recenti)").tag(ContiMovimentiListSort.registrationNewestFirst)
+                    }
+                } label: {
+                    Image(
+                        systemName: movimentiFiltersActive
+                            ? "line.3.horizontal.decrease.circle.fill"
+                            : "line.3.horizontal.decrease.circle"
+                    )
+                }
+                .accessibilityLabel("Filtri e ordinamento elenco")
+                Button("Saldi") {
+                    movimentiPath.append(MovimentiSchedaRoute.saldi)
+                }
+                .accessibilityLabel("Saldi")
+                Button {
+                    Task { @MainActor in
+                        await refreshLightSessionIfLoggedIn(forceReResolveEnc: true)
+                    }
+                } label: {
+                    if isRefreshingSession {
+                        ProgressView()
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                }
+                .disabled(isRefreshingSession || isBusy)
+                .accessibilityLabel("Aggiorna dati dal file")
             }
         }
         .sheet(isPresented: $showFiltriSheet) {
@@ -711,7 +852,12 @@ struct ContentView: View {
 
         Task { @MainActor in
             defer { isBusy = false }
-            let packet = await runLoginPacket(emailTrim: emailTrim, passwordTrim: passwordTrim, folderURL: folderURL)
+            let packet = await runLoginPacket(
+                emailTrim: emailTrim,
+                passwordTrim: passwordTrim,
+                folderURL: folderURL,
+                lightEncURLIfKnown: nil
+            )
             applyLoginPacket(packet, emailTrim: emailTrim, passwordTrim: passwordTrim)
         }
     }
@@ -741,9 +887,54 @@ struct ContentView: View {
             let packet = await runLoginPacket(
                 emailTrim: emailTrim,
                 passwordTrim: passwordTrim,
-                folderURL: folder
+                folderURL: folder,
+                lightEncURLIfKnown: nil
             )
             applyLoginPacket(packet, emailTrim: emailTrim, passwordTrim: passwordTrim)
+        }
+    }
+
+    /// Ricarica silenziosamente il file light dalla cartella (es. dopo sync Dropbox) senza toccare messaggi di login.
+    private func refreshLightSessionIfLoggedIn(forceReResolveEnc: Bool = false) async {
+        guard loggedInSessionDb != nil, let folder = dataFolderURL else { return }
+        let emailTrim = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let passwordTrim = password.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Niente lettura biometrica qui (eviterebbe prompt a ogni ritorno in primo piano).
+        guard !emailTrim.isEmpty, !passwordTrim.isEmpty else { return }
+        guard !isBusy, !isRefreshingSession else { return }
+
+        isRefreshingSession = true
+        defer { isRefreshingSession = false }
+
+        let encRef: URL?
+        if forceReResolveEnc {
+            encRef = nil
+        } else {
+            encRef = sessionLightEncURL
+        }
+
+        let packet = await runLoginPacket(
+            emailTrim: emailTrim,
+            passwordTrim: passwordTrim,
+            folderURL: folder,
+            lightEncURLIfKnown: encRef
+        )
+        guard let newDb = packet.sessionDb,
+              packet.keyURL != nil,
+              packet.lightEncURL != nil else { return }
+        loggedInSessionDb = newDb
+        if let d = newDb as? [String: Any] {
+            loggedInRecords = ContiDatabase.displayRecords(from: d, sort: movimentiListSort)
+            movimentiDisplayName = ContiDatabase.displayNameForHeader(db: d, email: emailTrim)
+        } else {
+            loggedInRecords = packet.records
+            movimentiDisplayName = emailTrim
+        }
+        sessionKeyURL = packet.keyURL
+        sessionLightEncURL = packet.lightEncURL
+        if let pm = packet.periodicStartupMessage?.trimmingCharacters(in: .whitespacesAndNewlines), !pm.isEmpty {
+            periodicStartupAlertText = pm
+            periodicStartupAlertPresented = true
         }
     }
 
@@ -751,7 +942,8 @@ struct ContentView: View {
     private func runLoginPacket(
         emailTrim: String,
         passwordTrim: String,
-        folderURL: URL
+        folderURL: URL,
+        lightEncURLIfKnown: URL?
     ) async -> LoginResultPacket {
         await withCheckedContinuation { (cont: CheckedContinuation<LoginResultPacket, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -769,7 +961,8 @@ struct ContentView: View {
                             records: [],
                             sessionDb: nil,
                             keyURL: nil,
-                            lightEncURL: nil
+                            lightEncURL: nil,
+                            periodicStartupMessage: nil
                         )
                     )
                     return
@@ -782,12 +975,18 @@ struct ContentView: View {
                         records: [],
                         sessionDb: nil,
                         keyURL: nil,
-                        lightEncURL: nil
+                        lightEncURL: nil,
+                        periodicStartupMessage: nil
                     )
                     cont.resume(returning: packet)
                     return
                 }
-                guard let encRef = ContiDatabase.resolvePrimaryEncURL(inFolder: folderURL, email: emailTrim) else {
+                let encRef: URL
+                if let known = lightEncURLIfKnown {
+                    encRef = known
+                } else if let resolved = ContiDatabase.resolvePrimaryEncURL(inFolder: folderURL, email: emailTrim) {
+                    encRef = resolved
+                } else {
                     let stem = ContiDatabase.userEncFilenameStem(forEmail: emailTrim)
                     packet = LoginResultPacket(
                         message: """
@@ -797,12 +996,18 @@ struct ContentView: View {
                         records: [],
                         sessionDb: nil,
                         keyURL: nil,
-                        lightEncURL: nil
+                        lightEncURL: nil,
+                        periodicStartupMessage: nil
                     )
                     cont.resume(returning: packet)
                     return
                 }
-                let waited = ContiDatabase.waitForPathsStableIfDropbox([keyRef, encRef])
+                let fullEncURL = ContiDatabase.perUserEncURL(primaryEnc: encRef, email: emailTrim)
+                var dropboxWaitPaths: [URL] = [keyRef, encRef]
+                if FileManager.default.fileExists(atPath: fullEncURL.path) {
+                    dropboxWaitPaths.append(fullEncURL)
+                }
+                let waited = ContiDatabase.waitForPathsStableIfDropbox(dropboxWaitPaths)
                 let syncWaitNote: String = waited >= 1.0
                     ? String(format: "Attesa sincronizzazione Dropbox: %.1fs.", waited)
                     : ""
@@ -816,11 +1021,57 @@ struct ContentView: View {
                         primaryEncURL: encRef
                     )
                     if ContiDatabase.tryLogin(db: db, email: emailTrim, password: passwordTrim) != nil {
-                        // Nessun sync al login: evita lettura/decifra del .enc completo qui.
-                        // Merge light→main, ricalcolo light_saldi e riscrittura full+light avvengono
-                        // in persistSessionDbToEncryptedFiles alla prima nuova registrazione (o salvataggio).
-                        let sessionDb = db
-                        let syncNote = ""
+                        // Con `conti_utente_*.enc` completo nella cartella: allinea light al completo
+                        // (stesse correzioni del desktop) e riscrivi entrambi i file, come in `syncDualEncAtStartup`.
+                        // Senza questo passo la sessione userebbe solo `*_light.enc`, che può restare indietro rispetto al desktop.
+                        var sessionDb: [String: Any] = db
+                        var syncNote = ""
+                        if FileManager.default.fileExists(atPath: fullEncURL.path) {
+                            do {
+                                let sync = try ContiDatabase.syncDualEncAtStartup(
+                                    lightDb: db,
+                                    lightEncURL: encRef,
+                                    keyURL: keyRef,
+                                    email: emailTrim,
+                                    password: passwordTrim
+                                )
+                                sessionDb = sync.sessionLight
+                                syncNote = sync.note
+                            } catch {
+                                syncNote = "Allineamento con il database completo non riuscito: \(error.localizedDescription). Vengono mostrati i dati del file light (possono non coincidere con le ultime modifiche sul desktop)."
+                            }
+                        }
+                        var periodicStartupMessage: String? = nil
+                        var periodicNotes: [String] = []
+                        do {
+                            var sd = sessionDb
+                            let (_, created) = try ContiDatabase.materializeAllPeriodicDue(db: &sd, today: Date())
+                            if !created.isEmpty {
+                                let placeholder = created.first ?? [String: Any]()
+                                do {
+                                    let out = try ContiDatabase.persistSessionDbToEncryptedFiles(
+                                        sessionDb: sd,
+                                        recordForSaldi: placeholder,
+                                        lightEncURL: encRef,
+                                        keyURL: keyRef,
+                                        email: emailTrim,
+                                        password: passwordTrim
+                                    )
+                                    sessionDb = out.sessionLight
+                                    periodicNotes.append(out.note)
+                                } catch {
+                                    sessionDb = sd
+                                    periodicNotes.append(
+                                        "Attenzione: registrazioni periodiche create in memoria ma salvataggio su file non riuscito: \(error.localizedDescription)"
+                                    )
+                                }
+                                periodicStartupMessage = ContiDatabase.periodicStartupUserMessage(created: created)
+                            }
+                        } catch {
+                            periodicNotes.append(
+                                "Registrazioni periodiche: elaborazione non riuscita (\(error.localizedDescription))."
+                            )
+                        }
                         let rows = ContiDatabase.displayRecords(from: sessionDb)
                         let baseMsg = rows.isEmpty
                             ? "Accesso effettuato. Nessun movimento nel file light."
@@ -828,13 +1079,15 @@ struct ContentView: View {
                         var notes: [String] = []
                         if !syncWaitNote.isEmpty { notes.append(syncWaitNote) }
                         if !syncNote.isEmpty { notes.append(syncNote) }
+                        notes.append(contentsOf: periodicNotes)
                         let msgOut = notes.isEmpty ? baseMsg : baseMsg + "\n\n" + notes.joined(separator: "\n")
                         packet = LoginResultPacket(
                             message: msgOut,
                             records: rows,
                             sessionDb: sessionDb as NSDictionary,
                             keyURL: keyRef,
-                            lightEncURL: encRef
+                            lightEncURL: encRef,
+                            periodicStartupMessage: periodicStartupMessage
                         )
                     } else {
                         packet = LoginResultPacket(
@@ -842,7 +1095,8 @@ struct ContentView: View {
                             records: [],
                             sessionDb: nil,
                             keyURL: nil,
-                            lightEncURL: nil
+                            lightEncURL: nil,
+                            periodicStartupMessage: nil
                         )
                     }
                 } catch {
@@ -857,7 +1111,8 @@ struct ContentView: View {
                         records: [],
                         sessionDb: nil,
                         keyURL: nil,
-                        lightEncURL: nil
+                        lightEncURL: nil,
+                        periodicStartupMessage: nil
                     )
                 }
                 cont.resume(returning: packet)
@@ -891,11 +1146,21 @@ struct ContentView: View {
             sessionKeyURL = packet.keyURL
             sessionLightEncURL = packet.lightEncURL
             if let d = dbObj as? [String: Any] {
-                loggedInRecords = ContiDatabase.displayRecords(from: d)
+                loggedInRecords = ContiDatabase.displayRecords(from: d, sort: movimentiListSort)
                 movimentiDisplayName = ContiDatabase.displayNameForHeader(db: d, email: emailTrim)
             } else {
                 loggedInRecords = packet.records
                 movimentiDisplayName = emailTrim
+            }
+            if let pm = packet.periodicStartupMessage?.trimmingCharacters(in: .whitespacesAndNewlines), !pm.isEmpty {
+                periodicStartupAlertText = pm
+                periodicStartupAlertPresented = true
+            }
+            // Stesso allineamento del tasto «Aggiorna», senza doverlo premere: Dropbox a volte consegna i .enc qualche secondo dopo l’apertura.
+            Task { @MainActor in
+                await refreshLightSessionIfLoggedIn(forceReResolveEnc: true)
+                try? await Task.sleep(nanoseconds: 2_500_000_000)
+                await refreshLightSessionIfLoggedIn(forceReResolveEnc: true)
             }
         } else {
             loggedInSessionDb = nil
@@ -914,6 +1179,8 @@ private struct LoginResultPacket: @unchecked Sendable {
     let sessionDb: NSDictionary?
     let keyURL: URL?
     let lightEncURL: URL?
+    /// Testo lungo per alert (solo se sono state create occorrenze periodiche).
+    let periodicStartupMessage: String?
 }
 
 private struct FolderPickRequest: Identifiable, Hashable {

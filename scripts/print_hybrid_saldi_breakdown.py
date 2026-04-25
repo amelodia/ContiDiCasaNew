@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Scompone il saldo assoluto ibrido (stessi passi di ``hybrid_absolute_balances_for_saldi``) per ogni
+Scompone il saldo assoluto in app (stessi passi di ``hybrid_absolute_balances_for_saldi``) per ogni
 colonna conto dell’ultimo anno: *sld* legacy, registrazioni app, annulli import, correzioni su righe .dat
 modificate, eventuale sostituzione «twin import».
 
@@ -61,7 +61,7 @@ def _resolve_db_enc_key(
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Scomposizione saldi ibridi (debug)")
+    ap = argparse.ArgumentParser(description="Scomposizione saldi assoluti (debug)")
     ap.add_argument("--enc", help="File .enc (default: più recente nella cartella dati)")
     ap.add_argument("--key", help="File chiave .key")
     args = ap.parse_args()
@@ -125,7 +125,7 @@ def main() -> int:
     w_name = max(8, min(28, max((len(str(a.get("name", ""))) for a in accounts), default=16)))
 
     if la is None:
-        print("*sld* legacy assente: il saldo ibrido usa solo il replay movimenti (fallback).")
+        print("*sld* legacy assente: il saldo finale usa solo il replay movimenti (fallback).")
         print()
     hdr = (
         f"{'cod':>{w_code}}  {'nome':<{w_name}}  {'legacy':>14}  {'+app':>14}  {'+annulli':>14}  "
@@ -157,12 +157,12 @@ def main() -> int:
             if i in aff and replay_excl is not None and i < len(replay_excl):
                 note = "replay twin"
             elif not tk or i not in aff:
-                note = "ibrido"
+                note = ""
 
             fin = final_h[i]
             ok = fin == (replay_excl[i] if (i in aff and replay_excl is not None and i < len(replay_excl)) else pre)
             if not ok and la is not None:
-                note = f"{note or 'ibrido'} (!)"
+                note = f"{note + ' (!)' if note else 'scarto (!)'}"
             print(
                 f"{code:>{w_code}}  {name:<{w_name}}  {leg_s:>14}  {app_s:>14}  {can_s:>14}  "
                 f"{ed_s:>14}  {pre_s:>14}  {format_euro_it(fin):>14}  {note}"

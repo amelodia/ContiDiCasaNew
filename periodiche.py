@@ -251,39 +251,45 @@ def ensure_year_bucket(db: dict, target_year: int) -> dict:
     return new_y
 
 
-def materialize_one_occurrence(db: dict, rule: dict, today: date) -> bool:
+def materialize_one_occurrence(db: dict, rule: dict, today: date) -> dict | None:
     """
     Se la regola è attiva e la prossima scadenza è <= oggi, crea una registrazione e aggiorna last_materialized_iso.
-    Ritorna True se ha creato.
+    Ritorna il record creato, oppure None.
     """
     ensure_periodic_registrations(db)
     if not rule.get("active", True):
-        return False
+        return None
     nd = next_due_date(rule)
     if nd is None or nd > today:
-        return False
+        return None
     iso = nd.isoformat()
     reg_n = count_all_records(db) + 1
     rec = build_periodic_record(db, rule, iso, reg_n)
     yb = ensure_year_bucket(db, int(rec["year"]))
     yb["records"].append(rec)
     rule["last_materialized_iso"] = iso
-    return True
+    return rec
 
 
-def materialize_all_due(db: dict, today: date, *, max_total: int = 2000) -> int:
-    """Esegue passate finché ci sono scadenze da soddisfare. Ritorna il numero di registrazioni create."""
+def materialize_all_due(
+    db: dict, today: date, *, max_total: int = 2000
+) -> tuple[int, list[dict[str, Any]]]:
+    """
+    Esegue passate finché ci sono scadenze da soddisfare.
+    Ritorna (numero di registrazioni create, elenco dei record creati, nell'ordine di creazione).
+    """
     ensure_periodic_registrations(db)
-    created = 0
-    while created < max_total:
+    created: list[dict[str, Any]] = []
+    while len(created) < max_total:
         progressed = False
         for rule in db["periodic_registrations"]:
-            if materialize_one_occurrence(db, rule, today):
-                created += 1
+            new_rec = materialize_one_occurrence(db, rule, today)
+            if new_rec is not None:
+                created.append(new_rec)
                 progressed = True
         if not progressed:
             break
-    return created
+    return (len(created), created)
 
 
 def list_due_rules(db: dict, today: date) -> list[dict]:

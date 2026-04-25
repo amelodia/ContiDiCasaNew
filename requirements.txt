@@ -9,6 +9,11 @@ cryptography>=42.0.0
 # Obbligatorio: finestra di accesso (JPEG incorporato in euro_login_asset via ImageTk).
 # Build eseguibile: assicurarsi che Pillow sia nel bundle (PyInstaller: --collect-all PIL o hiddenimports PIL._imaging).
 Pillow>=10.0.0
+# Grafici a barre (Statistiche; matplotlib: se assente, l’app mostra un messaggio)
+matplotlib>=3.7.0
+# PDF orizzontale (Statistiche); anche fallback stampa saldi/ricerca dove usato
+fpdf2>=2.7.0
+
 # Estratti conto PDF (scheda Verifica; layout Amex / Poste ecc.)
 pypdf>=4.0
 # CA bundle per TLS email (SMTP/IMAP) su macOS / Python senza certificati di sistema
@@ -24,6 +29,3 @@ pywin32>=306; sys_platform == "win32"
 
 # Windows: dialog stampa stile browser (Edge WebView2) se IE/COM non c'è
 pywebview>=5.0; sys_platform == "win32"
-
-# Windows: PDF A4 di fallback (tabella saldi) se anche pywebview non basta
-fpdf2>=2.7.0; sys_platform == "win32"
