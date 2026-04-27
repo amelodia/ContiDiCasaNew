@@ -35,7 +35,10 @@ private enum ContiLightFolderBookmark {
             UserDefaults.standard.removeObject(forKey: Self.key)
             return nil
         }
-        _ = stale // evitato clear del bookmark: spesso ancora valido, si rinnova in `refreshKeyStatus`
+        if stale {
+            UserDefaults.standard.removeObject(forKey: Self.key)
+            return nil
+        }
         return url
     }
 
@@ -102,6 +105,8 @@ struct ContentView: View {
     /// Messaggio lungo (come più ``showinfo`` sul desktop) dopo materializzazione periodiche.
     @State private var periodicStartupAlertText = ""
     @State private var periodicStartupAlertPresented = false
+    /// Evita ``refreshLightSessionIfLoggedIn`` a ogni micro-rientro in primo piano (ogni run può riscrivere i .enc se Dropbox è in ritardo → conflicted copies).
+    @State private var lastScenePhaseRefreshAt: Date = .distantPast
 
     private enum MovimentiFiltriPick: Hashable {
         case category
@@ -179,8 +184,12 @@ struct ContentView: View {
                 // La sessione resta in memoria dopo il login: senza questo passaggio le correzioni
                 // fatte sul desktop (nuovo *_light.enc su Dropbox) non compaiono finché non si riesce.
                 Task { @MainActor in
-                    await refreshLightSessionIfLoggedIn()
+                    if Date().timeIntervalSince(lastScenePhaseRefreshAt) >= 5 {
+                        await refreshLightSessionIfLoggedIn()
+                    }
                 }
+            } else if phase == .background {
+                closeCurrentSessionAndReleaseLock()
             }
         }
         .onChange(of: email) { _, _ in
@@ -633,12 +642,7 @@ struct ContentView: View {
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 Button("Esci", role: .none) {
-                    loggedInSessionDb = nil
-                    loggedInRecords = []
-                    movimentiDisplayName = ""
-                    sessionKeyURL = nil
-                    sessionLightEncURL = nil
-                    movimentiPath = NavigationPath()
+                    closeCurrentSessionAndReleaseLock()
                 }
             }
             ToolbarItemGroup(placement: .topBarTrailing) {
@@ -917,7 +921,8 @@ struct ContentView: View {
             emailTrim: emailTrim,
             passwordTrim: passwordTrim,
             folderURL: folder,
-            lightEncURLIfKnown: encRef
+            lightEncURLIfKnown: encRef,
+            skipSessionWorkspaceLock: true
         )
         guard let newDb = packet.sessionDb,
               packet.keyURL != nil,
@@ -936,6 +941,33 @@ struct ContentView: View {
             periodicStartupAlertText = pm
             periodicStartupAlertPresented = true
         }
+        lastScenePhaseRefreshAt = Date()
+    }
+
+    private func releaseSessionLockIfOwned() {
+        guard let folder = dataFolderURL else {
+            ContiDatabase.clearLocalInstanceSessionState()
+            return
+        }
+        let access = folder.startAccessingSecurityScopedResource()
+        defer {
+            if access { folder.stopAccessingSecurityScopedResource() }
+        }
+        if access {
+            ContiDatabase.releaseSessionWorkspaceLockOnClose(in: folder)
+        } else {
+            ContiDatabase.clearLocalInstanceSessionState()
+        }
+    }
+
+    private func closeCurrentSessionAndReleaseLock() {
+        releaseSessionLockIfOwned()
+        loggedInSessionDb = nil
+        loggedInRecords = []
+        movimentiDisplayName = ""
+        sessionKeyURL = nil
+        sessionLightEncURL = nil
+        movimentiPath = NavigationPath()
     }
 
     /// Carica e decifra il DB in background (come `loginWithPassword`).
@@ -943,7 +975,8 @@ struct ContentView: View {
         emailTrim: String,
         passwordTrim: String,
         folderURL: URL,
-        lightEncURLIfKnown: URL?
+        lightEncURLIfKnown: URL?,
+        skipSessionWorkspaceLock: Bool = false
     ) async -> LoginResultPacket {
         await withCheckedContinuation { (cont: CheckedContinuation<LoginResultPacket, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -969,6 +1002,23 @@ struct ContentView: View {
                 }
 
                 let packet: LoginResultPacket
+                if !skipSessionWorkspaceLock {
+                    do {
+                        try ContiDatabase.assertNoSessionWorkspaceLockBeforeOpen(in: folderURL)
+                    } catch {
+                        let s = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                        packet = LoginResultPacket(
+                            message: s,
+                            records: [],
+                            sessionDb: nil,
+                            keyURL: nil,
+                            lightEncURL: nil,
+                            periodicStartupMessage: nil
+                        )
+                        cont.resume(returning: packet)
+                        return
+                    }
+                }
                 guard let keyRef = ContiDatabase.preferredKeyFileURL(inFolder: folderURL) else {
                     packet = LoginResultPacket(
                         message: "Nessun file .key nella cartella. Copia qui conti_di_casa.key (stesso del desktop).",
@@ -981,6 +1031,7 @@ struct ContentView: View {
                     cont.resume(returning: packet)
                     return
                 }
+                // Il segnaposto si controlla in ``acquireSessionWorkspaceLockForOpen`` (stesso criteri «materiato»/scrittura).
                 let encRef: URL
                 if let known = lightEncURLIfKnown {
                     encRef = known
@@ -1013,73 +1064,41 @@ struct ContentView: View {
                     : ""
 
                 do {
-                    let encData = try Data(contentsOf: encRef)
-                    let keyString = try String(contentsOf: keyRef, encoding: .utf8)
+                    let encData = try ContiDatabase.coordinatedDataContents(of: encRef)
+                    let keyString = try ContiDatabase.coordinatedStringContents(of: keyRef, encoding: .utf8)
                     let (db, _) = try ContiDatabase.loadDBForEmail(
                         primaryEncData: encData,
                         keyString: keyString,
                         primaryEncURL: encRef
                     )
                     if ContiDatabase.tryLogin(db: db, email: emailTrim, password: passwordTrim) != nil {
-                        // Con `conti_utente_*.enc` completo nella cartella: allinea light al completo
-                        // (stesse correzioni del desktop) e riscrivi entrambi i file, come in `syncDualEncAtStartup`.
-                        // Senza questo passo la sessione userebbe solo `*_light.enc`, che può restare indietro rispetto al desktop.
-                        var sessionDb: [String: Any] = db
-                        var syncNote = ""
-                        if FileManager.default.fileExists(atPath: fullEncURL.path) {
+                        if !skipSessionWorkspaceLock {
                             do {
-                                let sync = try ContiDatabase.syncDualEncAtStartup(
-                                    lightDb: db,
-                                    lightEncURL: encRef,
-                                    keyURL: keyRef,
-                                    email: emailTrim,
-                                    password: passwordTrim
-                                )
-                                sessionDb = sync.sessionLight
-                                syncNote = sync.note
+                                try ContiDatabase.acquireSessionWorkspaceLockForOpen(in: folderURL)
                             } catch {
-                                syncNote = "Allineamento con il database completo non riuscito: \(error.localizedDescription). Vengono mostrati i dati del file light (possono non coincidere con le ultime modifiche sul desktop)."
+                                let s = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                                packet = LoginResultPacket(
+                                    message: s,
+                                    records: [],
+                                    sessionDb: nil,
+                                    keyURL: nil,
+                                    lightEncURL: nil,
+                                    periodicStartupMessage: nil
+                                )
+                                cont.resume(returning: packet)
+                                return
                             }
                         }
-                        var periodicStartupMessage: String? = nil
-                        var periodicNotes: [String] = []
-                        do {
-                            var sd = sessionDb
-                            let (_, created) = try ContiDatabase.materializeAllPeriodicDue(db: &sd, today: Date())
-                            if !created.isEmpty {
-                                let placeholder = created.first ?? [String: Any]()
-                                do {
-                                    let out = try ContiDatabase.persistSessionDbToEncryptedFiles(
-                                        sessionDb: sd,
-                                        recordForSaldi: placeholder,
-                                        lightEncURL: encRef,
-                                        keyURL: keyRef,
-                                        email: emailTrim,
-                                        password: passwordTrim
-                                    )
-                                    sessionDb = out.sessionLight
-                                    periodicNotes.append(out.note)
-                                } catch {
-                                    sessionDb = sd
-                                    periodicNotes.append(
-                                        "Attenzione: registrazioni periodiche create in memoria ma salvataggio su file non riuscito: \(error.localizedDescription)"
-                                    )
-                                }
-                                periodicStartupMessage = ContiDatabase.periodicStartupUserMessage(created: created)
-                            }
-                        } catch {
-                            periodicNotes.append(
-                                "Registrazioni periodiche: elaborazione non riuscita (\(error.localizedDescription))."
-                            )
-                        }
+                        // Login/refresh in sola lettura: nessuna riscrittura dei `.enc` in questa fase.
+                        // Le scritture restano solo nelle azioni esplicite utente (nuova immissione/modifica/annullamento).
+                        let sessionDb: [String: Any] = db
+                        let periodicStartupMessage: String? = nil
                         let rows = ContiDatabase.displayRecords(from: sessionDb)
                         let baseMsg = rows.isEmpty
                             ? "Accesso effettuato. Nessun movimento nel file light."
                             : "Accesso effettuato."
                         var notes: [String] = []
                         if !syncWaitNote.isEmpty { notes.append(syncWaitNote) }
-                        if !syncNote.isEmpty { notes.append(syncNote) }
-                        notes.append(contentsOf: periodicNotes)
                         let msgOut = notes.isEmpty ? baseMsg : baseMsg + "\n\n" + notes.joined(separator: "\n")
                         packet = LoginResultPacket(
                             message: msgOut,
@@ -1139,6 +1158,8 @@ struct ContentView: View {
         }
         message = msg
         if let dbObj = packet.sessionDb {
+            // Evita che `.active` immediato dopo il login lanci ``refreshLightSessionIfLoggedIn`` in parallelo al Task ritardato (doppia riscrittura .enc / conflict Dropbox).
+            lastScenePhaseRefreshAt = Date()
             movimentiPath = NavigationPath()
             filterCategoryKey = ""
             filterAccountKey = ""
@@ -1156,18 +1177,13 @@ struct ContentView: View {
                 periodicStartupAlertText = pm
                 periodicStartupAlertPresented = true
             }
-            // Stesso allineamento del tasto «Aggiorna», senza doverlo premere: Dropbox a volte consegna i .enc qualche secondo dopo l’apertura.
+            // Una sola ricarica ritardata: due passaggi ravvicinati riscrivevano spesso i .enc (sync + Dropbox) e generavano conflicted copies su ``*_light.enc``.
             Task { @MainActor in
-                await refreshLightSessionIfLoggedIn(forceReResolveEnc: true)
                 try? await Task.sleep(nanoseconds: 2_500_000_000)
                 await refreshLightSessionIfLoggedIn(forceReResolveEnc: true)
             }
         } else {
-            loggedInSessionDb = nil
-            loggedInRecords = []
-            movimentiDisplayName = ""
-            sessionKeyURL = nil
-            sessionLightEncURL = nil
+            closeCurrentSessionAndReleaseLock()
         }
     }
 }

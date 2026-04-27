@@ -18,7 +18,6 @@ import textwrap
 import tkinter as tk
 import webbrowser
 import atexit
-import uuid
 from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -5387,10 +5386,6 @@ def get_or_create_key(key_path: Path) -> bytes:
     return key
 
 
-_DATA_LOCK_STALE_SECONDS = 15 * 60
-_DATA_LOCK_SESSION_ID = uuid.uuid4().hex
-
-
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
@@ -5438,85 +5433,85 @@ def _assert_no_dropbox_conflicted_enc_files(primary_output_path: Path) -> None:
     )
 
 
-def _data_lock_path(data_dir: Path) -> Path:
-    return data_dir / "conti_di_casa_app.lock.json"
+_DATA_FOLDER_IN_USE_MARKER = "conti_di_casa_folder_in_use.txt"
+_LEGACY_DATA_LOCK_JSON = "conti_di_casa_app.lock.json"
 
 
-def _read_data_lock(data_dir: Path) -> dict | None:
-    p = _data_lock_path(data_dir)
-    if not p.is_file():
-        return None
+def _data_folder_in_use_marker_path(data_dir: Path) -> Path:
+    return data_dir / _DATA_FOLDER_IN_USE_MARKER
+
+
+def _is_data_folder_in_use_marker_name(name: str) -> bool:
+    n = name.lower()
+    return n.startswith("conti_di_casa_folder_in_use") and n.endswith(".txt")
+
+
+def _data_folder_in_use_marker_paths(data_dir: Path) -> list[Path]:
+    if not data_dir.is_dir():
+        return []
+    return sorted(
+        (p for p in data_dir.iterdir() if p.is_file() and _is_data_folder_in_use_marker_name(p.name)),
+        key=lambda p: p.name.lower(),
+    )
+
+
+def _remove_legacy_json_data_lock_if_present(data_dir: Path) -> None:
+    p = data_dir / _LEGACY_DATA_LOCK_JSON
     try:
-        obj = json.loads(p.read_text(encoding="utf-8"))
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
-
-
-def _data_lock_is_active_foreign(lock: dict | None) -> bool:
-    if not lock:
-        return False
-    if str(lock.get("session_id") or "") == _DATA_LOCK_SESSION_ID:
-        return False
-    try:
-        hb = float(lock.get("last_heartbeat_ts") or 0.0)
-    except (TypeError, ValueError):
-        hb = 0.0
-    return (time.time() - hb) < _DATA_LOCK_STALE_SECONDS
-
-
-def _data_lock_payload(app_kind: str) -> dict:
-    return {
-        "app": app_kind,
-        "session_id": _DATA_LOCK_SESSION_ID,
-        "pid": os.getpid(),
-        "device": platform.node(),
-        "opened_at": datetime.now().isoformat(timespec="seconds"),
-        "last_heartbeat": datetime.now().isoformat(timespec="seconds"),
-        "last_heartbeat_ts": time.time(),
-    }
+        if p.is_file():
+            p.unlink()
+    except OSError:
+        pass
 
 
 def acquire_data_workspace_lock(data_dir: Path, *, app_kind: str = "desktop") -> None:
-    lock = _read_data_lock(data_dir)
-    if _data_lock_is_active_foreign(lock):
+    data_dir.mkdir(parents=True, exist_ok=True)
+    _remove_legacy_json_data_lock_if_present(data_dir)
+    marker = _data_folder_in_use_marker_path(data_dir)
+    existing_markers = _data_folder_in_use_marker_paths(data_dir)
+    if existing_markers:
+        shown = "\n".join(f"- {p.name}" for p in existing_markers[:8])
         raise RuntimeError(
-            "Un'altra copia di Conti di casa risulta aperta sulla stessa cartella dati.\n\n"
-            f"App: {lock.get('app')}\n"
-            f"Dispositivo: {lock.get('device')}\n"
-            f"Ultimo segnale: {lock.get('last_heartbeat')}\n\n"
+            "Un'altra copia di Conti di casa risulta aperta sulla stessa cartella dati "
+            "(è presente il file segnaposto nella cartella).\n\n"
+            f"{shown}\n\n"
             "Chiudi l'altra app e attendi la sincronizzazione Dropbox prima di continuare."
         )
-    _atomic_write_bytes(_data_lock_path(data_dir), json.dumps(_data_lock_payload(app_kind), indent=2).encode("utf-8"))
-
-
-def heartbeat_data_workspace_lock(data_dir: Path, *, app_kind: str = "desktop") -> None:
-    lock = _read_data_lock(data_dir)
-    if lock and str(lock.get("session_id") or "") not in {"", _DATA_LOCK_SESSION_ID}:
-        return
-    _atomic_write_bytes(_data_lock_path(data_dir), json.dumps(_data_lock_payload(app_kind), indent=2).encode("utf-8"))
+    line = f"{app_kind}\n".encode("utf-8")
+    try:
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        raise RuntimeError(
+            "Un'altra copia di Conti di casa risulta aperta sulla stessa cartella dati "
+            "(è presente il file segnaposto nella cartella).\n\n"
+            "Chiudi l'altra app e attendi la sincronizzazione Dropbox prima di continuare."
+        ) from None
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def release_data_workspace_lock(data_dir: Path | None = None) -> None:
     try:
         d = data_dir if data_dir is not None else data_workspace.data_dir()
-        p = _data_lock_path(d)
-        lock = _read_data_lock(d)
-        if lock and str(lock.get("session_id") or "") == _DATA_LOCK_SESSION_ID and p.is_file():
+        for p in _data_folder_in_use_marker_paths(d):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        p = _data_folder_in_use_marker_path(d)
+        if p.is_file():
             p.unlink()
     except Exception:
         pass
-
-
-def _assert_no_active_foreign_data_lock(data_dir: Path) -> None:
-    lock = _read_data_lock(data_dir)
-    if _data_lock_is_active_foreign(lock):
-        raise RuntimeError(
-            "Salvataggio bloccato: un'altra copia dell'app risulta aperta sulla cartella dati.\n\n"
-            f"App: {lock.get('app')}\n"
-            f"Dispositivo: {lock.get('device')}\n"
-            f"Ultimo segnale: {lock.get('last_heartbeat')}"
-        )
 
 
 def _write_timestamped_presave_backup(path: Path) -> None:
@@ -5533,7 +5528,6 @@ def _write_timestamped_presave_backup(path: Path) -> None:
 
 def _assert_safe_to_save(primary_output_path: Path) -> None:
     _assert_no_dropbox_conflicted_enc_files(primary_output_path)
-    _assert_no_active_foreign_data_lock(primary_output_path.parent)
 
 
 def save_encrypted_db(db: dict, output_path: Path, key_path: Path) -> None:
@@ -8599,6 +8593,7 @@ th {{ background:#efefef; text-align:left; }}
 
         # Se la UI date è già stata creata, riallinea i campi preset su nuovi bounds (es. dopo import legacy).
         try:
+            refresh_date_year_menu()
             refresh_date_preview_from_modes()
         except NameError:
             pass
@@ -8862,7 +8857,7 @@ th {{ background:#efefef; text-align:left; }}
             return
         filter_direction_preview_var.set(which)
         refresh_movement_filter_button_styles()
-        refresh_date_preview_from_modes()
+        refresh_date_preview_from_modes(normalize_custom_range=True)
         try:
             refresh_registration_scope_and_controls()
         except Exception:
@@ -9243,6 +9238,27 @@ th {{ background:#efefef; text-align:left; }}
                 date_from_preview_var.set(d2.isoformat())
                 date_to_preview_var.set(d1.isoformat())
 
+    def _movement_custom_date_respects_direction(which: str, dsel: date) -> tuple[bool, str]:
+        other = _parse_iso_to_date(date_to_preview_var.get() if which == "from" else date_from_preview_var.get())
+        if other is None:
+            return True, ""
+        direction = filter_direction_preview_var.get()
+        if direction == "backward":
+            ok = dsel >= other if which == "from" else other >= dsel
+            if ok:
+                return True, ""
+            return (
+                False,
+                "Con All'indietro, dalla data deve essere più recente o uguale alla data finale.",
+            )
+        ok = dsel <= other if which == "from" else other <= dsel
+        if ok:
+            return True, ""
+        return (
+            False,
+            "Con In avanti, dalla data deve essere meno recente o uguale alla data finale.",
+        )
+
     def _dataset_minmax_safe() -> tuple[date, date]:
         mn = _dataset_min_date or date.today()
         mx = _dataset_max_date or date.today()
@@ -9288,7 +9304,6 @@ th {{ background:#efefef; text-align:left; }}
     def refresh_date_fields_from_current_preset() -> None:
         preset_id = date_preset_preview_var.get()
         if preset_id == "custom":
-            _normalize_range_preview()
             return
         d_from, d_to = _compute_preset_range(preset_id)
         direction = filter_direction_preview_var.get()
@@ -9308,7 +9323,7 @@ th {{ background:#efefef; text-align:left; }}
         date_from_entry.configure(state="normal")
         date_to_entry.configure(state="normal")
 
-    def refresh_date_preview_from_modes() -> None:
+    def refresh_date_preview_from_modes(*, normalize_custom_range: bool = False) -> None:
         preset_id = date_preset_preview_var.get()
         mn, mx = _dataset_minmax_safe()
         max_allowed = date.today() if filter_future_preview_var.get() == "exclude" else mx
@@ -9335,7 +9350,8 @@ th {{ background:#efefef; text-align:left; }}
                 d_to = max(min_allowed, min(d_to, max_allowed))
                 date_from_preview_var.set(d_from.isoformat())
                 date_to_preview_var.set(d_to.isoformat())
-                _normalize_range_preview()
+                if normalize_custom_range:
+                    _normalize_range_preview()
 
         refresh_date_entry_states()
         try:
@@ -9550,14 +9566,21 @@ th {{ background:#efefef; text-align:left; }}
                 days_frame.grid_columnconfigure(c, weight=1)
 
         def on_pick(dsel: date) -> None:
+            ok, err = _movement_custom_date_respects_direction(which, dsel)
+            if not ok:
+                messagebox.showerror("Data non coerente", err, parent=top)
+                return
             if which == "from":
                 date_from_preview_var.set(dsel.isoformat())
             else:
                 date_to_preview_var.set(dsel.isoformat())
             nonlocal date_custom_manual_override
             date_custom_manual_override = True
-            _normalize_range_preview()
             refresh_date_entry_states()
+            try:
+                refresh_category_account_dropdowns()
+            except Exception:
+                pass
             top.destroy()
 
         # Anni: menu a tendina (evita anni senza registrazioni; anno calendario corrente in cima, poi in discesa).
@@ -9644,12 +9667,19 @@ th {{ background:#efefef; text-align:left; }}
             # rispetta solo i vincoli globali (include/exclude), poi normalizza l'ordine
             # in base a "All'indietro/In avanti".
             today_clamped = max(global_min, min(today, global_max))
+            ok, err = _movement_custom_date_respects_direction(which, today_clamped)
+            if not ok:
+                messagebox.showerror("Data non coerente", err, parent=top)
+                return
             if which == "from":
                 date_from_preview_var.set(today_clamped.isoformat())
             else:
                 date_to_preview_var.set(today_clamped.isoformat())
-            _normalize_range_preview()
             refresh_date_entry_states()
+            try:
+                refresh_category_account_dropdowns()
+            except Exception:
+                pass
             top.destroy()
 
         render()
@@ -9864,7 +9894,7 @@ th {{ background:#efefef; text-align:left; }}
         style="DateEntry.TEntry",
     )
     date_from_entry.grid(row=0, column=1, sticky="w")
-    ttk.Label(fields_row, text="alla data", style="MovCdc.TLabel").grid(row=0, column=2, sticky="w", padx=(16, 6))
+    ttk.Label(fields_row, text="alla data", style="MovCdc.TLabel").grid(row=0, column=2, sticky="w", padx=(8, 6))
     date_to_entry = ttk.Entry(
         fields_row,
         textvariable=date_to_disp_var,
@@ -9872,6 +9902,53 @@ th {{ background:#efefef; text-align:left; }}
         style="DateEntry.TEntry",
     )
     date_to_entry.grid(row=0, column=3, sticky="w")
+    ttk.Label(fields_row, text="anno", style="MovCdc.TLabel").grid(row=0, column=4, sticky="w", padx=(10, 6))
+    date_year_var = tk.StringVar(value="Anno")
+
+    def _date_year_choices() -> list[int]:
+        years = sorted({int(y) for y in (_dataset_years_with_records or [])}, reverse=True)
+        if years:
+            return years
+        mn, mx = _dataset_minmax_safe()
+        return list(range(mx.year, mn.year - 1, -1))
+
+    def _apply_whole_year_filter(year_raw: object) -> None:
+        try:
+            y = int(str(year_raw).strip())
+        except Exception:
+            return
+        nonlocal date_custom_manual_override
+        date_preset_preview_var.set("custom")
+        date_custom_manual_override = True
+        d_start = date(y, 1, 1)
+        d_end = date(y, 12, 31)
+        if filter_direction_preview_var.get() == "backward":
+            date_from_preview_var.set(d_end.isoformat())
+            date_to_preview_var.set(d_start.isoformat())
+        else:
+            date_from_preview_var.set(d_start.isoformat())
+            date_to_preview_var.set(d_end.isoformat())
+        date_year_var.set(str(y))
+        _sync_date_displays_from_iso()
+        refresh_date_preset_button_styles()
+        refresh_date_entry_states()
+        try:
+            refresh_category_account_dropdowns()
+        except Exception:
+            pass
+
+    date_year_menu = tk.OptionMenu(fields_row, date_year_var, *[str(y) for y in _date_year_choices()], command=_apply_whole_year_filter)
+    date_year_menu.configure(font=filter_ui_font, highlightthickness=0)
+    date_year_menu.grid(row=0, column=5, sticky="w")
+
+    def refresh_date_year_menu() -> None:
+        years = _date_year_choices()
+        menu = date_year_menu["menu"]
+        menu.delete(0, "end")
+        for y in years:
+            menu.add_command(label=str(y), command=lambda yy=y: _apply_whole_year_filter(yy))
+        if date_year_var.get() not in {str(y) for y in years}:
+            date_year_var.set("Anno")
 
     def _close_calendar(which: str) -> None:
         nonlocal calendar_popup_from, calendar_popup_to
@@ -10062,6 +10139,11 @@ th {{ background:#efefef; text-align:left; }}
             )
             _refocus_manual()
             return
+        ok, err = _movement_custom_date_respects_direction(which, dsel)
+        if not ok:
+            messagebox.showerror("Data non coerente", err)
+            _refocus_manual()
+            return
 
         nonlocal date_custom_manual_override
         date_custom_manual_override = True
@@ -10069,7 +10151,6 @@ th {{ background:#efefef; text-align:left; }}
             date_from_preview_var.set(dsel.isoformat())
         else:
             date_to_preview_var.set(dsel.isoformat())
-        _normalize_range_preview()
         refresh_date_entry_states()
         # Aggiorna subito le tendine Categoria/Conto in base al nuovo intervallo.
         try:
@@ -21336,7 +21417,7 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
         st_title = t_line1 + "\n" + t_line2
 
         fig = Figure(figsize=(12.8, 8.2), dpi=100)
-        gs = fig.add_gridspec(3, 1, left=0.1, right=0.9, top=0.98, bottom=0.02, height_ratios=[0.1, 1, 0.22], hspace=0.5)
+        gs = fig.add_gridspec(3, 1, left=0.1, right=0.9, top=0.98, bottom=0.02, height_ratios=[0.1, 1, 0.22], hspace=0.38)
         ax_title = fig.add_subplot(gs[0, 0])
         ax = fig.add_subplot(gs[1, 0])
         ax_bottom = fig.add_subplot(gs[2, 0])
@@ -21434,13 +21515,13 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
         _label_bars(bars_abs, plot_abs)
         _label_bars(bars_delta, plot_delta)
 
-        tbl_lbl = f"% sul totale\nmensile delle {total_label}"
+        tbl_lbl = f"% sul totale mensile\ndelle {total_label}"
         pct_table = ax_bottom.table(
             cellText=[pct_row],
             rowLabels=[tbl_lbl],
             cellLoc="center",
             rowLoc="right",
-            bbox=(0.02, 0.5, 0.96, 0.3),
+            bbox=(0.02, 0.74, 0.96, 0.24),
         )
         pct_table.auto_set_font_size(False)
         pct_table.set_fontsize(7.1)
@@ -21467,7 +21548,7 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
         ax_bottom.legend(
             handles=[h1, h2],
             loc="upper center",
-            bbox_to_anchor=(0.5, 0.24),
+            bbox_to_anchor=(0.5, 0.51),
             ncol=2,
             fontsize=6.8,
             frameon=True,
@@ -24713,16 +24794,6 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
         except tk.TclError:
             pass
 
-    def _data_lock_heartbeat_tick() -> None:
-        try:
-            heartbeat_data_workspace_lock(data_workspace.data_dir(), app_kind="desktop")
-        except Exception:
-            pass
-        try:
-            root.after(30000, _data_lock_heartbeat_tick)
-        except tk.TclError:
-            pass
-
     def _banner_clock_tick() -> None:
         try:
             full_title = window_title_for_session(cur_db(), session_holder[0], show_clock=True)
@@ -24746,7 +24817,6 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
             pass
 
     root.after(250, _banner_clock_tick)
-    root.after(1000, _data_lock_heartbeat_tick)
 
     _present_main_window()
     root.mainloop()
@@ -24785,14 +24855,28 @@ def main() -> None:
         except Exception:
             pass
         return
+    data_dir = data_workspace.data_dir()
     try:
-        acquire_data_workspace_lock(data_workspace.data_dir(), app_kind="desktop")
-        atexit.register(release_data_workspace_lock, data_workspace.data_dir())
-        _assert_no_dropbox_conflicted_enc_files(data_workspace.data_dir() / "conti_utente_placeholder.enc")
+        acquire_data_workspace_lock(data_dir, app_kind="desktop")
     except Exception as exc:
-        release_data_workspace_lock()
+        # Non abbiamo creato il segnaposto: non va cancellato un file altrui ancora valido.
         try:
             messagebox.showerror("Cartella dati in uso", str(exc), parent=None)
+        except Exception:
+            print(f"Avvio interrotto: {exc}", file=sys.stderr)
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        return
+
+    atexit.register(release_data_workspace_lock, data_dir)
+    try:
+        _assert_no_dropbox_conflicted_enc_files(data_dir / "conti_utente_placeholder.enc")
+    except Exception as exc:
+        release_data_workspace_lock(data_dir)
+        try:
+            messagebox.showerror("Conti di casa", str(exc), parent=None)
         except Exception:
             print(f"Avvio interrotto: {exc}", file=sys.stderr)
         try:

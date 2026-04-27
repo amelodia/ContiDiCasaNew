@@ -1,5 +1,8 @@
 import Foundation
 import CryptoKit
+#if canImport(UIKit)
+import UIKit
+#endif
 
 public struct ContiSession {
     public let isRegistered: Bool
@@ -402,52 +405,114 @@ public enum ContiDatabase {
         return total
     }
 
-    private static let dataLockFilename = "conti_di_casa_app.lock.json"
-    private static let dataLockStaleSeconds: TimeInterval = 15 * 60
-    private static let dataLockSessionId = UUID().uuidString
+    /// Stesso nome del desktop: se il file esiste, la cartella dati è considerata in uso.
+    private static let dataFolderInUseMarkerFilename = "conti_di_casa_folder_in_use.txt"
+    private static let localInstanceMutex = NSLock()
+    /// Vero solo dopo creazione con successo di `conti_di_casa_folder_in_use.txt` in questa sessione: non va mai cancellato un segnaposto altrui.
+    private static var sessionHoldsDataFolderMarkerOnDisk = false
 
-    private static func dataLockURL(in folder: URL) -> URL {
-        folder.standardizedFileURL.appendingPathComponent(dataLockFilename, isDirectory: false)
+    private static func dataFolderInUseMarkerURL(in folder: URL) -> URL {
+        folder.standardizedFileURL.appendingPathComponent(dataFolderInUseMarkerFilename, isDirectory: false)
     }
 
-    private static func readDataLock(_ url: URL) -> [String: Any]? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        guard let obj = try? JSONSerialization.jsonObject(with: data, options: []) else { return nil }
-        return obj as? [String: Any]
+    private static func dataFolderInUseMarkerIsPresent(in folder: URL) -> Bool {
+        let fm = FileManager.default
+        let folderURL = folder.standardizedFileURL
+        guard let urls = try? fm.contentsOfDirectory(
+            at: folderURL,
+            includingPropertiesForKeys: nil,
+            options: []
+        ) else { return false }
+        guard let markerURL = urls.first(where: { $0.lastPathComponent == dataFolderInUseMarkerFilename }) else {
+            return false
+        }
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: markerURL.path, isDirectory: &isDirectory) else { return false }
+        return !isDirectory.boolValue
     }
 
-    private static func lockLastHeartbeatTs(_ lock: [String: Any]) -> TimeInterval {
-        if let n = lock["last_heartbeat_ts"] as? NSNumber { return n.doubleValue }
-        if let d = lock["last_heartbeat_ts"] as? Double { return d }
-        if let s = lock["last_heartbeat_ts"] as? String, let d = Double(s) { return d }
-        return 0
+    private static func removeDataFolderInUseMarkerFileIfSafe(_ markerURL: URL, in folder: URL) {
+        let fm = FileManager.default
+        let folderURL = folder.standardizedFileURL
+        let url = markerURL.standardizedFileURL
+        guard url.deletingLastPathComponent().path == folderURL.path else { return }
+        guard url.lastPathComponent == dataFolderInUseMarkerFilename else { return }
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return }
+        guard !isDirectory.boolValue else { return }
+        try? fm.removeItem(at: url)
     }
 
-    private static func isoNow() -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f.string(from: Date())
+    public static func assertNoSessionWorkspaceLockBeforeOpen(in dataFolder: URL) throws {
+        if dataFolderInUseMarkerIsPresent(in: dataFolder.standardizedFileURL) {
+            throw ContiLightImmissioneError.message(
+                "Avvio bloccato: la cartella dati risulta già in uso (file segnaposto presente nella cartella).\n\n"
+                    + "Chiudi l’altra app o attendi la sincronizzazione Dropbox."
+            )
+        }
     }
 
-    private static func isActiveForeignDataLock(_ lock: [String: Any]?) -> Bool {
-        guard let lock else { return false }
-        let sid = stringFromJSON(lock["session_id"]).trimmingCharacters(in: .whitespacesAndNewlines)
-        if sid.isEmpty || sid == dataLockSessionId { return false }
-        let hbTs = lockLastHeartbeatTs(lock)
-        return (Date().timeIntervalSince1970 - hbTs) < dataLockStaleSeconds
+    /// Nome file stile Dropbox (`… (nome's conflicted copy).enc` o «copia in conflitto»).
+    private static func dropboxConflictedEncNamePatternMatches(_ lastPathComponent: String) -> Bool {
+        let n = lastPathComponent.lowercased()
+        return n.contains("conflicted copy") || n.contains("copia in conflitto")
+    }
+
+    /// Dropbox: `stem (account's conflicted copy).enc` → nome del file «ufficiale» atteso accanto.
+    private static func canonicalEncFilenameStrippingDropboxConflictSuffix(_ conflictFilename: String) -> String? {
+        let l = conflictFilename.lowercased()
+        guard l.hasSuffix(".enc") else { return nil }
+        guard dropboxConflictedEncNamePatternMatches(conflictFilename) else { return nil }
+        guard let open = conflictFilename.range(of: " (") else { return nil }
+        let head = String(conflictFilename[..<open.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if head.isEmpty { return nil }
+        return head + ".enc"
+    }
+
+    /// Se nella cartella c’è già il `.enc` canonico (senza suffisso di conflitto Dropbox), la voce «… conflicted copy …»
+    /// è un duplicato o un residuo del provider in **File**: non deve bloccare il salvataggio (anche se risulta ancora leggibile in cache).
+    private static func dropboxConflictedEncIsIgnorableWhenCleanSiblingPresent(
+        conflictURL: URL,
+        folder: URL
+    ) -> Bool {
+        guard let cleanName = canonicalEncFilenameStrippingDropboxConflictSuffix(conflictURL.lastPathComponent) else {
+            return false
+        }
+        guard !dropboxConflictedEncNamePatternMatches(cleanName) else { return false }
+        let cleanURL = folder.standardizedFileURL.appendingPathComponent(cleanName)
+        return FileManager.default.fileExists(atPath: cleanURL.path)
+    }
+
+    /// Il provider Dropbox in **File** può restituire ancora in elenco voci già eliminate sul server.
+    /// Per non bloccare il salvataggio su «fantasmi», consideriamo il conflitto solo se esiste un file regolare non vuoto e leggibile.
+    private static func materializedConflictedEncExists(at url: URL) -> Bool {
+        let path = url.path
+        guard FileManager.default.fileExists(atPath: path) else { return false }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path) else { return false }
+        guard let typ = attrs[.type] as? FileAttributeType, typ == .typeRegular else { return false }
+        let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+        guard size > 0 else { return false }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let chunk = try? handle.read(upToCount: 1), !chunk.isEmpty else { return false }
+        return true
     }
 
     private static func assertNoDropboxConflictedEncFiles(in folder: URL) throws {
         let fm = FileManager.default
+        let folderURL = folder.standardizedFileURL
         guard let urls = try? fm.contentsOfDirectory(
-            at: folder.standardizedFileURL,
+            at: folderURL,
             includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]
         ) else { return }
         let conflicts = urls.filter { u in
             guard u.pathExtension.lowercased() == "enc" else { return false }
-            let n = u.lastPathComponent.lowercased()
-            return n.contains("conflicted copy") || n.contains("copia in conflitto")
+            guard dropboxConflictedEncNamePatternMatches(u.lastPathComponent) else { return false }
+            if dropboxConflictedEncIsIgnorableWhenCleanSiblingPresent(conflictURL: u, folder: folderURL) {
+                return false
+            }
+            return materializedConflictedEncExists(at: u)
         }.sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
         if conflicts.isEmpty { return }
         let shown = conflicts.prefix(8).map { "- \($0.lastPathComponent)" }.joined(separator: "\n")
@@ -457,73 +522,97 @@ public enum ContiDatabase {
         )
     }
 
-    private static func assertNoActiveForeignDataLock(in folder: URL) throws {
-        let p = dataLockURL(in: folder)
-        if FileManager.default.fileExists(atPath: p.path) {
-            _ = waitForFileStableIfDropbox(p, maxWaitSeconds: 25)
+    private static func currentLockAppKind() -> String {
+        #if canImport(UIKit)
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            return "ipad_light"
         }
-        let lock = readDataLock(p)
-        guard isActiveForeignDataLock(lock) else { return }
-        let app = stringFromJSON(lock?["app"]).trimmingCharacters(in: .whitespacesAndNewlines)
-        let dev = stringFromJSON(lock?["device"]).trimmingCharacters(in: .whitespacesAndNewlines)
-        let hb = stringFromJSON(lock?["last_heartbeat"]).trimmingCharacters(in: .whitespacesAndNewlines)
-        throw ContiLightImmissioneError.message(
-            "Salvataggio bloccato: un'altra copia dell'app risulta aperta sulla cartella dati.\n\nApp: \(app)\nDispositivo: \(dev)\nUltimo segnale: \(hb)"
-        )
-    }
-
-    private static func writeLockPayload(to lockURL: URL, appKind: String = "ios_light") throws {
-        let host = ProcessInfo.processInfo.hostName
-        let now = Date().timeIntervalSince1970
-        let payload: [String: Any] = [
-            "app": appKind,
-            "session_id": dataLockSessionId,
-            "device": host,
-            "opened_at": isoNow(),
-            "last_heartbeat": isoNow(),
-            "last_heartbeat_ts": now
-        ]
-        let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted])
-        try data.write(to: lockURL, options: .atomic)
-    }
-
-    private static func acquireDataWorkspaceLockForWrite(
-        in folder: URL,
-        appKind: String = "ios_light"
-    ) throws -> (lockURL: URL, releaseOnScopeExit: Bool) {
-        let p = dataLockURL(in: folder)
-        let lock = readDataLock(p)
-        if isActiveForeignDataLock(lock) {
-            try assertNoActiveForeignDataLock(in: folder)
-        }
-        try writeLockPayload(to: p, appKind: appKind)
-        return (p, true)
-    }
-
-    private static func releaseDataWorkspaceLockIfOwned(_ lockURL: URL) {
-        let lock = readDataLock(lockURL)
-        let sid = stringFromJSON(lock?["session_id"]).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard sid == dataLockSessionId else { return }
-        try? FileManager.default.removeItem(at: lockURL)
+        #endif
+        return "ios_light"
     }
 
     private static func assertSafeToSave(_ encURL: URL) throws {
         let folder = encURL.deletingLastPathComponent().standardizedFileURL
         try assertNoDropboxConflictedEncFiles(in: folder)
-        try assertNoActiveForeignDataLock(in: folder)
+    }
+
+    /// Dopo apertura riuscita del DB, crea il file segnaposto di questa sessione.
+    /// Non cancella nulla in apertura: il segnaposto viene rimosso solo in ``releaseSessionWorkspaceLockOnClose``.
+    public static func acquireSessionWorkspaceLockForOpen(in dataFolder: URL, appKind: String = "") throws {
+        let folder = dataFolder.standardizedFileURL
+        let p = dataFolderInUseMarkerURL(in: folder)
+        try assertNoSessionWorkspaceLockBeforeOpen(in: folder)
+        let kindTrim = appKind.trimmingCharacters(in: .whitespacesAndNewlines)
+        let line = (kindTrim.isEmpty ? currentLockAppKind() : kindTrim) + "\n"
+        guard let data = line.data(using: .utf8) else {
+            throw ContiLightImmissioneError.message("Impossibile creare il segnaposto di sessione.")
+        }
+        guard FileManager.default.createFile(atPath: p.path, contents: data, attributes: nil) else {
+            if dataFolderInUseMarkerIsPresent(in: folder) {
+                throw ContiLightImmissioneError.message(
+                    "Avvio bloccato: la cartella dati risulta già in uso (file segnaposto presente nella cartella).\n\n"
+                        + "Chiudi l’altra app o attendi la sincronizzazione Dropbox."
+                )
+            }
+            throw ContiLightImmissioneError.message("Impossibile creare il segnaposto di sessione.")
+        }
+        localInstanceMutex.lock()
+        sessionHoldsDataFolderMarkerOnDisk = true
+        localInstanceMutex.unlock()
+    }
+
+    /// Solo stato in RAM, senza toccare il segnaposto su disco.
+    public static func clearLocalInstanceSessionState() {
+        localInstanceMutex.lock()
+        sessionHoldsDataFolderMarkerOnDisk = false
+        localInstanceMutex.unlock()
+    }
+
+    /// Chiusura sessione light: azzera lo stato in RAM; rimuove il segnaposto **solo** se l’aveva creato questa istanza.
+    public static func releaseSessionWorkspaceLockOnClose(in dataFolder: URL) {
+        let folder = dataFolder.standardizedFileURL
+        localInstanceMutex.lock()
+        let shouldRemove = sessionHoldsDataFolderMarkerOnDisk
+        sessionHoldsDataFolderMarkerOnDisk = false
+        localInstanceMutex.unlock()
+        if shouldRemove {
+            removeDataFolderInUseMarkerFileIfSafe(dataFolderInUseMarkerURL(in: folder), in: folder)
+        }
+    }
+
+    public static func coordinatedDataContents(of url: URL) throws -> Data {
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        var coordinatorError: NSError?
+        var result: Result<Data, Error>?
+        coordinator.coordinate(readingItemAt: url, options: [], error: &coordinatorError) { readURL in
+            result = Result { try Data(contentsOf: readURL) }
+        }
+        if let coordinatorError { throw coordinatorError }
+        guard let result else {
+            throw NSError(domain: NSCocoaErrorDomain, code: CocoaError.fileReadUnknown.rawValue)
+        }
+        return try result.get()
+    }
+
+    public static func coordinatedStringContents(of url: URL, encoding: String.Encoding = .utf8) throws -> String {
+        let data = try coordinatedDataContents(of: url)
+        guard let string = String(data: data, encoding: encoding) else {
+            throw NSError(domain: NSCocoaErrorDomain, code: CocoaError.fileReadCorruptFile.rawValue)
+        }
+        return string
     }
 
     /// Legge `.key` come UTF-8 (stringa Base64), `.enc` come dati del token Fernet.
     public static func loadEncryptedDB(encURL: URL, keyURL: URL) throws -> [String: Any] {
         let keyString: String
         do {
-            keyString = try String(contentsOf: keyURL, encoding: .utf8)
+            keyString = try coordinatedStringContents(of: keyURL, encoding: .utf8)
         } catch {
             throw ContiDBError.cannotReadKey
         }
         let encData: Data
         do {
-            encData = try Data(contentsOf: encURL)
+            encData = try coordinatedDataContents(of: encURL)
         } catch {
             throw ContiDBError.cannotReadEnc
         }
@@ -534,13 +623,13 @@ public enum ContiDatabase {
     public static func loadEncryptedDBFull(encURL: URL, keyURL: URL) throws -> [String: Any] {
         let keyString: String
         do {
-            keyString = try String(contentsOf: keyURL, encoding: .utf8)
+            keyString = try coordinatedStringContents(of: keyURL, encoding: .utf8)
         } catch {
             throw ContiDBError.cannotReadKey
         }
         let encData: Data
         do {
-            encData = try Data(contentsOf: encURL)
+            encData = try coordinatedDataContents(of: encURL)
         } catch {
             throw ContiDBError.cannotReadEnc
         }
@@ -2329,7 +2418,7 @@ public enum ContiDatabase {
             waitPaths.append(fullURL)
         }
         _ = waitForPathsStableIfDropbox(waitPaths)
-        let keyString = try String(contentsOf: keyURL, encoding: .utf8)
+        let keyString = try coordinatedStringContents(of: keyURL, encoding: .utf8)
         if FileManager.default.fileExists(atPath: fullURL.path) {
             var main = try loadEncryptedDBFull(encURL: fullURL, keyURL: keyURL)
             guard tryLogin(db: main, email: em, password: password) != nil else {
@@ -2341,8 +2430,13 @@ public enum ContiDatabase {
             let nNew = mergeLightNewRecordsIntoMain(main: &main, light: sessionDb)
             recomputeLightSaldiFromFullDb(&main)
             let lightExport = try buildLightDatabaseForExport(from: main)
-            try saveEncryptedDbToDisk(db: main, encURL: fullURL, keyString: keyString)
-            try saveEncryptedDbToDisk(db: lightExport, encURL: lightEncURL, keyString: keyString)
+            try saveEncryptedDbPairUnderSingleWorkspaceLock(
+                keyString: keyString,
+                fullURL: fullURL,
+                fullDb: main,
+                lightURL: lightEncURL,
+                lightDb: lightExport
+            )
             var msg = "Salvati file completo e light nella cartella dati; saldi ricalcolati come sul desktop."
             if nNew > 0, nUp > 0 {
                 msg = "Importate \(nNew) nuove registrazione/i, aggiornate \(nUp) esistenti nel database completo. " + msg
@@ -2368,15 +2462,8 @@ public enum ContiDatabase {
         return (lightOnly, 0, msg)
     }
 
-    /// Scrive un database cifrato (stesso formato del desktop).
-    public static func saveEncryptedDbToDisk(db: [String: Any], encURL: URL, keyString: String) throws {
-        try assertSafeToSave(encURL)
-        let lk = try acquireDataWorkspaceLockForWrite(in: encURL.deletingLastPathComponent())
-        defer {
-            if lk.releaseOnScopeExit {
-                releaseDataWorkspaceLockIfOwned(lk.lockURL)
-            }
-        }
+    /// Cifratura Fernet + scrittura atomica (senza controlli cartella: uso interno dopo ``assertSafeToSave``).
+    private static func writeFernetEncryptedDb(db: [String: Any], encURL: URL, keyString: String) throws {
         guard let enc = FernetEncryptor(keyFileContents: keyString) else {
             throw ContiDBError.cannotEncrypt
         }
@@ -2389,6 +2476,32 @@ public enum ContiDatabase {
         )
         guard let outData = tokenUtf8.data(using: .utf8) else { throw ContiDBError.cannotEncrypt }
         try outData.write(to: encURL, options: .atomic)
+    }
+
+    /// Scrive ``conti_utente_*.enc`` e ``*_light.enc`` in successione (stessa cartella), dopo i controlli conflitti ``.enc``.
+    private static func saveEncryptedDbPairUnderSingleWorkspaceLock(
+        keyString: String,
+        fullURL: URL,
+        fullDb: [String: Any],
+        lightURL: URL,
+        lightDb: [String: Any]
+    ) throws {
+        let f1 = fullURL.deletingLastPathComponent().standardizedFileURL
+        let f2 = lightURL.deletingLastPathComponent().standardizedFileURL
+        precondition(
+            f1.path == f2.path,
+            "saveEncryptedDbPairUnderSingleWorkspaceLock: full e light devono essere nella stessa cartella dati."
+        )
+        try assertSafeToSave(fullURL)
+        try assertSafeToSave(lightURL)
+        try writeFernetEncryptedDb(db: fullDb, encURL: fullURL, keyString: keyString)
+        try writeFernetEncryptedDb(db: lightDb, encURL: lightURL, keyString: keyString)
+    }
+
+    /// Scrive un database cifrato (stesso formato del desktop).
+    public static func saveEncryptedDbToDisk(db: [String: Any], encURL: URL, keyString: String) throws {
+        try assertSafeToSave(encURL)
+        try writeFernetEncryptedDb(db: db, encURL: encURL, keyString: keyString)
     }
 
     /**
@@ -2408,7 +2521,7 @@ public enum ContiDatabase {
             return (lightDb, 0, "Nessun file completo \(fullURL.lastPathComponent); uso solo il light.")
         }
         _ = waitForPathsStableIfDropbox([keyURL, fullURL, lightEncURL])
-        let keyString = try String(contentsOf: keyURL, encoding: .utf8)
+        let keyString = try coordinatedStringContents(of: keyURL, encoding: .utf8)
         var fullDb = try loadEncryptedDBFull(encURL: fullURL, keyURL: keyURL)
         guard tryLogin(db: fullDb, email: em, password: password) != nil else {
             return (lightDb, 0, "File completo presente ma accesso non riuscito; uso solo il light.")
@@ -2425,8 +2538,13 @@ public enum ContiDatabase {
         }
         recomputeLightSaldiFromFullDb(&main)
         let lightExport = try buildLightDatabaseForExport(from: main)
-        try saveEncryptedDbToDisk(db: main, encURL: fullURL, keyString: keyString)
-        try saveEncryptedDbToDisk(db: lightExport, encURL: lightEncURL, keyString: keyString)
+        try saveEncryptedDbPairUnderSingleWorkspaceLock(
+            keyString: keyString,
+            fullURL: fullURL,
+            fullDb: main,
+            lightURL: lightEncURL,
+            lightDb: lightExport
+        )
         var msg = "Database allineato: saldi ricalcolati; salvati file completo e light."
         if n1 > 0, n2 > 0 {
             msg = "Sincronizzate \(n1) nuove e \(n2) modificate dell’app light con il file completo. " + msg
