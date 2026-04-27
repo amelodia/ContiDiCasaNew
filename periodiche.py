@@ -15,7 +15,7 @@ CADENCE_CHOICES: list[tuple[str, str]] = [
     ("daily", "Quotidiana"),
     ("weekly", "Settimanale"),
     ("monthly", "Mensile"),
-    ("bimonthly", "Bimensile"),
+    ("bimonthly", "Bimestrale"),
     ("quarterly", "Trimestrale"),
     ("quadrimestral", "Quadrimestrale"),
     ("semiannual", "Semestrale"),

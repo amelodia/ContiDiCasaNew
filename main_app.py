@@ -92,6 +92,7 @@ LEGACY_IMPORT_DISABLED_MESSAGE = (
     "Import legacy disabilitato: il database cifrato corrente è ormai la fonte definitiva. "
     "Usa i backup del DB corrente per eventuali ripristini."
 )
+CREDIT_CARD_CHEQUE_LABEL = "CCarta"
 
 # Inserimento griglia a lotti: migliaia di righe × 3 Treeview bloccano il main thread (macOS: beach ball).
 MOVEMENTS_INSERT_BATCH = 400
@@ -468,6 +469,7 @@ def bind_euro_amount_entry_validation(
     on_enter: Callable[[], object] | None = None,
     cursor_after_sign_on_focus: bool = False,
     external_focusout: bool = False,
+    format_zero: bool = True,
 ) -> None:
     """
     Limita immissione e incolla a importi euro: cifre e separatori . e ,; + e − solo come primo carattere
@@ -574,6 +576,8 @@ def bind_euro_amount_entry_validation(
         if reject_zero and val == Decimal("0.00"):
             _msg_zero_non_ammesso()
             return False
+        if not format_zero and val == Decimal("0.00"):
+            return False
         txt_abs = format_euro_it(abs(val))
         if allow_leading_sign:
             if val < 0:
@@ -617,6 +621,8 @@ def bind_euro_amount_entry_validation(
             else:
                 _set_amount_text_and_cursor(txt_abs, select_all=True)
             _msg_zero_non_ammesso()
+            return
+        if not format_zero and val == Decimal("0.00"):
             return
         txt_abs = format_euro_it(abs(val))
         if allow_leading_sign:
@@ -2570,7 +2576,7 @@ def compute_balances_from_2022_asof(
     Esclude annullate e scarichi virtuali. Dotazione (cat. 0) solo nel 1990. Piano conti = ultimo anno.
     Per saldo totale senza limiti di data usare cutoff_date_iso="9999-12-31".
     Se ``exclude_import_twin_actives`` è True, esclude dal replay le righe importate ancora attive che hanno
-    una gemella annullata (stessa data/conti/importo), per evitare doppioni rispetto al saldo *sld* + annulli.
+    una gemella annullata con la stessa identità stabile, per evitare doppioni rispetto al saldo *sld* + annulli.
     """
     if not db.get("years"):
         return (date.today().year, [], [])
@@ -2665,7 +2671,8 @@ def compute_cancelled_imported_records_balance_adjustment(
     """Correzione ai saldi basati su *sld*: movimenti importati ancora contati in *sld* ma annullati in app.
 
     ``compute_new_records_effect`` ignora le righe con ``raw_record`` pieno; qui si compensa l'effetto
-    contabile opposto (stessi vincoli di data/dotazione/giroconto/scarico virtuale di ``compute_balances_from_2022_asof``).
+    contabile opposto. L'annullo è strutturale: deve togliere dal saldo anche registrazioni con data futura,
+    perché il saldo *sld* le contiene già.
     """
     if not db.get("years"):
         return []
@@ -2692,10 +2699,6 @@ def compute_cancelled_imported_records_balance_adjustment(
         y = int(rec["year"])
         if is_dotazione_record(rec) and y != LEGACY_DOTAZIONE_YEAR:
             continue
-        r_date = str(rec.get("date_iso", ""))
-        if r_date and r_date > cutoff_date_iso:
-            continue
-
         amount = -to_decimal(rec["amount_eur"])
         c1 = rec.get("account_primary_code", "")
         c2 = rec.get("account_secondary_code", "")
@@ -2792,15 +2795,17 @@ def compute_imported_active_records_edit_balance_adjustment(db: dict) -> list[De
 
 
 def _imported_record_balance_twin_key(rec: dict) -> tuple[str, str, str, str]:
-    """Chiave per confrontare righe importate (stessa data/conti/importo = stesso movimento economico)."""
-    amt_s = str(rec.get("amount_eur") or "").strip()
-    if not amt_s:
-        amt_s = str(to_decimal(rec["amount_eur"]))
+    """Identità stabile per righe importate duplicate.
+
+    Non usare data/conti/importo: due registrazioni distinte possono avere gli stessi valori
+    e devono pesare entrambe sui saldi quando una o entrambe vengono annullate.
+    """
+    stable = str(rec.get("legacy_registration_key") or "").strip() or record_legacy_stable_key(rec)
     return (
-        str(rec.get("date_iso", ""))[:10],
-        str(rec.get("account_primary_code", "")).strip(),
-        str(rec.get("account_secondary_code", "")).strip(),
-        amt_s,
+        str(rec.get("year", "")).strip(),
+        str(rec.get("source_folder", "")).strip(),
+        str(rec.get("source_file", "")).strip(),
+        stable,
     )
 
 
@@ -2944,8 +2949,8 @@ def hybrid_absolute_balances_for_saldi(db: dict, *, today_cancel_cutoff_iso: str
 def hybrid_balances_saldo_in_data(db: dict, *, asof_iso: str) -> list[Decimal] | None:
     """
     Saldo per colonna «alla data», come la riga «Saldi alla data» del footer Movimenti:
-    ``hybrid_absolute_balances_for_saldi`` con cut-off annulli = ``asof_iso``, meno l’effetto delle
-    registrazioni con ``date_iso`` successiva ad ``asof_iso`` (``compute_balances_future_dated_only``).
+    ``hybrid_absolute_balances_for_saldi`` meno l’effetto delle registrazioni con ``date_iso``
+    successiva ad ``asof_iso`` (``compute_balances_future_dated_only``).
     """
     d = (asof_iso or date.today().isoformat())[:10]
     hyb = hybrid_absolute_balances_for_saldi(db, today_cancel_cutoff_iso=d)
@@ -5171,6 +5176,18 @@ def migrate_sync_display_amount_with_amount_eur(db: dict) -> int:
     return touched
 
 
+def migrate_credit_card_cheque_label(db: dict) -> int:
+    """Uniforma la dicitura storica dell'assegno per movimenti da conto carta di credito."""
+    touched = 0
+    for yb in db.get("years") or []:
+        for rec in yb.get("records") or []:
+            if str(rec.get("cheque") or "").strip() != "ccarta":
+                continue
+            rec["cheque"] = CREDIT_CARD_CHEQUE_LABEL
+            touched += 1
+    return touched
+
+
 def record_legacy_stable_key(rec: dict) -> str:
     """Chiave univoca del record nel DB unificato (come in import legacy)."""
     k = rec.get("legacy_registration_key")
@@ -6005,6 +6022,8 @@ def build_ui(
         if migrate_dotazione_remove_from_plan_charts(db_holder[0]):
             changed = True
         if migrate_sync_display_amount_with_amount_eur(db_holder[0]) > 0:
+            changed = True
+        if migrate_credit_card_cheque_label(db_holder[0]) > 0:
             changed = True
         if changed:
             save_encrypted_db_dual(db_holder[0], path_holder[0], key_path_holder[0])
@@ -12485,7 +12504,7 @@ th {{ background:#efefef; text-align:left; }}
             _cancel_saldo_procedure()
         _show_aggiorna_saldo_btn_if_needed()
 
-        # Cassa o Virtuale: nessun assegno; carta di credito: niente campo assegno, valore fisso «ccarta».
+        # Cassa o Virtuale: nessun assegno; carta di credito: niente campo assegno, valore fisso.
         if _is_cassa_first_account() or _is_virtuale_account(newreg_acc1_var.get()):
             lbl_assegno.grid_remove()
             ent_chq.grid_remove()
@@ -12497,7 +12516,7 @@ th {{ background:#efefef; text-align:left; }}
         elif _is_primary_account_credit_card():
             lbl_assegno.grid_remove()
             ent_chq.grid_remove()
-            newreg_cheque_var.set("ccarta")
+            newreg_cheque_var.set(CREDIT_CARD_CHEQUE_LABEL)
             try:
                 ent_chq.configure(takefocus=False)
             except Exception:
@@ -12750,13 +12769,23 @@ th {{ background:#efefef; text-align:left; }}
             messagebox.showerror("Nuova registrazione", "Nel giroconto il secondo conto è obbligatorio e diverso dal primo.")
             return None
         raw_amt = (newreg_amount_var.get() or "").strip()
-        if not raw_amt:
-            messagebox.showerror("Nuova registrazione", "Importo obbligatorio.")
+        if not raw_amt or raw_amt in ("+", "-"):
+            messagebox.showerror("Nuova registrazione", "Importo a zero non ammesso.")
+            try:
+                ent_amt.focus_set()
+                ent_amt.select_range(0, tk.END)
+            except Exception:
+                pass
             return None
         try:
             amt = normalize_euro_input(raw_amt)
-        except Exception as exc:
-            messagebox.showerror("Nuova registrazione", str(exc))
+        except Exception:
+            messagebox.showerror("Nuova registrazione", "Importo non valido.")
+            try:
+                ent_amt.focus_set()
+                ent_amt.select_range(0, tk.END)
+            except Exception:
+                pass
             return None
         if giro:
             amt = -abs(amt)
@@ -12766,11 +12795,16 @@ th {{ background:#efefef; text-align:left; }}
             amt = abs(amt)
         if amt == Decimal("0.00") and not saldo_aggiorna_locked[0]:
             messagebox.showerror("Nuova registrazione", "Importo a zero non ammesso.")
+            try:
+                ent_amt.focus_set()
+                ent_amt.select_range(0, tk.END)
+            except Exception:
+                pass
             return None
         if _is_cassa_first_account():
             chq = "-"
         elif _is_primary_account_credit_card():
-            chq = sanitize_single_line_text("ccarta", max_len=MAX_CHEQUE_LEN)
+            chq = sanitize_single_line_text(CREDIT_CARD_CHEQUE_LABEL, max_len=MAX_CHEQUE_LEN)
         else:
             chq = sanitize_single_line_text(newreg_cheque_var.get() or "", max_len=MAX_CHEQUE_LEN)
             if not chq:
@@ -13644,6 +13678,8 @@ th {{ background:#efefef; text-align:left; }}
             lbl_per_acc2.grid_remove()
             row_per_acc2.grid_remove()
             per_acc2_var.set("")
+            if (per_note_var.get() or "").strip().lower() == "giroconto":
+                per_note_var.set("")
 
     def _per_refresh_options() -> None:
         cb_per_acc1.configure(values=[n for n, _c in acc_opts_cache])
@@ -13692,6 +13728,12 @@ th {{ background:#efefef; text-align:left; }}
         chq = "Periodica"
         return ("", cad, last_it, next_it, cat, apt, ap2, chq)
 
+    def _per_rule_next_sort_key(rule: dict) -> tuple[int, str, str]:
+        if not rule.get("active", True):
+            return (1, "9999-12-31", str(rule.get("id") or ""))
+        nd = periodiche.next_due_date(rule)
+        return (0, nd.isoformat() if nd else "9999-12-31", str(rule.get("id") or ""))
+
     def _per_rule_note_cell(rule: dict) -> str:
         tpl = rule.get("template") or {}
         n = str(tpl.get("note") or "")
@@ -13704,7 +13746,8 @@ th {{ background:#efefef; text-align:left; }}
         tree_per_amt.delete(*tree_per_amt.get_children())
         tree_per_note.delete(*tree_per_note.get_children())
         row_i = 0
-        for rule in cur_db().get("periodic_registrations", []):
+        rules_sorted = sorted(cur_db().get("periodic_registrations", []), key=_per_rule_next_sort_key)
+        for rule in rules_sorted:
             rid = str(rule.get("id", ""))
             if not rid:
                 continue
@@ -13828,13 +13871,23 @@ th {{ background:#efefef; text-align:left; }}
             )
             return None
         raw_amt = (per_amount_var.get() or "").strip()
-        if not raw_amt:
-            messagebox.showerror("Registrazioni periodiche", "Importo obbligatorio.")
+        if not raw_amt or raw_amt in ("+", "-"):
+            messagebox.showerror("Registrazioni periodiche", "Importo a zero non ammesso.")
+            try:
+                ent_per_amt.focus_set()
+                ent_per_amt.select_range(0, tk.END)
+            except Exception:
+                pass
             return None
         try:
             amt = normalize_euro_input(raw_amt)
-        except Exception as exc:
-            messagebox.showerror("Registrazioni periodiche", str(exc))
+        except Exception:
+            messagebox.showerror("Registrazioni periodiche", "Importo non valido.")
+            try:
+                ent_per_amt.focus_set()
+                ent_per_amt.select_range(0, tk.END)
+            except Exception:
+                pass
             return None
         if giro:
             amt = -abs(amt)
@@ -13844,6 +13897,11 @@ th {{ background:#efefef; text-align:left; }}
             amt = abs(amt)
         if amt == Decimal("0.00"):
             messagebox.showerror("Registrazioni periodiche", "Importo a zero non ammesso.")
+            try:
+                ent_per_amt.focus_set()
+                ent_per_amt.select_range(0, tk.END)
+            except Exception:
+                pass
             return None
         chq = sanitize_single_line_text("Periodica", max_len=MAX_CHEQUE_LEN)
         note = format_record_note_stored(
@@ -13881,6 +13939,14 @@ th {{ background:#efefef; text-align:left; }}
             if rid_edit
             else "Confermi la creazione della registrazione periodica nel database?",
         ):
+            return
+        if to_decimal(str(tpl.get("amount_eur") or "0")) == Decimal("0.00"):
+            messagebox.showerror("Registrazioni periodiche", "Importo a zero non ammesso.")
+            try:
+                ent_per_amt.focus_set()
+                ent_per_amt.select_range(0, tk.END)
+            except Exception:
+                pass
             return
         periodiche.ensure_periodic_registrations(cur_db())
         rules = cur_db()["periodic_registrations"]
@@ -14039,12 +14105,383 @@ th {{ background:#efefef; text-align:left; }}
         _per_refresh_form_title()
 
     def _per_prepare_edit_selected() -> None:
-        if not _per_current_selected_id():
+        rid = _per_current_selected_id()
+        if not rid:
             messagebox.showinfo("Registrazioni periodiche", "Seleziona una riga nell'elenco.")
             return
-        _per_load_selected_rule_into_form()
-        per_follow_grid_selection[0] = True
-        per_status_var.set("Modifica la regola e conferma: le registrazioni già create restano invariate.")
+        rule = next((r for r in cur_db().get("periodic_registrations", []) if str(r.get("id")) == rid), None)
+        if rule is None:
+            messagebox.showerror("Registrazioni periodiche", "Voce non trovata nell'elenco.")
+            return
+
+        def _rule_title_text() -> str:
+            vals = _per_rule_tree_values(rule)
+            return f"{vals[2] or '-'} -> {vals[3] or '-'}   {vals[4]}"
+
+        def _per_save_rules_change(status_text: str, old_regs: list | None = None) -> bool:
+            old_regs = old_regs if old_regs is not None else copy.deepcopy(cur_db().get("periodic_registrations", []))
+            try:
+                save_encrypted_db_dual(
+                    cur_db(),
+                    Path(data_file_var.get()),
+                    Path(key_file_var.get()),
+                )
+            except Exception as exc:
+                cur_db()["periodic_registrations"] = old_regs
+                messagebox.showerror("Registrazioni periodiche", str(exc))
+                return False
+            today = date.today()
+            n, per_created = periodiche.materialize_all_due(cur_db(), today)
+            if n > 0:
+                try:
+                    save_encrypted_db_dual(
+                        cur_db(),
+                        Path(data_file_var.get()),
+                        Path(key_file_var.get()),
+                    )
+                except Exception as exc:
+                    cur_db()["periodic_registrations"] = old_regs
+                    messagebox.showerror("Registrazioni periodiche", str(exc), parent=root)
+                    return False
+                _movements_dirty[0] = True
+                populate_movements_trees()
+                refresh_balance_footer()
+                messagebox.showinfo(
+                    "Registrazioni periodiche",
+                    f"Sono state create {n} registrazioni da scadenze maturate.",
+                    parent=root,
+                )
+                for rec in per_created:
+                    messagebox.showinfo(
+                        "Registrazione periodica creata",
+                        _periodic_created_record_detail_message(rec),
+                        parent=root,
+                    )
+            _per_refresh_tree()
+            _per_refresh_action_buttons()
+            per_status_var.set(status_text)
+            return True
+
+        def _set_rule_next_due(rule_obj: dict, next_iso: str) -> None:
+            rule_obj["start_anchor_iso"] = next_iso
+            lm_old = rule_obj.get("last_materialized_iso")
+            if lm_old and str(lm_old).strip() and rule_obj.get("active", True):
+                cad_e = str(rule_obj.get("cadence") or "").strip()
+                if cad_e in periodiche.CADENCE_IDS:
+                    try:
+                        d_new = date.fromisoformat(next_iso[:10])
+                        rule_obj["last_materialized_iso"] = periodiche.previous_by_cadence(
+                            d_new, cad_e
+                        ).isoformat()
+                    except Exception:
+                        pass
+
+        def _open_periodic_date_edit() -> None:
+            top = tk.Toplevel(root)
+            top.title("Modifica prossima scadenza")
+            top.transient(root)
+            frm = ttk.Frame(top, padding=12)
+            frm.pack(fill=tk.BOTH, expand=True)
+            ttk.Label(frm, text=_rule_title_text()).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+            cur_due = periodiche.next_due_date(rule)
+            v = tk.StringVar(value=to_italian_date((cur_due or date.today()).isoformat()))
+            ent = ttk.Entry(frm, textvariable=v, width=_NR_W_DATE)
+            ttk.Label(frm, text="Prossima scadenza").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+            ent.grid(row=1, column=1, sticky="w", pady=4)
+
+            def on_ok() -> None:
+                iso = parse_italian_ddmmyyyy_to_iso(v.get())
+                if not iso:
+                    messagebox.showerror("Registrazioni periodiche", "Data non valida (gg/mm/aaaa).", parent=top)
+                    return
+                dsel = date.fromisoformat(iso)
+                dmin, dmax = immissione_date_bounds()
+                if dsel < dmin or dsel > dmax:
+                    messagebox.showerror(
+                        "Registrazioni periodiche",
+                        "Data fuori intervallo consentito (da -1 anno a +1 anno rispetto a oggi).",
+                        parent=top,
+                    )
+                    return
+                if not messagebox.askyesno(
+                    "Registrazioni periodiche",
+                    "Confermi la modifica della prossima scadenza?",
+                    parent=top,
+                ):
+                    return
+                old_regs = copy.deepcopy(cur_db().get("periodic_registrations", []))
+                _set_rule_next_due(rule, iso)
+                if _per_save_rules_change("Prossima scadenza modificata (solo creazioni future).", old_regs):
+                    top.destroy()
+
+            bf = ttk.Frame(frm)
+            bf.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            ttk.Button(bf, text="Salva", command=on_ok).pack(side=tk.LEFT)
+            ttk.Button(bf, text="Annulla", command=top.destroy).pack(side=tk.LEFT, padx=(8, 0))
+            bind_return_and_kp_enter(ent, lambda _e: (on_ok(), "break")[1])
+            ent.focus_set()
+            ent.select_range(0, tk.END)
+
+        def _open_periodic_cadence_edit() -> None:
+            top = tk.Toplevel(root)
+            top.title("Modifica cadenza")
+            top.transient(root)
+            frm = ttk.Frame(top, padding=12)
+            frm.pack(fill=tk.BOTH, expand=True)
+            ttk.Label(frm, text=_rule_title_text()).pack(anchor=tk.W, pady=(0, 8))
+            labels = [lab for _cid, lab in periodiche.CADENCE_CHOICES]
+            current_lab = periodiche.cadence_label(str(rule.get("cadence") or "monthly"))
+            v = tk.StringVar(value=current_lab if current_lab in labels else labels[0])
+            cb = ttk.Combobox(frm, textvariable=v, values=labels, state="readonly", width=18)
+            cb.pack(anchor=tk.W)
+
+            def on_ok() -> None:
+                cid = next((c for c, lab in periodiche.CADENCE_CHOICES if lab == v.get()), "")
+                if cid not in periodiche.CADENCE_IDS:
+                    messagebox.showerror("Registrazioni periodiche", "Seleziona una cadenza.", parent=top)
+                    return
+                if not messagebox.askyesno("Registrazioni periodiche", "Confermi la modifica della cadenza?", parent=top):
+                    return
+                old_regs = copy.deepcopy(cur_db().get("periodic_registrations", []))
+                rule["cadence"] = cid
+                if _per_save_rules_change("Cadenza modificata (solo creazioni future).", old_regs):
+                    top.destroy()
+
+            bf = ttk.Frame(frm)
+            bf.pack(anchor=tk.W, pady=(10, 0))
+            ttk.Button(bf, text="Salva", command=on_ok).pack(side=tk.LEFT)
+            ttk.Button(bf, text="Annulla", command=top.destroy).pack(side=tk.LEFT, padx=(8, 0))
+
+        def _open_periodic_category_edit() -> None:
+            top = tk.Toplevel(root)
+            top.title("Modifica categoria")
+            top.transient(root)
+            frm = ttk.Frame(top, padding=12)
+            frm.pack(fill=tk.BOTH, expand=True)
+            ttk.Label(frm, text=_rule_title_text()).pack(anchor=tk.W, pady=(0, 8))
+            values = [n for n, _c in cat_opts_cache]
+            tpl = rule.get("template") or {}
+            cur_name = category_display_name(str(tpl.get("category_name") or ""))
+            v = tk.StringVar(value=cur_name if cur_name in values else (values[0] if values else ""))
+            cb = ttk.Combobox(frm, textvariable=v, values=values, state="readonly", width=_NR_W_CAT)
+            cb.pack(anchor=tk.W)
+
+            def on_ok() -> None:
+                cat_name = v.get().strip()
+                cat_code = next((c for n, c in cat_opts_cache if n == cat_name), "")
+                if not cat_code:
+                    messagebox.showerror("Registrazioni periodiche", "Categoria obbligatoria.", parent=top)
+                    return
+                if virtuale_discharge_active[0] and _is_giro_label(cat_name):
+                    messagebox.showerror(
+                        "Registrazioni periodiche",
+                        "Durante lo scarico del saldo virtuale non è possibile usare una Girata conto/conto.",
+                        parent=top,
+                    )
+                    return
+                if not messagebox.askyesno("Registrazioni periodiche", "Confermi la modifica della categoria?", parent=top):
+                    return
+                old_regs = copy.deepcopy(cur_db().get("periodic_registrations", []))
+                giro = _is_giro_label(cat_name)
+                tpl["category_code"] = cat_code
+                tpl["category_name"] = cat_raw_name_by_code_cache.get(cat_code, cat_name)
+                tpl["category_note"] = cat_note_by_code_cache.get(cat_code, "") or ""
+                tpl["is_giroconto"] = giro
+                if giro:
+                    amt = to_decimal(str(tpl.get("amount_eur") or "0"))
+                    tpl["amount_eur"] = format_money(-abs(amt))
+                    names = [n for n, _c in acc_opts_cache]
+                    sec_name = str(tpl.get("account_secondary_name") or "").strip()
+                    if names:
+                        pri_current = str(tpl.get("account_primary_name") or "").strip()
+                        if not sec_name or sec_name == pri_current:
+                            tpl["account_secondary_name"] = next((n for n in names if n != pri_current), names[0])
+                            sec_name = str(tpl.get("account_secondary_name") or "")
+                    tpl["account_secondary_code"] = next((c for n, c in acc_opts_cache if n == sec_name), "")
+                    if not tpl["account_secondary_code"] or tpl["account_secondary_code"] == tpl.get("account_primary_code"):
+                        cur_db()["periodic_registrations"] = old_regs
+                        messagebox.showerror(
+                            "Registrazioni periodiche",
+                            "Nel giroconto il secondo conto è obbligatorio e diverso dal primo.",
+                            parent=top,
+                        )
+                        top.destroy()
+                        return
+                    if not (str(tpl.get("note") or "").strip()) or str(tpl.get("note") or "").strip() == "-":
+                        tpl["note"] = "Giroconto"
+                else:
+                    tpl["account_secondary_code"] = ""
+                    tpl["account_secondary_flags"] = ""
+                    tpl["account_secondary_name"] = ""
+                    if str(tpl.get("note") or "").strip().lower() == "giroconto":
+                        tpl["note"] = "-"
+                if _per_save_rules_change("Categoria modificata (solo creazioni future).", old_regs):
+                    top.destroy()
+
+            bf = ttk.Frame(frm)
+            bf.pack(anchor=tk.W, pady=(10, 0))
+            ttk.Button(bf, text="Salva", command=on_ok).pack(side=tk.LEFT)
+            ttk.Button(bf, text="Annulla", command=top.destroy).pack(side=tk.LEFT, padx=(8, 0))
+
+        def _open_periodic_account_edit(*, secondary: bool) -> None:
+            tpl = rule.get("template") or {}
+            if secondary and not bool(tpl.get("is_giroconto")):
+                messagebox.showinfo("Registrazioni periodiche", "Il secondo conto si usa solo per Girata conto/conto.")
+                return
+            top = tk.Toplevel(root)
+            top.title("Modifica secondo conto" if secondary else "Modifica conto")
+            top.transient(root)
+            frm = ttk.Frame(top, padding=12)
+            frm.pack(fill=tk.BOTH, expand=True)
+            ttk.Label(frm, text=_rule_title_text()).pack(anchor=tk.W, pady=(0, 8))
+            values = [n for n, _c in acc_opts_cache]
+            key_name = "account_secondary_name" if secondary else "account_primary_name"
+            current = str(tpl.get(key_name) or "")
+            v = tk.StringVar(value=current if current in values else (values[0] if values else ""))
+            cb = ttk.Combobox(frm, textvariable=v, values=values, state="readonly", width=_NR_W_ACC)
+            cb.pack(anchor=tk.W)
+
+            def on_ok() -> None:
+                name = v.get().strip()
+                code = next((c for n, c in acc_opts_cache if n == name), "")
+                if not code:
+                    messagebox.showerror("Registrazioni periodiche", "Conto obbligatorio.", parent=top)
+                    return
+                other_key = "account_primary_code" if secondary else "account_secondary_code"
+                if bool(tpl.get("is_giroconto")) and code == str(tpl.get(other_key) or ""):
+                    messagebox.showerror(
+                        "Registrazioni periodiche",
+                        "Nel giroconto i due conti devono essere diversi.",
+                        parent=top,
+                    )
+                    return
+                label = "secondo conto" if secondary else "conto"
+                if not messagebox.askyesno("Registrazioni periodiche", f"Confermi la modifica del {label}?", parent=top):
+                    return
+                old_regs = copy.deepcopy(cur_db().get("periodic_registrations", []))
+                if secondary:
+                    tpl["account_secondary_name"] = name
+                    tpl["account_secondary_code"] = code
+                else:
+                    tpl["account_primary_name"] = name
+                    tpl["account_primary_code"] = code
+                    tpl["account_primary_with_flags"] = code
+                if _per_save_rules_change(f"{label.capitalize()} modificato (solo creazioni future).", old_regs):
+                    top.destroy()
+
+            bf = ttk.Frame(frm)
+            bf.pack(anchor=tk.W, pady=(10, 0))
+            ttk.Button(bf, text="Salva", command=on_ok).pack(side=tk.LEFT)
+            ttk.Button(bf, text="Annulla", command=top.destroy).pack(side=tk.LEFT, padx=(8, 0))
+
+        def _open_periodic_amount_edit() -> None:
+            top = tk.Toplevel(root)
+            top.title("Modifica importo")
+            top.transient(root)
+            frm = ttk.Frame(top, padding=12)
+            frm.pack(fill=tk.BOTH, expand=True)
+            ttk.Label(frm, text=_rule_title_text()).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+            tpl = rule.get("template") or {}
+            try:
+                amt_dec = to_decimal(str(tpl.get("amount_eur") or "0"))
+            except Exception:
+                amt_dec = Decimal("0")
+            v = tk.StringVar(value=("-" if amt_dec < 0 else "+") + format_euro_it(abs(amt_dec)))
+            ent = ttk.Entry(frm, textvariable=v, width=_NR_W_AMT)
+            ttk.Label(frm, text="Importo (€)").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+            ent.grid(row=1, column=1, sticky="w", pady=4)
+            bind_euro_amount_entry_validation(
+                ent,
+                v,
+                allow_leading_sign=True,
+                require_leading_sign=True,
+                reject_zero=False,
+                cursor_after_sign_on_focus=True,
+            )
+
+            def on_ok() -> None:
+                try:
+                    amt = normalize_euro_input(v.get())
+                except Exception as exc:
+                    messagebox.showerror("Registrazioni periodiche", str(exc), parent=top)
+                    return
+                if bool(tpl.get("is_giroconto")):
+                    amt = -abs(amt)
+                elif str(v.get()).strip().startswith("-"):
+                    amt = -abs(amt)
+                else:
+                    amt = abs(amt)
+                if not messagebox.askyesno("Registrazioni periodiche", "Confermi la modifica dell'importo?", parent=top):
+                    return
+                if amt == Decimal("0.00"):
+                    messagebox.showerror("Registrazioni periodiche", "Importo a zero non ammesso.", parent=top)
+                    return
+                old_regs = copy.deepcopy(cur_db().get("periodic_registrations", []))
+                tpl["amount_eur"] = format_money(amt)
+                if _per_save_rules_change("Importo modificato (solo creazioni future).", old_regs):
+                    top.destroy()
+
+            bf = ttk.Frame(frm)
+            bf.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            ttk.Button(bf, text="Salva", command=on_ok).pack(side=tk.LEFT)
+            ttk.Button(bf, text="Annulla", command=top.destroy).pack(side=tk.LEFT, padx=(8, 0))
+            bind_return_and_kp_enter(ent, lambda _e: (on_ok(), "break")[1])
+            ent.focus_set()
+            ent.select_range(0, tk.END)
+
+        def _open_periodic_note_edit() -> None:
+            top = tk.Toplevel(root)
+            top.title("Modifica nota")
+            top.transient(root)
+            frm = ttk.Frame(top, padding=12)
+            frm.pack(fill=tk.BOTH, expand=True)
+            ttk.Label(frm, text=_rule_title_text()).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+            tpl = rule.get("template") or {}
+            current = "" if str(tpl.get("note") or "") == "-" else str(tpl.get("note") or "")
+            v = tk.StringVar(value=current)
+            ent = ttk.Entry(frm, textvariable=v, width=_NR_W_NOTE)
+            ttk.Label(frm, text="Nota").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+            ent.grid(row=1, column=1, sticky="w", pady=4)
+            bind_limited_single_line_text_entry(ent, v, max_len=MAX_RECORD_NOTE_LEN)
+
+            def on_ok() -> None:
+                if not messagebox.askyesno("Registrazioni periodiche", "Confermi la modifica della nota?", parent=top):
+                    return
+                note = format_record_note_stored(
+                    sanitize_single_line_text(v.get() or "", max_len=MAX_RECORD_NOTE_LEN)
+                )
+                old_regs = copy.deepcopy(cur_db().get("periodic_registrations", []))
+                tpl["note"] = note if note else "-"
+                if _per_save_rules_change("Nota modificata (solo creazioni future).", old_regs):
+                    top.destroy()
+
+            bf = ttk.Frame(frm)
+            bf.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            ttk.Button(bf, text="Salva", command=on_ok).pack(side=tk.LEFT)
+            ttk.Button(bf, text="Annulla", command=top.destroy).pack(side=tk.LEFT, padx=(8, 0))
+            bind_return_and_kp_enter(ent, lambda _e: (on_ok(), "break")[1])
+            ent.focus_set()
+            ent.icursor(tk.END)
+
+        chooser = tk.Toplevel(root)
+        chooser.title("Modifica registrazione periodica")
+        chooser.transient(root)
+        frm = ttk.Frame(chooser, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, text="Quale campo vuoi modificare?").pack(anchor=tk.W)
+        ttk.Label(frm, text=_rule_title_text()).pack(anchor=tk.W, pady=(2, 10))
+
+        def _choice(label: str, fn: Callable[[], None]) -> None:
+            ttk.Button(frm, text=label, command=lambda: (chooser.destroy(), fn())).pack(fill=tk.X, anchor=tk.W, pady=2)
+
+        _choice("Prossima scadenza", _open_periodic_date_edit)
+        _choice("Cadenza", _open_periodic_cadence_edit)
+        _choice("Categoria", _open_periodic_category_edit)
+        _choice("Conto", lambda: _open_periodic_account_edit(secondary=False))
+        _choice("Secondo conto", lambda: _open_periodic_account_edit(secondary=True))
+        _choice("Importo", _open_periodic_amount_edit)
+        _choice("Nota", _open_periodic_note_edit)
+        ttk.Button(frm, text="Annulla", command=chooser.destroy).pack(fill=tk.X, anchor=tk.W, pady=(8, 0))
 
     cb_per_cat.bind("<<ComboboxSelected>>", lambda _e: _per_sync_cat_and_second())
     cb_per_acc1.bind("<<ComboboxSelected>>", lambda _e: _per_sync_cat_and_second())
@@ -14131,9 +14568,10 @@ th {{ background:#efefef; text-align:left; }}
         per_amount_var,
         allow_leading_sign=True,
         require_leading_sign=True,
-        reject_zero=True,
+        reject_zero=False,
         on_enter=lambda: _per_enter_from_amt(None),
         cursor_after_sign_on_focus=True,
+        format_zero=False,
     )
     def _per_oggi_click() -> None:
         dmin, dmax = immissione_date_bounds()
@@ -14185,11 +14623,6 @@ th {{ background:#efefef; text-align:left; }}
             else:
                 amt_chk = abs(amt_chk)
             if amt_chk == Decimal("0.00"):
-                messagebox.showerror("Registrazioni periodiche", "Importo a zero non ammesso.")
-                try:
-                    ent_per_amt.focus_set()
-                except Exception:
-                    pass
                 return "break"
         except Exception:
             messagebox.showerror(
@@ -14269,38 +14702,43 @@ th {{ background:#efefef; text-align:left; }}
         _per_mirror_tree_selection(_e)
         _per_tree_select()
 
+    def _per_scroll_rows(units: int) -> None:
+        if units == 0:
+            return
+        # tree_per è la griglia master: il suo yscrollcommand sincronizza importo e nota.
+        tree_per.yview("scroll", units, "units")
+
     def _per_tree_wheel(event: tk.Event) -> str:
         d = getattr(event, "delta", 0)
         if d:
             u = int(-d / 120)
-            tree_per.yview("scroll", u, "units")
-            tree_per_amt.yview("scroll", u, "units")
-            tree_per_note.yview("scroll", u, "units")
+            if u == 0:
+                u = -1 if d > 0 else 1
+            _per_scroll_rows(u)
         return "break"
 
     def _per_tree_wheel_linux(event: tk.Event) -> str:
         if event.num == 4:
-            tree_per.yview("scroll", -1, "units")
-            tree_per_amt.yview("scroll", -1, "units")
-            tree_per_note.yview("scroll", -1, "units")
+            _per_scroll_rows(-1)
         elif event.num == 5:
-            tree_per.yview("scroll", 1, "units")
-            tree_per_amt.yview("scroll", 1, "units")
-            tree_per_note.yview("scroll", 1, "units")
+            _per_scroll_rows(1)
         return "break"
+
+    def _bind_per_tree_mousewheel_recursive(w: tk.Misc) -> None:
+        w.bind("<MouseWheel>", _per_tree_wheel, add="+")
+        w.bind("<Button-4>", _per_tree_wheel_linux, add="+")
+        w.bind("<Button-5>", _per_tree_wheel_linux, add="+")
+        try:
+            children = w.winfo_children()
+        except Exception:
+            children = []
+        for child in children:
+            _bind_per_tree_mousewheel_recursive(child)
 
     tree_per.bind("<<TreeviewSelect>>", _per_on_tree_row_select)
     tree_per_amt.bind("<<TreeviewSelect>>", _per_on_tree_row_select)
     tree_per_note.bind("<<TreeviewSelect>>", _per_on_tree_row_select)
-    tree_per.bind("<MouseWheel>", _per_tree_wheel, add="+")
-    tree_per_amt.bind("<MouseWheel>", _per_tree_wheel, add="+")
-    tree_per_note.bind("<MouseWheel>", _per_tree_wheel, add="+")
-    tree_per.bind("<Button-4>", _per_tree_wheel_linux, add="+")
-    tree_per.bind("<Button-5>", _per_tree_wheel_linux, add="+")
-    tree_per_amt.bind("<Button-4>", _per_tree_wheel_linux, add="+")
-    tree_per_amt.bind("<Button-5>", _per_tree_wheel_linux, add="+")
-    tree_per_note.bind("<Button-4>", _per_tree_wheel_linux, add="+")
-    tree_per_note.bind("<Button-5>", _per_tree_wheel_linux, add="+")
+    _bind_per_tree_mousewheel_recursive(per_tree_frame)
 
     def _per_widget_under_list_block(w: tk.Misc | None) -> bool:
         if w is None:
@@ -14594,11 +15032,6 @@ th {{ background:#efefef; text-align:left; }}
             else:
                 amt_chk = -abs(amt_chk) if newreg_sign_var.get() == "-" else abs(amt_chk)
             if amt_chk == Decimal("0.00"):
-                messagebox.showerror("Nuova registrazione", "Importo a zero non ammesso.")
-                try:
-                    ent_amt.focus_set()
-                except Exception:
-                    pass
                 return "break"
         except Exception:
             messagebox.showerror(
@@ -14649,9 +15082,10 @@ th {{ background:#efefef; text-align:left; }}
         newreg_amount_var,
         allow_leading_sign=True,
         require_leading_sign=True,
-        reject_zero=True,
+        reject_zero=False,
         on_enter=lambda: _on_amt_enter(None),
         cursor_after_sign_on_focus=True,
+        format_zero=False,
     )
     ent_amt.bind("<FocusOut>", _on_amt_focusout, add="+")
     bind_return_and_kp_enter(ent_chq, _on_chq_enter)
