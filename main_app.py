@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import html as html_module
+import importlib
 import json
 import os
 import re
@@ -19,7 +20,7 @@ import tkinter as tk
 import webbrowser
 import atexit
 from collections.abc import Callable
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 from datetime import date, datetime, timedelta
@@ -84,6 +85,13 @@ DEFAULT_VIRTUALE_SALDO_FILE = Path.home() / "Library/Application Support/ContiDi
 VIRTUALE_ACCOUNT_NAME = "VIRTUALE"
 DEBUG_LOG_PATH = "/Users/macand/Library/CloudStorage/Dropbox/CursorAppMacCdc/.cursor/debug-8c5304.log"
 DEBUG_SESSION_ID = "8c5304"
+
+# Import legacy conservato nel codice ma non più eseguibile: il DB cifrato corrente è la fonte definitiva.
+LEGACY_IMPORT_ENABLED = False
+LEGACY_IMPORT_DISABLED_MESSAGE = (
+    "Import legacy disabilitato: il database cifrato corrente è ormai la fonte definitiva. "
+    "Usa i backup del DB corrente per eventuali ripristini."
+)
 
 # Inserimento griglia a lotti: migliaia di righe × 3 Treeview bloccano il main thread (macOS: beach ball).
 MOVEMENTS_INSERT_BATCH = 400
@@ -1667,6 +1675,17 @@ def record_is_within_recent_mod_delete_window(rec: dict) -> bool:
     return rd >= RECORD_MOD_DELETE_CUTOFF_DATE
 
 
+def record_is_before_2022(rec: dict) -> bool:
+    iso = str(rec.get("date_iso", "")).strip()
+    if not iso:
+        return False
+    try:
+        rd = date.fromisoformat(iso)
+    except Exception:
+        return False
+    return rd < date(2022, 1, 1)
+
+
 def record_contains_any_asterisk(rec: dict) -> bool:
     """True se qualunque campo stringa della registrazione contiene '*'."""
     for v in rec.values():
@@ -2305,6 +2324,31 @@ def sanitize_single_line_text(value: str, *, max_len: int | None = None) -> str:
     """Normalizza testo utente su una riga (rimuove CR/LF) e applica trim/lunghezza."""
     out = (value or "").replace("\r", " ").replace("\n", " ").strip()
     return out[:max_len] if max_len is not None else out
+
+
+def bind_limited_single_line_text_entry(entry: tk.Misc, var: tk.StringVar, *, max_len: int) -> None:
+    """Impedisce a un campo testuale breve di superare il limite anche durante digitazione/incolla."""
+    busy = [False]
+
+    def _cleanup(*_args: object) -> None:
+        if busy[0]:
+            return
+        current = var.get() or ""
+        cleaned = sanitize_single_line_text(current, max_len=max_len)
+        if cleaned == current:
+            return
+        busy[0] = True
+        try:
+            var.set(cleaned)
+            try:
+                entry.icursor(tk.END)
+            except Exception:
+                pass
+        finally:
+            busy[0] = False
+
+    var.trace_add("write", _cleanup)
+    _cleanup()
 
 
 def apply_amount_to_record(rec: dict, amount: Decimal) -> None:
@@ -4404,8 +4448,8 @@ def _print_balances_native_windows(html_utf8: str) -> bool:
     Su Windows 11 IE può mancare: in quel caso ritorna False e si usa il fallback browser.
     """
     try:
-        import pythoncom
-        import win32com.client
+        pythoncom = importlib.import_module("pythoncom")
+        win32com_client = importlib.import_module("win32com.client")
     except ImportError:
         return False
     tmp_path: str | None = None
@@ -4421,7 +4465,7 @@ def _print_balances_native_windows(html_utf8: str) -> bool:
             f.write(html_utf8)
             tmp_path = str(Path(f.name).resolve())
         url = Path(tmp_path).resolve().as_uri()
-        ie = win32com.client.DispatchEx("InternetExplorer.Application")
+        ie = win32com_client.DispatchEx("InternetExplorer.Application")
         ie.Visible = 1
         ie.Navigate2(url)
 
@@ -4461,7 +4505,7 @@ def _print_balances_windows_pywebview(html_utf8: str) -> bool:
     separato per non bloccare Tk.
     """
     try:
-        import webview  # noqa: F401
+        importlib.import_module("webview")
     except ImportError:
         return False
     worker = Path(__file__).resolve().parent / "webview_print_worker.py"
@@ -5826,6 +5870,9 @@ def load_database_at_startup(*, sync_ui_parent: tk.Misc | None = None) -> tuple[
             _finalize_startup_db_with_light_sidecar(db, boot_enc)
             return db, boot_enc
 
+    if not LEGACY_IMPORT_ENABLED:
+        raise RuntimeError(LEGACY_IMPORT_DISABLED_MESSAGE)
+
     data_workspace.legacy_import_dir().mkdir(parents=True, exist_ok=True)
     out_json = data_workspace.default_legacy_json_output()
     print(
@@ -6767,21 +6814,21 @@ def build_ui(
     mov_tree.heading("mov_pad", text="")
     mov_tree.column("mov_pad", width=1, minwidth=1, stretch=False, anchor=tk.CENTER)
     mov_tree.heading("reg_display", text="Reg #", anchor="e")
-    mov_tree.column("reg_display", width=62, anchor="e", stretch=False, minwidth=50)
+    mov_tree.column("reg_display", width=58, anchor="e", stretch=False, minwidth=48)
     mov_tree.heading("date_it", text="Data", anchor="e")
     mov_tree.heading("category_name", text="Categoria", anchor="w")
     mov_tree.heading("account_primary_name", text="Dal conto", anchor="w")
     mov_tree.heading("account_primary_flags", text="")
     mov_tree.heading("account_secondary_name", text="al conto", anchor="w")
     mov_tree.heading("account_secondary_flags", text="")
-    mov_tree.heading("cheque", text="Assegno")
-    mov_tree.column("date_it", width=92, anchor="e", stretch=False, minwidth=80)
-    mov_tree.column("category_name", width=160, anchor="w", stretch=True, minwidth=80)
-    mov_tree.column("account_primary_name", width=130, anchor="w", stretch=True, minwidth=70)
-    mov_tree.column("account_primary_flags", width=36, anchor=tk.CENTER, stretch=False, minwidth=32)
-    mov_tree.column("account_secondary_name", width=150, anchor="w", stretch=True, minwidth=70)
-    mov_tree.column("account_secondary_flags", width=36, anchor=tk.CENTER, stretch=False, minwidth=32)
-    mov_tree.column("cheque", width=78, anchor=tk.CENTER, stretch=False, minwidth=60)
+    mov_tree.heading("cheque", text="Assegno", anchor="w")
+    mov_tree.column("date_it", width=78, anchor="e", stretch=False, minwidth=74)
+    mov_tree.column("category_name", width=146, anchor="w", stretch=False, minwidth=130)
+    mov_tree.column("account_primary_name", width=110, anchor="w", stretch=False, minwidth=100)
+    mov_tree.column("account_primary_flags", width=24, anchor=tk.CENTER, stretch=False, minwidth=22)
+    mov_tree.column("account_secondary_name", width=110, anchor="w", stretch=False, minwidth=100)
+    mov_tree.column("account_secondary_flags", width=24, anchor=tk.CENTER, stretch=False, minwidth=22)
+    mov_tree.column("cheque", width=76, anchor="w", stretch=False, minwidth=68)
 
     mov_tree.tag_configure("stripe0", background=CDC_GRID_STRIPE0_BG)
     mov_tree.tag_configure("stripe1", background=CDC_GRID_STRIPE1_BG)
@@ -6906,7 +6953,7 @@ def build_ui(
         style="MovGridAmount.Treeview",
     )
     amt_tree.heading("amount_eur", text="Importo", anchor="e")
-    amt_tree.column("amount_eur", width=128, anchor="e", stretch=False, minwidth=96)
+    amt_tree.column("amount_eur", width=116, anchor="e", stretch=False, minwidth=96)
     amt_tree.tag_configure("neg", foreground=COLOR_AMOUNT_NEG)
     amt_tree.tag_configure("pos", foreground=COLOR_AMOUNT_POS)
     amt_tree.tag_configure("stripe0", background=CDC_GRID_STRIPE0_BG)
@@ -6920,7 +6967,7 @@ def build_ui(
         style="MovGrid.Treeview",
     )
     note_tree.heading("note", text="Nota", anchor="w")
-    note_tree.column("note", width=280, anchor="w", stretch=True, minwidth=120)
+    note_tree.column("note", width=420, anchor="w", stretch=True, minwidth=180)
     note_tree.tag_configure("stripe0", background=CDC_GRID_STRIPE0_BG)
     note_tree.tag_configure("stripe1", background=CDC_GRID_STRIPE1_BG)
 
@@ -6944,22 +6991,22 @@ def build_ui(
     hdr_sep_2_line = tk.Frame(hdr_sep_2, bg="#c0c0c0", width=1)
 
     # La riga header deve seguire la griglia principale (mov / amt / note).
-    header_row.grid_columnconfigure(0, weight=1, minsize=120)  # mov_hdr
+    header_row.grid_columnconfigure(0, weight=0, minsize=120)  # mov_hdr
     header_row.grid_columnconfigure(1, weight=0, minsize=_SEP_CH_W)    # sep
-    header_row.grid_columnconfigure(2, weight=0, minsize=104)  # amt_hdr
+    header_row.grid_columnconfigure(2, weight=0, minsize=116)  # amt_hdr
     header_row.grid_columnconfigure(3, weight=0, minsize=_SEP_CH_W)    # sep
-    header_row.grid_columnconfigure(4, weight=1, minsize=100)  # note_hdr
+    header_row.grid_columnconfigure(4, weight=1, minsize=180)  # note_hdr
 
     # Mov header columns (pixel widths = come Treeview)
     mov_hdr.grid_columnconfigure(0, minsize=1)    # mov_pad
-    mov_hdr.grid_columnconfigure(1, minsize=62)   # Reg #
-    mov_hdr.grid_columnconfigure(2, minsize=92)   # Data
-    mov_hdr.grid_columnconfigure(3, weight=1, minsize=160)  # Categoria
-    mov_hdr.grid_columnconfigure(4, weight=1, minsize=130)  # Dal conto
-    mov_hdr.grid_columnconfigure(5, minsize=36)   # flags
-    mov_hdr.grid_columnconfigure(6, weight=1, minsize=150)  # al conto
-    mov_hdr.grid_columnconfigure(7, minsize=36)   # flags2
-    mov_hdr.grid_columnconfigure(8, minsize=78)   # Assegno
+    mov_hdr.grid_columnconfigure(1, minsize=58)   # Reg #
+    mov_hdr.grid_columnconfigure(2, minsize=78)   # Data
+    mov_hdr.grid_columnconfigure(3, minsize=146)  # Categoria
+    mov_hdr.grid_columnconfigure(4, minsize=110)  # Dal conto
+    mov_hdr.grid_columnconfigure(5, minsize=24)   # flags
+    mov_hdr.grid_columnconfigure(6, minsize=110)  # al conto
+    mov_hdr.grid_columnconfigure(7, minsize=24)   # flags2
+    mov_hdr.grid_columnconfigure(8, minsize=76)   # Assegno
 
     tk.Label(mov_hdr, text="", bg=header_bg, fg=header_fg, font=header_font).grid(row=0, column=0, sticky="ew")
     tk.Label(mov_hdr, text="Reg #", bg=header_bg, fg=header_fg, font=header_font, anchor="center").grid(row=0, column=1, sticky="ew")
@@ -6969,7 +7016,7 @@ def build_ui(
     tk.Label(mov_hdr, text="", bg=header_bg, fg=header_fg, font=header_font).grid(row=0, column=5, sticky="ew")
     tk.Label(mov_hdr, text="al conto", bg=header_bg, fg=header_fg, font=header_font, anchor="w").grid(row=0, column=6, sticky="ew")
     tk.Label(mov_hdr, text="", bg=header_bg, fg=header_fg, font=header_font).grid(row=0, column=7, sticky="ew")
-    tk.Label(mov_hdr, text="Assegno", bg=header_bg, fg=header_fg, font=header_font, anchor="center").grid(row=0, column=8, sticky="ew")
+    tk.Label(mov_hdr, text="Assegno", bg=header_bg, fg=header_fg, font=header_font, anchor="w").grid(row=0, column=8, sticky="ew")
 
     # Linee verticali in intestazione (mov_hdr): overlay, coerenti con le larghezze del Treeview.
     mov_hdr_vlines: list[tk.Frame] = []
@@ -7028,10 +7075,10 @@ def build_ui(
     mov_hdr.bind("<Configure>", _schedule_mov_hdr_vlines_on_configure, add=True)
     root.after(0, _position_mov_hdr_vlines)
 
-    amt_hdr.grid_columnconfigure(0, weight=1, minsize=128)
+    amt_hdr.grid_columnconfigure(0, weight=1, minsize=116)
     tk.Label(amt_hdr, text="Importo", bg=header_bg, fg=header_fg, font=header_font, anchor="e").grid(row=0, column=0, sticky="ew")
 
-    note_hdr.grid_columnconfigure(0, weight=1, minsize=280)
+    note_hdr.grid_columnconfigure(0, weight=1, minsize=420)
     tk.Label(note_hdr, text="Nota", bg=header_bg, fg=header_fg, font=header_font, anchor="w").grid(row=0, column=0, sticky="ew")
 
     yscroll = ttk.Scrollbar(records_frame, orient=tk.VERTICAL, command=mov_tree.yview)
@@ -7327,6 +7374,7 @@ def build_ui(
         want_elimina = False
         want_msg = False
         want_modifica = False
+        category_only_legacy = False
         has_verifica_flags = False
         forza_ok_recency = False
         msg_text = (
@@ -7345,12 +7393,23 @@ def build_ui(
                     want_msg = True
                     msg_text = "Conto congelato: la registrazione non è modificabile né eliminabile."
                 elif not record_is_within_recent_mod_delete_window(rec):
-                    want_msg = True
+                    if record_is_before_2022(rec) and not is_giroconto_record(rec):
+                        want_modifica = True
+                        category_only_legacy = True
+                    else:
+                        want_msg = True
+                elif record_is_before_2022(rec):
+                    want_modifica = True
+                    category_only_legacy = True
                 else:
                     want_modifica = True
                     if record_contains_any_asterisk(rec):
                         want_msg = True
                         msg_text = "Registrazione verificata non cancellabile."
+
+                if category_only_legacy:
+                    want_msg = True
+                    msg_text = "Registrazione storica: modificabile solo la categoria."
 
         want_forza = (
             has_verifica_flags
@@ -7358,7 +7417,7 @@ def build_ui(
             and forza_ok_recency
             and correzione_forza_revealed[0]
         )
-        want_elimina = want_modifica and (not want_forza)
+        want_elimina = want_modifica and (not want_forza) and (not category_only_legacy)
         if sel:
             pair = find_record_year_and_ref(cur_db(), sel[0])
             if pair:
@@ -7528,11 +7587,27 @@ def build_ui(
                 parent=root,
             )
             return
-        if not record_is_within_edit_age(rec):
+        category_only_legacy = record_is_before_2022(rec)
+        if category_only_legacy and is_giroconto_record(rec):
+            messagebox.showwarning(
+                "Categoria",
+                "Le registrazioni storiche «GIRATA CONTO/CONTO» non possono essere riclassificate.",
+                parent=root,
+            )
+            return
+        if not record_is_within_edit_age(rec) and not category_only_legacy:
             return
         year_categories = year_categories_map(cur_db()).get(rec.get("year"), [])
         choices: list[tuple[str, str]] = []
         disp_to_raw: dict[str, str] = {}
+
+        def _norm_cat_mov_label(s: str) -> str:
+            return " ".join((s or "").strip().lower().replace(".", " ").replace("/", " / ").split())
+
+        def _is_girata_display_name(s: str) -> bool:
+            n = _norm_cat_mov_label(s)
+            return ("girata conto / conto" in n) or ("girata conto conto" in n)
+
         for i, c in enumerate(year_categories):
             code = str(c.get("code", str(i)))
             if code == "0":
@@ -7540,6 +7615,8 @@ def build_ui(
             if is_hidden_dotazione_category_name(str(c.get("name", ""))):
                 continue
             disp = category_display_name(c.get("name", ""))
+            if category_only_legacy and _is_girata_display_name(disp):
+                continue
             raw_nm = str(c.get("name", "") or "")
             choices.append((disp, code))
             disp_to_raw.setdefault(disp, raw_nm)
@@ -7548,19 +7625,8 @@ def build_ui(
             messagebox.showerror("Categoria", "Nessuna categoria disponibile per questo anno.")
             return
 
-        def _norm_cat_mov_label(s: str) -> str:
-            return " ".join((s or "").strip().lower().replace(".", " ").replace("/", " / ").split())
-
         consumi_disp = next((d for d, _c in choices if _norm_cat_mov_label(d) == "consumi ordinari"), None)
-        girata_disp = next(
-            (
-                d
-                for d, _c in choices
-                if ("girata conto / conto" in _norm_cat_mov_label(d))
-                or ("girata conto conto" in _norm_cat_mov_label(d))
-            ),
-            None,
-        )
+        girata_disp = None if category_only_legacy else next((d for d, _c in choices if _is_girata_display_name(d)), None)
         locked_heads = [x for x in (consumi_disp, girata_disp) if x]
         others = [(d, c) for d, c in choices if d not in locked_heads]
         others.sort(key=lambda it: it[0].lower())
@@ -7615,6 +7681,13 @@ def build_ui(
             code = next((code for d, code in choices if d == picked), None)
             if code is None:
                 messagebox.showerror("Categoria", "Selezione non valida.", parent=top)
+                return
+            if category_only_legacy and _is_girata_display_name(picked):
+                messagebox.showwarning(
+                    "Categoria",
+                    "Non è consentito applicare «GIRATA CONTO/CONTO» a una registrazione storica.",
+                    parent=top,
+                )
                 return
             sync_record_category_from_plan(rec, year_categories, code)
             top.destroy()
@@ -7790,7 +7863,9 @@ def build_ui(
         frm.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frm, text="Assegno:").grid(row=0, column=0, sticky="w")
         v = tk.StringVar(value=str(rec.get("cheque") or ""))
-        ttk.Entry(frm, textvariable=v, width=16).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ent_edit_cheque = ttk.Entry(frm, textvariable=v, width=MAX_CHEQUE_LEN)
+        ent_edit_cheque.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        bind_limited_single_line_text_entry(ent_edit_cheque, v, max_len=MAX_CHEQUE_LEN)
 
         def on_ok() -> None:
             rec["cheque"] = sanitize_single_line_text(v.get() or "", max_len=MAX_CHEQUE_LEN)
@@ -7919,7 +7994,9 @@ def build_ui(
         if not pair:
             return None
         _yd, rec = pair
-        if not record_is_within_recent_mod_delete_window(rec):
+        if not record_is_within_recent_mod_delete_window(rec) and not (
+            record_is_before_2022(rec) and not is_giroconto_record(rec)
+        ):
             return None
         return (sel[0], rec)
 
@@ -7947,11 +8024,8 @@ def build_ui(
                 parent=root,
             )
             return
-        is_virtuale_rec = _record_has_virtuale(rec0)
         forza_revealed_cell[0] = True
         refresh_bar()
-        has_star = record_has_account_verification_flags(rec0)
-        giro = is_giroconto_record(rec0)
         m = tk.Menu(menu_parent, tearoff=0)
 
         def run_edit(fn: Callable[[str], None]) -> None:
@@ -7959,19 +8033,8 @@ def build_ui(
             if cur2:
                 fn(cur2[0])
 
-        if is_virtuale_rec:
-            m.add_command(label="Assegno", command=lambda: run_edit(open_edit_cheque))
-            m.add_command(label="Nota", command=lambda: run_edit(open_edit_note))
-        else:
-            m.add_command(label="Data", command=lambda: run_edit(open_edit_date))
-            m.add_command(label="Categoria", command=lambda: run_edit(open_edit_category))
-            if not has_star:
-                m.add_command(label="Dal conto", command=lambda: run_edit(open_edit_account_primary))
-                if giro:
-                    m.add_command(label="al conto", command=lambda: run_edit(open_edit_account_secondary))
-                m.add_command(label="Importo", command=lambda: run_edit(open_edit_amount))
-            m.add_command(label="Assegno", command=lambda: run_edit(open_edit_cheque))
-            m.add_command(label="Nota", command=lambda: run_edit(open_edit_note))
+        for label, fn in _movimenti_edit_actions_for_record(rec0):
+            m.add_command(label=label, command=lambda f=fn: run_edit(f))
         try:
             m.tk_popup(event.x_root, event.y_root)
         finally:
@@ -7988,6 +8051,96 @@ def build_ui(
             forza_revealed_cell=correzione_forza_revealed,
             menu_parent=correzione_row,
         )
+
+    def _movimenti_edit_actions_for_record(rec: dict) -> list[tuple[str, Callable[[str], None]]]:
+        is_virtuale_rec = _record_has_virtuale(rec)
+        giro = is_giroconto_record(rec)
+        if is_virtuale_rec:
+            return [
+                ("Assegno", open_edit_cheque),
+                ("Nota", open_edit_note),
+            ]
+        if record_is_before_2022(rec) and not giro:
+            return [("Categoria", open_edit_category)]
+        actions: list[tuple[str, Callable[[str], None]]] = [
+            ("Data", open_edit_date),
+            ("Categoria", open_edit_category),
+        ]
+        if not record_has_account_verification_flags(rec):
+            actions.append(("Dal conto", open_edit_account_primary))
+            if giro:
+                actions.append(("al conto", open_edit_account_secondary))
+            actions.append(("Importo", open_edit_amount))
+        actions.extend(
+            [
+                ("Assegno", open_edit_cheque),
+                ("Nota", open_edit_note),
+            ]
+        )
+        return actions
+
+    def _movimenti_cell_edit_label(event: tk.Event, tree: ttk.Treeview) -> str | None:
+        if tree is amt_tree:
+            return "Importo"
+        if tree is note_tree:
+            return "Nota"
+        try:
+            col = tree.identify_column(event.x)
+        except tk.TclError:
+            return None
+        return {
+            "#3": "Data",
+            "#4": "Categoria",
+            "#5": "Dal conto",
+            "#7": "al conto",
+            "#8": "al conto",
+            "#9": "Assegno",
+        }.get(col)
+
+    def _run_single_movimenti_edit_action(stable_key: str, label: str) -> None:
+        pair = find_record_year_and_ref(cur_db(), stable_key)
+        if not pair:
+            return
+        _yd, rec = pair
+        if record_touches_frozen_account(cur_db(), rec):
+            messagebox.showwarning(
+                "Movimenti",
+                "La registrazione coinvolge un conto congelato: non è modificabile.",
+                parent=root,
+            )
+            return
+        actions = dict(_movimenti_edit_actions_for_record(rec))
+        fn = actions.get(label)
+        if fn is None:
+            return
+        fn(stable_key)
+
+    def on_movimenti_grid_context_menu(event: tk.Event) -> str:
+        tree = event.widget if isinstance(event.widget, ttk.Treeview) else mov_tree
+        try:
+            iid = tree.identify_row(event.y)
+        except tk.TclError:
+            iid = ""
+        if not iid:
+            sel = tree.selection()
+            iid = sel[0] if sel else ""
+        if iid:
+            for t in (mov_tree, amt_tree, note_tree):
+                try:
+                    t.selection_set(iid)
+                    t.focus(iid)
+                    t.see(iid)
+                except tk.TclError:
+                    pass
+        if not mov_tree.selection():
+            return "break"
+        refresh_correction_bar()
+        field_label = _movimenti_cell_edit_label(event, tree)
+        if field_label and iid:
+            root.after(1, lambda k=iid, lab=field_label: _run_single_movimenti_edit_action(k, lab))
+        else:
+            root.after(1, lambda e=event: on_modifica_reg_click(e))
+        return "break"
 
     def _flags_star_count(flags: str) -> int:
         return str(flags or "").count("*")
@@ -8246,6 +8399,10 @@ th {{ background:#efefef; text-align:left; }}
     btn_modifica_reg.bind("<Button-1>", on_modifica_reg_click)
     btn_forza_verifica.bind("<Button-1>", on_forza_verifica_click)
     btn_elimina_reg.bind("<Button-1>", on_elimina_reg_click)
+    for _t in (mov_tree, amt_tree, note_tree):
+        _t.bind("<Button-3>", on_movimenti_grid_context_menu, add="+")
+        _t.bind("<Button-2>", on_movimenti_grid_context_menu, add="+")
+        _t.bind("<Control-Button-1>", on_movimenti_grid_context_menu, add="+")
 
     def _on_selection_refresh_correction(_event: tk.Event | None = None) -> None:
         refresh_correction_bar()
@@ -8254,11 +8411,11 @@ th {{ background:#efefef; text-align:left; }}
         _t.bind("<<TreeviewSelect>>", _on_selection_refresh_correction, add="+")
 
     # Colonne griglia: mov | sep | amt | sep | note | scrollbar
-    records_frame.grid_columnconfigure(0, weight=1, minsize=120)
+    records_frame.grid_columnconfigure(0, weight=0, minsize=120)
     records_frame.grid_columnconfigure(1, weight=0, minsize=_SEP_CH_W)
-    records_frame.grid_columnconfigure(2, weight=0, minsize=104)
+    records_frame.grid_columnconfigure(2, weight=0, minsize=116)
     records_frame.grid_columnconfigure(3, weight=0, minsize=_SEP_CH_W)
-    records_frame.grid_columnconfigure(4, weight=1, minsize=100)
+    records_frame.grid_columnconfigure(4, weight=1, minsize=180)
     records_frame.grid_columnconfigure(5, weight=0, minsize=20)
     records_frame.grid_rowconfigure(0, weight=0)
     records_frame.grid_rowconfigure(1, weight=0)
@@ -8742,6 +8899,8 @@ th {{ background:#efefef; text-align:left; }}
                 highlightthickness=0,
             )
 
+    _FILTER_ROW_BUTTON_GAP = 8
+
     g1 = ttk.Frame(filters_row, style="MovCdc.TFrame")
     g1.pack(side=tk.LEFT, anchor=tk.W)
     btn_order_date = tk.Label(
@@ -8764,11 +8923,11 @@ th {{ background:#efefef; text-align:left; }}
     )
     btn_order_date.bind("<Button-1>", lambda _e: pick_order("date"))
     btn_order_reg.bind("<Button-1>", lambda _e: pick_order("registration"))
-    btn_order_date.pack(side=tk.LEFT, padx=(0, 8))
+    btn_order_date.pack(side=tk.LEFT, padx=(0, _FILTER_ROW_BUTTON_GAP))
     btn_order_reg.pack(side=tk.LEFT)
 
     g2 = ttk.Frame(filters_row, style="MovCdc.TFrame")
-    g2.pack(side=tk.LEFT, padx=(14, 0), anchor=tk.W)
+    g2.pack(side=tk.LEFT, padx=(_FILTER_ROW_BUTTON_GAP, 0), anchor=tk.W)
     btn_future_include = tk.Label(
         g2,
         text="Date future comprese",
@@ -8789,11 +8948,11 @@ th {{ background:#efefef; text-align:left; }}
     )
     btn_future_include.bind("<Button-1>", lambda _e: pick_future("include"))
     btn_future_exclude.bind("<Button-1>", lambda _e: pick_future("exclude"))
-    btn_future_include.pack(side=tk.LEFT, padx=(0, 8))
+    btn_future_include.pack(side=tk.LEFT, padx=(0, _FILTER_ROW_BUTTON_GAP))
     btn_future_exclude.pack(side=tk.LEFT)
 
     g3 = ttk.Frame(filters_row, style="MovCdc.TFrame")
-    g3.pack(side=tk.LEFT, padx=(14, 0), anchor=tk.W)
+    g3.pack(side=tk.LEFT, padx=(_FILTER_ROW_BUTTON_GAP, 0), anchor=tk.W)
     btn_dir_backward = tk.Label(
         g3,
         text="All'indietro, dalla più recente",
@@ -8814,7 +8973,7 @@ th {{ background:#efefef; text-align:left; }}
     )
     btn_dir_backward.bind("<Button-1>", lambda _e: pick_direction("backward"))
     btn_dir_forward.bind("<Button-1>", lambda _e: pick_direction("forward"))
-    btn_dir_backward.pack(side=tk.LEFT, padx=(0, 8))
+    btn_dir_backward.pack(side=tk.LEFT, padx=(0, _FILTER_ROW_BUTTON_GAP))
     btn_dir_forward.pack(side=tk.LEFT)
 
     def refresh_movement_filter_button_styles() -> None:
@@ -9143,13 +9302,39 @@ th {{ background:#efefef; text-align:left; }}
     _CERCA_GREEN_ACTIVE = "#1b5e20"
     _PULISCI_BLUE = "#1565c0"
     _PULISCI_BLUE_ACTIVE = "#0d47a1"
+    cerca_wrap = tk.Frame(filters_row, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
+    lbl_cerca = tk.Label(
+        cerca_wrap,
+        text="Cerca",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        width=14,
+        padx=10,
+        pady=5,
+        bg=_CERCA_GREEN,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    lbl_cerca.bind("<Button-1>", apply_movement_search)
+
+    def _cerca_enter(_e: tk.Event) -> None:
+        lbl_cerca.configure(bg=_CERCA_GREEN_ACTIVE)
+
+    def _cerca_leave(_e: tk.Event) -> None:
+        lbl_cerca.configure(bg=_CERCA_GREEN)
+
+    lbl_cerca.bind("<Enter>", _cerca_enter)
+    lbl_cerca.bind("<Leave>", _cerca_leave)
+
     lbl_pulisci_filtri = tk.Label(
         filters_row,
         text="Pulisci filtri",
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        width=12,
+        width=10,
         padx=10,
         pady=5,
         bg=_PULISCI_BLUE,
@@ -9157,7 +9342,9 @@ th {{ background:#efefef; text-align:left; }}
         relief=tk.RAISED,
         bd=1,
     )
-    lbl_pulisci_filtri.pack(side=tk.RIGHT, padx=(8, 0))
+    cerca_wrap.pack(side=tk.LEFT, padx=(_FILTER_ROW_BUTTON_GAP, 0))
+    lbl_cerca.pack(side=tk.TOP, fill=tk.X)
+    lbl_pulisci_filtri.pack(side=tk.LEFT, padx=(_FILTER_ROW_BUTTON_GAP, 0))
 
     def _pulisci_enter(_e: tk.Event) -> None:
         lbl_pulisci_filtri.configure(bg=_PULISCI_BLUE_ACTIVE)
@@ -9169,38 +9356,11 @@ th {{ background:#efefef; text-align:left; }}
     lbl_pulisci_filtri.bind("<Leave>", _pulisci_leave)
     lbl_pulisci_filtri.bind("<Button-1>", lambda _e: clear_movement_text_filters())
 
-    filters_search_actions = ttk.Frame(filters_search_row, style="MovCdc.TFrame")
     filters_search_spacer = tk.Frame(
         filters_search_row, highlightthickness=0, borderwidth=0, bg=MOVIMENTI_PAGE_BG
     )
-    cerca_wrap = tk.Frame(filters_search_actions, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
-    lbl_cerca = tk.Label(
-        cerca_wrap,
-        text="Cerca",
-        cursor="hand2",
-        highlightthickness=0,
-        font=filter_ui_font,
-        width=12,
-        padx=10,
-        pady=5,
-        bg=_CERCA_GREEN,
-        fg="#ffffff",
-        relief=tk.RAISED,
-        bd=1,
-    )
-    lbl_cerca.bind("<Button-1>", apply_movement_search)
-    def _cerca_enter(_e: tk.Event) -> None:
-        lbl_cerca.configure(bg=_CERCA_GREEN_ACTIVE)
-
-    def _cerca_leave(_e: tk.Event) -> None:
-        lbl_cerca.configure(bg=_CERCA_GREEN)
-
-    lbl_cerca.bind("<Enter>", _cerca_enter)
-    lbl_cerca.bind("<Leave>", _cerca_leave)
 
     note_entry.pack(side=tk.LEFT, padx=(0, 8))
-    cerca_wrap.pack(side=tk.RIGHT, padx=(0, 0))
-    lbl_cerca.pack(side=tk.TOP, fill=tk.X)
 
     # ------------------------------
     # Ricerca per data: preset + intervallo (dalla/alla) + calendario
@@ -9790,14 +9950,13 @@ th {{ background:#efefef; text-align:left; }}
                 return
             main_end = main.winfo_x() + main.winfo_width()
             w = max(0, int(target_x - main_end))
-            h = max(28, int(filters_search_actions.winfo_reqheight() or 28))
+            h = 28
             filters_search_spacer.configure(width=w, height=h)
             filters_search_spacer.pack_propagate(False)
         except Exception:
             pass
 
     date_controls_left.pack(side=tk.LEFT, anchor=tk.W)
-    filters_search_actions.pack(side=tk.RIGHT, anchor=tk.NE)
 
     _PRESETS: list[tuple[str, str]] = [
         ("last_12", "Ultimi 12 mesi"),
@@ -11627,7 +11786,7 @@ th {{ background:#efefef; text-align:left; }}
     _NR_W_CAT = MAX_CATEGORY_NAME_LEN
     _NR_W_ACC = MAX_ACCOUNT_NAME_LEN
     _NR_W_AMT = 14
-    _NR_W_CHQ = 16
+    _NR_W_CHQ = MAX_CHEQUE_LEN
     _NR_W_NOTE = 44
 
     _newreg_py = 2
@@ -11719,6 +11878,7 @@ th {{ background:#efefef; text-align:left; }}
     lbl_assegno.grid(row=4, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
     ent_chq = ttk.Entry(nuova_form, textvariable=newreg_cheque_var, width=_NR_W_CHQ, style="NewReg.TEntry")
     ent_chq.grid(row=4, column=1, sticky="w", pady=_newreg_py)
+    bind_limited_single_line_text_entry(ent_chq, newreg_cheque_var, max_len=MAX_CHEQUE_LEN)
     ttk.Label(nuova_form, text="Nota", style="NewReg.TLabel").grid(row=5, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
     ent_note = ttk.Entry(nuova_form, textvariable=newreg_note_var, width=_NR_W_NOTE, style="NewReg.TEntry")
     ent_note.grid(row=5, column=1, sticky="w", pady=_newreg_py)
@@ -16442,7 +16602,9 @@ th {{ background:#efefef; text-align:left; }}
         if not pair:
             return None
         _yd, rec = pair
-        if not record_is_within_recent_mod_delete_window(rec):
+        if not record_is_within_recent_mod_delete_window(rec) and not (
+            record_is_before_2022(rec) and not is_giroconto_record(rec)
+        ):
             return None
         return (sel[0], rec)
 
@@ -16457,6 +16619,7 @@ th {{ background:#efefef; text-align:left; }}
         want_elimina = False
         want_msg = False
         want_modifica = False
+        category_only_legacy = False
         has_verifica_flags = False
         forza_ok_recency = False
         msg_text = (
@@ -16472,12 +16635,23 @@ th {{ background:#efefef; text-align:left; }}
                     has_verifica_flags = True
                 forza_ok_recency = record_is_within_forza_verifica_recency(rec)
                 if not record_is_within_recent_mod_delete_window(rec):
-                    want_msg = True
+                    if record_is_before_2022(rec) and not is_giroconto_record(rec):
+                        want_modifica = True
+                        category_only_legacy = True
+                    else:
+                        want_msg = True
+                elif record_is_before_2022(rec):
+                    want_modifica = True
+                    category_only_legacy = True
                 else:
                     want_modifica = True
                     if record_contains_any_asterisk(rec):
                         want_msg = True
                         msg_text = "Registrazione verificata non cancellabile."
+
+                if category_only_legacy:
+                    want_msg = True
+                    msg_text = "Registrazione storica: modificabile solo la categoria."
 
         want_forza = (
             has_verifica_flags
@@ -16485,7 +16659,7 @@ th {{ background:#efefef; text-align:left; }}
             and forza_ok_recency
             and ver_unver_correzione_forza_revealed[0]
         )
-        want_elimina = want_modifica and (not want_forza)
+        want_elimina = want_modifica and (not want_forza) and (not category_only_legacy)
         if sel:
             pair = find_record_year_and_ref(cur_db(), sel[0])
             if pair:
@@ -19970,6 +20144,8 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
     stat_ref_year = tk.IntVar(value=_stat_y_max)
     stat_view_mode = tk.StringVar(value="full")
     stat_report_mode = tk.StringVar(value="conti")
+    stat_category_history_mode = tk.BooleanVar(value=False)
+    stat_category_history_var = tk.StringVar(value="")
     stat_header = ttk.Frame(statistiche_frame, style="MovCdc.TFrame")
     stat_header.grid(row=0, column=0, sticky="ew", pady=(0, 4))
     stat_header.columnconfigure(0, weight=1)
@@ -20007,8 +20183,16 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         bd=1,
     )
     stat_report_categorie_btn.pack(side=tk.LEFT)
-    stat_report_conti_btn.bind("<Button-1>", lambda _e: stat_report_mode.set("conti"))
-    stat_report_categorie_btn.bind("<Button-1>", lambda _e: stat_report_mode.set("categorie"))
+    def _stat_select_report_mode(mode: str) -> None:
+        stat_category_history_mode.set(False)
+        if str(stat_report_mode.get() or "") == mode:
+            _stat_apply_report_mode()
+            _stat_refresh_trees()
+        else:
+            stat_report_mode.set(mode)
+
+    stat_report_conti_btn.bind("<Button-1>", lambda _e: _stat_select_report_mode("conti"))
+    stat_report_categorie_btn.bind("<Button-1>", lambda _e: _stat_select_report_mode("categorie"))
     stat_mode_row = ttk.Frame(stat_header, style="MovCdc.TFrame")
     stat_mode_row.grid(row=1, column=0, sticky="w")
     stat_year_sp = tk.Spinbox(
@@ -20043,15 +20227,24 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         value="full",
     )
     _stat_rb_intero["b"].pack(side=tk.LEFT, padx=(0, 8))
-    ttk.Radiobutton(
+    stat_month_rb = ttk.Radiobutton(
         stat_mode_row,
         text="Scelta del mese",
         variable=stat_view_mode,
         value="month",
-    ).pack(side=tk.LEFT, padx=(0, 12))
-    ttk.Label(stat_mode_row, text="Mese concluso:", style="MovCdc.TLabel").pack(side=tk.LEFT, padx=(0, 8))
+    )
+    stat_month_rb.pack(side=tk.LEFT, padx=(0, 12))
+    stat_month_lbl = ttk.Label(stat_mode_row, text="Mese concluso:", style="MovCdc.TLabel")
+    stat_month_lbl.pack(side=tk.LEFT, padx=(0, 8))
     stat_month_cb = ttk.Combobox(stat_mode_row, width=14, state="disabled")
     stat_month_cb.pack(side=tk.LEFT, padx=(0, 8))
+    stat_history_category_lbl = ttk.Label(stat_mode_row, text="Categoria:", style="MovCdc.TLabel")
+    stat_history_category_cb = ttk.Combobox(
+        stat_mode_row,
+        textvariable=stat_category_history_var,
+        width=34,
+        state="readonly",
+    )
     _stat_sync_intero_label()
     stat_mode_actions = ttk.Frame(stat_mode_row, style="MovCdc.TFrame")
     stat_mode_actions.pack(side=tk.LEFT, padx=(8, 0))
@@ -20080,6 +20273,14 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         relief="flat",
     )
     _stat_sty.configure("StatCdc.Treeview.Heading", font=(_stat_ffam, _stat_fsz, "bold"))
+    _stat_sty.configure(
+        "StatHistoryCdc.Treeview",
+        font=(_stat_ffam, _stat_fsz),
+        rowheight=max(20, int(_stat_fsz * 1.55)),
+        borderwidth=0,
+        relief="flat",
+    )
+    _stat_sty.configure("StatHistoryCdc.Treeview.Heading", font=(_stat_ffam, _stat_fsz, "bold"))
 
     # Sette colonne dati (niente «Raffronto» in tabella; il valore resta calcolabile dove serve).
     _stat_month_right_cols = ("ini", "fin", "dsaldo", "pct", "entr", "usc", "net")
@@ -20147,6 +20348,35 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         ("cat",),
         ("Categorie a saldo zero",),
     )
+    stat_category_history_frame = ttk.Frame(stat_category_body, style="MovCdc.TFrame")
+    stat_category_history_frame.columnconfigure(0, weight=1)
+    stat_category_history_frame.rowconfigure(0, weight=1)
+    stat_category_history_tv = ttk.Treeview(
+        stat_category_history_frame,
+        columns=("year", "value", "bar"),
+        show="headings",
+        height=18,
+        selectmode="browse",
+        style="StatHistoryCdc.Treeview",
+    )
+    stat_category_history_vsb = ttk.Scrollbar(
+        stat_category_history_frame,
+        orient="vertical",
+        command=stat_category_history_tv.yview,
+    )
+    stat_category_history_tv.configure(yscrollcommand=stat_category_history_vsb.set)
+    stat_category_history_tv.grid(row=0, column=0, sticky="nsew")
+    stat_category_history_vsb.grid(row=0, column=1, sticky="ns")
+    stat_category_history_tv.heading("year", text="Anno", anchor=tk.W)
+    stat_category_history_tv.heading("value", text="Saldo categoria", anchor=tk.E)
+    stat_category_history_tv.heading("bar", text="Andamento annuale", anchor=tk.W)
+    stat_category_history_tv.column("year", width=72, minwidth=62, stretch=False, anchor=tk.W)
+    stat_category_history_tv.column("value", width=165, minwidth=140, stretch=False, anchor=tk.E)
+    stat_category_history_tv.column("bar", width=430, minwidth=260, stretch=True, anchor=tk.W)
+    stat_category_history_tv.tag_configure("statpos", foreground=COLOR_AMOUNT_POS)
+    stat_category_history_tv.tag_configure("statneg", foreground=COLOR_AMOUNT_NEG)
+    stat_category_history_tv.tag_configure("statzero", foreground="#333333")
+    stat_category_history_tv.tag_configure("stattotal", font=(_stat_ffam, _stat_fsz, "bold"))
 
     def _stat_sep_heavy(master: tk.Misc, width: int | None = None) -> tk.Frame:
         w = _STAT_LINE_OUTER if width is None else width
@@ -21003,7 +21233,11 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
             stat_month_cb.configure(values=[])
             stat_month_cb.set("")
             if str(stat_report_mode.get() or "") == "categorie":
-                _stat_refresh_category_tables()
+                if bool(stat_category_history_mode.get()):
+                    _stat_refresh_category_history_choices()
+                    _stat_refresh_category_history_table()
+                else:
+                    _stat_refresh_category_tables()
                 return
             _stat_m_clear()
             _stat_apply_month_table_headings_placeholder()
@@ -21023,7 +21257,11 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
             stat_month_cb.set("")
 
         if str(stat_report_mode.get() or "") == "categorie":
-            _stat_refresh_category_tables()
+            if bool(stat_category_history_mode.get()):
+                _stat_refresh_category_history_choices()
+                _stat_refresh_category_history_table()
+            else:
+                _stat_refresh_category_tables()
             return
 
         if str(stat_view_mode.get() or "") == "month":
@@ -21157,6 +21395,18 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
             rpr = _stat_y_max
         ry = max(_stat_y_min, min(_stat_y_max, rpr))
         if str(stat_report_mode.get() or "") == "categorie":
+            if bool(stat_category_history_mode.get()):
+                _stat_refresh_category_history_table()
+                _heads, rows, selected = _stat_category_history_rows_for_selected()
+                if not selected or not rows:
+                    messagebox.showinfo("Stampa statistiche", "Scegli una categoria da stampare.", parent=root)
+                    return
+                if _stat_print_category_history_table(intro_plain):
+                    _stat_restore_category_history_colors_later()
+                    return
+                _stat_print_category_history_via_browser(intro_plain)
+                _stat_restore_category_history_colors_later()
+                return
             period = _stat_category_period()
             if period is None:
                 messagebox.showinfo("Stampa statistiche", "Scegli un periodo valido.", parent=root)
@@ -21593,6 +21843,348 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
         finally:
             menu.grab_release()
 
+    def _stat_category_history_available_categories() -> list[str]:
+        db = db_holder[0]
+        cats_by_year = year_categories_map(db)
+        out: set[str] = set()
+        for cats in cats_by_year.values():
+            for c in cats or []:
+                nm = category_display_name(str(c.get("name") or "")).strip()
+                if not nm or is_hidden_dotazione_category_name(nm) or _stat_category_excluded_from_summary(nm):
+                    continue
+                out.add(nm)
+
+        for yb in db.get("years", []) or []:
+            for rec in yb.get("records", []) or []:
+                if rec.get("is_cancelled"):
+                    continue
+                rec_year = int(rec.get("year") or yb.get("year") or 0)
+                cat_name = category_name_for_record(rec, cats_by_year.get(rec_year, [])).strip()
+                if not cat_name or is_hidden_dotazione_category_name(cat_name) or _stat_category_excluded_from_summary(cat_name):
+                    continue
+                out.add(cat_name)
+        return sorted(out, key=lambda s: s.lower())
+
+    def _stat_category_history_bar(value: Decimal, max_abs: Decimal, *, width: int = 30) -> str:
+        if max_abs <= 0 or value == 0:
+            return "."
+        n = max(1, int((abs(value) / max_abs * Decimal(str(width))).to_integral_value(rounding=ROUND_HALF_UP)))
+        bar = "█" * min(width, n)
+        return ("> " if value > 0 else "< ") + bar
+
+    def _stat_category_history_rows_for_selected() -> tuple[list[str], list[tuple[str, str, str]], str]:
+        db = db_holder[0]
+        selected = str(stat_category_history_var.get() or "").strip()
+        years = sorted(
+            {
+                int(yb.get("year", 0) or 0)
+                for yb in db.get("years", []) or []
+                if int(yb.get("year", 0) or 0) > 0
+            },
+            reverse=True,
+        )
+        if not selected or not years:
+            return ["Anno", "Saldo categoria", "Andamento annuale"], [], selected
+        cats_by_year = year_categories_map(db)
+        present_years: set[int] = set()
+        sums_by_year: dict[int, Decimal] = {y: Decimal("0") for y in years}
+        selected_key = selected.lower()
+
+        for y in years:
+            for c in cats_by_year.get(y, []) or []:
+                nm = category_display_name(str(c.get("name") or "")).strip()
+                if nm.lower() == selected_key:
+                    present_years.add(y)
+                    break
+
+        for yb in db.get("years", []) or []:
+            for rec in yb.get("records", []) or []:
+                if rec.get("is_cancelled"):
+                    continue
+                d_iso = str(rec.get("date_iso") or "").strip()
+                if len(d_iso) < 4 or not d_iso[:4].isdigit():
+                    continue
+                y = int(d_iso[:4])
+                if y not in sums_by_year:
+                    continue
+                rec_year = int(rec.get("year") or yb.get("year") or y)
+                cat_name = category_name_for_record(rec, cats_by_year.get(rec_year, [])).strip()
+                if cat_name.lower() != selected_key:
+                    continue
+                sums_by_year[y] += to_decimal(rec.get("amount_eur") or "0")
+
+        max_abs = max((abs(v) for v in sums_by_year.values()), default=Decimal("0"))
+        rows: list[tuple[str, str, str]] = []
+        total = Decimal("0")
+        for y in years:
+            if y not in present_years:
+                rows.append((str(y), "—", ""))
+                continue
+            value = sums_by_year.get(y, Decimal("0"))
+            total += value
+            rows.append((str(y), _stat_cell_eur(value), _stat_category_history_bar(value, max_abs)))
+        rows.append(("Totale", _stat_cell_eur(total), ""))
+        return ["Anno", selected, "Andamento annuale"], rows, selected
+
+    def _stat_category_history_print_data() -> tuple[str, list[tuple[int, Decimal | None]], Decimal, Decimal] | None:
+        selected = str(stat_category_history_var.get() or "").strip()
+        if not selected:
+            return None
+        heads, rows, _selected = _stat_category_history_rows_for_selected()
+        if not rows:
+            return None
+        values: list[tuple[int, Decimal | None]] = []
+        total = Decimal("0")
+        max_abs = Decimal("0")
+        for year_label, value_label, _bar_label in rows:
+            if year_label == "Totale":
+                continue
+            if not str(year_label).isdigit():
+                continue
+            if value_label == "—":
+                values.append((int(year_label), None))
+                continue
+            try:
+                value = parse_amount(value_label.replace("€", "").strip())
+            except Exception:
+                value = Decimal("0")
+            values.append((int(year_label), value))
+            total += value
+            max_abs = max(max_abs, abs(value))
+        return heads[1], values, total, max_abs
+
+    def _stat_print_category_history_table(intro_plain: str) -> bool:
+        data = _stat_category_history_print_data()
+        if data is None:
+            return False
+        selected, rows, total, max_abs = data
+        main_title = f"Categorie per anno - {selected}"
+        try:
+            from fpdf import FPDF
+            from fpdf.enums import XPos, YPos
+        except ImportError:
+            return False
+        try:
+            pdf = FPDF(orientation="P", unit="mm", format="A4")
+            pdf.set_margins(12, 10, 12)
+            pdf.set_auto_page_break(auto=True, margin=10)
+            pdf.add_page()
+            pdf.set_title(_pdf_safe_text(main_title)[:128])
+            pdf.set_font("Helvetica", "B", 13)
+            pdf.cell(0, 7, _pdf_safe_text(main_title), align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_font("Helvetica", "", 8)
+            pdf.multi_cell(0, 4.0, _pdf_safe_text(intro_plain), align="C")
+            pdf.ln(2)
+
+            epw = pdf.epw
+            table_w = min(epw, 142.0)
+            x0 = pdf.l_margin + (epw - table_w) / 2.0
+            w_year = 14.0
+            w_val = 37.0
+            w_bar = table_w - w_year - w_val
+            row_h = 4.6
+            head_h = 5.2
+
+            def _draw_header() -> None:
+                pdf.set_x(x0)
+                pdf.set_font("Helvetica", "B", 7.2)
+                pdf.set_text_color(0, 0, 0)
+                pdf.set_fill_color(227, 242, 253)
+                pdf.cell(w_year, head_h, "Anno", border=1, align="L", fill=True)
+                pdf.cell(w_val, head_h, "Saldo categoria", border=1, align="R", fill=True)
+                pdf.cell(w_bar, head_h, "Andamento annuale", border=1, align="L", fill=True)
+                pdf.ln(head_h)
+
+            _draw_header()
+            for year_label, value in rows:
+                if pdf.get_y() > 278:
+                    pdf.add_page()
+                    _draw_header()
+                pdf.set_x(x0)
+                pdf.set_font("Helvetica", "", 7.2)
+                pdf.set_text_color(0, 0, 0)
+                pdf.cell(w_year, row_h, str(year_label), border=1, align="L")
+                if value is None:
+                    pdf.set_text_color(80, 80, 80)
+                    pdf.cell(w_val, row_h, "-", border=1, align="R")
+                    pdf.cell(w_bar, row_h, "", border=1, align="L")
+                    pdf.ln(row_h)
+                    continue
+                pdf.set_text_color(0, 100, 0) if value > 0 else pdf.set_text_color(178, 34, 34) if value < 0 else pdf.set_text_color(0, 0, 0)
+                pdf.cell(w_val, row_h, _pdf_safe_text(_stat_cell_eur(value)), border=1, align="R")
+                bar_x = pdf.get_x()
+                bar_y = pdf.get_y()
+                pdf.set_text_color(0, 0, 0)
+                pdf.cell(w_bar, row_h, "", border=1, align="L")
+                if max_abs > 0 and value != 0:
+                    if value > 0:
+                        pdf.set_fill_color(46, 125, 50)
+                    else:
+                        pdf.set_fill_color(178, 34, 34)
+                    bw = max(1.5, float(abs(value) / max_abs) * (w_bar - 5.0))
+                    pdf.rect(bar_x + 2.0, bar_y + 1.2, bw, row_h - 2.4, style="F")
+                pdf.ln(row_h)
+
+            if pdf.get_y() > 278:
+                pdf.add_page()
+            pdf.set_x(x0)
+            pdf.set_font("Helvetica", "B", 7.4)
+            pdf.set_fill_color(240, 240, 240)
+            pdf.set_text_color(0, 0, 0)
+            pdf.cell(w_year, row_h, "TOTALE", border=1, align="L", fill=True)
+            pdf.set_text_color(0, 100, 0) if total > 0 else pdf.set_text_color(178, 34, 34) if total < 0 else pdf.set_text_color(0, 0, 0)
+            pdf.cell(w_val, row_h, _pdf_safe_text(_stat_cell_eur(total)), border=1, align="R", fill=True)
+            pdf.set_text_color(0, 0, 0)
+            pdf.cell(w_bar, row_h, "", border=1, align="L", fill=True)
+
+            fd, out_path = tempfile.mkstemp(suffix=".pdf", prefix="categorie_per_anno_")
+            os.close(fd)
+            pdf.output(out_path)
+            _open_generated_pdf(out_path)
+            return True
+        except Exception:
+            return False
+
+    def _stat_print_category_history_via_browser(intro_plain: str) -> None:
+        data = _stat_category_history_print_data()
+        if data is None:
+            messagebox.showinfo("Stampa statistiche", "Scegli una categoria da stampare.", parent=root)
+            return
+        selected, rows, total, max_abs = data
+        trs: list[str] = []
+        for year_label, value in rows:
+            if value is None:
+                trs.append(f"<tr><td>{year_label}</td><td class='amt muted'>-</td><td></td></tr>")
+                continue
+            cls = "pos" if value > 0 else "neg" if value < 0 else "zero"
+            pct = 0 if max_abs <= 0 else max(1, int(abs(value) / max_abs * 100))
+            trs.append(
+                "<tr>"
+                f"<td>{year_label}</td>"
+                f"<td class='amt {cls}'>{html_module.escape(_stat_cell_eur(value))}</td>"
+                f"<td><div class='barwrap'><div class='bar {cls}' style='width:{pct}%'></div></div></td>"
+                "</tr>"
+            )
+        tcls = "pos" if total > 0 else "neg" if total < 0 else "zero"
+        trs.append(
+            "<tr class='tot'>"
+            "<td>TOTALE</td>"
+            f"<td class='amt {tcls}'>{html_module.escape(_stat_cell_eur(total))}</td>"
+            "<td></td>"
+            "</tr>"
+        )
+        intro_html = "<br/>".join(html_module.escape(line) for line in intro_plain.splitlines())
+        html = f"""<!DOCTYPE html>
+<html lang="it"><head><meta charset="utf-8"/>
+<title>{html_module.escape('Categorie per anno - ' + selected)}</title>
+<style>
+body {{ font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 9mm; font-size: 8.4pt; }}
+h1 {{ font-size: 12pt; text-align: center; margin: 0 0 4px 0; }}
+.meta {{ text-align: center; font-size: 7.5pt; color: #333; margin-bottom: 8px; }}
+table {{ border-collapse: collapse; width: 142mm; margin: 0 auto; }}
+th:first-child, td:first-child {{ width: 14mm; }}
+th:nth-child(2), td:nth-child(2) {{ width: 37mm; }}
+th, td {{ border: 1px solid #999; padding: 2px 5px; line-height: 1.05; }}
+th {{ background: #e3f2fd; }}
+td.amt {{ text-align: right; white-space: nowrap; }}
+.pos {{ color: #2e7d32; }} .neg {{ color: #b22222; }} .zero {{ color: #222; }} .muted {{ color: #555; }}
+.barwrap {{ height: 8px; width: 100%; }}
+.bar {{ height: 8px; }}
+.bar.pos {{ background: #2e7d32; }} .bar.neg {{ background: #b22222; }} .bar.zero {{ background: #777; }}
+tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
+</style></head><body>
+<h1>{html_module.escape('Categorie per anno - ' + selected)}</h1>
+<div class="meta">{intro_html}</div>
+<table><thead><tr><th>Anno</th><th>Saldo categoria</th><th>Andamento annuale</th></tr></thead>
+<tbody>{''.join(trs)}</tbody></table>
+<script>window.addEventListener("load", function () {{ setTimeout(function () {{ window.print(); }}, 400); }});</script>
+</body></html>"""
+        _print_stat_via_browser(html)
+
+    def _stat_refresh_category_history_choices() -> None:
+        choices = _stat_category_history_available_categories()
+        stat_history_category_cb.configure(values=choices)
+        cur = str(stat_category_history_var.get() or "").strip()
+        if cur and cur not in choices:
+            stat_category_history_var.set("")
+        if not choices:
+            stat_category_history_var.set("")
+
+    def _stat_configure_category_history_tags() -> None:
+        stat_category_history_tv.tag_configure("statpos", foreground=COLOR_AMOUNT_POS)
+        stat_category_history_tv.tag_configure("statneg", foreground=COLOR_AMOUNT_NEG)
+        stat_category_history_tv.tag_configure("statzero", foreground="#333333")
+        stat_category_history_tv.tag_configure("stattotal", font=(_stat_ffam, _stat_fsz, "bold"), foreground="#111111")
+
+    def _stat_refresh_category_history_table() -> None:
+        _stat_configure_category_history_tags()
+        stat_category_history_tv.delete(*stat_category_history_tv.get_children())
+        heads, rows, _selected = _stat_category_history_rows_for_selected()
+        stat_category_history_tv.heading("year", text=heads[0], anchor=tk.W)
+        stat_category_history_tv.heading("value", text=heads[1], anchor=tk.E)
+        stat_category_history_tv.heading("bar", text=heads[2], anchor=tk.W)
+        if not rows:
+            stat_category_history_frame.grid_remove()
+            return
+        if not stat_category_history_frame.winfo_ismapped():
+            stat_category_history_frame.grid(row=0, column=0, sticky="n", pady=(8, 0))
+        for year_label, value_label, bar_label in rows:
+            if year_label == "Totale":
+                stat_category_history_tv.insert(
+                    "", tk.END, values=("Σ TOTALE", value_label, bar_label), tags=("stattotal",)
+                )
+                continue
+            tag = "statzero"
+            if value_label != "—":
+                try:
+                    v = parse_amount(value_label.replace("€", "").strip())
+                    tag = "statpos" if v > 0 else "statneg" if v < 0 else "statzero"
+                except Exception:
+                    tag = "statzero"
+            stat_category_history_tv.insert("", tk.END, values=(year_label, value_label, bar_label), tags=(tag,))
+
+    def _stat_enter_category_history_mode() -> None:
+        stat_report_mode.set("categorie")
+        stat_category_history_mode.set(True)
+        stat_category_history_var.set("")
+        _stat_refresh_category_history_choices()
+        _stat_apply_report_mode()
+
+    def _stat_restore_category_history_colors_later() -> None:
+        if not bool(stat_category_history_mode.get()):
+            return
+        if not str(stat_category_history_var.get() or "").strip():
+            return
+
+        def _restore() -> None:
+            try:
+                _stat_configure_category_history_tags()
+                stat_category_history_tv.update_idletasks()
+            except tk.TclError:
+                pass
+
+        for delay_ms in (50, 400, 1200):
+            try:
+                root.after(delay_ms, _restore)
+            except tk.TclError:
+                pass
+
+    def _stat_category_history_focus_restore(_event: tk.Event | None = None) -> None:
+        _stat_restore_category_history_colors_later()
+
+    root.bind("<FocusIn>", _stat_category_history_focus_restore, add="+")
+
+    def _stat_open_categories_by_year_table() -> None:
+        choices = _stat_category_history_available_categories()
+        if not choices:
+            messagebox.showinfo(
+                "Categorie per anno",
+                "Nessun dato categoria disponibile.",
+                parent=root,
+            )
+            return
+        _stat_enter_category_history_mode()
+
     _STAT_TK_PRINT_RED = "#c62828"
     _STAT_TK_PRINT_RED_ACT = "#8e0000"
     _STAT_TK_BARS_BLUE = "#1565c0"
@@ -21669,6 +22261,28 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
     stat_category_chart_btn.bind("<Enter>", lambda _e: stat_category_chart_btn.configure(bg=_STAT_TK_BARS_BLUE_ACT))
     stat_category_chart_btn.bind("<Leave>", lambda _e: stat_category_chart_btn.configure(bg=_STAT_TK_BARS_BLUE))
 
+    stat_categories_by_year_btn = tk.Label(
+        stat_mode_actions,
+        text="Categorie per anno",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=8,
+        pady=2,
+        bg=_STAT_TK_BARS_BLUE,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    stat_categories_by_year_btn.bind("<Button-1>", lambda _e: _stat_open_categories_by_year_table())
+    stat_categories_by_year_btn.bind(
+        "<Enter>", lambda _e: stat_categories_by_year_btn.configure(bg=_STAT_TK_BARS_BLUE_ACT)
+    )
+    stat_categories_by_year_btn.bind(
+        "<Leave>", lambda _e: stat_categories_by_year_btn.configure(bg=_STAT_TK_BARS_BLUE)
+    )
+    stat_history_category_cb.bind("<<ComboboxSelected>>", lambda _e: _stat_refresh_category_history_table())
+
     def _stat_config_report_button(btn: tk.Label, *, selected: bool, active: bool = False) -> None:
         if selected:
             btn.configure(
@@ -21688,26 +22302,71 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
         _stat_config_report_button(stat_report_conti_btn, selected=(mode == "conti"))
         _stat_config_report_button(stat_report_categorie_btn, selected=(mode == "categorie"))
 
+    def _stat_show_standard_period_controls(show: bool) -> None:
+        widgets: tuple[tk.Misc, ...] = (
+            stat_year_sp,
+            _stat_rb_intero["b"],
+            stat_month_rb,
+            stat_month_lbl,
+            stat_month_cb,
+        )
+        if show:
+            if not stat_year_sp.winfo_ismapped():
+                stat_year_sp.pack(side=tk.LEFT, padx=(0, 12), before=stat_mode_actions)
+            if not _stat_rb_intero["b"].winfo_ismapped():
+                _stat_rb_intero["b"].pack(side=tk.LEFT, padx=(0, 8), before=stat_mode_actions)
+            if not stat_month_rb.winfo_ismapped():
+                stat_month_rb.pack(side=tk.LEFT, padx=(0, 12), before=stat_mode_actions)
+            if not stat_month_lbl.winfo_ismapped():
+                stat_month_lbl.pack(side=tk.LEFT, padx=(0, 8), before=stat_mode_actions)
+            if not stat_month_cb.winfo_ismapped():
+                stat_month_cb.pack(side=tk.LEFT, padx=(0, 8), before=stat_mode_actions)
+            stat_history_category_lbl.pack_forget()
+            stat_history_category_cb.pack_forget()
+            return
+        for w in widgets:
+            w.pack_forget()
+        if not stat_history_category_lbl.winfo_ismapped():
+            stat_history_category_lbl.pack(side=tk.LEFT, padx=(0, 8), before=stat_mode_actions)
+        if not stat_history_category_cb.winfo_ismapped():
+            stat_history_category_cb.pack(side=tk.LEFT, padx=(0, 8), before=stat_mode_actions)
+
     def _stat_apply_report_mode(*_a: object) -> None:
         mode = str(stat_report_mode.get() or "conti")
         _stat_refresh_report_buttons()
         if mode == "categorie":
+            history_mode = bool(stat_category_history_mode.get())
+            _stat_show_standard_period_controls(not history_mode)
             try:
                 stat_bars_btn.pack_forget()
                 stat_bars_flussi_btn.pack_forget()
-                if not stat_category_chart_btn.winfo_ismapped():
+                if history_mode:
+                    stat_category_chart_btn.pack_forget()
+                elif not stat_category_chart_btn.winfo_ismapped():
                     stat_category_chart_btn.pack(side=tk.LEFT, padx=(0, 8), after=stat_print_btn)
+                if not stat_categories_by_year_btn.winfo_ismapped():
+                    after_btn = stat_print_btn if history_mode else stat_category_chart_btn
+                    stat_categories_by_year_btn.pack(side=tk.LEFT, padx=(0, 8), after=after_btn)
             except tk.TclError:
                 pass
             try:
                 stat_month_body.grid_remove()
                 stat_category_body.grid(row=2, column=0, sticky="nsew")
-                _stat_refresh_category_tables()
+                if history_mode:
+                    stat_category_stack.grid_remove()
+                    _stat_refresh_category_history_table()
+                else:
+                    stat_category_history_frame.grid_remove()
+                    stat_category_stack.grid(row=0, column=0, sticky="n", pady=(8, 0))
+                    _stat_refresh_category_tables()
             except tk.TclError:
                 pass
             return
+        stat_category_history_mode.set(False)
+        _stat_show_standard_period_controls(True)
         try:
             stat_category_chart_btn.pack_forget()
+            stat_categories_by_year_btn.pack_forget()
             if not stat_bars_btn.winfo_ismapped():
                 stat_bars_btn.pack(side=tk.LEFT, padx=(0, 8), after=stat_print_btn)
             if not stat_bars_flussi_btn.winfo_ismapped():
@@ -23568,11 +24227,12 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
         pass
 
     # Opzioni page (scroll verticale: posta, percorsi, legacy possono superare l’altezza finestra)
-    opz_scroll_outer = ttk.Frame(opzioni_frame, style="MovCdc.TFrame")
+    _OPZ_PAGE_BG = "#f0f0f0"
+    opz_scroll_outer = ttk.Frame(opzioni_frame)
     opz_scroll_outer.pack(fill=tk.BOTH, expand=True)
-    opz_canvas = tk.Canvas(opz_scroll_outer, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
+    opz_canvas = tk.Canvas(opz_scroll_outer, highlightthickness=0, bg=_OPZ_PAGE_BG)
     opz_vsb = ttk.Scrollbar(opz_scroll_outer, orient="vertical", command=opz_canvas.yview)
-    opz_scrollable = ttk.Frame(opz_canvas, style="MovCdc.TFrame")
+    opz_scrollable = ttk.Frame(opz_canvas)
     opz_scrollable_win = opz_canvas.create_window((0, 0), window=opz_scrollable, anchor="nw")
 
     def _opz_on_scrollable_configure(_event: object) -> None:
@@ -23587,26 +24247,63 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
     opz_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     opz_vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
-    opz_plan_row = ttk.Frame(opz_scrollable, style="MovCdc.TFrame")
-    opz_plan_row.pack(fill=tk.X, pady=(0, 10))
-    ttk.Label(
-        opz_plan_row,
-        text="Piano conti:",
-        font=("TkDefaultFont", 11, "bold"),
-    ).pack(side=tk.LEFT)
-    ttk.Button(
-        opz_plan_row,
-        text="Apri scheda Categorie…",
-        command=lambda: (_ensure_plan_conti_tab(), notebook.select(plan_categorie_frame), _reload_plan_conti_form()),
-    ).pack(side=tk.LEFT, padx=(12, 4))
-    ttk.Button(
-        opz_plan_row,
-        text="Apri scheda Conti…",
-        command=lambda: (_ensure_plan_conti_tab(), notebook.select(plan_conti_frame), _reload_plan_conti_form()),
+    _OPZ_BLUE = "#1565c0"
+    _OPZ_BLUE_ACTIVE = "#0d47a1"
+    _OPZ_RED = "#b71c1c"
+    _OPZ_RED_ACTIVE = "#7f0000"
+    _OPZ_TITLE_FONT = ("TkDefaultFont", 14, "bold")
+    _OPZ_PATH_ENTRY_WIDTH = 64
+    _OPZ_PATH_BTN_WIDTH = 14
+
+    def _opz_action_label(
+        parent: tk.Misc,
+        text: str,
+        command: Callable[[], None],
+        *,
+        color: str = _OPZ_BLUE,
+        active_color: str = _OPZ_BLUE_ACTIVE,
+        width: int | None = None,
+    ) -> tk.Label:
+        lbl = tk.Label(
+            parent,
+            text=text,
+            cursor="hand2",
+            highlightthickness=0,
+            font=("TkDefaultFont", 10, "bold"),
+            padx=12,
+            pady=4,
+            bg=color,
+            fg="#ffffff",
+            relief=tk.RAISED,
+            bd=1,
+            width=width if width is not None else 0,
+        )
+        lbl.bind("<Button-1>", lambda _e: command())
+        lbl.bind("<Enter>", lambda _e: lbl.configure(bg=active_color))
+        lbl.bind("<Leave>", lambda _e: lbl.configure(bg=color))
+        return lbl
+
+    opz_plan_row = ttk.Frame(opz_scrollable)
+    opz_plan_row.pack(fill=tk.X, padx=(28, 10), pady=(0, 8))
+    opz_plan_center = ttk.Frame(opz_plan_row)
+    opz_plan_center.pack(anchor=tk.CENTER)
+
+    _opz_action_label(
+        opz_plan_center,
+        "Apri scheda Categorie…",
+        lambda: (_ensure_plan_conti_tab(), notebook.select(plan_categorie_frame), _reload_plan_conti_form()),
+    ).pack(side=tk.LEFT, padx=(0, 8))
+    _opz_action_label(
+        opz_plan_center,
+        "Apri scheda Conti…",
+        lambda: (_ensure_plan_conti_tab(), notebook.select(plan_conti_frame), _reload_plan_conti_form()),
     ).pack(side=tk.LEFT, padx=(0, 0))
 
-    mail_outer = ttk.LabelFrame(opz_scrollable, text="Posta e sicurezza", padding=10)
-    mail_outer.pack(fill=tk.X, pady=(0, 14))
+    mail_outer = ttk.LabelFrame(opz_scrollable, padding=10)
+    mail_outer.configure(
+        labelwidget=ttk.Label(mail_outer, text="Posta e sicurezza", font=_OPZ_TITLE_FONT)
+    )
+    mail_outer.pack(fill=tk.X, padx=(28, 10), pady=(0, 10))
 
     mail_setup_frame = ttk.Frame(mail_outer)
     mail_verified_frame = ttk.Frame(mail_outer)
@@ -23762,26 +24459,23 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
 
     def _factory_reset_security_and_data() -> None:
         if not messagebox.askyesno(
-            "Reset completo",
-            "Verranno reimportati i dati dall'archivio legacy predefinito, "
-            "cancellati account utente, impostazioni posta e sicurezza.\n\n"
-            "L'applicazione si chiuderà: al riavvio andrà rifatto il primo accesso.\n\n"
+            "Reset account, posta e sicurezza",
+            "Verranno cancellati il profilo utente locale, le impostazioni posta e la configurazione di sicurezza.\n\n"
+            "I movimenti, i conti, le categorie, i saldi, le periodiche e i percorsi dati NON vengono reimportati "
+            "né cancellati.\n\n"
+            "L'applicazione si chiuderà: al riavvio andrà rifatto il primo accesso e riconfigurata la posta.\n\n"
             "Confermi?",
+            parent=root,
         ):
             return
         try:
-            data_workspace.legacy_import_dir().mkdir(parents=True, exist_ok=True)
-            out_json = data_workspace.default_legacy_json_output()
-            run_import_legacy(DEFAULT_CDC_ROOT, out_json)
-            new_db = json.loads(out_json.read_text(encoding="utf-8"))
-            periodiche.ensure_periodic_registrations(new_db)
-            email_client.ensure_email_settings(new_db)
-            security_auth.ensure_security(new_db)
-            security_auth.reset_user_profile_for_registration_restart(new_db)
-            new_db["security_config"] = dict(security_auth.DEFAULT_SECURITY_CONFIG)
-            new_db["email_settings"] = dict(email_client.DEFAULT_EMAIL_SETTINGS)
+            d = cur_db()
+            d["user_profile"] = {}
+            d["security_config"] = dict(security_auth.DEFAULT_SECURITY_CONFIG)
+            d["email_settings"] = dict(email_client.DEFAULT_EMAIL_SETTINGS)
+            periodiche.ensure_periodic_registrations(d)
             save_encrypted_db_dual(
-                new_db,
+                d,
                 Path(data_file_var.get()),
                 Path(key_file_var.get()),
             )
@@ -23796,6 +24490,18 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
             root.destroy()
         finally:
             sys.exit(0)
+
+    def _send_registration_notification_with_confirm() -> None:
+        if not messagebox.askyesno(
+            "Invia notifica registrazione",
+            "Verrà inviata di nuovo la notifica di registrazione all'amministratore e in copia all'utente.\n\n"
+            "La registrazione risulterà confermata solo quando nella casella IMAP configurata comparirà una mail "
+            "che contiene REGISTRA: o REGISTRATO: seguito dall'email utente.\n\n"
+            "Procedere?",
+            parent=root,
+        ):
+            return
+        _send_registration_notification_now()
 
     def _send_registration_notification_now() -> None:
         _apply_mail_vars_to_db()
@@ -23919,15 +24625,19 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
         text="La configurazione della posta è stata verificata con successo.",
         font=("TkDefaultFont", 12),
     ).pack(anchor=tk.W)
-    ttk.Button(
+    _opz_action_label(
         mail_verified_frame,
-        text="Resettare account, posta e impostazioni di sicurezza…",
-        command=_factory_reset_security_and_data,
+        "Resettare account, posta e impostazioni di sicurezza…",
+        _factory_reset_security_and_data,
+        color=_OPZ_RED,
+        active_color=_OPZ_RED_ACTIVE,
     ).pack(anchor=tk.W, pady=(10, 0))
-    ttk.Button(
+    _opz_action_label(
         mail_verified_frame,
-        text="Invia di nuovo notifica registrazione (primo accesso)",
-        command=_send_registration_notification_now,
+        "Invia di nuovo notifica registrazione (primo accesso)",
+        _send_registration_notification_with_confirm,
+        color=_OPZ_RED,
+        active_color=_OPZ_RED_ACTIVE,
     ).pack(anchor=tk.W, pady=(12, 0))
     ttk.Label(
         mail_verified_frame,
@@ -23942,10 +24652,17 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
     _load_mail_vars_from_db()
     refresh_mail_security_visibility()
 
-    opzioni_inner = ttk.Frame(opz_scrollable)
+    data_outer = ttk.LabelFrame(opz_scrollable, padding=10)
+    data_outer.configure(
+        labelwidget=ttk.Label(data_outer, text="Cartella dati", font=_OPZ_TITLE_FONT)
+    )
+    data_outer.pack(fill=tk.X, padx=(28, 10), pady=(0, 10))
+    opzioni_inner = ttk.Frame(data_outer)
     opzioni_inner.pack(fill=tk.X)
 
     workspace_path_var = tk.StringVar()
+    pending_workspace_path_var = tk.StringVar(value="")
+    pending_workspace_selected_path_var = tk.StringVar(value="")
 
     def _refresh_workspace_path_display(*_a: object) -> None:
         try:
@@ -23955,15 +24672,23 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
 
     _refresh_workspace_path_display()
 
-    ttk.Label(opzioni_inner, text="Cartella dati configurata", font=("TkDefaultFont", 12, "bold")).grid(
-        row=0, column=0, columnspan=2, sticky="w", pady=(0, 4)
+    data_path_row = ttk.Frame(opzioni_inner)
+    data_path_row.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+    data_path_row.columnconfigure(0, weight=0)
+    workspace_entry = ttk.Entry(
+        data_path_row,
+        textvariable=workspace_path_var,
+        width=_OPZ_PATH_ENTRY_WIDTH,
     )
+    workspace_entry.grid(row=0, column=0, sticky="w", padx=(0, 8))
+    _data_folder_btns = ttk.Frame(data_path_row)
+    _data_folder_btns.grid(row=0, column=1, sticky="w")
     ttk.Label(
         opzioni_inner,
-        textvariable=workspace_path_var,
+        textvariable=pending_workspace_path_var,
         wraplength=620,
-        font=("TkDefaultFont", 11),
-    ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        foreground="#444444",
+    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 2))
 
     legacy_path_var = tk.StringVar(value=str(DEFAULT_CDC_ROOT))
     _ep_init = estratti_pdf_settings_from_db(cur_db())
@@ -23971,20 +24696,24 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
     estratti_pdf_feedback_var = tk.StringVar(value="")
     _estratti_pdf_save_feedback_after: list[int | None] = [None]
 
-    ttk.Label(
-        opzioni_inner,
-        text="Cartella dati: sposta insieme file .enc completo, .enc light e .key (stessi nomi).",
-        wraplength=620,
-    ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 4))
-
     def browse_data_folder() -> None:
-        import light_enc_sidecar
-
         picked = filedialog.askdirectory(
             initialdir=str(Path(data_file_var.get()).expanduser().parent),
             title="Cartella destinazione per i file dati",
         )
         if not picked:
+            return
+        dest_dir = Path(picked).expanduser().resolve()
+        pending_workspace_selected_path_var.set(str(dest_dir))
+        workspace_path_var.set(str(dest_dir))
+        pending_workspace_path_var.set(f"Nuova cartella selezionata: {dest_dir}")
+
+    def save_data_folder() -> None:
+        import light_enc_sidecar
+
+        picked = (pending_workspace_selected_path_var.get() or "").strip() or (workspace_path_var.get() or "").strip()
+        if not picked:
+            messagebox.showinfo("Cartella dati", "Seleziona prima una nuova cartella.", parent=root)
             return
         dest_dir = Path(picked).expanduser().resolve()
         src_enc = Path(data_file_var.get()).expanduser().resolve()
@@ -23996,6 +24725,8 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
 
         if src_enc.parent.resolve() == dest_dir:
             status_var.set("Cartella invariata.")
+            pending_workspace_selected_path_var.set("")
+            pending_workspace_path_var.set("")
             return
         moves: list[tuple[str, Path, Path]] = []
         if src_enc.is_file():
@@ -24029,7 +24760,7 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
             return
         names = "\n".join(f"• {lbl}" for lbl, _, _ in moves)
         if not messagebox.askyesno(
-            "Conferma spostamento",
+            "Salva nuova cartella dati",
             f"Verranno spostati in:\n{dest_dir}\n\n{names}\n\nContinuare?",
             parent=root,
         ):
@@ -24051,15 +24782,26 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
         except Exception:
             pass
         _refresh_workspace_path_display()
+        pending_workspace_selected_path_var.set("")
+        pending_workspace_path_var.set("")
         status_var.set(f"File spostati in: {dest_dir}")
 
-    ttk.Button(opzioni_inner, text="Sposta nella cartella…", command=browse_data_folder).grid(
-        row=3, column=0, columnspan=2, sticky="w", pady=(0, 8)
-    )
+    _opz_action_label(
+        _data_folder_btns,
+        "Seleziona",
+        browse_data_folder,
+        width=_OPZ_PATH_BTN_WIDTH,
+    ).pack(side=tk.LEFT, padx=(0, 8))
+    _opz_action_label(
+        _data_folder_btns,
+        "Salva cartella",
+        save_data_folder,
+        color=_OPZ_RED,
+        active_color=_OPZ_RED_ACTIVE,
+        width=_OPZ_PATH_BTN_WIDTH,
+    ).pack(side=tk.LEFT)
 
-    ttk.Label(opzioni_inner, text="File dati nuova app (criptato)").grid(row=4, column=0, sticky="w", pady=(12, 6))
     data_entry = ttk.Entry(opzioni_inner, textvariable=data_file_var, width=80)
-    data_entry.grid(row=5, column=0, sticky="we", padx=(0, 8))
 
     backup_info_var = tk.StringVar()
 
@@ -24079,12 +24821,6 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
     _refresh_backup_path_hint()
     data_file_var.trace_add("write", _refresh_backup_path_hint)
 
-    ttk.Label(
-        opzioni_inner,
-        textvariable=backup_info_var,
-        wraplength=620,
-    ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
-
     def browse_data_file() -> None:
         picked = filedialog.asksaveasfilename(
             initialdir=str(Path(data_file_var.get()).parent),
@@ -24095,11 +24831,7 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
         if picked:
             data_file_var.set(picked)
 
-    ttk.Button(opzioni_inner, text="Sfoglia...", command=browse_data_file).grid(row=5, column=1, sticky="w")
-
-    ttk.Label(opzioni_inner, text="File chiave cifratura").grid(row=7, column=0, sticky="w", pady=(12, 6))
     key_entry = ttk.Entry(opzioni_inner, textvariable=key_file_var, width=80)
-    key_entry.grid(row=8, column=0, sticky="we", padx=(0, 8))
 
     def browse_key_file() -> None:
         picked = filedialog.asksaveasfilename(
@@ -24111,19 +24843,28 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
         if picked:
             key_file_var.set(picked)
 
-    ttk.Button(opzioni_inner, text="Sfoglia...", command=browse_key_file).grid(row=8, column=1, sticky="w")
-
     status_var = tk.StringVar(value="")
-    ttk.Label(opzioni_inner, textvariable=status_var).grid(row=9, column=0, columnspan=2, sticky="w", pady=(10, 0))
+    ttk.Label(opzioni_inner, textvariable=status_var).grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 4))
+    data_restore_row = ttk.Frame(opzioni_inner)
+    data_restore_row.grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 0))
 
-    ttk.Label(
-        opzioni_inner,
-        text="Estratti conto PDF (verifica conto)",
-        font=("TkDefaultFont", 11, "italic"),
-    ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(16, 4))
-    ttk.Label(opzioni_inner, text="Cartella radice degli estratti").grid(row=11, column=0, sticky="w", pady=(0, 4))
-    estratti_pdf_entry = ttk.Entry(opzioni_inner, textvariable=estratti_pdf_root_var, width=80)
-    estratti_pdf_entry.grid(row=12, column=0, sticky="we", padx=(0, 8))
+    estratti_outer = ttk.LabelFrame(opz_scrollable, padding=10)
+    estratti_outer.configure(
+        labelwidget=ttk.Label(
+            estratti_outer,
+            text="Cartella dove collocare gli estratti conto pdf per verifica",
+            font=_OPZ_TITLE_FONT,
+        )
+    )
+    estratti_outer.pack(fill=tk.X, padx=(28, 10), pady=(0, 10))
+    estratti_inner = ttk.Frame(estratti_outer)
+    estratti_inner.pack(fill=tk.X)
+
+    estratti_path_row = ttk.Frame(estratti_inner)
+    estratti_path_row.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 2))
+    estratti_path_row.columnconfigure(0, weight=0)
+    estratti_pdf_entry = ttk.Entry(estratti_path_row, textvariable=estratti_pdf_root_var, width=_OPZ_PATH_ENTRY_WIDTH)
+    estratti_pdf_entry.grid(row=0, column=0, sticky="w", padx=(0, 8))
 
     def browse_estratti_pdf_root() -> None:
         init = (estratti_pdf_root_var.get() or "").strip()
@@ -24141,6 +24882,14 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
             to_store = str(Path(raw).expanduser().resolve()) if raw else ""
         except Exception:
             to_store = raw
+        if not messagebox.askyesno(
+            "Salva cartella estratti PDF",
+            "Il percorso della cartella degli estratti conto PDF verrà salvato nel database cifrato.\n\n"
+            + (to_store if to_store else "(campo vuoto: verrà rimossa la cartella configurata)")
+            + "\n\nProcedere?",
+            parent=root,
+        ):
+            return
         estratti_pdf_settings_from_db(cur_db())["root_folder"] = to_store
         try:
             save_encrypted_db_dual(
@@ -24173,30 +24922,47 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
         except Exception as exc:
             messagebox.showerror("Estratti PDF", str(exc), parent=root)
 
-    _estr_btns = ttk.Frame(opzioni_inner)
-    _estr_btns.grid(row=12, column=1, sticky="w")
-    ttk.Button(_estr_btns, text="Sfoglia…", command=browse_estratti_pdf_root).pack(side=tk.LEFT, padx=(0, 8))
-    ttk.Button(_estr_btns, text="Salva cartella", command=save_estratti_pdf_root).pack(side=tk.LEFT, padx=(0, 8))
+    _estr_btns = ttk.Frame(estratti_path_row)
+    _estr_btns.grid(row=0, column=1, sticky="w")
+    _opz_action_label(
+        _estr_btns,
+        "Seleziona",
+        browse_estratti_pdf_root,
+        width=_OPZ_PATH_BTN_WIDTH,
+    ).pack(side=tk.LEFT, padx=(0, 8))
+    _opz_action_label(
+        _estr_btns,
+        "Salva cartella",
+        save_estratti_pdf_root,
+        color=_OPZ_RED,
+        active_color=_OPZ_RED_ACTIVE,
+        width=_OPZ_PATH_BTN_WIDTH,
+    ).pack(side=tk.LEFT, padx=(0, 8))
     ttk.Label(
         _estr_btns,
         textvariable=estratti_pdf_feedback_var,
         font=("TkDefaultFont", 10, "bold"),
-        foreground="#1b5e20",
+        foreground="#555555",
     ).pack(side=tk.LEFT, padx=(4, 0))
     ttk.Label(
-        opzioni_inner,
-        text=(
-            "Un’unica cartella radice (nessuna sottocartella obbligatoria per anno): dentro ci sono i PDF con nome "
-            "«nomebase» + spazio + mese 01…12 o trimestre T1…T4. Dopo aver modificato il percorso usare «Salva cartella» "
-            "per scriverlo nel .enc (Sfoglia o incolla da soli non salvano). In «Conti» il nome base senza suffisso né .pdf. "
-            "Modulo: estratto_conto_pdf.py (ESTRATTO_PDF_DEBUG=1 per adattamenti)."
-        ),
-        wraplength=620,
+        estratti_inner,
+        text="La cartella deve contenere file pdf con i nomi previsti nelle correlazioni indicati nella pagina Conti, seguite dalla numerazione mensile 01, 02, ..., 12.",
+        wraplength=980,
         font=("TkDefaultFont", 9),
         foreground="#444444",
-    ).grid(row=13, column=0, columnspan=2, sticky="w", pady=(4, 8))
+    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 6))
 
-    def opzioni_restore_from_library_backup() -> None:
+    ttk.Label(
+        estratti_inner,
+        text=(
+            "Funzioni presenti ma non attivabili da questa pagina: import legacy, azzeramento di emergenza del saldo "
+            "virtuale, verifica coerenza file cifrati e copia manuale Dropbox verso Library."
+        ),
+        wraplength=980,
+        foreground="#555555",
+    ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+    def opzioni_restore_from_library_backup(*, confirm_existing: bool = True) -> None:
         primary = Path(data_file_var.get()).expanduser().resolve()
         kp = Path(key_file_var.get()).expanduser().resolve()
         backup = user_local_backup_enc_path(primary)
@@ -24209,7 +24975,7 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
                 parent=root,
             )
             return
-        if primary.is_file():
+        if confirm_existing and primary.is_file():
             if not messagebox.askyesno(
                 "Sovrascrivere",
                 f"Il file operativo esiste già:\n{primary}\n\n"
@@ -24259,6 +25025,30 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
             parent=root,
         )
 
+    def _opzioni_restore_from_library_backup_with_confirm() -> None:
+        try:
+            primary = Path(data_file_var.get()).expanduser().resolve()
+        except Exception:
+            primary = Path(data_file_var.get())
+        if not messagebox.askyesno(
+            "Ripristina cartella dati da Library",
+            "Verrà ripristinato il database operativo usando la copia di sicurezza nella Library dell'utente.\n\n"
+            f"Percorso operativo:\n{primary}\n\n"
+            "Il file attuale verrà sovrascritto e l'app ricaricherà i dati ripristinati.\n\n"
+            "Procedere?",
+            parent=root,
+        ):
+            return
+        opzioni_restore_from_library_backup(confirm_existing=False)
+
+    _opz_action_label(
+        data_restore_row,
+        "Ripristina cartella dati da Library",
+        _opzioni_restore_from_library_backup_with_confirm,
+        color=_OPZ_RED,
+        active_color=_OPZ_RED_ACTIVE,
+    ).pack(side=tk.LEFT)
+
     ripristina_btn = ttk.Button(
         opzioni_inner,
         text="Ripristina da backup (Library Mac)…",
@@ -24266,26 +25056,18 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
     )
 
     def _refresh_ripristina_visibility(*_a: object) -> None:
-        try:
-            show = (
-                not session_holder[0].entered_via_backdoor
-                and (
-                    not Path(data_file_var.get()).expanduser().resolve().is_file()
-                    or not Path(key_file_var.get()).expanduser().resolve().is_file()
-                )
-            )
-        except Exception:
-            show = False
-        if show:
-            ripristina_btn.grid(row=14, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        else:
-            ripristina_btn.grid_remove()
+        # Funzione mantenuta per recovery, ma il pulsante non è più esposto nella pagina Opzioni.
+        ripristina_btn.grid_remove()
 
     data_file_var.trace_add("write", _refresh_ripristina_visibility)
     key_file_var.trace_add("write", _refresh_ripristina_visibility)
     _refresh_ripristina_visibility()
 
     def reload_legacy_overwrite() -> None:
+        if not LEGACY_IMPORT_ENABLED:
+            messagebox.showwarning("Import legacy disabilitato", LEGACY_IMPORT_DISABLED_MESSAGE, parent=root)
+            status_var.set("Import legacy disabilitato.")
+            return
         confirmed = messagebox.askyesno(
             "Conferma import legacy",
             "Confermi l'avvio di ImportLegacy?\n\n"
@@ -24375,22 +25157,18 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
         if picked:
             legacy_path_var.set(picked)
 
-    ttk.Label(
-        opzioni_inner,
-        text="Import legacy (sorgente applicazione precedente)",
-        font=("TkDefaultFont", 11, "italic"),
-    ).grid(row=15, column=0, columnspan=2, sticky="w", pady=(20, 4))
-
-    ttk.Label(opzioni_inner, text="Sorgente import legacy").grid(row=16, column=0, sticky="w", pady=(0, 6))
     legacy_entry = ttk.Entry(opzioni_inner, textvariable=legacy_path_var, width=80)
-    legacy_entry.grid(row=17, column=0, sticky="we", padx=(0, 8))
-    ttk.Button(opzioni_inner, text="Sfoglia...", command=browse_legacy).grid(row=17, column=1, sticky="w")
+    legacy_browse_btn = ttk.Button(opzioni_inner, text="Sfoglia...", command=browse_legacy)
 
-    ttk.Button(
+    legacy_import_btn = ttk.Button(
         opzioni_inner,
         text="Ricarica importi legacy (sovrascrive dati nuova app)",
         command=reload_legacy_overwrite,
-    ).grid(row=18, column=0, sticky="w", pady=(16, 0))
+    )
+    if not LEGACY_IMPORT_ENABLED:
+        legacy_entry.configure(state="disabled")
+        legacy_browse_btn.configure(state="disabled")
+        legacy_import_btn.configure(state="disabled")
 
     # --- Azzeramento di emergenza saldo virtuale ---
     def _emergency_reset_virtuale() -> None:
@@ -24414,18 +25192,6 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
         _exit_virtuale_discharge_mode()
         _populate_form_defaults(keep_last=False)
         messagebox.showinfo("Saldo virtuale", "Saldo virtuale azzerato.")
-
-    ttk.Label(
-        opzioni_inner,
-        text="Saldo virtuale — emergenza",
-        font=("TkDefaultFont", 11, "italic"),
-    ).grid(row=19, column=0, columnspan=2, sticky="w", pady=(20, 4))
-
-    ttk.Button(
-        opzioni_inner,
-        text="Azzera saldo virtuale (emergenza)",
-        command=_emergency_reset_virtuale,
-    ).grid(row=20, column=0, sticky="w", pady=(4, 0))
 
     # --- Diagnostica e recovery file cifrati ---
     def _enc_file_info(p: Path) -> str | None:
@@ -24570,14 +25336,7 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
         else:
             messagebox.showinfo("Copia Dropbox → Library", f"{len(pairs)} file copiati con successo.")
 
-    ttk.Label(
-        opzioni_inner,
-        text="Diagnostica file cifrato",
-        font=("TkDefaultFont", 11, "italic"),
-    ).grid(row=21, column=0, columnspan=2, sticky="w", pady=(20, 4))
-
     _diag_btn_row = tk.Frame(opzioni_inner, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    _diag_btn_row.grid(row=22, column=0, columnspan=2, sticky="w", pady=(4, 0))
     ttk.Button(
         _diag_btn_row,
         text="Verifica coerenza Dropbox ↔ Library",
