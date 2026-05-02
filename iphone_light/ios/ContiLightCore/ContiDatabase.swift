@@ -580,12 +580,41 @@ public enum ContiDatabase {
         }
     }
 
+    /// Lettura contenuto file dentro `coordinate`; per Dropbox+.enc più passaggi e pause lunghe perché anche «Aggiorna»
+    /// nella stessa sessione può rileggere la stessa copia cached del provider — serve tempo tra una lettura e l’altra
+    /// (equivalente pragmatico del «secondo avvio» dell’app).
+    private static func coordinatedReadUncachedPreferringHydrated(dropboxEncURL readURL: URL) throws -> Data {
+        precondition(pathLooksUnderDropbox(readURL))
+        var data = try Data(contentsOf: readURL, options: [.uncached])
+        // Ritardi ispirati a sync provider: dopo 0,7 s e 2,0 s molti File Provider consegnano il blob aggiornato.
+        Thread.sleep(forTimeInterval: 0.7)
+        data = try Data(contentsOf: readURL, options: [.uncached])
+        Thread.sleep(forTimeInterval: 2.0)
+        data = try Data(contentsOf: readURL, options: [.uncached])
+        return data
+    }
+
     public static func coordinatedDataContents(of url: URL) throws -> Data {
         let coordinator = NSFileCoordinator(filePresenter: nil)
         var coordinatorError: NSError?
         var result: Result<Data, Error>?
         coordinator.coordinate(readingItemAt: url, options: [], error: &coordinatorError) { readURL in
-            result = Result { try Data(contentsOf: readURL) }
+            result = Result {
+                if pathLooksUnderDropbox(readURL) {
+                    let p = readURL.path.lowercased()
+                    if p.hasSuffix(".enc") {
+                        return try coordinatedReadUncachedPreferringHydrated(dropboxEncURL: readURL)
+                    }
+                    var data = try Data(contentsOf: readURL, options: [.uncached])
+                    Thread.sleep(forTimeInterval: 0.22)
+                    let again = try Data(contentsOf: readURL, options: [.uncached])
+                    if again != data {
+                        data = again
+                    }
+                    return data
+                }
+                return try Data(contentsOf: readURL)
+            }
         }
         if let coordinatorError { throw coordinatorError }
         guard let result else {
@@ -919,6 +948,7 @@ public enum ContiDatabase {
             m.removeValue(forKey: contiLightEditSupersedesYearKey)
             m.removeValue(forKey: contiLightEditSupersedesLegacyKeyKey)
             m.removeValue(forKey: contiLightEditSupersedesSourceIndexKey)
+            copyAccountVerificationFields(from: old, into: &m)
             recs0[ri0] = m
             allYears[yi0]["records"] = recs0
             db["years"] = allYears
@@ -950,6 +980,7 @@ public enum ContiDatabase {
                 m.removeValue(forKey: contiLightEditSupersedesLegacyKeyKey)
                 m.removeValue(forKey: contiLightEditSupersedesSourceIndexKey)
             }
+            copyAccountVerificationFields(from: old, into: &m)
             recs1.append(m)
             yb1["records"] = recs1
             allY2[yi1] = yb1
@@ -1892,6 +1923,33 @@ public enum ContiDatabase {
         return m
     }
 
+    /// Campi «verifica conto» (asterischi sul desktop). L’app light non li imposta in UI: vanno preservati dal record già nel main o dalla riga sessione pre-modifica.
+    private static let accountVerificationFieldKeys: [String] = [
+        "account_primary_flags",
+        "account_primary_with_flags",
+        "account_secondary_flags",
+        "account_secondary_with_flags",
+    ]
+
+    /// Copia i campi verifica da ``existing`` su ``merged`` se presenti in ``existing`` (non sovrascrivere con template vuoti da immissione light).
+    private static func copyAccountVerificationFields(from existing: [String: Any], into merged: inout [String: Any]) {
+        for k in accountVerificationFieldKeys {
+            if existing[k] != nil {
+                merged[k] = existing[k]
+            }
+        }
+    }
+
+    /// Dopo un merge light → main: ``incoming`` porta i dati modificabili da iOS; ``existingInMain`` è la riga attuale nel file completo (appena letto).
+    private static func lightIncomingRecordMergedWithMainVerification(
+        existingInMain: [String: Any],
+        incoming: [String: Any]
+    ) -> [String: Any] {
+        var merged = incoming
+        copyAccountVerificationFields(from: existingInMain, into: &merged)
+        return merged
+    }
+
     /// Toglie dal completo la riga «vecchia» quando una modifica iOS sposta l’anno (prima: desktop senza `conti_light_id`).
     private static func removeMainRecordForIosSupersede(
         main: inout [String: Any],
@@ -1963,7 +2021,11 @@ public enum ContiDatabase {
         main["years"] = allY
     }
 
-    /// Sostituisce o sposta in main le righe del light (per `conti_light_record_id` e/o stessa `legacy_registration_key` nello stesso anno, anche record desktop), dopo eventuale rimozione con ``conti_light_edit_supersedes_*``.
+    /**
+     Sostituisce o sposta in main le righe del light (per `conti_light_record_id` e/o stessa `legacy_registration_key` nello stesso anno, anche record desktop), dopo eventuale rimozione con ``conti_light_edit_supersedes_*``.
+
+     Per ogni riga già presente nel file **completo**, i campi di verifica conto (asterischi) sono presi dalla copia **main** appena letta, non dalla sessione light: così una sessione iOS non può azzerare verifiche fatte sul desktop se l’utente non ha modificato quelle righe dal form.
+     */
     public static func upsertLightSessionRecordsInMain(main: inout [String: Any], light: [String: Any]) -> Int {
         guard let lightYears = light["years"] as? [[String: Any]] else { return 0 }
         var flat: [[String: Any]] = []
@@ -2003,7 +2065,8 @@ public enum ContiDatabase {
                 let yOld = intFromJSON(allYears[fyi]["year"])
                 if yOld == yNew {
                     var recs = coerceToArrayOfStringKeyedDicts(allYears[fyi]["records"])
-                    recs[fri] = recL
+                    let prevMain = recs[fri]
+                    recs[fri] = lightIncomingRecordMergedWithMainVerification(existingInMain: prevMain, incoming: recL)
                     var yb = allYears[fyi]
                     yb["records"] = recs
                     allYears[fyi] = yb
@@ -2011,6 +2074,7 @@ public enum ContiDatabase {
                     updated += 1
                 } else {
                     var recsOld = coerceToArrayOfStringKeyedDicts(allYears[fyi]["records"])
+                    let removedFromOldYear = recsOld[fri]
                     recsOld.remove(at: fri)
                     var ybOld = allYears[fyi]
                     ybOld["records"] = recsOld
@@ -2029,9 +2093,10 @@ public enum ContiDatabase {
                     if !rid.isEmpty, let j = recsN.firstIndex(where: {
                         stringFromJSON($0[contiLightRecordIdKey]).trimmingCharacters(in: .whitespacesAndNewlines) == rid
                     }) {
-                        recsN[j] = recL
+                        let prevNj = recsN[j]
+                        recsN[j] = lightIncomingRecordMergedWithMainVerification(existingInMain: prevNj, incoming: recL)
                     } else {
-                        recsN.append(recL)
+                        recsN.append(lightIncomingRecordMergedWithMainVerification(existingInMain: removedFromOldYear, incoming: recL))
                     }
                     ybN["records"] = recsN
                     allY2[yiN] = ybN
@@ -2296,6 +2361,11 @@ public enum ContiDatabase {
             if a2.code == acc1.code {
                 throw ContiLightImmissioneError.message("Il secondo conto deve essere diverso dal primo.")
             }
+            if a2.isCreditCard {
+                throw ContiLightImmissioneError.message(
+                    "Nelle girate conto/conto il secondo conto non può essere un conto carta di credito."
+                )
+            }
         }
         guard let dIsoFull = parseItalianOrIsoDateToIso(dateText) else {
             throw ContiLightImmissioneError.message("Data non valida (gg/mm/aaaa).")
@@ -2401,6 +2471,8 @@ public enum ContiDatabase {
     /**
      Scrive su disco ``*_light.enc`` e, se presente e autenticabile, anche ``conti_utente_*.enc`` completo.
      ``recordForSaldi`` è usato in sola lettura come documentazione legata a ``appendLightSessionRecord``; i saldi sul file light vengono ricalcolati interamente da movimenti; sul completo: merge + upsert + ricalcolo.
+
+     **Flusso:** si carica il completo da disco, si applica ``sessionDb`` con ``upsertLightSessionRecordsInMain`` (che **preserva** sul main i campi verifica conto già presenti), poi le sole righe light nuove con ``mergeLightNewRecordsIntoMain``. Infine saldi e riscrittura doppia file.
      */
     public static func persistSessionDbToEncryptedFiles(
         sessionDb: [String: Any],

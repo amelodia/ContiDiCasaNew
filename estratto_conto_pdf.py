@@ -140,8 +140,9 @@ _RE_ONE_DATE_DESC_AMT_TAIL = re.compile(
 # Riga che inizia con doppia data operazione/valuta seguita da testo (movimento anche se spezzato su più righe PDF)
 _RE_LINE_START_TWO_DATES = re.compile(rf"^{_DATE_Y}\s+{_DATE_Y}\s+\S")
 
-# Date con separatore - o . (comuni in estratti non Poste)
-_RE_DATE_SEP = re.compile(r"\b(\d{2})[-.](\d{2})[-.](\d{2,4})\b")
+# Date con separatore -, . o /, anche se l'estrattore PDF inserisce spazi attorno al separatore
+# (es. Amex: ``08 . 04 . 26``).
+_RE_DATE_SEP = re.compile(r"\b(\d{2})\s*[-./]\s*(\d{2})\s*[-./]\s*(\d{2,4})\b")
 # Riga solo importo italiano (evita di accodarla come nota al movimento precedente su Amex)
 _RE_ORPHAN_AMOUNT_LINE = re.compile(
     rf"^(?:\d{{1,3}}(?:\.\d{{3}})*|\d+),\d{{2}}{_AMT_LINE_SUFFIX}$",
@@ -208,7 +209,7 @@ def _compact_for_keyword(s: str) -> str:
 
 
 def _normalize_date_separators(line: str) -> str:
-    """Converte 12-01-26 / 12.01.2026 in 12/01/26 per allinearsi ai pattern esistenti."""
+    """Converte 12-01-26 / 12.01.2026 / 12 . 01 . 26 in 12/01/26."""
 
     def _sub(m: re.Match[str]) -> str:
         a, b, c = m.group(1), m.group(2), m.group(3)
@@ -293,9 +294,10 @@ def _prepare_statement_lines(text: str) -> list[str]:
         if not x or x.startswith("--"):
             continue
         x1 = x.replace("\n", " ")
+        x = _normalize_date_separators(_insert_space_before_glued_calendar_date(x))
+        x1 = x.replace("\n", " ")
         if _line_looks_shattered(x1):
             x = _collapse_shattered_line(x1)
-        x = _insert_space_before_glued_calendar_date(x)
         raw.append(x)
     merged = _merge_broken_statement_lines(raw)
     return [_normalize_date_separators(_insert_space_before_glued_calendar_date(L)) for L in merged]
@@ -413,6 +415,8 @@ def _bcc_note_suggests_dare_outflow(note: str) -> bool:
 def _skip_description(desc: str) -> bool:
     u = " ".join(desc.split()).upper()
     c = _compact_for_keyword(desc)
+    if "SALDOPRECEDENTE" in c or "IMPORTODOVUTO" in c or "ESTRATTOCONTOATTUALE" in c:
+        return True
     if "SALDOINIZIALE" in c or "SALDO INIZIALE" in u or "SALDO INIZ." in u:
         return True
     if "TOTALUSCITE" in c or "TOTALENTRATE" in c or "TOTALE USCITE" in u or "TOTALE ENTRATE" in u:
@@ -434,6 +438,8 @@ def _line_is_summary_not_movement(line: str) -> bool:
     """Righe di riepilogo estratto (saldo iniziale, totali) da non trattare come movimenti."""
     u = " ".join(line.split()).upper()
     c = _compact_for_keyword(line)
+    if "SALDOPRECEDENTE" in c or "IMPORTODOVUTO" in c or "ESTRATTOCONTOATTUALE" in c:
+        return True
     if "SALDOINIZIALE" in c or "SALDO INIZIALE" in u or "SALDO INIZ." in u:
         return True
     if "SALDO ALLA DATA DEL" in u and "INIZ" in u:
@@ -535,6 +541,8 @@ def _try_parse_saldo_finale_amount(line: str) -> Decimal | None:
 def _note_looks_like_summary_row(note: str) -> bool:
     u = " ".join((note or "").split()).upper()
     c = _compact_for_keyword(note or "")
+    if "SALDOPRECEDENTE" in c or "IMPORTODOVUTO" in c or "ESTRATTOCONTOATTUALE" in c:
+        return True
     if "SALDOINIZIALE" in c or "SALDO INIZIALE" in u or "TOTALE ENTRATE" in u or "TOTALE USCITE" in u:
         return True
     if "SALDOFINALE" in c or "SALDO FINALE" in u:
@@ -916,9 +924,10 @@ def _line_starts_like_new_movement(line: str, *, max_note_len: int) -> bool:
     if t == _AMEX_BLOCK_MARKER:
         return False
     x = t.replace("\n", " ")
+    t = _normalize_date_separators(_insert_space_before_glued_calendar_date(x))
+    x = t
     if _line_looks_shattered(x):
         t = _collapse_shattered_line(x)
-    t = _normalize_date_separators(t)
     if _RE_TWO_DATE.match(t) or _RE_TWO_DATE_COMPACT.match(t):
         return True
     if _RE_ONE_DATE.match(t) or _RE_ONE_DATE_COMPACT.match(t):
@@ -1003,7 +1012,7 @@ def _movement_row(
 
 
 def _parse_two_date_desc_amount_from_line_tail(
-    line: str, *, max_note_len: int
+    line: str, *, max_note_len: int, prefer_amex_foreign_glued: bool = False
 ) -> dict[str, object] | None:
     """
     Doppia data + causale + importo in coda.
@@ -1014,8 +1023,41 @@ def _parse_two_date_desc_amount_from_line_tail(
     """
     s = line.strip()
     s = re.sub(r"\s*<<<AMEX_HRULE>>>\s*$", "", s, flags=re.I).strip()
+    if prefer_amex_foreign_glued:
+        m_fx_glued = re.search(
+            rf"(?<!\d)(?P<foreign>\d+\.\d{{2}})(?P<euro>{_AMT_CORE}){_AMT_LINE_SUFFIX}(?:\s+CR\s*)?$",
+            s,
+            re.I,
+        )
+        if m_fx_glued:
+            amt = _parse_it_amount(m_fx_glued.group("euro"))
+            if amt is None:
+                return None
+            pre = s[: m_fx_glued.start()].rstrip()
+            pair_rx = re.compile(rf"(?<![0-9/])({_DATE_Y})\s+({_DATE_Y})(?=\s)")
+            pairs = list(pair_rx.finditer(pre))
+            if not pairs:
+                return None
+            m_pair = pairs[-1]
+            d1, _d2 = m_pair.group(1), m_pair.group(2)
+            desc = pre[m_pair.end() :].strip()
+            if not desc:
+                return None
+            if _skip_description(desc):
+                return None
+            row = _movement_row(
+                d1,
+                amt,
+                f"{desc} {m_fx_glued.group('foreign')}".strip(),
+                max_note_len=max_note_len,
+            )
+            if re.search(r"(?i)\s+CR\s*$", s):
+                note0 = str(row.get("note") or "")
+                if not _RE_AMEX_NOTE_HAS_CR.search(note0):
+                    row["note"] = ((note0 + " CR").strip())[:max_note_len]
+            return row
     m_amt = re.search(
-        rf"(?<![0-9,])({_AMT_CORE})({_AMT_LINE_SUFFIX})(?:\s+CR\s*)?$",
+        rf"(?<![0-9,.])({_AMT_CORE})({_AMT_LINE_SUFFIX})(?:\s+CR\s*)?$",
         s,
         re.I,
     )
@@ -1045,14 +1087,17 @@ def _parse_two_date_desc_amount_from_line_tail(
     return row
 
 
-def _parse_movement_line(line: str, *, max_note_len: int) -> dict[str, object] | None:
+def _parse_movement_line(
+    line: str, *, max_note_len: int, prefer_amex_foreign_glued: bool = False
+) -> dict[str, object] | None:
     """Interpreta una riga come movimento; None se non riconosciuta."""
     line = _normalize_pdf_line(line)
     x = line.replace("\n", " ")
+    line = _normalize_date_separators(_insert_space_before_glued_calendar_date(line))
+    x = line.replace("\n", " ")
     if _line_looks_shattered(x):
         line = _collapse_shattered_line(x)
-    line = _insert_space_before_glued_calendar_date(line)
-    line = _normalize_date_separators(line)
+        line = _normalize_date_separators(_insert_space_before_glued_calendar_date(line))
     line = re.sub(r"\s*<<<AMEX_HRULE>>>\s*$", "", line, flags=re.I).strip()
 
     for regex in (_RE_TWO_DATE_COMPACT, _RE_TWO_DATE, _RE_ONE_DATE_COMPACT, _RE_ONE_DATE):
@@ -1071,7 +1116,11 @@ def _parse_movement_line(line: str, *, max_note_len: int) -> dict[str, object] |
             continue
         return _movement_row(d1, amt, desc, max_note_len=max_note_len)
 
-    row_two_tail = _parse_two_date_desc_amount_from_line_tail(line, max_note_len=max_note_len)
+    row_two_tail = _parse_two_date_desc_amount_from_line_tail(
+        line,
+        max_note_len=max_note_len,
+        prefer_amex_foreign_glued=prefer_amex_foreign_glued,
+    )
     if row_two_tail is not None:
         return row_two_tail
 
@@ -1280,6 +1329,28 @@ def _amex_filter_non_movement_rows(rows: list[dict[str, object]]) -> list[dict[s
     return out
 
 
+def _amex_line_has_euro_after_foreign_amount(line: str) -> bool:
+    """
+    True se la riga Amex contiene importo in valuta estera e importo Euro finale.
+
+    Nei PDF ricostruiti per posizione può capitare che i due importi siano separati da spazio
+    (``211.98 186,43``) oppure incollati (``24.5121,52``). Se invece una riga è seguita da
+    ``Dollari Statunitensi`` ma ha un solo importo, quell'importo è la valuta estera e non va
+    usato come Euro.
+    """
+    s = (line or "").strip()
+    if re.search(rf"(?<!\d)\d+\.\d{{2}}\s+{_AMT_CORE}{_AMT_LINE_SUFFIX}$", s, re.I):
+        return True
+    if re.search(rf"(?<!\d)\d+\.\d{{2}}{_AMT_CORE}{_AMT_LINE_SUFFIX}$", s, re.I):
+        return True
+    return False
+
+
+def _amex_next_line_is_foreign_currency_label(line: str) -> bool:
+    u = " ".join((line or "").split()).upper()
+    return u.startswith("DOLLARI STATUNITENSI")
+
+
 def _parse_statement_text(text: str, *, max_note_len: int) -> tuple[list[dict[str, object]], Decimal | None]:
     """Estrae movimenti e saldo finale da testo già letto dal PDF."""
     is_amex = _looks_like_amex_estratto(text)
@@ -1306,14 +1377,13 @@ def _parse_statement_text(text: str, *, max_note_len: int) -> tuple[list[dict[st
     prev_amex_block = False
     amex_doc_i = 0
 
-    for line in prepared[start:]:
+    body_lines = prepared[start:]
+    for idx_line, line in enumerate(body_lines):
         if line.strip() == _AMEX_BLOCK_MARKER:
             prev_amex_block = True
             continue
         work = _amex_trim_leading_before_movement_dates(line) if is_amex else line
         if re.match(r"^Pag\.", work, re.I):
-            continue
-        if _line_is_summary_not_movement(work):
             continue
         uu = work.upper()
         ckln = _compact_for_keyword(work)
@@ -1326,13 +1396,25 @@ def _parse_statement_text(text: str, *, max_note_len: int) -> tuple[list[dict[st
         if _line_is_probable_table_header(work, max_note_len=max_note_len):
             continue
 
-        row = _parse_movement_line(work, max_note_len=max_note_len)
+        next_line = body_lines[idx_line + 1] if idx_line + 1 < len(body_lines) else ""
+        next_is_foreign = is_amex and _amex_next_line_is_foreign_currency_label(next_line)
+        row = _parse_movement_line(
+            work,
+            max_note_len=max_note_len,
+            prefer_amex_foreign_glued=next_is_foreign,
+        )
         if row is not None:
+            if next_is_foreign and not _amex_line_has_euro_after_foreign_amount(work):
+                prev_amex_block = False
+                continue
             if is_amex:
                 row["_amex_doc_i"] = amex_doc_i
                 amex_doc_i += 1
             rows.append(row)
             prev_amex_block = False
+            continue
+
+        if _line_is_summary_not_movement(work):
             continue
 
         if rows and line and _should_append_continuation(
@@ -1711,6 +1793,10 @@ def extract_estratto_conto_movements_from_pdf(path: Path, *, max_note_len: int =
                 bal_geo = _amex_closing_balance_from_first_page(reader)
                 if bal_geo is not None:
                     closing_balance = bal_geo
+            if closing_balance is not None:
+                # Amex espone l'Importo Dovuto come numero positivo, ma i movimenti carta
+                # in app sono addebiti negativi: il saldo estratto deve avere lo stesso segno.
+                closing_balance = -abs(closing_balance)
             if rows or closing_balance is not None:
                 return EstrattoContoPdfExtract(rows, closing_balance)
         rows, closing_balance = [], None

@@ -106,6 +106,22 @@ def default_key_file() -> Path:
     return data_dir() / "conti_di_casa.key"
 
 
+def primary_user_enc_files_sorted(workspace: Path) -> list[Path]:
+    """File ``conti_utente_<hash>.enc`` nella cartella dati, **senza** il sidecar ``*_light.enc`` dell'app iOS.
+
+    Ordine: ``st_mtime`` decrescente (il più recentemente modificato per primo). Il pattern ``conti_utente_*.enc``
+    altrimenti includerebbe anche ``…_light.enc``, spesso più recente del file completo e scelto per errore.
+    """
+    out: list[Path] = []
+    for p in workspace.glob("conti_utente_*.enc"):
+        if not p.is_file():
+            continue
+        if p.name.endswith("_light.enc"):
+            continue
+        out.append(p)
+    return sorted(out, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
 def legacy_import_dir() -> Path:
     return data_dir() / "legacy_import"
 

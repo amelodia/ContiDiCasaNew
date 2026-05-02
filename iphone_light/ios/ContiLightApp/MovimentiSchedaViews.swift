@@ -522,6 +522,11 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         }
     }
 
+    /// Girata conto/conto: il secondo conto non può essere carta (come sul desktop).
+    private var accRowsGirataSecondo: [(code: String, label: String, subtitle: String?)] {
+        (lists?.conti ?? []).filter { !$0.isCreditCard }.map { ($0.code, $0.name, nil) }
+    }
+
     private var selectedCatNote: String {
         lists?.categorie.first { $0.code == catCode }?.planNote ?? "—"
     }
@@ -657,7 +662,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                             NavigationLink {
                                 ImmissioneCodePickView(
                                     title: "Secondo conto",
-                                    rows: accRows,
+                                    rows: accRowsGirataSecondo,
                                     includeNone: true,
                                     noneLabel: "Nessuno",
                                     selectedCode: $acc2Code
@@ -665,7 +670,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                             } label: {
                                 LabeledContent("Secondo conto", value: acc2Label)
                             }
-                            .disabled(accRows.isEmpty)
+                            .disabled(accRowsGirataSecondo.isEmpty)
                         }
                     }
                     Section {
@@ -784,6 +789,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                     } else if n.isEmpty || n == "-" {
                         noteText = "Giroconto"
                     }
+                    clearAcc2IfCreditCardInGirata()
                 }
             } else {
                 acc2Code = ""
@@ -792,6 +798,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         }
         .onChange(of: acc1Code) { _, _ in
             syncChequeFromAcc1()
+            clearAcc2IfCreditCardInGirata()
         }
         .onChange(of: acc2Code) { _, _ in
             guard girataSelected else { return }
@@ -861,6 +868,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
             noteText = p.note
             let clid = p.contiLightId.trimmingCharacters(in: .whitespacesAndNewlines)
             pendingLightRecordId = clid.isEmpty ? UUID().uuidString : clid
+            clearAcc2IfCreditCardInGirata()
         } catch {
             if let ce = error as? ContiLightImmissioneError, case .message(let s) = ce {
                 errorAlertMessage = s
@@ -1121,6 +1129,13 @@ struct ContiLightNuovoMovimentoSchedaView: View {
 
     private func dismissNumericKeyboard() {
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    }
+
+    private func clearAcc2IfCreditCardInGirata() {
+        guard girataSelected else { return }
+        if let a2 = lists?.conti.first(where: { $0.code == acc2Code }), a2.isCreditCard {
+            acc2Code = ""
+        }
     }
 
     /// Allineato al desktop: carta → «ccarta» senza campo; Cassa/Virtuale → vuoto.

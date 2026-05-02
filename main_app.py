@@ -10,19 +10,23 @@ import os
 import re
 import shutil
 import calendar
+from bisect import bisect_left
 import platform
 import subprocess
 import sys
 import time
 import tempfile
 import textwrap
+import unicodedata
 import tkinter as tk
 import webbrowser
 import atexit
+from collections import defaultdict
 from collections.abc import Callable
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, ttk
+from dataclasses import asdict
 from datetime import date, datetime, timedelta
 
 try:
@@ -71,10 +75,15 @@ from import_legacy import (
     MAX_CHEQUE_LEN,
     MAX_RECORD_NOTE_LEN,
     clip_text,
+    find_single_file,
     format_euro_it,
     format_money,
+    guess_year_from_folder,
+    iter_year_folders,
     normalize_euro_input,
+    parse_aco_list,
     parse_amount,
+    parse_dat_records,
     run_import_legacy,
 )
 
@@ -2048,13 +2057,21 @@ def parse_estratto_pdf_suffix_for_stem(pdf_filename: str, stem: str) -> tuple[st
     return None
 
 
-def pick_estratto_pdf_in_folder(folder: Path, stem: str, dco: date) -> Path | None:
+def pick_estratto_pdf_in_folder(
+    folder: Path,
+    stem: str,
+    dco: date,
+    *,
+    allow_next_month: bool = False,
+) -> Path | None:
     """
     Tra i PDF **direttamente** nella cartella ``folder`` che rispettano il nome base ``stem``, sceglie quello con **suffisso più alto**
     tra quelli ancora compatibili con la data di chiusura: mese ``MM`` con ``MM <= mese(chiusura)``, oppure — se non
-    ce n’è nessuno — trimestre ``Tn`` con ``n <= trimestre(chiusura)``. Stessa logica di lettura del file scelto.
+    ce n’è nessuno — trimestre ``Tn`` con ``n <= trimestre(chiusura)``. Per le carte può essere ammesso anche il
+    mese successivo alla chiusura, perché alcuni estratti sono nominati col mese di emissione/pagamento.
+    Stessa logica di lettura del file scelto.
     """
-    cut_m = dco.month
+    cut_m = min(12, dco.month + (1 if allow_next_month else 0))
     cut_q = (dco.month - 1) // 3 + 1
     monthly: list[tuple[int, Path]] = []
     quarterly: list[tuple[int, Path]] = []
@@ -2128,11 +2145,14 @@ def resolve_estratto_pdf_for_account(
         ln("Errore: data di chiusura non interpretabile.")
         return None, "\n".join(lines)
 
+    allow_next_month = account_is_credit_card_by_code(db, acc_code)
+    month_limit = min(12, dco.month + (1 if allow_next_month else 0))
+    extra_month_note = " (conto carta: ammesso anche il mese successivo)" if allow_next_month else ""
     ln(
         f"Criterio: tra i .pdf con nome «{stem}» + spazio opzionale + (01…12 o T1…T4), suffisso massimo "
-        f"con mese ≤ {dco.month} (oppure trimestre ≤ {(dco.month - 1) // 3 + 1})."
+        f"con mese ≤ {month_limit}{extra_month_note} (oppure trimestre ≤ {(dco.month - 1) // 3 + 1})."
     )
-    picked = pick_estratto_pdf_in_folder(root, stem, dco)
+    picked = pick_estratto_pdf_in_folder(root, stem, dco, allow_next_month=allow_next_month)
     if picked is not None and picked.is_file():
         try:
             ln(f"File selezionato: {picked.resolve()}")
@@ -2185,7 +2205,8 @@ def category_code_used_any_year(db: dict, code: str) -> bool:
     cc = str(code).strip()
     for yb in db.get("years", []) or []:
         for r in yb.get("records", []) or []:
-            if str(r.get("category_code", "")).strip() == cc:
+            rc = str(r.get("category_code", "")).strip()
+            if _category_codes_equal_migration(rc, cc):
                 return True
     return False
 
@@ -2284,17 +2305,50 @@ def remove_category_from_all_years(db: dict, code: str) -> None:
 
 
 def sync_record_category_from_plan(rec: dict, year_categories: list[dict[str, str]], code_str: str) -> None:
+    """Aggiorna categoria registrazione dal piano anno. Codice: prima …==… stretto (evita 9 vs 09 su categorie diverse)."""
     rec["category_code"] = code_str
     cs = str(code_str).strip()
-    for c in year_categories:
+    cats = list(year_categories or [])
+    for c in cats:
         if str(c.get("code", "")).strip() == cs:
+            chart_code = str(c.get("code", "")).strip()
+            rec["category_code"] = chart_code if chart_code else cs
             rec["category_name"] = str(c.get("name", "") or "").strip() or str(rec.get("category_name") or "")
             return
+    loose_matches = [
+        c for c in cats if _category_codes_equal_migration(str(c.get("code", "") or ""), cs)
+    ]
+    if len(loose_matches) == 1:
+        c = loose_matches[0]
+        chart_code = str(c.get("code", "") or "").strip()
+        rec["category_code"] = chart_code if chart_code else cs
+        rec["category_name"] = str(c.get("name", "") or "").strip() or str(rec.get("category_name") or "")
+        return
+    if len(loose_matches) > 1:
+        for c in loose_matches:
+            cc = str(c.get("code", "") or "").strip()
+            if cc == cs:
+                rec["category_code"] = cc
+                rec["category_name"] = str(c.get("name", "") or "").strip() or str(rec.get("category_name") or "")
+                return
+        if cs.isdigit():
+            want = str(int(cs))
+            for c in loose_matches:
+                cc = str(c.get("code", "") or "").strip()
+                if cc.isdigit() and cc == want:
+                    rec["category_code"] = cc
+                    rec["category_name"] = str(c.get("name", "") or "").strip() or str(rec.get("category_name") or "")
+                    return
+        c = loose_matches[0]
+        chart_code = str(c.get("code", "") or "").strip()
+        rec["category_code"] = chart_code if chart_code else cs
+        rec["category_name"] = str(c.get("name", "") or "").strip() or str(rec.get("category_name") or "")
+        return
     if cs.isdigit():
         idx = int(cs)
-        if 0 <= idx < len(year_categories):
+        if 0 <= idx < len(cats):
             rec["category_name"] = (
-                str(year_categories[idx].get("name", "") or "").strip() or str(rec.get("category_name") or "")
+                str(cats[idx].get("name", "") or "").strip() or str(rec.get("category_name") or "")
             )
 
 
@@ -2371,11 +2425,56 @@ def apply_amount_to_record(rec: dict, amount: Decimal) -> None:
 
 
 def year_accounts_map(db: dict) -> dict[int, list[dict[str, str]]]:
-    return {y["year"]: y["accounts"] for y in db.get("years", [])}
+    """Chiavi anno sempre ``int`` (JSON può avere anno come numero o stringa)."""
+    out: dict[int, list[dict[str, str]]] = {}
+    for y in db.get("years", []) or []:
+        try:
+            yr = int(y.get("year", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if yr <= 0:
+            continue
+        out[yr] = y.get("accounts") or []
+    return out
 
 
 def year_categories_map(db: dict) -> dict[int, list[dict[str, str]]]:
-    return {y["year"]: y["categories"] for y in db.get("years", [])}
+    """Chiavi anno sempre ``int`` (JSON può avere anno come numero o stringa)."""
+    out: dict[int, list[dict[str, str]]] = {}
+    for y in db.get("years", []) or []:
+        try:
+            yr = int(y.get("year", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if yr <= 0:
+            continue
+        out[yr] = y.get("categories") or []
+    return out
+
+
+def record_category_plan_year(rec: dict, year_bucket: dict | None, *, fallback_year: int | None = None) -> int:
+    """Anno del piano categorie per un record: bucket legacy prima di ``rec['year']`` (allineato alla migrazione merge)."""
+    if year_bucket:
+        try:
+            by = int(year_bucket.get("year", 0) or 0)
+            if by > 0:
+                return by
+        except (TypeError, ValueError):
+            pass
+    try:
+        ry = int(rec.get("year") or 0)
+        if ry > 0:
+            return ry
+    except (TypeError, ValueError):
+        pass
+    if fallback_year is not None:
+        try:
+            fy = int(fallback_year)
+            if fy > 0:
+                return fy
+        except (TypeError, ValueError):
+            pass
+    return 0
 
 
 def account_name_for_record(rec: dict, accounts_for_year: list[dict[str, str]], which: str) -> str:
@@ -2504,6 +2603,27 @@ def is_dotazione_record(rec: dict) -> bool:
     return _category_code_int(rec) == 0
 
 
+def record_skip_for_category_statistics_budget(rec: dict, twin_keys: frozenset) -> bool:
+    """Prospetti **per categoria** (tabellone budget, statistiche per categoria, somme stile Statistiche).
+
+    Esclude: annullate, duplicati import «twin», **dotazioni** (cat. cod. 0), **Girata conto/conto**.
+    Le registrazioni su carta/VIRTUALE restano incluse (data di impegno / attribuzione categoria).
+    """
+    if rec.get("is_cancelled"):
+        return True
+    if (
+        twin_keys
+        and (rec.get("raw_record") or "").strip()
+        and _imported_record_balance_twin_key(rec) in twin_keys
+    ):
+        return True
+    if is_dotazione_record(rec):
+        return True
+    if is_giroconto_record(rec):
+        return True
+    return False
+
+
 def format_amount_for_verification_account(rec: dict, *, side: str) -> tuple[str, str]:
     """Importo mostrato dal punto di vista del conto in verifica (girata sul conto 2: stesso segno usato nei totali)."""
     flip = giro_record_secondary_amount_flip(rec, side)
@@ -2527,7 +2647,7 @@ def format_amount_for_verification_account(rec: dict, *, side: str) -> tuple[str
 
 
 def _ver_summary_signed_eur(v: Decimal) -> str:
-    """Importo nel riepilogo verifica (schermo e stampa HTML): segno + e suffisso €."""
+    """Importo nel riepilogo verifica (schermo e stampa PDF risultati): segno + e suffisso €."""
     s = format_euro_it(v)
     if v > 0 and not s.startswith("+"):
         s = "+" + s
@@ -2754,6 +2874,32 @@ def _synthetic_record_from_legacy_dat_raw(raw_line: str, host_year: int) -> dict
         "account_primary_code": acc1_code if acc1_code.isdigit() else "",
         "account_secondary_code": acc2_code if acc2_code.isdigit() else "",
     }
+
+
+def legacy_dat_category_code_from_raw_record(rec: dict) -> str | None:
+    """Codice categoria come nel .dat originale (``raw_record`` [37:39]), se presente e valido."""
+    raw = str(rec.get("raw_record") or "").strip()
+    if len(raw) < _LEGACY_DAT_RECORD_LEN:
+        return None
+    chunk = raw[37:39].strip()
+    if not chunk.isdigit():
+        return None
+    return chunk
+
+
+def _chart_row_for_legacy_category_code(cats: list[dict[str, str]] | None, code_slot: str) -> dict | None:
+    """Riga piano categoria per il codice/slot legacy (come in import: codice ``k`` ≡ riga ``k``)."""
+    for c in cats or []:
+        if not isinstance(c, dict):
+            continue
+        if _category_codes_equal_migration(str(c.get("code", "") or ""), code_slot):
+            return c
+    if code_slot.isdigit():
+        i = int(code_slot)
+        cl = list(cats or [])
+        if 0 <= i < len(cl) and isinstance(cl[i], dict):
+            return cl[i]
+    return None
 
 
 def compute_imported_active_records_edit_balance_adjustment(db: dict) -> list[Decimal]:
@@ -3024,6 +3170,74 @@ def compute_balances_future_dated_only(
     return latest_year, names, balances
 
 
+def compute_balances_future_dated_only_batch(
+    db: dict, *, today_isos: list[str], exclude_import_twin_actives: bool = False
+) -> list[list[Decimal]]:
+    """Stesso effetto di ``compute_balances_future_dated_only`` per più date in un solo passaggio sul pool."""
+    n_cut = len(today_isos)
+    if not db.get("years"):
+        return [[] for _ in range(n_cut)]
+    latest_year = max(y["year"] for y in db["years"])
+    year_data = next(y for y in db["years"] if y["year"] == latest_year)
+    accounts = year_data["accounts"]
+    n_accounts = len(accounts)
+    if n_accounts == 0:
+        return [[] for _ in range(n_cut)]
+
+    twin_keys = import_cancel_twin_balance_keys(db) if exclude_import_twin_actives else set()
+
+    pool: list[dict] = []
+    for yd in db["years"]:
+        y = int(yd["year"])
+        if y > latest_year:
+            continue
+        pool.extend(yd.get("records", []))
+    pool.sort(key=record_merge_sort_key)
+
+    idx_sorted = sorted(range(n_cut), key=lambda i: today_isos[i])
+    sorted_cutoffs = [today_isos[i] for i in idx_sorted]
+
+    out: list[list[Decimal]] = [[Decimal("0") for _ in range(n_accounts)] for _ in range(n_cut)]
+
+    for rec in pool:
+        if rec.get("is_cancelled"):
+            continue
+        if rec.get("is_virtuale_discharge"):
+            continue
+        if (
+            twin_keys
+            and (rec.get("raw_record") or "").strip()
+            and _imported_record_balance_twin_key(rec) in twin_keys
+        ):
+            continue
+        y = int(rec["year"])
+        if is_dotazione_record(rec) and y != LEGACY_DOTAZIONE_YEAR:
+            continue
+        r_date = str(rec.get("date_iso", ""))
+        if not r_date:
+            continue
+        j = bisect_left(sorted_cutoffs, r_date)
+        if j <= 0:
+            continue
+
+        amount = to_decimal(rec["amount_eur"])
+        c1 = rec.get("account_primary_code", "")
+        c2 = rec.get("account_secondary_code", "")
+
+        c1_idx = account_column_index_in_latest_chart(accounts, c1)
+        c2_idx = account_column_index_in_latest_chart(accounts, c2)
+
+        for si in range(j):
+            orig = idx_sorted[si]
+            row = out[orig]
+            if 0 <= c1_idx < n_accounts:
+                row[c1_idx] += amount
+            if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts:
+                row[c2_idx] -= amount
+
+    return out
+
+
 def compute_credit_card_impegni_by_account_index(db: dict) -> list[Decimal]:
     """Spese per carte di credito (stesso ordine dei conti dell'ultimo anno del piano).
 
@@ -3187,15 +3401,28 @@ def _stats_contrib_to_account_index(
     return Decimal("0")
 
 
+def _stats_account_index_is_cc_or_virtual(accounts: list[dict], j: int) -> bool:
+    """True se il conto in posizione ``j`` è carta di credito o conto VIRTUALE (flussi/saldi «reali»)."""
+    if j < 0 or j >= len(accounts):
+        return True
+    acc = accounts[j]
+    if bool(acc.get("credit_card")):
+        return True
+    if str(acc.get("name", "") or "").strip().upper() == VIRTUALE_ACCOUNT_NAME:
+        return True
+    return False
+
+
 def _stats_accum_flows_for_record(
     flows_row: list[list[Decimal]],
     rec: dict,
     accounts: list[dict],
     n_accounts: int,
 ) -> None:
-    if is_giroconto_record(rec):
-        return
+    """Flussi entrate/uscite per conto: nessun accumulo su colonne carta/VIRTUALE; le girate contano solo sui conti ordinari."""
     for j in range(n_accounts):
+        if _stats_account_index_is_cc_or_virtual(accounts, j):
+            continue
         c = _stats_contrib_to_account_index(rec, accounts, n_accounts, j)
         if c > 0:
             flows_row[j][0] += c
@@ -3254,8 +3481,8 @@ def stats_replay_month_snapshots_and_flows(
     Per ogni (anno, mese) in ``months`` (ordine cronologico):
     - saldo iniziale = dopo tutte le registrazioni con date_iso < primo giorno del mese;
     - saldo finale = dopo tutte le registrazioni con date_iso <= ultimo giorno del mese;
-    - entrate/uscite = somma contributi positivi / valore assoluto dei negativi nel mese solare (date_iso nel mese),
-      **escluse** le registrazioni «Girata conto/conto» (non sono entrate né uscite).
+    - entrate/uscite = contributi nel mese solare sulle colonne conto **che non sono** carta di credito né VIRTUALE;
+      sulle girate conto/conto si accumula solo il lato dei conti ordinari (carta e virtuale ignorati).
 
     Replay ordinato per data ISO e poi ``record_merge_sort_key``.
     """
@@ -4247,6 +4474,15 @@ def account_is_credit_card_by_code(db: dict, acc_code: str) -> bool:
     return bool(a and a.get("credit_card"))
 
 
+def record_touches_credit_card_account(db: dict, rec: dict) -> bool:
+    """True se il primo o il secondo conto della registrazione è un conto carta (flag ``credit_card`` nel piano)."""
+    for key in ("account_primary_code", "account_secondary_code"):
+        c = str(rec.get(key) or "").strip()
+        if c and account_is_credit_card_by_code(db, c):
+            return True
+    return False
+
+
 def credit_card_reference_code_str(db: dict, acc_code: str) -> str:
     a = account_dict_for_code_latest_year(db, acc_code)
     if not a:
@@ -4563,16 +4799,52 @@ def _open_generated_pdf(path: str) -> None:
         raise RuntimeError("apertura browser/viewer non riuscita")
 
 
+def _open_generated_pdf_readable(path: str | Path) -> None:
+    """Salva-su-disco poi lettura: apre sempre il viewer (sistema prima, fallback URI file/browser)."""
+    p = Path(path).expanduser().resolve()
+    if not p.is_file():
+        raise OSError(f"file PDF inesistente: {p}")
+    pe = str(p)
+    errs: list[str] = []
+    try:
+        _open_generated_pdf(pe)
+        return
+    except Exception as exc:
+        errs.append(str(exc))
+    try:
+        uri = p.as_uri()
+        if webbrowser.open(uri):
+            return
+        errs.append("webbrowser.open non ha associato alcun gestore.")
+    except Exception as exc:
+        errs.append(str(exc))
+    raise RuntimeError("Impossibile aprire il PDF in lettura: " + "; ".join(errs))
+
+
 def _pdf_safe_text(value: object) -> str:
+    """Testo sicuro per FPDF/font core (Helvetica ≈ Latin-1): evita eccezioni su simboli Unicode."""
     s = str(value if value is not None else "")
-    return (
+    s = (
         s.replace("€", "EUR")
         .replace("–", "-")
         .replace("—", "-")
         .replace("“", '"')
         .replace("”", '"')
         .replace("’", "'")
+        .replace("✖", "X")
+        .replace("✗", "X")
+        .replace("✓", "+")
+        .replace("✔", "+")
+        .replace("\u2714", "+")
+        .replace("\u2713", "+")
+        .replace("\u202f", " ")
+        .replace("\u00a0", " ")
     )
+    try:
+        s.encode("latin-1")
+    except UnicodeEncodeError:
+        s = s.encode("latin-1", errors="replace").decode("latin-1")
+    return s
 
 
 def _print_statistics_fpdf(
@@ -4972,8 +5244,298 @@ def _print_ricerca_fpdf(
         return False
 
 
+def _verifica_pdf_safe_filename_segment(name: str) -> str:
+    """Nome conto sicuro nei nomi file (mantiene spazi e punti utili come «CC.PP.TT»)."""
+    t = (name or "").strip()
+    for ch in '<>:"/\\|?*\n\r\t':
+        t = t.replace(ch, " ")
+    t = " ".join(t.split())
+    return t[:100] if t else "conto"
+
+
+# Stampa PDF verifica — tabella registrazioni non verificate (mm; somma = 182 ≈ printable width A4 margine)
+_VER_UNVER_PDF_COL_MM = [10.0, 15.0, 34.0, 18.0, 18.0, 12.0, 65.0, 10.0]
+_VER_UNVER_PDF_HDR_ROW_H = 9.0
+# Lunghezza massima caratteri per colonna (dopo sanitizzazione) per evitare testo fuori cella.
+_VER_UNVER_PDF_MAX_CH = (6, 10, 26, 12, 14, 8, 48, 2)
+
+
+def _ver_pdf_trunc_cell_for_column(col_idx: int, raw: object) -> str:
+    lim = _VER_UNVER_PDF_MAX_CH[col_idx] if 0 <= col_idx < len(_VER_UNVER_PDF_MAX_CH) else 40
+    t = str(raw if raw is not None else "").strip()
+    if len(t) <= lim:
+        return t
+    adj = max(0, lim - 2)
+    return (t[:adj] + "..") if adj > 0 else ".."
+
+
+def save_verifica_results_pdf(
+    db: dict,
+    parent: tk.Misc | None,
+    *,
+    user_header: str,
+    acc_name: str,
+    cutoff_display: str,
+    pending_rows: list[tuple[str, str, str, str]],
+    unver_rows: list[tuple[str, ...]],
+    pd: dict,
+    match_ok: bool,
+) -> bool:
+    """Scrive il rapporto stampa-verifica come PDF nella cartella estratti (Opzioni) se configurata."""
+    try:
+        from fpdf import FPDF
+        from fpdf.enums import XPos, YPos
+    except ImportError:
+        messagebox.showerror(
+            "Stampa verifica",
+            "Modulo fpdf2 assente: installare da requirements.txt (`python3 -m pip install -r requirements.txt`).",
+            parent=parent,
+        )
+        return False
+    cutoff_iso_file = parse_italian_ddmmyyyy_to_iso(cutoff_display.strip()) or date.today().isoformat()
+    ymd_u = cutoff_iso_file[:10].replace("-", "_")
+
+    fname_hint = (
+        "Verifica conto "
+        + _verifica_pdf_safe_filename_segment(acc_name)
+        + " data "
+        + ymd_u
+        + ".pdf"
+    )
+
+    raw_root = (estratti_pdf_settings_from_db(db).get("root_folder") or "").strip()
+    out_path: Path
+    informative: str | None = None
+    try:
+        if raw_root:
+            pr = Path(raw_root).expanduser().resolve()
+            if pr.is_dir():
+                out_path = pr / fname_hint
+            else:
+                informative = (
+                    "La cartella radice degli estratti (Opzioni) non è valida;\n"
+                    "il PDF viene salvato come file temporaneo.\n\n"
+                    f"Nome consigliato: {fname_hint}"
+                )
+                fd, tmp = tempfile.mkstemp(suffix=".pdf", prefix="verifica_")
+                os.close(fd)
+                out_path = Path(tmp)
+        else:
+            informative = (
+                "Cartella radice degli estratti non impostata in Opzioni;\n"
+                "il PDF viene salvato come file temporaneo.\n\n"
+                f"Nome consigliato: {fname_hint}"
+            )
+            fd, tmp = tempfile.mkstemp(suffix=".pdf", prefix="verifica_")
+            os.close(fd)
+            out_path = Path(tmp)
+    except OSError as exc:
+        messagebox.showerror("Stampa verifica", f"Impossibile definire il percorso di salvataggio:\n{exc}", parent=parent)
+        return False
+
+    uh_plain = _pdf_safe_text(user_header or "Conti di casa")
+
+    current_balance = pd.get("current_balance", Decimal("0"))
+    count_unverified = pd.get("count_unverified", 0)
+    sum_unverified = pd.get("sum_unverified", Decimal("0"))
+    projected = pd.get("projected", Decimal("0"))
+    stmt_balance = pd.get("stmt_balance", Decimal("0"))
+    diff = pd.get("diff", Decimal("0"))
+    try:
+        pdf = FPDF(orientation="P", unit="mm", format="A4")
+        try:
+            pdf.set_title("")
+            pdf.set_subject("")
+            pdf.set_author("")
+            pdf.set_creator("")
+            pdf.set_keywords("")
+        except Exception:
+            pass
+        pdf.set_auto_page_break(auto=True, margin=10)
+        pdf.set_margins(14, 14, 14)
+        pdf.add_page()
+
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(
+            0,
+            7,
+            uh_plain[:200],
+            align="C",
+            new_x=XPos.LMARGIN,
+            new_y=YPos.NEXT,
+        )
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(
+            0,
+            7,
+            _pdf_safe_text(f"Verifica conto: {acc_name}") + _pdf_safe_text(f" — Chiusura: {cutoff_display}"),
+            align="L",
+            new_x=XPos.LMARGIN,
+            new_y=YPos.NEXT,
+        )
+        pdf.set_font("Helvetica", "", 8.5)
+        pdf.cell(
+            0,
+            5,
+            _pdf_safe_text(_linea_data_ora_stampa()),
+            align="L",
+            new_x=XPos.LMARGIN,
+            new_y=YPos.NEXT,
+        )
+        pdf.ln(2)
+
+        if pending_rows:
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.cell(0, 6, _pdf_safe_text("Dati di verifica in sospeso"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.ln(1)
+            ph = ["Data", "Importo", "Assegno", "Nota", "Stato"]
+            pw = [22, 28, 22, 90, 20]
+            row_h = 5.5
+            pdf.set_font("Helvetica", "B", 7.5)
+            for h, w in zip(ph, pw):
+                pdf.cell(w, row_h + 1, _pdf_safe_text(h), border=1, align="C")
+            pdf.ln(row_h + 1)
+            pdf.set_font("Helvetica", "", 7)
+            for date_disp, amt_s, chq, note in pending_rows:
+                if pdf.get_y() > 270:
+                    pdf.add_page()
+                vals = [_pdf_safe_text(date_disp), _pdf_safe_text(amt_s), _pdf_safe_text(chq)]
+                vals.append(_pdf_safe_text((note or "")[:120]))
+                vals.append(_pdf_safe_text("In sospeso"))
+                for i, (v, w) in enumerate(zip(vals, pw)):
+                    align = "L" if i in (3, 4) else ("R" if i == 1 else "L")
+                    pdf.cell(w, row_h, v, border=1, align=align)
+                pdf.ln(row_h)
+            pdf.ln(3)
+        else:
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_text_color(46, 125, 50)
+            pdf.multi_cell(
+                0,
+                5,
+                _pdf_safe_text("Tutti i dati di verifica hanno trovato corrispondenza."),
+            )
+            pdf.set_text_color(0, 0, 0)
+            pdf.ln(2)
+
+        if unver_rows:
+            uw_unv = _VER_UNVER_PDF_COL_MM
+            hdr_row_h = _VER_UNVER_PDF_HDR_ROW_H
+
+            def _draw_unverified_table_header() -> None:
+                x0 = pdf.l_margin
+                y0 = pdf.get_y()
+                labels_7 = ["#", "Data", "Categoria", "Conto", "Importo", "Assegno", "Nota"]
+                pdf.set_font("Helvetica", "B", 6.5)
+                for i, lbl in enumerate(labels_7):
+                    pdf.set_xy(x0, y0)
+                    pdf.cell(uw_unv[i], hdr_row_h, _pdf_safe_text(lbl), border=1, align="C")
+                    x0 += uw_unv[i]
+                lx = x0
+                pdf.rect(lx, y0, uw_unv[7], hdr_row_h)
+                pdf.set_font("Helvetica", "B", 5.3)
+                pdf.set_xy(lx, y0 + 0.9)
+                pdf.cell(uw_unv[7], 3.1, _pdf_safe_text("Entro il"), align="C")
+                pdf.set_xy(lx, y0 + 4.85)
+                pdf.cell(uw_unv[7], 3.25, _pdf_safe_text("periodo"), align="C")
+                pdf.set_xy(pdf.l_margin, y0 + hdr_row_h)
+
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.cell(
+                0,
+                6,
+                _pdf_safe_text("Registrazioni non verificate"),
+                new_x=XPos.LMARGIN,
+                new_y=YPos.NEXT,
+            )
+            pdf.ln(1)
+            _draw_unverified_table_header()
+            pdf.ln(0)
+            row_h = 5.5
+            pdf.set_font("Helvetica", "", 6.5)
+            for tup in unver_rows:
+                if pdf.get_y() > 265:
+                    pdf.add_page()
+                    _draw_unverified_table_header()
+                    pdf.ln(0)
+                    pdf.set_font("Helvetica", "", 6.5)
+                row_src = list(tup[:8])
+                while len(row_src) < 8:
+                    row_src.append("")
+                vals = [_pdf_safe_text(_ver_pdf_trunc_cell_for_column(i, row_src[i])) for i in range(8)]
+                for i, (v, w) in enumerate(zip(vals, uw_unv)):
+                    align = "R" if i in (0, 4) else ("C" if i == 7 else "L")
+                    pdf.cell(w, row_h, v, border=1, align=align)
+                pdf.ln(row_h)
+            pdf.ln(3)
+        else:
+            pdf.set_font("Helvetica", "", 9)
+            pdf.cell(0, 5, _pdf_safe_text("Tutte le registrazioni sono state verificate."), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 6, _pdf_safe_text("Riepilogo"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(2)
+
+        spec_rows = _ver_summary_row_definitions(
+            current_balance=current_balance,
+            count_unverified=int(count_unverified),
+            sum_unverified=sum_unverified,
+            projected=projected,
+            stmt_balance=stmt_balance,
+            diff=diff,
+        )
+        desc_w = 118.0
+        amt_w = 55.0
+        row_gap = 5.8
+        for desc, val in spec_rows:
+            is_diff_row = desc == "Differenza"
+            amt_col = _ver_summary_diff_line_color(bool(match_ok)) if is_diff_row else _ver_summary_amount_line_color(val)
+            r, gg, bb = _hex_to_rgb_triplet(amt_col)
+            pdf.set_font("Helvetica", "B" if is_diff_row else "", 10 if is_diff_row else 9)
+            pdf.set_text_color(0, 0, 0)
+            dn = (_pdf_safe_text(desc)[:90])[:90]
+            pdf.cell(desc_w, row_gap, dn, align="L")
+            pdf.set_text_color(r, gg, bb)
+            amt_txt = _ver_summary_signed_eur(val)
+            pdf.cell(amt_w, row_gap, _pdf_safe_text(amt_txt), align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_text_color(0, 0, 0)
+
+        pdf.ln(2)
+        if match_ok:
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.set_text_color(46, 125, 50)
+            pdf.multi_cell(0, 7, _pdf_safe_text("Verifica coincidente"))
+        else:
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.set_text_color(198, 40, 40)
+            pdf.multi_cell(0, 7, _pdf_safe_text("Scostamento: sono necessari controlli"))
+
+        pdf.output(str(out_path))
+    except Exception as exc:
+        messagebox.showerror("Stampa verifica", str(exc), parent=parent)
+        return False
+
+    try:
+        _open_generated_pdf_readable(out_path)
+    except Exception as exc:
+        messagebox.showwarning(
+            "Stampa verifica",
+            f"PDF salvato ma apertura in lettura non riuscita:\n{exc}\n\nPercorso file:\n{out_path}",
+            parent=parent,
+        )
+
+    if informative:
+        messagebox.showinfo(
+            "Stampa verifica",
+            informative + f"\n\nFile:\n{out_path}",
+            parent=parent,
+        )
+
+    return True
+
+
 def show_record_in_movements_grid(rec: dict) -> bool:
-    """Categoria 0 (Dotazione) nascosta tranne le registrazioni importate per il 1990 (Conti90)."""
     if rec.get("is_cancelled"):
         return False
     cat = str(rec.get("category_code", "")).strip()
@@ -4983,6 +5545,1213 @@ def show_record_in_movements_grid(rec: dict) -> bool:
         except (TypeError, ValueError):
             return False
     return True
+
+
+_BUDGET_MONTH_FULL_IT = (
+    "Gennaio",
+    "Febbraio",
+    "Marzo",
+    "Aprile",
+    "Maggio",
+    "Giugno",
+    "Luglio",
+    "Agosto",
+    "Settembre",
+    "Ottobre",
+    "Novembre",
+    "Dicembre",
+)
+
+
+def migrate_ensure_budget_sheet(db: dict) -> bool:
+    if "budget_sheet" not in db or not isinstance(db.get("budget_sheet"), dict):
+        db["budget_sheet"] = {}
+        return True
+    return False
+
+
+def budget_collect_movement_totals_by_cat_month(
+    db: dict, year: int
+) -> dict[tuple[str, int], Decimal]:
+    """Somma per (codice categoria, mese 1–12) nell'anno solare.
+
+    Stesse esclusioni dei prospetti **per categoria**: annullate, twin import, dotazioni (cat. 0), Girata conto/conto;
+    importo ``amount_eur`` con data ``date_iso`` nel mese (incluse carte e VIRTUALE).
+    """
+    _, pool, twin_keys = _stats_filtered_sorted_pool(db)
+    out: dict[tuple[str, int], Decimal] = {}
+    prefix = f"{int(year):04d}-"
+    for rec in pool:
+        if record_skip_for_category_statistics_budget(rec, twin_keys):
+            continue
+        d = str(rec.get("date_iso") or "").strip()[:10]
+        if len(d) < 10 or not d.startswith(prefix):
+            continue
+        try:
+            m = int(d[5:7])
+        except ValueError:
+            continue
+        if m < 1 or m > 12:
+            continue
+        try:
+            add_v = to_decimal(rec.get("amount_eur") or "0")
+        except (InvalidOperation, TypeError, ValueError):
+            add_v = Decimal("0")
+        cc = str(rec.get("category_code") or "").strip()
+        if not cc or cc == "0":
+            continue
+        k = (cc, m)
+        out[k] = out.get(k, Decimal("0")) + add_v
+    return out
+
+
+def category_excluded_from_stat_category_summary(name: str) -> bool:
+    """Come ``_stat_category_excluded_from_summary`` (Statistiche › categoria)."""
+    return plan_conti_category_name_locked(name) and category_display_name(name).strip().lower() != "consumi ordinari"
+
+
+def stats_style_category_annual_sums_for_year(db: dict, year: int) -> dict[str, Decimal]:
+    """Somme annue per etichetta categoria (allineato a tabellone budget e Statistiche › categoria).
+
+    Esclusioni sulle registrazioni: come ``record_skip_for_category_statistics_budget``; importo ``amount_eur``.
+    """
+    ry = int(year)
+    start_iso = date(ry, 1, 1).isoformat()
+    end_iso = date(ry, 12, 31).isoformat()
+    twin_keys = frozenset(import_cancel_twin_balance_keys(db))
+    cats_by_year = year_categories_map(db)
+    sums: dict[str, Decimal] = {}
+    for c in cats_by_year.get(ry, []) or []:
+        nm = category_display_name(str(c.get("name") or "")).strip()
+        if not nm or is_hidden_dotazione_category_name(nm) or category_excluded_from_stat_category_summary(nm):
+            continue
+        sums.setdefault(nm, Decimal("0"))
+    for yb in db.get("years", []) or []:
+        for rec in yb.get("records", []) or []:
+            if record_skip_for_category_statistics_budget(rec, twin_keys):
+                continue
+            d_iso = str(rec.get("date_iso") or "").strip()[:10]
+            if not d_iso or d_iso < start_iso or d_iso > end_iso:
+                continue
+            try:
+                add_v = to_decimal(rec.get("amount_eur") or "0")
+            except (InvalidOperation, TypeError, ValueError):
+                add_v = Decimal("0")
+            py = record_category_plan_year(rec, yb, fallback_year=ry)
+            cat_name = category_name_for_record(rec, cats_by_year.get(py, [])).strip()
+            if not cat_name or category_excluded_from_stat_category_summary(cat_name):
+                continue
+            sums[cat_name] = sums.get(cat_name, Decimal("0")) + add_v
+    return sums
+
+
+def budget_categories_in_use_ordered(db: dict, year: int) -> list[tuple[str, str]]:
+    """(code, name_stored) come Statistiche › categoria; ordinamento da somme annuali (regole prospetti per categoria)."""
+    yb = year_bucket_for_calendar_year(db, int(year)) or chart_clone_source_bucket(db)
+    if not yb:
+        return []
+    ry = int(year)
+    sums = stats_style_category_annual_sums_for_year(db, ry)
+    by_disp: dict[str, list[tuple[str, str]]] = {}
+    for c in yb.get("categories") or []:
+        code = str(c.get("code", "")).strip()
+        if not code or code == "0":
+            continue
+        name_stored = str(c.get("name") or "")
+        nm = category_display_name(name_stored).strip()
+        if not nm or is_hidden_dotazione_category_name(nm) or category_excluded_from_stat_category_summary(nm):
+            continue
+        by_disp.setdefault(nm, []).append((code, name_stored))
+
+    def _code_sort_key(t: tuple[str, str]) -> tuple[int, str]:
+        raw = t[0]
+        return (int(raw), raw) if raw.isdigit() else (999999, raw)
+
+    for _lst in by_disp.values():
+        _lst.sort(key=_code_sort_key)
+
+    pos = sorted(((n, v) for n, v in sums.items() if v > 0), key=lambda item: (-item[1], item[0].lower()))
+    neg = sorted(((n, v) for n, v in sums.items() if v < 0), key=lambda item: (item[1], item[0].lower()))
+    zero = sorted((n for n, v in sums.items() if v == 0), key=lambda n: n.lower())
+
+    out: list[tuple[str, str]] = []
+    for n, _v in pos:
+        out.extend(by_disp.get(n, []))
+    for n, _v in neg:
+        out.extend(by_disp.get(n, []))
+    for n in zero:
+        out.extend(by_disp.get(n, []))
+    return out
+
+
+def budget_get_manual_override(db: dict, year: int, cat_code: str, month: int) -> Decimal | None:
+    bs = db.get("budget_sheet")
+    if not isinstance(bs, dict):
+        return None
+    ym = bs.get(str(int(year)))
+    if not isinstance(ym, dict):
+        return None
+    cm = ym.get(str(cat_code).strip())
+    if not isinstance(cm, dict):
+        return None
+    raw = cm.get(str(int(month)))
+    if raw is None or raw == "":
+        return None
+    try:
+        return to_decimal(str(raw))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def budget_set_manual_override(db: dict, year: int, cat_code: str, month: int, val: Decimal) -> None:
+    bs = db.setdefault("budget_sheet", {})
+    assert isinstance(bs, dict)
+    ym = bs.setdefault(str(int(year)), {})
+    assert isinstance(ym, dict)
+    cm = ym.setdefault(str(cat_code).strip(), {})
+    assert isinstance(cm, dict)
+    cm[str(int(month))] = f"{val.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):f}"
+
+
+def budget_clear_manual_override(db: dict, year: int, cat_code: str, month: int) -> None:
+    bs = db.get("budget_sheet")
+    if not isinstance(bs, dict):
+        return
+    ym = bs.get(str(int(year)))
+    if not isinstance(ym, dict):
+        return
+    cm = ym.get(str(cat_code).strip())
+    if not isinstance(cm, dict):
+        return
+    cm.pop(str(int(month)), None)
+    if not cm:
+        ym.pop(str(cat_code).strip(), None)
+    if not ym:
+        bs.pop(str(int(year)), None)
+
+
+def migrate_ensure_budget_snapshots(db: dict) -> bool:
+    if "budget_snapshots" not in db or not isinstance(db.get("budget_snapshots"), dict):
+        db["budget_snapshots"] = {}
+        return True
+    return False
+
+
+def migrate_ensure_budget_ui_prefs(db: dict) -> bool:
+    if "_budget_prefs" not in db or not isinstance(db.get("_budget_prefs"), dict):
+        db["_budget_prefs"] = {}
+        return True
+    return False
+
+
+def budget_prefs_set_last_saved_snapshot(db: dict, year: int, name: str) -> None:
+    migrate_ensure_budget_ui_prefs(db)
+    p = db["_budget_prefs"]
+    assert isinstance(p, dict)
+    p["last_saved_year"] = int(year)
+    p["last_saved_name"] = sanitize_single_line_text(name or "", max_len=120)
+
+
+def budget_prefs_get_last_saved_snapshot(db: dict) -> tuple[int, str] | None:
+    migrate_ensure_budget_ui_prefs(db)
+    p = db.get("_budget_prefs")
+    if not isinstance(p, dict):
+        return None
+    try:
+        y = int(p.get("last_saved_year"))
+    except (TypeError, ValueError):
+        return None
+    nm = str(p.get("last_saved_name") or "").strip()
+    if y <= 0 or not nm:
+        return None
+    return y, nm
+
+
+def budget_snapshot_names_for_year(db: dict, year: int) -> list[str]:
+    bsnap = db.get("budget_snapshots")
+    if not isinstance(bsnap, dict):
+        return []
+    ym = bsnap.get(str(int(year)))
+    if not isinstance(ym, dict):
+        return []
+    return sorted(ym.keys(), key=lambda s: str(s).lower())
+
+
+def budget_snapshot_save(db: dict, year: int, name: str, *, overwrite: bool = False) -> tuple[bool, str]:
+    nm = sanitize_single_line_text(name or "", max_len=120)
+    if not nm:
+        return False, "Nome obbligatorio."
+    bs = db.setdefault("budget_sheet", {})
+    assert isinstance(bs, dict)
+    yk = str(int(year))
+    src = bs.get(yk)
+    if not isinstance(src, dict):
+        src = {}
+    snap = db.setdefault("budget_snapshots", {})
+    assert isinstance(snap, dict)
+    ysn = snap.setdefault(yk, {})
+    assert isinstance(ysn, dict)
+    if nm in ysn and not overwrite:
+        return False, "Esiste già uno scenario con questo nome."
+    ysn[nm] = copy.deepcopy(src)
+    budget_prefs_set_last_saved_snapshot(db, int(year), nm)
+    return True, ""
+
+
+def budget_snapshot_load(db: dict, year: int, name: str) -> tuple[bool, str]:
+    nm = (name or "").strip()
+    if not nm:
+        return False, "Nome non valido."
+    bsnap = db.get("budget_snapshots")
+    if not isinstance(bsnap, dict):
+        return False, "Nessuno scenario salvato."
+    ysn = bsnap.get(str(int(year)))
+    if not isinstance(ysn, dict):
+        return False, "Nessuno scenario per questo anno."
+    data = ysn.get(nm)
+    if not isinstance(data, dict):
+        return False, "Scenario non trovato."
+    bs = db.setdefault("budget_sheet", {})
+    assert isinstance(bs, dict)
+    yk = str(int(year))
+    bs[yk] = copy.deepcopy(data)
+    if not bs[yk]:
+        bs.pop(yk, None)
+    return True, ""
+
+
+def budget_named_snapshot_matches_current_sheet(db: dict, year: int, name: str) -> bool:
+    """True se il ramo budget_sheet dell'anno coincide con lo snapshot salvato (stesso «mostrato» dopo Applica scenario)."""
+    nm = (name or "").strip()
+    if not nm:
+        return False
+    bsnap = db.get("budget_snapshots")
+    if not isinstance(bsnap, dict):
+        return False
+    ysn = bsnap.get(str(int(year)))
+    if not isinstance(ysn, dict):
+        return False
+    snap = ysn.get(nm)
+    if not isinstance(snap, dict):
+        return False
+    bs = db.get("budget_sheet")
+    if not isinstance(bs, dict):
+        cur: dict = {}
+    else:
+        raw = bs.get(str(int(year)))
+        cur = raw if isinstance(raw, dict) else {}
+    return cur == snap
+
+
+def budget_snapshot_delete(db: dict, year: int, name: str) -> tuple[bool, str]:
+    nm = (name or "").strip()
+    bsnap = db.get("budget_snapshots")
+    if not isinstance(bsnap, dict):
+        return False, "Nessuno scenario salvato."
+    ysn = bsnap.get(str(int(year)))
+    if not isinstance(ysn, dict) or nm not in ysn:
+        return False, "Scenario non trovato."
+    ysn.pop(nm, None)
+    if not ysn:
+        bsnap.pop(str(int(year)), None)
+    return True, ""
+
+
+def budget_clear_all_overrides_for_year(db: dict, year: int) -> None:
+    bs = db.get("budget_sheet")
+    if isinstance(bs, dict):
+        bs.pop(str(int(year)), None)
+
+
+def _budget_ov_from_year_branch(ym: dict, cat_code: str, month: int) -> Decimal | None:
+    cm = ym.get(str(cat_code).strip())
+    if not isinstance(cm, dict):
+        return None
+    raw = cm.get(str(int(month)))
+    if raw is None or raw == "":
+        return None
+    try:
+        return to_decimal(str(raw))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def budget_effective_budget_cell(
+    db: dict,
+    year: int,
+    cat_code: str,
+    month: int,
+    mov_prev: dict[tuple[str, int], Decimal],
+    *,
+    ym_override: dict | None = None,
+) -> Decimal:
+    base = mov_prev.get((cat_code, month), Decimal("0"))
+    if ym_override is None:
+        ov = budget_get_manual_override(db, year, cat_code, month)
+    else:
+        ov = _budget_ov_from_year_branch(ym_override, cat_code, month)
+    return ov if ov is not None else base
+
+
+def budget_category_apply_monthly_average(db: dict, year: int, cat_code: str) -> Decimal:
+    """Imposta i 12 budget al valore medio dei budget mensili **già in tabella** (override o default da anno prec.)."""
+    cc = str(cat_code).strip()
+    y = int(year)
+    y_prev = y - 1
+    mov_prev = budget_collect_movement_totals_by_cat_month(db, y_prev) if y_prev > 0 else {}
+    bud_m = [
+        budget_effective_budget_cell(db, y, cc, m, mov_prev, ym_override=None) for m in range(1, 13)
+    ]
+    total = sum(bud_m, Decimal("0"))
+    avg = (total / Decimal(12)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    for m in range(1, 13):
+        budget_set_manual_override(db, y, cc, m, avg)
+    return avg
+
+
+def budget_category_monthly_mov_and_bud(
+    db: dict,
+    year: int,
+    cat_code: str,
+    *,
+    ym_override: dict | None = None,
+) -> tuple[list[Decimal], list[Decimal]]:
+    mov_y = budget_collect_movement_totals_by_cat_month(db, int(year))
+    y_prev = int(year) - 1
+    mov_prev = budget_collect_movement_totals_by_cat_month(db, y_prev) if y_prev > 0 else {}
+    cc = str(cat_code).strip()
+    mov_m = [mov_y.get((cc, m), Decimal("0")) for m in range(1, 13)]
+    bud_m = [
+        budget_effective_budget_cell(db, int(year), cc, m, mov_prev, ym_override=ym_override) for m in range(1, 13)
+    ]
+    return mov_m, bud_m
+
+
+def budget_open_mov_bud_bar_chart_for_category(
+    *,
+    parent: tk.Misc,
+    db: dict,
+    year: int,
+    cat_code: str,
+    cat_display: str,
+) -> None:
+    try:
+        _mpldir = data_workspace.app_support_dir() / "mpl_config"
+        try:
+            _mpldir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            _mpldir = Path(tempfile.gettempdir()) / "conti_cdc_mpl"
+            _mpldir.mkdir(parents=True, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = str(_mpldir)
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+        from matplotlib.ticker import FuncFormatter
+        import numpy as _np
+    except Exception as exc:  # pragma: no cover
+        messagebox.showerror(
+            "Budget — grafico",
+            f"Serve matplotlib (pip install matplotlib).\n{exc!s}",
+            parent=parent,
+        )
+        return
+    mov_m, bud_m = budget_category_monthly_mov_and_bud(db, year, cat_code, ym_override=None)
+    labels = [m[:3] for m in _BUDGET_MONTH_FULL_IT]
+    x = _np.arange(12)
+    w = 0.38
+    fig = Figure(figsize=(10.5, 5.8), dpi=100)
+    ax = fig.add_subplot(1, 1, 1)
+    ax.bar(x - w / 2, [float(v) for v in mov_m], w, label="Movimenti", color="#4a90c2", edgecolor="#2d5a80", linewidth=0.4)
+    ax.bar(x + w / 2, [float(v) for v in bud_m], w, label="Budget", color="#7cb87c", edgecolor="#3d6b3d", linewidth=0.4)
+    ax.axhline(0.0, color="#444444", linewidth=0.6)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=8)
+    ax.set_xlabel("Mese", fontsize=9)
+    ax.grid(True, axis="y", alpha=0.35)
+
+    def _eur_ax(v: float, _p: object) -> str:
+        try:
+            return f"{format_euro_it(Decimal(str(v)))} €"
+        except Exception:
+            return f"{v:.2f} €"
+
+    ax.yaxis.set_major_formatter(FuncFormatter(_eur_ax))
+    ax.legend(loc="upper right", fontsize=8)
+    td = (cat_display or "").strip() or cat_code
+    fig.suptitle(f"Budget — {_pdf_safe_text(td)} — anno {int(year)}", fontsize=11, y=0.98)
+    _gen_ts = datetime.now().strftime("%d/%m/%Y %H:%M")
+    fig.text(0.5, 0.93, f"Generato il {_gen_ts}", ha="center", fontsize=8, color="#444444")
+    fig.tight_layout(rect=(0, 0, 1, 0.89))
+    try:
+        fd, pdf_path = tempfile.mkstemp(prefix="conti_budget_cat_", suffix=".pdf", dir=tempfile.gettempdir())
+        os.close(fd)
+        _ = FigureCanvasAgg(fig)
+        fig.savefig(pdf_path, format="pdf", metadata={"Title": _pdf_safe_text(f"Budget {td} {year}")})
+        _open_generated_pdf(str(Path(pdf_path).resolve()))
+    except Exception as exc:
+        messagebox.showerror("Budget — grafico", f"Salvataggio PDF non riuscito.\n{exc!s}", parent=parent)
+
+
+def _budget_tabellone_rows_for_export_month_range(
+    db: dict,
+    year: int,
+    month_lo: int,
+    month_hi: int,
+    *,
+    ym_override: dict | None = None,
+) -> tuple[list[str], list[list[str]]] | None:
+    """Righe tabellone con colonne mensili solo per month_lo–month_hi; Σ Mov, Σ Bud e Δ riga sono sempre totali **anno intero** (1–12)."""
+    if month_lo < 1 or month_hi > 12 or month_lo > month_hi:
+        raise ValueError("Intervallo mesi non valido.")
+    y_ref = int(year)
+    mov_y = budget_collect_movement_totals_by_cat_month(db, y_ref)
+    y_prev = y_ref - 1
+    mov_prev = budget_collect_movement_totals_by_cat_month(db, y_prev) if y_prev > 0 else {}
+    cats_ordered = budget_categories_in_use_ordered(db, y_ref)
+    if not cats_ordered:
+        return None
+    abb = tuple(m[:3] for m in _BUDGET_MONTH_FULL_IT)
+    heads: list[str] = ["Categoria", "Σ Mov", "Σ Bud", "Δ riga"]
+    for mi in range(month_lo, month_hi + 1):
+        heads.append(f"{abb[mi - 1]} M")
+        heads.append(f"{abb[mi - 1]} B")
+
+    cat_rows: list[tuple[str, str, list[Decimal], list[Decimal]]] = []
+    for code, name_stored in cats_ordered:
+        label = category_display_name(name_stored).strip().upper()
+        mm = [mov_y.get((code, m), Decimal("0")) for m in range(1, 13)]
+        bud: list[Decimal] = []
+        for m in range(1, 13):
+            bud.append(budget_effective_budget_cell(db, y_ref, code, m, mov_prev, ym_override=ym_override))
+        cat_rows.append((code, label, mm, bud))
+
+    def _pack_row_rng(mov_row_m: list[Decimal], bud_row_m: list[Decimal]) -> list[str]:
+        tr_m_y = sum(mov_row_m)
+        tr_b_y = sum(bud_row_m)
+        out = [
+            format_euro_it(tr_m_y),
+            format_euro_it(tr_b_y),
+            format_euro_it(tr_m_y - tr_b_y),
+        ]
+        for m in range(month_lo, month_hi + 1):
+            out.append(format_euro_it(mov_row_m[m - 1]))
+            out.append(format_euro_it(bud_row_m[m - 1]))
+        return out
+
+    rows: list[list[str]] = []
+    tot_mov_m = [sum(cat_rows[i][2][j] for i in range(len(cat_rows))) for j in range(12)]
+    tot_bud_m = [sum(cat_rows[i][3][j] for i in range(len(cat_rows))) for j in range(12)]
+    grand_diff_year = sum(tot_mov_m[j] - tot_bud_m[j] for j in range(12))
+    rows.append(["TOTALI", *_pack_row_rng(tot_mov_m, tot_bud_m)])
+    diff_tail: list[str] = []
+    for j in range(month_lo - 1, month_hi):
+        diff_tail.append(format_euro_it(tot_mov_m[j] - tot_bud_m[j]))
+        diff_tail.append("")
+    rows.append(["DIFFERENZE", format_euro_it(grand_diff_year), "", ""] + diff_tail)
+    for _code, label, mm, bb in cat_rows:
+        rows.append([label, *_pack_row_rng(mm, bb)])
+    return heads, rows
+
+
+def _budget_tabellone_rows_for_export(
+    db: dict,
+    year: int,
+    *,
+    ym_override: dict | None = None,
+) -> tuple[list[str], list[list[str]]] | None:
+    return _budget_tabellone_rows_for_export_month_range(db, year, 1, 12, ym_override=ym_override)
+
+
+def budget_export_tabellone_pdf(
+    db: dict,
+    year: int,
+    pdf_path: str,
+    *,
+    title_line: str,
+    ym_override: dict | None = None,
+    generated_at: datetime | None = None,
+) -> None:
+    try:
+        _mpldir = data_workspace.app_support_dir() / "mpl_config"
+        try:
+            _mpldir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            _mpldir = Path(tempfile.gettempdir()) / "conti_cdc_mpl"
+            _mpldir.mkdir(parents=True, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = str(_mpldir)
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        from matplotlib.backends.backend_pdf import PdfPages
+        from matplotlib.figure import Figure
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        raise RuntimeError(f"matplotlib: {exc}") from exc
+
+    def _truncate_cat_cell(val: str) -> str:
+        s = (val or "").strip()
+        if s in ("TOTALI", "DIFFERENZE"):
+            return s
+        return (s[:10] if len(s) > 10 else s)
+
+    def _table_chunk_pdf(
+        pdf: object,
+        *,
+        heads: list[str],
+        chunk_rows: list[list[str]],
+        page_tag: str,
+        ncol: int,
+        stamp: str,
+        year_i: int,
+    ) -> None:
+        fig = Figure(figsize=(11.69, 8.27))
+        ax = fig.add_axes([0.025, 0.028, 0.95, 0.805])
+        ax.set_axis_off()
+        fig.text(0.5, 0.968, title_line, ha="center", fontsize=11, fontweight="bold")
+        fig.text(
+            0.5,
+            0.948,
+            f"Anno contabile {year_i} · generato il {stamp}",
+            ha="center",
+            fontsize=8,
+            color="#333333",
+        )
+        fig.text(
+            0.5,
+            0.928,
+            "Movimenti e differenze: dati presenti nel database al momento della generazione.",
+            ha="center",
+            fontsize=7,
+            color="#555555",
+        )
+        fig.text(
+            0.5,
+            0.912,
+            "Budget mensile: secondo l’opzione di stampa (situazione attuale, budget di base o scenario salvato).",
+            ha="center",
+            fontsize=7,
+            color="#555555",
+        )
+        fig.text(0.5, 0.892, page_tag, ha="center", fontsize=8, color="#333333")
+        disp = [[_truncate_cat_cell(r[0])] + list(r[1:]) for r in chunk_rows]
+        w_cat = 0.13
+        w_sig = 0.058
+        w_rest = max(0.02, (1.0 - w_cat - 3 * w_sig) / max(1, ncol - 4))
+        colWidths = [w_cat, w_sig, w_sig, w_sig] + [w_rest] * (ncol - 4)
+        tab = ax.table(
+            cellText=disp,
+            colLabels=heads,
+            loc="upper center",
+            cellLoc="right",
+            colWidths=colWidths,
+        )
+        tab.auto_set_font_size(False)
+        tab.set_fontsize(5.8)
+        for (ri, cj), cell in tab.get_celld().items():
+            cell.set_edgecolor("#aaaaaa")
+            cell.set_linewidth(0.25)
+            txt = cell.get_text()
+            if cj == 0:
+                txt.set_ha("left")
+            else:
+                txt.set_ha("right")
+            if ri == 0:
+                cell.set_facecolor("#b8d4eb")
+                txt.set_fontweight("bold")
+            elif ri >= 1 and ri <= 2:
+                cell.set_facecolor("#e8f2fa")
+                txt.set_fontweight("bold")
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    stamp_dt = generated_at or datetime.now()
+    stamp = stamp_dt.strftime("%d/%m/%Y %H:%M")
+    year_i = int(year)
+    STICKY_MAX = 4
+    CAT_CHUNK = 22
+
+    sems: list[tuple[str, int, int]] = [
+        ("Semestre 1 — gennaio–giugno", 1, 6),
+        ("Semestre 2 — luglio–dicembre", 7, 12),
+    ]
+    all_chunks: list[tuple[str, list[str], list[list[str]], str, int]] = []
+    for sem_label, m_lo, m_hi in sems:
+        tbl = _budget_tabellone_rows_for_export_month_range(db, year_i, m_lo, m_hi, ym_override=ym_override)
+        if tbl is None:
+            raise ValueError("Nessun dato da esportare.")
+        heads, body = tbl
+        ncol = len(heads)
+        sticky_n = min(STICKY_MAX, len(body))
+        prefix = body[:sticky_n]
+        rest = body[sticky_n:]
+        n_pages = max(1, (len(rest) + CAT_CHUNK - 1) // CAT_CHUNK)
+        for pi in range(n_pages):
+            sl = rest[pi * CAT_CHUNK : (pi + 1) * CAT_CHUNK]
+            chunk = prefix + sl
+            page_tag = f"{sem_label} · pag. {pi + 1}/{n_pages} · {len(chunk)} righe nel riquadro"
+            all_chunks.append((sem_label, heads, chunk, page_tag, ncol))
+
+    with PdfPages(pdf_path) as pdf:
+        for _, heads, chunk, page_tag, ncol in all_chunks:
+            _table_chunk_pdf(pdf, heads=heads, chunk_rows=chunk, page_tag=page_tag, ncol=ncol, stamp=stamp, year_i=year_i)
+
+
+def budget_total_absolute_non_cc_visible(db: dict, *, asof_iso: str) -> Decimal | None:
+    """Totale «Saldi assoluti» (conti non carta esclusi congelati) alla data ``asof_iso`` — allineamento footer Saldi."""
+    d = (asof_iso or "")[:10]
+    if len(d) != 10:
+        return None
+    vec_saldo = hybrid_balances_saldo_in_data(db, asof_iso=d)
+    if vec_saldo is None:
+        return None
+    if not db.get("years"):
+        return None
+    latest_year = max(y["year"] for y in db["years"])
+    year_data = next(y for y in db["years"] if y["year"] == latest_year)
+    accounts = year_data.get("accounts") or []
+    names = [a["name"] for a in accounts]
+    n = len(vec_saldo)
+    if len(names) != n:
+        return None
+    cc = account_is_credit_card_column_flags(db, n)
+    keep = saldi_visible_account_column_indices(db, names)
+    tot = Decimal("0")
+    for i in keep:
+        if i < n and i < len(cc) and not cc[i]:
+            tot += vec_saldo[i]
+    return tot
+
+
+def budget_total_absolute_non_cc_visible_for_cutoffs(db: dict, cutoffs_iso: list[str]) -> list[Decimal | None]:
+    """Come ``budget_total_absolute_non_cc_visible`` per più date ISO (ordine preservato), con un solo passaggio sul pool delle registrazioni future."""
+    out: list[Decimal | None] = []
+    n_cut = len(cutoffs_iso)
+    if n_cut == 0:
+        return out
+    norms = [(s or "")[:10] for s in cutoffs_iso]
+    if any(len(s) != 10 for s in norms):
+        return [None] * n_cut
+    if not db.get("years"):
+        return [None] * n_cut
+
+    latest_year = max(y["year"] for y in db["years"])
+    year_data = next(y for y in db["years"] if y["year"] == latest_year)
+    accounts = year_data.get("accounts") or []
+    n_accounts = len(accounts)
+    if n_accounts == 0:
+        return [None] * n_cut
+
+    names = [a["name"] for a in accounts]
+    tk_flag = bool(import_cancel_twin_balance_keys(db))
+    fut_vecs = compute_balances_future_dated_only_batch(
+        db, today_isos=list(norms), exclude_import_twin_actives=tk_flag
+    )
+    if len(fut_vecs) != n_cut:
+        return [None] * n_cut
+
+    cc = account_is_credit_card_column_flags(db, n_accounts)
+    keep = saldi_visible_account_column_indices(db, names)
+
+    la = legacy_absolute_account_amounts(db, n_accounts)
+
+    def _row_from_hyb_fut(hyb: list[Decimal], fut: list[Decimal]) -> Decimal | None:
+        if len(hyb) != n_accounts or len(fut) != n_accounts:
+            return None
+        vec_saldo = [hyb[i] - fut[i] for i in range(n_accounts)]
+        tot = Decimal("0")
+        for i in keep:
+            if i < n_accounts and i < len(cc) and not cc[i]:
+                tot += vec_saldo[i]
+        return tot
+
+    if la is None:
+        for k in range(n_cut):
+            hyb = hybrid_absolute_balances_for_saldi(db, today_cancel_cutoff_iso=norms[k])
+            if hyb is None:
+                out.append(None)
+                continue
+            out.append(_row_from_hyb_fut(hyb, fut_vecs[k]))
+        return out
+
+    hyb0 = hybrid_absolute_balances_for_saldi(db, today_cancel_cutoff_iso=norms[0])
+    if hyb0 is None:
+        return [None] * n_cut
+    for k in range(n_cut):
+        out.append(_row_from_hyb_fut(hyb0, fut_vecs[k]))
+    return out
+
+
+def _budget_pct_vs_basis(diff: Decimal, basis: Decimal) -> str:
+    if basis == 0:
+        return "—"
+    try:
+        p = ((diff / basis) * Decimal(100)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ZeroDivisionError, ArithmeticError):
+        return "—"
+    sign = "-" if p < 0 else ""
+    v = abs(p).quantize(Decimal("0.1"))
+    t = f"{v:.1f}".replace(".", ",")
+    return f"{sign}{t} %"
+
+
+def budget_display_title_for_year(db: dict, year: int) -> str:
+    y = int(year)
+    for nm in budget_snapshot_names_for_year(db, y):
+        if budget_named_snapshot_matches_current_sheet(db, y, nm):
+            return f"Budget {y} — scenario «{nm}»"
+    bs = db.get("budget_sheet")
+    ym = bs.get(str(y)) if isinstance(bs, dict) else None
+    if isinstance(ym, dict) and ym:
+        for cm in ym.values():
+            if isinstance(cm, dict) and cm:
+                return f"Budget {y} — modifiche manuali (non come scenario salvato)"
+    return f"Budget {y} — di base"
+
+
+def budget_summary_monthly_net_non_cc_non_virtual(db: dict, year: int) -> list[Decimal]:
+    """Netto mensile (entrate − uscite) sui soli conti non carta e non VIRTUALE — coerente con Statistiche › conto."""
+    y = int(year)
+    months = [(y, m) for m in range(1, 13)]
+    accounts, _sn, flows = stats_replay_month_snapshots_and_flows(db, months, today=date.today())
+    n = len(accounts)
+    out: list[Decimal] = []
+    for m in range(1, 13):
+        ym = (y, m)
+        fr = flows.get(ym)
+        if not fr or n == 0:
+            out.append(Decimal("0"))
+            continue
+        t = Decimal("0")
+        for j in range(n):
+            if _stats_account_index_is_cc_or_virtual(accounts, j):
+                continue
+            t += fr[j][0] - fr[j][1]
+        out.append(t)
+    return out
+
+
+def budget_summary_monthly_totals(
+    db: dict, year: int, *, ym_override: dict | None
+) -> tuple[list[Decimal], list[Decimal]] | None:
+    y_ref = int(year)
+    cats = budget_categories_in_use_ordered(db, y_ref)
+    if not cats:
+        return None
+    y_prev = y_ref - 1
+    mov_prev = budget_collect_movement_totals_by_cat_month(db, y_prev) if y_prev > 0 else {}
+    tot_mov_m = budget_summary_monthly_net_non_cc_non_virtual(db, y_ref)
+    tot_bud_m: list[Decimal] = []
+    for m in range(1, 13):
+        sb = Decimal("0")
+        for code, _name_stored in cats:
+            sb += budget_effective_budget_cell(db, y_ref, code, m, mov_prev, ym_override=ym_override)
+        tot_bud_m.append(sb)
+    return tot_mov_m, tot_bud_m
+
+
+def budget_year_pos_neg_aggregate(
+    totals_m: list[Decimal],
+) -> tuple[Decimal, Decimal, Decimal]:
+    """Σ positivi (entrate), Σ negativi (valore assoluto), Σ algebrica netta (stesso anno)."""
+    ent = Decimal("0")
+    us = Decimal("0")
+    net = Decimal("0")
+    for v in totals_m:
+        net += v
+        if v > 0:
+            ent += v
+        elif v < 0:
+            us += abs(v)
+    return ent, us, net
+
+
+def budget_summary_payload(
+    db: dict,
+    year: int,
+    *,
+    ym_override: dict | None = None,
+) -> dict | None:
+    """Dati tabellari per sintesi budget (UI / PDF)."""
+    tup = budget_summary_monthly_totals(db, int(year), ym_override=ym_override)
+    if tup is None:
+        return None
+    tot_mov_m, tot_bud_m = tup
+    y_ref = int(year)
+    monthes_it = tuple(m[:3] for m in _BUDGET_MONTH_FULL_IT)
+    months_mov = [m for m in range(1, 13) if tot_mov_m[m - 1] != 0]
+
+    def _fine_mese_label(mi: int) -> str:
+        return f"Fine {_BUDGET_MONTH_FULL_IT[mi]}"
+    opening_iso_gen = date(y_ref, 1, 1).isoformat()
+    cutoffs_abs = [opening_iso_gen] + [
+        date(y_ref, m, calendar.monthrange(y_ref, m)[1]).isoformat() for m in range(1, 13)
+    ]
+    abs_series = budget_total_absolute_non_cc_visible_for_cutoffs(db, cutoffs_abs)
+    open_abs = abs_series[0] if abs_series and abs_series[0] is not None else Decimal("0")
+    cum_mov: list[Decimal] = []
+    cum_bud: list[Decimal] = []
+    s_m = Decimal("0")
+    s_b = Decimal("0")
+    for j in range(12):
+        s_m += tot_mov_m[j]
+        s_b += tot_bud_m[j]
+        cum_mov.append(s_m)
+        cum_bud.append(s_b)
+    saldo_act_for_col: list[Decimal] = []
+    saldo_bud_traj: list[Decimal] = []
+    for m in range(1, 13):
+        act_e = abs_series[m] if len(abs_series) > m else None
+        if act_e is None:
+            act_e = open_abs + cum_mov[m - 1]
+        saldo_act_for_col.append(act_e)
+        saldo_bud_traj.append(open_abs + cum_bud[m - 1])
+    saldo_diff = [saldo_act_for_col[i] - saldo_bud_traj[i] for i in range(12)]
+    saldo_pct = [_budget_pct_vs_basis(saldo_diff[i], saldo_bud_traj[i]) for i in range(12)]
+
+    h1 = [
+        "Periodo",
+        "Totale\nmovimenti",
+        "Totale\nbudget",
+        "Differenza",
+        "Scostamento\n%",
+        "Saldo cum.\nmovimenti (rete anno)",
+        "Saldo cum.\nbudget",
+        "Differenza\ncum.",
+    ]
+    if months_mov:
+        rows1 = []
+        for m in months_mov:
+            i = m - 1
+            rows1.append(
+                [
+                    _fine_mese_label(i),
+                    format_euro_it(tot_mov_m[i]),
+                    format_euro_it(tot_bud_m[i]),
+                    format_euro_it(tot_mov_m[i] - tot_bud_m[i]),
+                    _budget_pct_vs_basis(tot_mov_m[i] - tot_bud_m[i], tot_bud_m[i]),
+                    format_euro_it(cum_mov[i]),
+                    format_euro_it(cum_bud[i]),
+                    format_euro_it(cum_mov[i] - cum_bud[i]),
+                ]
+            )
+    else:
+        rows1 = [["—", "—", "—", "—", "—", "—", "—", "—"]]
+    # Tab. 2: stessi mesi della tab. 1 (``months_mov``); righe oltre la nona erano solo nascoste dall’altezza Treeview in UI.
+    h2 = [
+        "Periodo",
+        "Saldo\nassoluto",
+        "Saldo previsto\na budget",
+        "Differenza",
+        "Scostamento\n%",
+    ]
+    rows2 = [
+        [
+            "Inizio anno",
+            format_euro_it(open_abs),
+            format_euro_it(open_abs),
+            format_euro_it(Decimal("0")),
+            "—",
+        ]
+    ]
+    for m in months_mov:
+        i = m - 1
+        rows2.append(
+            [
+                _fine_mese_label(i),
+                format_euro_it(saldo_act_for_col[i]),
+                format_euro_it(saldo_bud_traj[i]),
+                format_euro_it(saldo_diff[i]),
+                saldo_pct[i],
+            ]
+        )
+    ent_m, us_m, net_m = budget_year_pos_neg_aggregate(tot_mov_m)
+    ent_b, us_b, net_b = budget_year_pos_neg_aggregate(tot_bud_m)
+    h3 = ["Voce", "Movimenti\nanno", "Budget\nanno", "Differenza", "Scostamento\n%"]
+    rows3 = [
+        [
+            "Totali entrate anno (importi positivi)",
+            format_euro_it(ent_m),
+            format_euro_it(ent_b),
+            format_euro_it(ent_m - ent_b),
+            _budget_pct_vs_basis(ent_m - ent_b, ent_b),
+        ],
+        [
+            "Totale uscite anno (importi negativi)",
+            format_euro_it(us_m),
+            format_euro_it(us_b),
+            format_euro_it(us_m - us_b),
+            _budget_pct_vs_basis(us_m - us_b, us_b),
+        ],
+        [
+            "Differenza netta annua",
+            format_euro_it(net_m),
+            format_euro_it(net_b),
+            format_euro_it(net_m - net_b),
+            _budget_pct_vs_basis(net_m - net_b, net_b),
+        ],
+    ]
+    return {
+        "year": y_ref,
+        "monthes_short": monthes_it,
+        "months_with_mov": months_mov,
+        "h1": h1,
+        "rows1": rows1,
+        "h2": h2,
+        "rows2": rows2,
+        "h3": h3,
+        "rows3": rows3,
+        "tot_mov_m": tot_mov_m,
+        "tot_bud_m": tot_bud_m,
+        "cum_mov": cum_mov,
+        "cum_bud": cum_bud,
+        "saldo_act": saldo_act_for_col,
+        "saldo_bud": saldo_bud_traj,
+        "open_abs": open_abs,
+    }
+
+
+def budget_export_summary_pdf(
+    db: dict,
+    year: int,
+    pdf_path: str,
+    *,
+    title_line: str,
+    ym_override: dict | None = None,
+    generated_at: datetime | None = None,
+) -> None:
+    try:
+        _mpldir = data_workspace.app_support_dir() / "mpl_config"
+        try:
+            _mpldir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            _mpldir = Path(tempfile.gettempdir()) / "conti_cdc_mpl"
+            _mpldir.mkdir(parents=True, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = str(_mpldir)
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        from matplotlib.backends.backend_pdf import PdfPages
+        from matplotlib.figure import Figure
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        raise RuntimeError(f"matplotlib: {exc}") from exc
+
+    pl = budget_summary_payload(db, int(year), ym_override=ym_override)
+    if pl is None:
+        raise ValueError("Nessun dato sintesi budget.")
+    y_ref = int(pl["year"])
+    tot_mov_m = pl["tot_mov_m"]
+    tot_bud_m = pl["tot_bud_m"]
+    cum_mov = pl["cum_mov"]
+    cum_bud = pl["cum_bud"]
+    saldo_act_for_col = pl["saldo_act"]
+    saldo_bud_traj = pl["saldo_bud"]
+    monthes_it = pl["monthes_short"]
+    months_mov = pl["months_with_mov"]
+
+    stamp_dt = generated_at or datetime.now()
+    stamp = stamp_dt.strftime("%d/%m/%Y %H:%M")
+    # A4 orizzontale (pollici): larghezza > altezza
+    _pdf_syn_figsize = (11.69, 8.27)
+
+    def _table_pdf(
+        fig: Figure,
+        ax_title: str,
+        heads: list[str],
+        rows: list[list[str]],
+        *,
+        section_title_y: float,
+        period_col_frac: float,
+    ) -> None:
+        """Tabella centrata; colonne dati ~25% più larghe rispetto alla ripartizione base; intestazioni multilinea più alte."""
+        ncol = len(heads)
+        disp = rows
+        fig.text(0.5, section_title_y, ax_title, ha="center", va="bottom", fontsize=10, fontweight="bold")
+        tw = min(0.93, max(0.56, (0.38 + 0.050 * ncol) * 1.14))
+        left = (1.0 - tw) / 2
+        ax_h = 0.64
+        ax_bottom = 0.085
+        ax = fig.add_axes([left, ax_bottom, tw, ax_h])
+        ax.set_axis_off()
+        w0 = period_col_frac
+        n_rest = max(1, ncol - 1)
+        base_rest = (1.0 - w0) / n_rest
+        w_rest = base_rest * 1.25
+        norm = w0 + n_rest * w_rest
+        colWidths = [w0 / norm] + [w_rest / norm] * n_rest
+        tab = ax.table(
+            cellText=disp,
+            colLabels=heads,
+            loc="upper center",
+            cellLoc="right",
+            colWidths=colWidths,
+        )
+        tab.auto_set_font_size(False)
+        tab.set_fontsize(5.6)
+        tab.scale(1, 1.48)
+        for cj in range(ncol):
+            c = tab[(0, cj)]
+            try:
+                c.set_height(c.get_height() * 2.05)
+            except Exception:
+                pass
+        for (ri, cj), cell in tab.get_celld().items():
+            cell.set_edgecolor("#bbbbbb")
+            cell.set_linewidth(0.2)
+            txt = cell.get_text()
+            if ri == 0:
+                cell.set_facecolor("#b8d4eb")
+                txt.set_fontweight("bold")
+                txt.set_fontsize(5.25)
+                txt.set_ha("left" if cj == 0 else "right")
+                txt.set_multialignment("left" if cj == 0 else "right")
+            elif cj == 0:
+                txt.set_ha("left")
+                txt.set_fontsize(5.6)
+            else:
+                txt.set_ha("right")
+                txt.set_fontsize(5.6)
+
+    h1 = pl["h1"]
+    rows_mov_sec = pl["rows1"]
+
+    fig1 = Figure(figsize=_pdf_syn_figsize)
+    fig1.text(
+        0.5,
+        0.965,
+        _pdf_safe_text(title_line),
+        ha="center",
+        fontsize=12,
+        fontweight="bold",
+    )
+    fig1.text(
+        0.5,
+        0.938,
+        f"Sintesi annua {y_ref} · generato il {stamp}",
+        ha="center",
+        fontsize=8,
+        color="#333333",
+    )
+    fig1.text(
+        0.5,
+        0.921,
+        "Movimenti e saldi consolidati sono quelli dell’anno; saldi previsti budget = saldo inizio anno + cumulo budget mensile.",
+        ha="center",
+        fontsize=7,
+        color="#555555",
+    )
+    _table_pdf(
+        fig1,
+        "1) MOVIMENTI — totali mensili e cumulo (rete categorie)",
+        h1,
+        rows_mov_sec,
+        section_title_y=0.828,
+        period_col_frac=0.095,
+    )
+
+    h2_hdr = pl["h2"]
+    rows_s = pl["rows2"]
+
+    fig2 = Figure(figsize=_pdf_syn_figsize)
+    fig2.text(0.5, 0.965, _pdf_safe_text(title_line), ha="center", fontsize=12, fontweight="bold")
+    fig2.text(
+        0.5,
+        0.938,
+        f"Sintesi annua {y_ref} · generato il {stamp} · pag. 2",
+        ha="center",
+        fontsize=8,
+        color="#333333",
+    )
+    _table_pdf(
+        fig2,
+        "2) SALDI — consolidato vs traiettoria budget",
+        h2_hdr,
+        rows_s,
+        section_title_y=0.872,
+        period_col_frac=0.095,
+    )
+
+    h3 = pl["h3"]
+    body3 = pl["rows3"]
+
+    fig3 = Figure(figsize=_pdf_syn_figsize)
+    fig3.text(0.5, 0.965, _pdf_safe_text(title_line), ha="center", fontsize=12, fontweight="bold")
+    fig3.text(
+        0.5,
+        0.938,
+        f"Sintesi annua {y_ref} · generato il {stamp} · pag. 3",
+        ha="center",
+        fontsize=8,
+        color="#333333",
+    )
+    _table_pdf(
+        fig3,
+        "3) ENTRATE / USCITE",
+        h3,
+        body3,
+        section_title_y=0.872,
+        period_col_frac=0.30,
+    )
+
+    # --- Grafici (da sezioni 1–2)
+    fig4 = Figure(figsize=_pdf_syn_figsize)
+    fig4.text(0.5, 0.965, _pdf_safe_text(title_line), ha="center", fontsize=12, fontweight="bold")
+    fig4.text(
+        0.5,
+        0.938,
+        f"Sintesi annua {y_ref} · generato il {stamp} · pag. 4",
+        ha="center",
+        fontsize=8,
+        color="#333333",
+    )
+
+    ax_a = fig4.add_axes([0.08, 0.53, 0.84, 0.38])
+    xs = list(range(1, 13))
+    ax_a.plot(xs, [float(cum_mov[i]) for i in range(12)], "o-", color="#1565c0", label="Cumulo movimenti", linewidth=1.2)
+    ax_a.plot(xs, [float(cum_bud[i]) for i in range(12)], "s-", color="#2e7d32", label="Cumulo budget", linewidth=1.2)
+    ax_a.axhline(0, color="#999999", linewidth=0.4)
+    ax_a.set_xticks(xs)
+    ax_a.set_xticklabels([monthes_it[i] for i in range(12)], fontsize=7, rotation=45, ha="right")
+    ax_a.set_ylabel("€ (cumulo)")
+    ax_a.legend(loc="best", fontsize=7)
+    ax_a.grid(True, alpha=0.3)
+    ax_a.set_title("Cumulo rete mensile vs budget")
+
+    ax_b = fig4.add_axes([0.08, 0.08, 0.84, 0.38])
+    ax_b.plot(
+        xs,
+        [float(saldo_act_for_col[i]) for i in range(12)],
+        "o-",
+        color="#c62828",
+        linewidth=1.2,
+        label="Saldo assoluto consolidato",
+    )
+    ax_b.plot(
+        xs,
+        [float(saldo_bud_traj[i]) for i in range(12)],
+        "s--",
+        color="#6a1b9a",
+        linewidth=1.2,
+        label="Traiettoria da budget",
+    )
+    ax_b.axhline(0, color="#999999", linewidth=0.4)
+    ax_b.set_xticks(xs)
+    ax_b.set_xticklabels([monthes_it[i] for i in range(12)], fontsize=7, rotation=45, ha="right")
+    ax_b.set_ylabel("€")
+    ax_b.legend(loc="best", fontsize=7)
+    ax_b.grid(True, alpha=0.3)
+    ax_b.set_title("Saldi assoluti a fine mese vs previsto")
+
+    with PdfPages(pdf_path) as pdf:
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+        for _fig in (fig1, fig2, fig3, fig4):
+            _ = FigureCanvasAgg(_fig)
+            pdf.savefig(_fig)
+
+    plt.close("all")
 
 
 def merged_categories_for_plan_editor(db: dict) -> list[dict]:
@@ -5186,6 +6955,644 @@ def migrate_credit_card_cheque_label(db: dict) -> int:
             rec["cheque"] = CREDIT_CARD_CHEQUE_LABEL
             touched += 1
     return touched
+
+
+def _migration_category_disp_key(raw: str) -> str:
+    """Chiave stabile per confrontare nomi categoria (import legacy, Unicode)."""
+    t = category_display_name(str(raw or "")).strip().lower()
+    return unicodedata.normalize("NFKC", t)
+
+
+def _migration_category_merge_token_key(raw: str) -> str:
+    """Solo lettere/cifre (NFKC, minuscolo): equipara ``SIP.2`` e ``SIP 2`` nella migrazione merge."""
+    return "".join(ch for ch in _migration_category_disp_key(raw) if ch.isalnum())
+
+
+_ROMA_TELEFONO_MERGE_SOURCE_LABELS: tuple[str, ...] = (
+    "INFOSTRADA",
+    "SIP.2",
+    "SIP.2.LN",
+    "SIP.3",
+    "TF.ROMA",
+    "TF.ROM.2",
+    "TISCALI",
+)
+
+
+def _migration_merge_name_matches_sources(
+    name_raw: str,
+    *,
+    src_disp_keys: set[str],
+    src_token_keys: set[str],
+) -> bool:
+    if _migration_category_disp_key(name_raw) in src_disp_keys:
+        return True
+    tok = _migration_category_merge_token_key(name_raw)
+    return bool(tok) and tok in src_token_keys
+
+
+def _category_codes_equal_migration(a: str, b: str) -> bool:
+    """Codici categoria equivalenti (08 / 8)."""
+    x, y = str(a).strip(), str(b).strip()
+    if not x or not y:
+        return False
+    if x.isdigit() and y.isdigit():
+        return int(x) == int(y)
+    return x == y
+
+
+def _find_category_code_ci(cats: list | None, display: str) -> str | None:
+    want = _migration_category_disp_key(display)
+    if not want:
+        return None
+    for c in cats or []:
+        nm = _migration_category_disp_key(str(c.get("name") or ""))
+        if nm == want:
+            return str(c.get("code", "")).strip()
+    return None
+
+
+def _migration_find_chart_row_by_display_any_year(db: dict, target_display: str) -> tuple[str | None, dict | None]:
+    """Prima riga piano categoria con lo stesso nome display (qualsiasi bucket anno)."""
+    want = _migration_category_disp_key(target_display)
+    if not want:
+        return None, None
+    for yb in db.get("years", []) or []:
+        for c in yb.get("categories", []) or []:
+            if not isinstance(c, dict):
+                continue
+            nm = _migration_category_disp_key(str(c.get("name") or ""))
+            if nm != want:
+                continue
+            code = str(c.get("code", "")).strip()
+            return (code if code else None, copy.deepcopy(c))
+    return None, None
+
+
+def _budget_remap_category_code_keys(db: dict, old_code: str, new_code: str) -> None:
+    """Sposta override manuali budget da un codice categoria a un altro (per anno: unisce i mesi)."""
+    o = str(old_code).strip()
+    n = str(new_code).strip()
+    if not o or not n or o == n:
+        return
+    bs = db.get("budget_sheet")
+    if not isinstance(bs, dict):
+        return
+    for yk, ym in list(bs.items()):
+        if not isinstance(ym, dict):
+            continue
+        cm_old = ym.get(o)
+        if not isinstance(cm_old, dict):
+            continue
+        cm_new = ym.setdefault(n, {})
+        if not isinstance(cm_new, dict):
+            cm_new = {}
+            ym[n] = cm_new
+        for mk, mv in cm_old.items():
+            if mk not in cm_new or cm_new.get(mk) in (None, ""):
+                cm_new[mk] = mv
+        ym.pop(o, None)
+        if not ym:
+            bs.pop(yk, None)
+
+
+def _migration_normalized_year_categories_map(db: dict) -> dict[int, list[dict[str, str]]]:
+    """Chiavi anno sempre ``int`` (evita ``cmap.get(2005)`` fallito se l'anno era stringa nel JSON)."""
+    out: dict[int, list[dict[str, str]]] = {}
+    for yb in db.get("years", []) or []:
+        try:
+            yr = int(yb.get("year", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if yr <= 0:
+            continue
+        raw = yb.get("categories")
+        out[yr] = list(raw) if isinstance(raw, list) else []
+    return out
+
+
+def _migration_resolve_record_calendar_year(rec: dict, bucket_year: int) -> int:
+    """Anno contabile preferendo il campo ``year``; se assente, dalla data movimento; infine il bucket."""
+    try:
+        y = int(rec.get("year") or 0)
+        if y > 0:
+            return y
+    except (TypeError, ValueError):
+        pass
+    d = str(rec.get("date_iso") or "").strip()[:10]
+    if len(d) >= 4 and d[:4].isdigit():
+        try:
+            return int(d[:4])
+        except ValueError:
+            pass
+    return bucket_year
+
+
+def _migration_ensure_target_category_in_bucket(yb: dict, ref_cat: dict) -> bool:
+    """Se nel bucket anno manca la categoria di destinazione (stesso nome «display» del ref), aggiunge una riga dal piano di riferimento."""
+    cats = yb.setdefault("categories", [])
+    if not isinstance(cats, list):
+        return False
+    want = _migration_category_disp_key(str(ref_cat.get("name") or ""))
+    if not want:
+        return False
+    for c in cats:
+        if _migration_category_disp_key(str(c.get("name") or "")) == want:
+            return False
+    new_c = copy.deepcopy(ref_cat)
+
+    def _bucket_code_taken(want_cc: str) -> bool:
+        for c in cats:
+            if _category_codes_equal_migration(str(c.get("code", "") or ""), want_cc):
+                return True
+        return False
+
+    cc = str(new_c.get("code", "") or "").strip()
+    if cc and _bucket_code_taken(cc):
+        mx = 0
+        for c in cats:
+            s = str(c.get("code", "") or "").strip()
+            if s.isdigit():
+                mx = max(mx, int(s))
+        new_c["code"] = str(mx + 1)
+    cats.append(new_c)
+    return True
+
+
+def migrate_legacy_category_renames_and_merges(db: dict) -> bool:
+    """Rinomina categorie legacy e accorpa gruppi in ROMA.TELEFONO / VARIE; idempotente."""
+    changed = False
+
+    for old_disp, new_plain in (
+        ("ASS.VITA", "ASSICURAZIONI.VITA"),
+        ("CASA.2", "CASA.SANPIETRO"),
+        ("ENEL.2", "LUCE.SANPIETRO"),
+        ("GAS.2", "GAS.SANPIETRO"),
+    ):
+        stored_new = format_category_chart_name_stored(new_plain)
+        codes_hit: set[str] = set()
+        for yb in db.get("years", []) or []:
+            for c in yb.get("categories", []) or []:
+                nm = str(c.get("name") or "")
+                if category_display_name(nm).strip().lower() != old_disp.strip().lower():
+                    continue
+                code = str(c.get("code", "")).strip()
+                if not code:
+                    continue
+                codes_hit.add(code)
+                if nm != stored_new:
+                    c["name"] = stored_new
+                    changed = True
+        for code in codes_hit:
+            sync_record_category_names_for_code(db, code, stored_new)
+        if codes_hit:
+            periodiche.ensure_periodic_registrations(db)
+            for rule in db.get("periodic_registrations") or []:
+                tpl = rule.get("template")
+                if not isinstance(tpl, dict):
+                    continue
+                if str(tpl.get("category_code") or "").strip() not in codes_hit:
+                    continue
+                if str(tpl.get("category_name") or "").strip() != stored_new:
+                    tpl["category_name"] = stored_new
+                    changed = True
+            changed = True
+
+    def _merge_sources_into_target(
+        source_labels: tuple[str, ...],
+        target_display: str,
+        *,
+        skip_if_name_matches_sources: tuple[str, ...] | None = None,
+    ) -> None:
+        """Accorpa per nome/codice categoria (legacy): nome risolto, nome sul record o codice nel piano anno."""
+        nonlocal changed
+        periodiche.ensure_periodic_registrations(db)
+        src_keys = {_migration_category_disp_key(x) for x in source_labels}
+        src_token_keys = {_migration_category_merge_token_key(x) for x in source_labels}
+        src_token_keys.discard("")
+        skip_sk: set[str] | None = None
+        skip_tk: set[str] | None = None
+        if skip_if_name_matches_sources:
+            skip_sk = {_migration_category_disp_key(x) for x in skip_if_name_matches_sources}
+            skip_tk = {_migration_category_merge_token_key(x) for x in skip_if_name_matches_sources}
+            skip_tk.discard("")
+        ref = chart_clone_source_bucket(db)
+        ref_cats = (ref or {}).get("categories") or []
+        tgt_code_ref = _find_category_code_ci(ref_cats, target_display)
+        tgt_row = next(
+            (c for c in ref_cats if _category_codes_equal_migration(str(c.get("code", "")), str(tgt_code_ref or ""))),
+            None,
+        )
+        if not tgt_code_ref or not tgt_row:
+            fb_code, fb_row = _migration_find_chart_row_by_display_any_year(db, target_display)
+            if fb_code and fb_row:
+                tgt_code_ref, tgt_row = fb_code, fb_row
+            else:
+                return
+        tgt_name_stored = str(tgt_row.get("name") or "")
+        tgt_note = str(tgt_row.get("note") or tgt_row.get("category_note") or "")
+
+        for yb in db.get("years", []) or []:
+            if _migration_ensure_target_category_in_bucket(yb, tgt_row):
+                changed = True
+
+        cmap = _migration_normalized_year_categories_map(db)
+
+        source_codes_found: set[str] = set()
+        for yb in db.get("years", []) or []:
+            for c in yb.get("categories", []) or []:
+                if _migration_merge_name_matches_sources(
+                    str(c.get("name") or ""), src_disp_keys=src_keys, src_token_keys=src_token_keys
+                ):
+                    source_codes_found.add(str(c.get("code", "")).strip())
+
+        codes_per_year: dict[int, set[str]] = {}
+        for yr, cats in cmap.items():
+            sc_y: set[str] = set()
+            for c in cats or []:
+                if _migration_merge_name_matches_sources(
+                    str(c.get("name") or ""), src_disp_keys=src_keys, src_token_keys=src_token_keys
+                ):
+                    sc_y.add(str(c.get("code", "")).strip())
+            codes_per_year[int(yr)] = sc_y
+
+        def _migration_record_matches_sources_for_year(
+            r: dict, pyr: int, cats_list: list,
+        ) -> bool:
+            """True se la registrazione risulta assegnata a una delle categorie sorgente secondo il piano ``pyr``."""
+            cr = category_name_for_record(r, cats_list).strip()
+            raw = str(r.get("category_name") or "").strip()
+            rcc = str(r.get("category_code") or "").strip()
+            if _migration_merge_name_matches_sources(cr, src_disp_keys=src_keys, src_token_keys=src_token_keys):
+                return True
+            if raw and _migration_merge_name_matches_sources(
+                raw, src_disp_keys=src_keys, src_token_keys=src_token_keys
+            ):
+                return True
+            for scode in codes_per_year.get(int(pyr), set()):
+                if _category_codes_equal_migration(rcc, scode):
+                    return True
+            return False
+
+        for yb in db.get("years", []) or []:
+            try:
+                y_bucket_year = int(yb.get("year", 0) or 0)
+            except (TypeError, ValueError):
+                y_bucket_year = 0
+            for rec in yb.get("records", []) or []:
+                if rec.get("is_cancelled"):
+                    continue
+                plan_apply = y_bucket_year if y_bucket_year > 0 else _migration_resolve_record_calendar_year(rec, 0)
+                cats_apply = cmap.get(plan_apply, []) or []
+
+                cal_y = 0
+                d_iso = str(rec.get("date_iso") or "").strip()[:10]
+                if len(d_iso) >= 4 and d_iso[:4].isdigit():
+                    try:
+                        cal_y = int(d_iso[:4])
+                    except ValueError:
+                        cal_y = 0
+
+                if skip_sk is not None and skip_tk is not None:
+
+                    def _rec_skip_merge_for_sources(cat_list: list) -> bool:
+                        cr_skip = category_name_for_record(rec, cat_list).strip()
+                        rr_skip = str(rec.get("category_name") or "").strip()
+                        if _migration_merge_name_matches_sources(
+                            cr_skip, src_disp_keys=skip_sk, src_token_keys=skip_tk
+                        ):
+                            return True
+                        return bool(rr_skip) and _migration_merge_name_matches_sources(
+                            rr_skip, src_disp_keys=skip_sk, src_token_keys=skip_tk
+                        )
+
+                    if _rec_skip_merge_for_sources(cats_apply):
+                        continue
+                    if (
+                        cal_y > 0
+                        and cal_y != plan_apply
+                        and cal_y in cmap
+                        and _rec_skip_merge_for_sources(cmap.get(cal_y, []) or [])
+                    ):
+                        continue
+
+                match_src = _migration_record_matches_sources_for_year(rec, plan_apply, cats_apply)
+                if (
+                    not match_src
+                    and cal_y > 0
+                    and cal_y != plan_apply
+                    and cal_y in cmap
+                ):
+                    match_src = _migration_record_matches_sources_for_year(
+                        rec, cal_y, cmap.get(cal_y, []) or []
+                    )
+
+                if not match_src:
+                    continue
+
+                tgt_code = _find_category_code_ci(cats_apply, target_display)
+                if not tgt_code:
+                    continue
+                sync_record_category_from_plan(rec, cats_apply, tgt_code)
+                changed = True
+
+        periodiche.ensure_periodic_registrations(db)
+        for rule in db.get("periodic_registrations") or []:
+            tpl = rule.get("template")
+            if not isinstance(tpl, dict):
+                continue
+            tpl_cc = str(tpl.get("category_code") or "").strip()
+            match_tpl = _migration_merge_name_matches_sources(
+                str(tpl.get("category_name") or ""), src_disp_keys=src_keys, src_token_keys=src_token_keys
+            ) or any(_category_codes_equal_migration(tpl_cc, sc) for sc in source_codes_found)
+            if not match_tpl:
+                continue
+            tpl["category_code"] = tgt_code_ref
+            tpl["category_name"] = tgt_name_stored
+            tpl["category_note"] = tgt_note
+            changed = True
+
+        for sc in source_codes_found:
+            if sc and not _category_codes_equal_migration(sc, tgt_code_ref):
+                _budget_remap_category_code_keys(db, sc, tgt_code_ref)
+        for sc in source_codes_found:
+            if (
+                sc
+                and not _category_codes_equal_migration(sc, tgt_code_ref)
+                and not category_code_used_any_year(db, sc)
+            ):
+                remove_category_from_all_years(db, sc)
+                changed = True
+
+    _merge_sources_into_target(
+        _ROMA_TELEFONO_MERGE_SOURCE_LABELS,
+        "ROMA.TELEFONO",
+    )
+    _merge_sources_into_target(
+        ("LIBERO", "LIBERALITA'", "LIBERALITA", "LIBERALITÀ"),
+        "VARIE",
+        skip_if_name_matches_sources=_ROMA_TELEFONO_MERGE_SOURCE_LABELS,
+    )
+
+    # Ripara: nome immagazzinato sulla registrazione ancora uno dei 7 label telefoni ma nome risolto no (es. 9≡09 sul piano).
+    cmap_fix = _migration_normalized_year_categories_map(db)
+    rsk_fix = {_migration_category_disp_key(x) for x in _ROMA_TELEFONO_MERGE_SOURCE_LABELS}
+    rtk_fix = {_migration_category_merge_token_key(x) for x in _ROMA_TELEFONO_MERGE_SOURCE_LABELS}
+    rtk_fix.discard("")
+    for yb_fix in db.get("years", []) or []:
+        try:
+            py_fix = int(yb_fix.get("year", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if py_fix <= 0:
+            continue
+        cats_fix = cmap_fix.get(py_fix, []) or []
+        tc_rom = _find_category_code_ci(cats_fix, "ROMA.TELEFONO")
+        if not tc_rom:
+            continue
+        for rec_fix in yb_fix.get("records", []) or []:
+            if rec_fix.get("is_cancelled"):
+                continue
+            snap_fix = str(rec_fix.get("category_name") or "").strip()
+            if not snap_fix or not _migration_merge_name_matches_sources(
+                snap_fix, src_disp_keys=rsk_fix, src_token_keys=rtk_fix
+            ):
+                continue
+            disp_fix = category_name_for_record(rec_fix, cats_fix).strip()
+            if _migration_category_disp_key(disp_fix) == _migration_category_disp_key("ROMA.TELEFONO"):
+                continue
+            sync_record_category_from_plan(rec_fix, cats_fix, tc_rom)
+            changed = True
+
+    if migrate_recover_roma_telefono_from_legacy_dat_slot(db):
+        changed = True
+
+    if migrate_recover_roma_telefono_from_legacy_archive_files(db):
+        changed = True
+
+    return changed
+
+
+def migrate_recover_roma_telefono_from_legacy_dat_slot(db: dict) -> bool:
+    """Ripristina ROMA.TELEFONO da ``raw_record`` (.dat): legge il codice categoria originale nel file.
+
+    Recupero possibile quando la registrazione è ancora collegata al blocco 121 caratteri importato da Conti/VB6:
+    il codice nello slot [37:39] non dipende da errori successivi su ``category_code`` (es. 9 vs 09).
+    Si riallinea a ROMA.TELEFONO se sul piano dell'anno del bucket quello slot ha ancora nome di una delle
+    7 sorgenti telefono oppure è già «ROMA.TELEFONO».
+    """
+    changed = False
+    rsk = {_migration_category_disp_key(x) for x in _ROMA_TELEFONO_MERGE_SOURCE_LABELS}
+    rtk = {_migration_category_merge_token_key(x) for x in _ROMA_TELEFONO_MERGE_SOURCE_LABELS}
+    rtk.discard("")
+    cmap = _migration_normalized_year_categories_map(db)
+    roma_key = _migration_category_disp_key("ROMA.TELEFONO")
+
+    for yb in db.get("years", []) or []:
+        try:
+            py = int(yb.get("year", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if py <= 0:
+            continue
+        cats = cmap.get(py, []) or []
+        tc_rom = _find_category_code_ci(cats, "ROMA.TELEFONO")
+        if not tc_rom:
+            continue
+        for rec in yb.get("records", []) or []:
+            if rec.get("is_cancelled") or rec.get("is_virtuale_discharge"):
+                continue
+            slot = legacy_dat_category_code_from_raw_record(rec)
+            if not slot:
+                continue
+            try:
+                si = int(rec.get("source_index") or 0)
+            except (TypeError, ValueError):
+                si = 0
+            if py == 1990 and 1 <= si <= 8:
+                continue
+            row = _chart_row_for_legacy_category_code(cats, slot)
+            if not row:
+                continue
+            nm_slot = str(row.get("name") or "")
+            disp_now = category_name_for_record(rec, cats).strip()
+            if _migration_category_disp_key(disp_now) == roma_key:
+                continue
+            phone_by_name = _migration_merge_name_matches_sources(
+                nm_slot, src_disp_keys=rsk, src_token_keys=rtk
+            )
+            slot_row_is_roma = _migration_category_disp_key(nm_slot) == roma_key
+            if not (phone_by_name or slot_row_is_roma):
+                continue
+            sync_record_category_from_plan(rec, cats, tc_rom)
+            changed = True
+    return changed
+
+
+_ROMA_TELEFONO_ARCHIVE_FS_YEAR_MIN = 1995
+_ROMA_TELEFONO_ARCHIVE_FS_YEAR_MAX = 2007
+
+
+def _roma_archive_fs_fingerprint(bucket_year: int, rec: dict) -> tuple[int, str, str, str, str, str]:
+    iso = str(rec.get("date_iso") or "").strip()[:10]
+    try:
+        amt = format_money(to_decimal(rec.get("amount_eur") or "0"))
+    except Exception:
+        amt = str(rec.get("amount_eur") or "").strip()
+    return (
+        int(bucket_year),
+        iso,
+        amt,
+        str(rec.get("account_primary_code") or "").strip(),
+        str(rec.get("account_secondary_code") or "").strip(),
+        (rec.get("note") or "").strip(),
+    )
+
+
+def _roma_archive_fs_build_indexes(
+    db: dict,
+) -> tuple[dict[str, list[tuple[dict, dict]]], dict[tuple, list[tuple[dict, dict]]]]:
+    by_lgk: dict[str, list[tuple[dict, dict]]] = defaultdict(list)
+    by_fpr: dict[tuple, list[tuple[dict, dict]]] = defaultdict(list)
+    for yb in db.get("years", []) or []:
+        try:
+            py = int(yb.get("year", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if py < _ROMA_TELEFONO_ARCHIVE_FS_YEAR_MIN or py > _ROMA_TELEFONO_ARCHIVE_FS_YEAR_MAX:
+            continue
+        for rec in yb.get("records", []) or []:
+            if rec.get("is_cancelled") or rec.get("is_virtuale_discharge"):
+                continue
+            lk = str(rec.get("legacy_registration_key") or "").strip()
+            if lk:
+                by_lgk[lk].append((yb, rec))
+            by_fpr[_roma_archive_fs_fingerprint(py, rec)].append((yb, rec))
+    return dict(by_lgk), dict(by_fpr)
+
+
+def _roma_archive_fs_pick_match(
+    lr_d: dict,
+    year: int,
+    by_lgk: dict[str, list[tuple[dict, dict]]],
+    by_fpr: dict[tuple, list[tuple[dict, dict]]],
+) -> tuple[dict, dict] | None:
+    fp = _roma_archive_fs_fingerprint(year, lr_d)
+    lgk = str(lr_d.get("legacy_registration_key") or "").strip()
+    if lgk:
+        hits = by_lgk.get(lgk) or []
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            narrowed = [
+                (yb, r)
+                for yb, r in hits
+                if _roma_archive_fs_fingerprint(int(yb.get("year", 0) or 0), r) == fp
+            ]
+            if len(narrowed) == 1:
+                return narrowed[0]
+        return None
+    cand = by_fpr.get(fp) or []
+    sf = str(lr_d.get("source_file") or "").strip()
+    fd = str(lr_d.get("source_folder") or "").strip()
+    narrowed = [
+        (yb, r)
+        for yb, r in cand
+        if int(yb.get("year", 0) or 0) == year
+        and str(r.get("source_folder") or "").strip() == fd
+        and str(r.get("source_file") or "").strip() == sf
+    ]
+    if len(narrowed) == 1:
+        return narrowed[0]
+    if len(narrowed) == 0 and len(cand) == 1 and int(cand[0][0].get("year", 0) or 0) == year:
+        return cand[0]
+    return None
+
+
+def migrate_recover_roma_telefono_from_legacy_archive_files(
+    db: dict,
+    *,
+    cdc_root: Path | None = None,
+) -> bool:
+    """Legge *dat.aco / *cat.aco su disco (anni 1995–2007); per le 7 categorie telefono, abbinamento al DB via chiave legacy o impronta forte, poi ROMA.TELEFONO.
+
+    Usa ``cdc_root``, oppure ``DEFAULT_CDC_ROOT``, oppure ``CONTI_CDC_ROOT`` se la cartella esiste;
+    altrimenti è no-op.
+    """
+    root = Path(cdc_root).expanduser() if cdc_root is not None else DEFAULT_CDC_ROOT.expanduser()
+    if not root.is_dir():
+        alt = (os.environ.get("CONTI_CDC_ROOT") or "").strip()
+        if alt:
+            root = Path(alt).expanduser()
+    if not root.is_dir():
+        return False
+
+    rsk = {_migration_category_disp_key(x) for x in _ROMA_TELEFONO_MERGE_SOURCE_LABELS}
+    rtk = {_migration_category_merge_token_key(x) for x in _ROMA_TELEFONO_MERGE_SOURCE_LABELS}
+    rtk.discard("")
+    roma_key = _migration_category_disp_key("ROMA.TELEFONO")
+    cmap = _migration_normalized_year_categories_map(db)
+
+    by_lgk, by_fpr = _roma_archive_fs_build_indexes(db)
+    changed = False
+
+    dummy_notes: list[str] = []
+
+    for folder in iter_year_folders(root):
+        try:
+            y_dir = guess_year_from_folder(folder.name)
+        except ValueError:
+            continue
+        if y_dir < _ROMA_TELEFONO_ARCHIVE_FS_YEAR_MIN or y_dir > _ROMA_TELEFONO_ARCHIVE_FS_YEAR_MAX:
+            continue
+        try:
+            cat_p = find_single_file(folder, "*cat.aco")
+            coc_p = find_single_file(folder, "*coc.aco")
+            dat_p = find_single_file(folder, "*dat.aco")
+        except FileNotFoundError:
+            continue
+        try:
+            cats_aco = parse_aco_list(cat_p)
+            accounts_aco = parse_aco_list(coc_p)
+        except (OSError, ValueError):
+            continue
+        need_n = max(len(cats_aco) + 8, 96)
+        if len(dummy_notes) < need_n:
+            dummy_notes.extend([""] * (need_n - len(dummy_notes)))
+        try:
+            legacy_rows = parse_dat_records(
+                dat_p, y_dir, cats_aco, accounts_aco, dummy_notes[:need_n]
+            )
+        except (OSError, ValueError, FileNotFoundError):
+            continue
+
+        for lr in legacy_rows:
+            if lr.is_cancelled:
+                continue
+            lr_d = asdict(lr)
+            cname = str(lr_d.get("category_name") or "")
+            if not _migration_merge_name_matches_sources(
+                cname, src_disp_keys=rsk, src_token_keys=rtk
+            ):
+                continue
+            hit = _roma_archive_fs_pick_match(lr_d, y_dir, by_lgk, by_fpr)
+            if hit is None:
+                continue
+            yb_hit, rec_hit = hit
+            try:
+                py = int(yb_hit.get("year", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            cats_py = cmap.get(py, []) or []
+            tc_rom = _find_category_code_ci(cats_py, "ROMA.TELEFONO")
+            if not tc_rom:
+                continue
+            disp_now = category_name_for_record(rec_hit, cats_py).strip()
+            if _migration_category_disp_key(disp_now) == roma_key:
+                continue
+            sync_record_category_from_plan(rec_hit, cats_py, tc_rom)
+            changed = True
+    return changed
 
 
 def record_legacy_stable_key(rec: dict) -> str:
@@ -5664,7 +8071,12 @@ def save_encrypted_db_dual(
 
 
 def _finalize_startup_db_with_light_sidecar(db: dict, primary_path: Path) -> None:
-    """Fonde ``*_light.enc`` nel DB, salva se servito, rigenera il sidecar per l'app iOS."""
+    """Fonde ``*_light.enc`` nel DB; salva completo+light solo se il merge ha importato righe.
+
+    Non rigenera il sidecar a ogni avvio se il file esiste già: evita versioni Dropbox ravvicinate
+    inutili (il completo non viene riscritto). ``save_encrypted_db_dual`` aggiorna sempre il light
+    dopo ogni salvataggio dati. Se il sidecar manca, viene creato una tantum all'avvio.
+    """
     try:
         import light_enc_sidecar
 
@@ -5677,7 +8089,10 @@ def _finalize_startup_db_with_light_sidecar(db: dict, primary_path: Path) -> Non
                 primary_path,
                 data_workspace.default_key_file(),
             )
-        light_enc_sidecar.write_light_enc_sidecar(db, primary_path, data_workspace.default_key_file())
+        else:
+            lp = light_enc_sidecar.light_enc_path_for_primary(primary_path)
+            if not lp.is_file():
+                light_enc_sidecar.write_light_enc_sidecar(db, primary_path, data_workspace.default_key_file())
     except Exception:
         pass
 
@@ -6025,6 +8440,14 @@ def build_ui(
             changed = True
         if migrate_credit_card_cheque_label(db_holder[0]) > 0:
             changed = True
+        if migrate_legacy_category_renames_and_merges(db_holder[0]):
+            changed = True
+        if migrate_ensure_budget_sheet(db_holder[0]):
+            changed = True
+        if migrate_ensure_budget_snapshots(db_holder[0]):
+            changed = True
+        if migrate_ensure_budget_ui_prefs(db_holder[0]):
+            changed = True
         if changed:
             save_encrypted_db_dual(db_holder[0], path_holder[0], key_path_holder[0])
     except Exception:
@@ -6145,6 +8568,7 @@ def build_ui(
     _plan_conti_visible: list[bool] = [False]
     # (pagina_attuale, pagina_destinazione) -> True se si può procedere al cambio tab; assegnato dopo la UI piano.
     _plan_tab_leave_check: list[Callable[[tk.Widget, tk.Widget], bool] | None] = [None]
+    nuovi_leave_guard_ref: list[Callable[[tk.Widget], bool] | None] = [None]
     _frame_to_tab_label: dict[tk.Widget, tk.Label] = {}
     # Sessione Verifica (manuale/automatica): definito qui per uso in _cdc_select (blocco uscita pagina).
     ver_session_active: list[bool] = [False]
@@ -6186,6 +8610,7 @@ def build_ui(
 
     _ver_on_tab_enter_fn: list[Callable[[], None] | None] = [None]
     _stat_on_tab_enter_fn: list[Callable[[], None] | None] = [None]
+    _budget_on_tab_enter_fn: list[Callable[[], None] | None] = [None]
 
     def _cdc_on_tab_side_effects(_new: tk.Widget) -> None:
         if _new is movimenti_frame:
@@ -6209,6 +8634,10 @@ def build_ui(
             fn_s = _stat_on_tab_enter_fn[0]
             if fn_s is not None:
                 fn_s()
+        elif _new is budget_frame:
+            fn_b = _budget_on_tab_enter_fn[0]
+            if fn_b is not None:
+                fn_b()
 
     def _cdc_select(f: tk.Widget) -> None:
         if _cdc_current[0] is verifica_frame and f is not verifica_frame and ver_session_active[0]:
@@ -6225,6 +8654,15 @@ def build_ui(
             _cdc_sync_tab_style()
             return
         old_tab = _cdc_current[0]
+        nuovi_leave = nuovi_leave_guard_ref[0]
+        if (
+            old_tab is nuovi_dati_frame
+            and f is not nuovi_dati_frame
+            and nuovi_leave is not None
+            and not nuovi_leave(f)
+        ):
+            _cdc_sync_tab_style()
+            return
         leave_chk = _plan_tab_leave_check[0]
         if old_tab is not None and leave_chk is not None and not leave_chk(old_tab, f):
             _cdc_sync_tab_style()
@@ -6352,9 +8790,10 @@ def build_ui(
     text_category_preview_var = tk.StringVar(value="")
     text_account_preview_var = tk.StringVar(value="")
     text_cheque_preview_var = tk.StringVar(value="")
-    amount_filter_sign_var = tk.StringVar(value="-")
     text_amount_preview_var = tk.StringVar(value="-")
     text_note_preview_var = tk.StringVar(value="")
+    text_aggregate_category_preview_var = tk.StringVar(value="")
+    text_aggregate_category_applied_var = tk.StringVar(value="")
     text_category_applied_var = tk.StringVar(value="")
     text_account_applied_var = tk.StringVar(value="")
     text_cheque_applied_var = tk.StringVar(value="")
@@ -6431,11 +8870,66 @@ def build_ui(
         filters_text_inner,
         textvariable=text_category_preview_var,
         state="readonly",
-        width=20,
+        width=13,
         values=("",),
         style="MovCdc.TCombobox",
     )
-    category_entry.pack(side=tk.LEFT, padx=(0, 8))
+    category_entry.pack(side=tk.LEFT, padx=(0, 6))
+
+    _MOV_AGG_CAT_BTN_BG = "#1565c0"
+    _MOV_AGG_CAT_BTN_ACT = "#0d47a1"
+
+    def _mov_refresh_aggregate_category_button_caption() -> None:
+        s = (text_aggregate_category_applied_var.get() or "").strip()
+        if not s:
+            s = (text_aggregate_category_preview_var.get() or "").strip()
+        if s:
+            short = s if len(s) <= 12 else s[:11] + "…"
+            mov_aggregate_cat_btn.configure(text=f"«{short}»")
+        else:
+            mov_aggregate_cat_btn.configure(text="Aggrega")
+
+    def _mov_aggregate_category_prompt(_event: tk.Event | None = None) -> None:
+        from tkinter import simpledialog
+
+        if (text_aggregate_category_applied_var.get() or "").strip():
+            text_aggregate_category_preview_var.set("")
+            text_aggregate_category_applied_var.set("")
+            _mov_refresh_aggregate_category_button_caption()
+            apply_movement_search()
+            return
+
+        cur = (text_aggregate_category_preview_var.get() or "").strip()
+        raw = simpledialog.askstring(
+            "Aggrega categorie",
+            "Mostra movimenti le cui categorie contengono nel nome (senza distinguere maiuscole/minuscole).\n\n"
+            "Vuoto → OK rimuove il filtro aggregato.\nGià applicato: un nuovo clic su Aggrega o «Pulisci filtri» azzera.",
+            parent=root,
+            initialvalue=cur,
+        )
+        if raw is None:
+            return
+        text_aggregate_category_preview_var.set(str(raw).strip())
+        _mov_refresh_aggregate_category_button_caption()
+        apply_movement_search()
+
+    mov_aggregate_cat_btn = tk.Label(
+        filters_text_inner,
+        text="Aggrega",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=6,
+        pady=2,
+        bg=_MOV_AGG_CAT_BTN_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    mov_aggregate_cat_btn.pack(side=tk.LEFT, padx=(0, 6))
+    mov_aggregate_cat_btn.bind("<Button-1>", _mov_aggregate_category_prompt)
+    mov_aggregate_cat_btn.bind("<Enter>", lambda _e: mov_aggregate_cat_btn.configure(bg=_MOV_AGG_CAT_BTN_ACT))
+    mov_aggregate_cat_btn.bind("<Leave>", lambda _e: mov_aggregate_cat_btn.configure(bg=_MOV_AGG_CAT_BTN_BG))
 
     _mov_cat_type_prefix: list[str] = [""]
     _mov_cat_type_after_id: list[str | None] = [None]
@@ -6500,7 +8994,7 @@ def build_ui(
         filters_text_inner,
         textvariable=text_account_preview_var,
         state="readonly",
-        width=16,
+        width=12,
         values=("",),
         style="MovCdc.TCombobox",
     )
@@ -6529,14 +9023,10 @@ def build_ui(
     def _format_movement_amount_filter_entry(_e: tk.Event | None = None) -> None:
         raw = (text_amount_preview_var.get() or "").strip()
         if not raw or raw in ("+", "-"):
-            text_amount_preview_var.set("-" if amount_filter_sign_var.get() == "-" else "+")
+            text_amount_preview_var.set(raw if raw in ("+", "-") else "-")
             return
         try:
             amt = normalize_euro_input(raw)
-            if amount_filter_sign_var.get() == "-":
-                amt = -abs(amt)
-            else:
-                amt = abs(amt)
             txt = format_euro_it(abs(amt))
             text_amount_preview_var.set(("-" if amt < 0 else "+") + txt)
         except Exception:
@@ -6882,7 +9372,10 @@ def build_ui(
         acc = (text_account_applied_var.get() or "").strip()
         chq = (text_cheque_applied_var.get() or "").strip()
         note = (text_note_applied_var.get() or "").strip()
-        if cat and cat != _ALL_CATEGORIES_LABEL:
+        agg_f = (text_aggregate_category_applied_var.get() or "").strip()
+        if agg_f:
+            parts.append(f"per categorie il cui nome contiene «{agg_f}»")
+        elif cat and cat != _ALL_CATEGORIES_LABEL:
             parts.append(f"per la categoria {cat}")
         if acc and acc != _ALL_ACCOUNTS_LABEL:
             parts.append(f"per il conto {acc}")
@@ -7483,7 +9976,7 @@ def build_ui(
                 pass
             lbl_saldo_parziale_categoria.grid_remove()
 
-    def persist_db_after_edit(reselect_key: str | None) -> None:
+    def persist_db_after_edit(reselect_key: str | None, *, refresh_movements: bool = True) -> None:
         try:
             save_encrypted_db_dual(
                 cur_db(),
@@ -7506,12 +9999,19 @@ def build_ui(
         except Exception as exc:
             messagebox.showerror("Salvataggio", str(exc))
             return
-        populate_movements_trees(reselect_stable_key=reselect_key)
-        refresh_balance_footer()
+        if refresh_movements:
+            populate_movements_trees(reselect_stable_key=reselect_key, preserve_scroll=True)
+            refresh_balance_footer()
         vrf = ver_results_after_persist_cb[0]
         if vrf is not None:
             try:
                 vrf()
+            except Exception:
+                pass
+        fn_bud = _budget_on_tab_enter_fn[0]
+        if fn_bud is not None:
+            try:
+                fn_bud()
             except Exception:
                 pass
 
@@ -7616,7 +10116,8 @@ def build_ui(
             return
         if not record_is_within_edit_age(rec) and not category_only_legacy:
             return
-        year_categories = year_categories_map(cur_db()).get(rec.get("year"), [])
+        py = record_category_plan_year(rec, _yd)
+        year_categories = year_categories_map(cur_db()).get(py, []) or []
         choices: list[tuple[str, str]] = []
         disp_to_raw: dict[str, str] = {}
 
@@ -8206,12 +10707,14 @@ def build_ui(
 
         d = cur_db()
         acc_by_year = year_accounts_map(d)
+        _bpair = find_record_year_and_ref(d, stable_key)
+        py0 = record_category_plan_year(rec, _bpair[0] if _bpair else None)
         reg_all, reg_map = _build_reg_index_maps()
         selected_reg_n = reg_map.get(stable_key)
         if selected_reg_n is None:
             return
 
-        y_accounts = acc_by_year.get(rec.get("year"), [])
+        y_accounts = acc_by_year.get(py0, []) or []
         acc_a = account_name_for_record(rec, y_accounts, "primary")
         acc_b = account_name_for_record(rec, y_accounts, "secondary")
         st_a = _flags_star_count(str(rec.get("account_primary_flags") or ""))
@@ -8322,10 +10825,10 @@ def build_ui(
             date_it = to_italian_date(date.today().isoformat())
             mov_vals = (
                 to_italian_date(str(rec.get("date_iso", ""))),
-                category_name_for_record(rec, year_categories_map(d).get(rec.get("year"), [])),
-                account_name_for_record(rec, acc_by_year.get(rec.get("year"), []), "primary"),
+                category_name_for_record(rec, year_categories_map(d).get(py0, []) or []),
+                account_name_for_record(rec, acc_by_year.get(py0, []) or [], "primary"),
                 str(rec.get("account_primary_flags") or ""),
-                account_name_for_record(rec, acc_by_year.get(rec.get("year"), []), "secondary"),
+                account_name_for_record(rec, acc_by_year.get(py0, []) or [], "secondary"),
                 str(rec.get("account_secondary_flags") or ""),
                 str(rec.get("cheque") or ""),
             )
@@ -8348,7 +10851,7 @@ th {{ background:#efefef; text-align:left; }}
 <p><b>E' stata tolta la spunta di verifica alla registrazione {selected_reg_n}</b></p>
 <table>
 <tr><th>Data</th><td>{html_module.escape(to_italian_date(str(rec.get("date_iso", ""))))}</td></tr>
-<tr><th>Categoria</th><td>{html_module.escape(category_name_for_record(rec, year_categories_map(d).get(rec.get("year"), [])))}</td></tr>
+<tr><th>Categoria</th><td>{html_module.escape(category_name_for_record(rec, year_categories_map(d).get(py0, []) or []))}</td></tr>
 <tr><th>Dal conto</th><td>{html_module.escape(str(a1))} {html_module.escape(str(f1))}</td></tr>
 <tr><th>Al conto</th><td>{html_module.escape(str(a2))} {html_module.escape(str(f2))}</td></tr>
 <tr><th>Assegno</th><td>{html_module.escape(str(chq))}</td></tr>
@@ -8590,9 +11093,11 @@ th {{ background:#efefef; text-align:left; }}
             except Exception:
                 reg_from_n = None
                 reg_to_n = None
+        q_cat_sub = (text_aggregate_category_applied_var.get() or "").strip().lower()
         return {
             "mode": filter_order_applied_var.get(),
             "q_cat": q_cat,
+            "q_cat_sub": q_cat_sub,
             "q_acc": q_acc,
             "q_chq": q_chq,
             "q_note": q_note,
@@ -8623,12 +11128,16 @@ th {{ background:#efefef; text-align:left; }}
         stars_2 = r.get("account_secondary_flags", "")
         mode = st["mode"]
         q_cat = str(st["q_cat"] or "")
+        q_cat_sub = str(st.get("q_cat_sub") or "")
         q_acc = str(st["q_acc"] or "")
         q_chq = str(st["q_chq"] or "")
         q_note = str(st["q_note"] or "")
         q_amt = st.get("q_amt")
         if mode == "date":
-            if q_cat and q_cat != (category_name or "").lower():
+            if q_cat_sub:
+                if q_cat_sub not in (category_name or "").lower():
+                    return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
+            elif q_cat and q_cat != (category_name or "").lower():
                 return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
             if q_acc and q_acc != acc1_norm and q_acc != acc2_norm:
                 return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
@@ -8653,7 +11162,10 @@ th {{ background:#efefef; text-align:left; }}
                 else:
                     if nreg < reg_from_n or nreg > reg_to_n:
                         return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
-            if q_cat and q_cat != (category_name or "").lower():
+            if q_cat_sub:
+                if q_cat_sub not in (category_name or "").lower():
+                    return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
+            elif q_cat and q_cat != (category_name or "").lower():
                 return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
             if q_acc and q_acc != acc1_norm and q_acc != acc2_norm:
                 return (False, category_name, account_1_name, stars_1, account_2_name, stars_2)
@@ -8702,8 +11214,9 @@ th {{ background:#efefef; text-align:left; }}
         accounts_by_year: dict,
         categories_by_year: dict,
     ) -> None:
+        agg_raw = (text_aggregate_category_applied_var.get() or "").strip()
         cat_raw = (text_category_applied_var.get() or "").strip()
-        if not cat_raw or cat_raw == _ALL_CATEGORIES_LABEL:
+        if not agg_raw and (not cat_raw or cat_raw == _ALL_CATEGORIES_LABEL):
             saldo_parziale_categoria_ricerca_text[0] = ""
             return
         st = _build_movement_search_filter_state()
@@ -8728,15 +11241,31 @@ th {{ background:#efefef; text-align:left; }}
             return
         di = to_italian_date(df)
         al = to_italian_date(dt)
+        amt_txt = format_saldo_cell("E", tot)
+        if agg_raw:
+            saldo_parziale_categoria_ricerca_text[0] = (
+                f"Saldo parziale delle categorie il cui nome contiene «{agg_raw}» dal {di} al {al}: {amt_txt}"
+            )
+            return
         saldo_parziale_categoria_ricerca_text[0] = (
-            f"Saldo parziale della categoria «{cat_raw}» dal {di} al {al}: {format_saldo_cell('E', tot)}"
+            f"Saldo parziale della categoria «{cat_raw}» dal {di} al {al}: {amt_txt}"
         )
 
-    def populate_movements_trees(reselect_stable_key: str | None = None) -> None:
+    def populate_movements_trees(
+        reselect_stable_key: str | None = None,
+        *,
+        preserve_scroll: bool = False,
+    ) -> None:
         nonlocal movements_population_seq
         movements_population_seq += 1
         token_local = movements_population_seq
         reselect_key = reselect_stable_key
+        saved_yview_top: float | None = None
+        if preserve_scroll:
+            try:
+                saved_yview_top = float(mov_tree.yview()[0])
+            except Exception:
+                saved_yview_top = None
         try:
             refresh_search_title()
         except Exception:
@@ -8755,7 +11284,8 @@ th {{ background:#efefef; text-align:left; }}
             amt_tree.delete(iid)
         for iid in note_tree.get_children():
             note_tree.delete(iid)
-        scroll_movements_grid_to_top()
+        if not preserve_scroll:
+            scroll_movements_grid_to_top()
         d = cur_db()
         accounts_by_year = year_accounts_map(d)
         categories_by_year = year_categories_map(d)
@@ -8841,7 +11371,19 @@ th {{ background:#efefef; text-align:left; }}
                     yscroll.grid()
                 except Exception:
                     pass
-                root.after_idle(scroll_movements_grid_to_top)
+
+                def _restore_scroll_or_top() -> None:
+                    if token_local != movements_population_seq:
+                        return
+                    if preserve_scroll and saved_yview_top is not None:
+                        try:
+                            mov_tree.yview_moveto(saved_yview_top)
+                        except Exception:
+                            pass
+                    else:
+                        scroll_movements_grid_to_top()
+
+                root.after_idle(_restore_scroll_or_top)
 
                 def _reselect_and_bar() -> None:
                     if token_local != movements_population_seq:
@@ -8850,7 +11392,8 @@ th {{ background:#efefef; text-align:left; }}
                         try:
                             if mov_tree.exists(reselect_key):
                                 mov_tree.selection_set(reselect_key)
-                                mov_tree.see(reselect_key)
+                                if not preserve_scroll:
+                                    mov_tree.see(reselect_key)
                         except Exception:
                             pass
                     try:
@@ -9053,6 +11596,7 @@ th {{ background:#efefef; text-align:left; }}
         rt_preview: str,
         cat_preview: str,
         acc_preview: str,
+        agg_cat_preview: str,
         chq_preview: str,
         amt_preview: str,
         note_preview: str,
@@ -9070,6 +11614,7 @@ th {{ background:#efefef; text-align:left; }}
             and rt_preview == reg_to_applied_var.get()
             and cat_preview == text_category_applied_var.get()
             and acc_preview == text_account_applied_var.get()
+            and agg_cat_preview == text_aggregate_category_applied_var.get()
             and chq_preview == text_cheque_applied_var.get()
             and amt_preview == (text_amount_applied_var.get() or "").strip()
             and note_preview == text_note_applied_var.get()
@@ -9085,6 +11630,7 @@ th {{ background:#efefef; text-align:left; }}
         dp_preview = date_preset_preview_var.get()
         cat_preview = text_category_preview_var.get()
         acc_preview = text_account_preview_var.get()
+        agg_cat_preview = text_aggregate_category_preview_var.get()
         chq_preview = text_cheque_preview_var.get()
         note_preview = text_note_preview_var.get()
         amt_preview_raw = (text_amount_preview_var.get() or "").strip()
@@ -9092,15 +11638,11 @@ th {{ background:#efefef; text-align:left; }}
         if amt_preview_raw and amt_preview_raw not in ("+", "-"):
             try:
                 amt_chk = normalize_euro_input(amt_preview_raw)
-                if amount_filter_sign_var.get() == "-":
-                    amt_chk = -abs(amt_chk)
-                else:
-                    amt_chk = abs(amt_chk)
-                amt_preview = format_euro_it(amt_chk)
+                amt_preview = ("+" if amt_chk >= 0 else "-") + format_euro_it(abs(amt_chk))
             except Exception:
                 return True
         elif amt_preview_raw in ("+", "-"):
-            amt_preview = "-" if amount_filter_sign_var.get() == "-" else "+"
+            amt_preview = ""
         rp_preview = reg_preset_preview_var.get()
         rf_preview = reg_from_preview_var.get()
         rt_preview = reg_to_preview_var.get()
@@ -9116,6 +11658,7 @@ th {{ background:#efefef; text-align:left; }}
             rt_preview,
             cat_preview,
             acc_preview,
+            agg_cat_preview,
             chq_preview,
             amt_preview,
             note_preview,
@@ -9130,6 +11673,7 @@ th {{ background:#efefef; text-align:left; }}
         dp_preview = date_preset_preview_var.get()
         cat_preview = text_category_preview_var.get()
         acc_preview = text_account_preview_var.get()
+        agg_cat_preview = text_aggregate_category_preview_var.get()
         chq_preview = text_cheque_preview_var.get()
         note_preview = text_note_preview_var.get()
         amt_preview_raw = (text_amount_preview_var.get() or "").strip()
@@ -9137,11 +11681,7 @@ th {{ background:#efefef; text-align:left; }}
         if amt_preview_raw and amt_preview_raw not in ("+", "-"):
             try:
                 amt_chk = normalize_euro_input(amt_preview_raw)
-                if amount_filter_sign_var.get() == "-":
-                    amt_chk = -abs(amt_chk)
-                else:
-                    amt_chk = abs(amt_chk)
-                amt_preview = format_euro_it(amt_chk)
+                amt_preview = ("+" if amt_chk >= 0 else "-") + format_euro_it(abs(amt_chk))
                 text_amount_preview_var.set(amt_preview)
             except Exception:
                 messagebox.showerror(
@@ -9150,7 +11690,8 @@ th {{ background:#efefef; text-align:left; }}
                 )
                 return
         elif amt_preview_raw in ("+", "-"):
-            text_amount_preview_var.set("-" if amount_filter_sign_var.get() == "-" else "+")
+            amt_preview = ""
+            text_amount_preview_var.set(amt_preview_raw)
         rp_preview = reg_preset_preview_var.get()
         rf_preview = reg_from_preview_var.get()
         rt_preview = reg_to_preview_var.get()
@@ -9229,6 +11770,7 @@ th {{ background:#efefef; text-align:left; }}
             rt_preview,
             cat_preview,
             acc_preview,
+            agg_cat_preview,
             chq_preview,
             amt_preview,
             note_preview,
@@ -9245,9 +11787,11 @@ th {{ background:#efefef; text-align:left; }}
         reg_to_applied_var.set(rt_preview)
         text_category_applied_var.set(cat_preview)
         text_account_applied_var.set(acc_preview)
+        text_aggregate_category_applied_var.set(agg_cat_preview)
         text_cheque_applied_var.set(chq_preview)
         text_amount_applied_var.set(amt_preview)
         text_note_applied_var.set(note_preview)
+        _mov_refresh_aggregate_category_button_caption()
         populate_movements_trees()
 
     def _on_movement_search_preview_trace(*_args: object) -> None:
@@ -9273,10 +11817,10 @@ th {{ background:#efefef; text-align:left; }}
         reg_to_preview_var,
         text_category_preview_var,
         text_account_preview_var,
+        text_aggregate_category_preview_var,
         text_cheque_preview_var,
         text_amount_preview_var,
         text_note_preview_var,
-        amount_filter_sign_var,
     ):
         _pref_var.trace_add("write", _on_movement_search_preview_trace)
 
@@ -9285,32 +11829,26 @@ th {{ background:#efefef; text-align:left; }}
         bind_return_and_kp_enter(_w, apply_movement_search)
 
     def clear_movement_text_filters() -> None:
-        # Ripristino completo dei filtri alla condizione di default.
-        nonlocal date_custom_manual_override
-        filter_order_preview_var.set("date")
-        filter_future_preview_var.set("include")
-        filter_direction_preview_var.set("backward")
-        date_preset_preview_var.set("last_12")
-        reg_preset_preview_var.set("last_12")
-        date_custom_manual_override = False
-        try:
-            refresh_movement_filter_button_styles()
-            refresh_date_preview_from_modes()
-            refresh_date_controls_visibility()
-            refresh_reg_preset_button_styles()
-            refresh_registration_scope_and_controls()
-        except Exception:
-            pass
-        try:
-            refresh_date_preset_button_styles()
-        except Exception:
-            pass
+        # Solo filtri testuali (categoria, conti, importo, …). Ordine, date future, preset intervallo
+        # data/registrazione e «Ultimi 12 mesi» / «Tutto il periodo» restano come selezionati (no reset visivo).
         text_category_preview_var.set(_ALL_CATEGORIES_LABEL)
         text_account_preview_var.set(_ALL_ACCOUNTS_LABEL)
-        amount_filter_sign_var.set("-")
+        text_aggregate_category_preview_var.set("")
+        text_aggregate_category_applied_var.set("")
         text_amount_preview_var.set("-")
         text_cheque_preview_var.set("")
         text_note_preview_var.set("")
+        try:
+            if filter_order_preview_var.get() == "date":
+                refresh_category_account_dropdowns()
+            else:
+                refresh_registration_scope_and_controls()
+        except Exception:
+            pass
+        try:
+            refresh_date_controls_visibility()
+        except Exception:
+            pass
         apply_movement_search()
         try:
             category_entry.focus_set()
@@ -12304,6 +14842,8 @@ th {{ background:#efefef; text-align:left; }}
         """«Aut » + gg/mm + spazio (cursore dopo la data per testo aggiuntivo)."""
         if not _is_giro_label(newreg_cat_var.get()):
             return None
+        if _is_cassa_first_account() or _is_primary_account_credit_card():
+            return None
         if not _is_second_account_cassa():
             return None
         iso = parse_italian_ddmmyyyy_to_iso(newreg_date_var.get())
@@ -12406,6 +14946,19 @@ th {{ background:#efefef; text-align:left; }}
         newreg_sign_var.set(sign)
         newreg_amount_var.set(("-" if sign == "-" else "+") + format_euro_it(m))
 
+    def _giro_combo_pair_lists() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        """Per Girata conto/conto: tutte le coppie nome/codice per il primo conto; per il secondo si escludono le carte."""
+        pairs = _order_account_name_code_pairs(list(acc_opts_cache), virtuale_last=True)
+        acc_names_giro = [n for n, _c in pairs]
+        if VIRTUALE_ACCOUNT_NAME not in acc_names_giro:
+            pairs = _order_account_name_code_pairs(
+                pairs + [(VIRTUALE_ACCOUNT_NAME, "")],
+                virtuale_last=True,
+            )
+        db = cur_db()
+        acc2_pairs = [(n, c) for n, c in pairs if not c or not account_is_credit_card_by_code(db, c)]
+        return pairs, acc2_pairs
+
     def _sync_cat_note_and_second_account() -> None:
         if virtuale_discharge_active[0]:
             vals = [n for n, _c in cat_opts_cache if not _is_giro_label(n)]
@@ -12448,37 +15001,43 @@ th {{ background:#efefef; text-align:left; }}
             except Exception:
                 pass
             cb_acc2.pack(side=tk.LEFT)
-            giro_pairs = _order_account_name_code_pairs(list(acc_opts_cache), virtuale_last=True)
-            acc_names_giro = [n for n, _c in giro_pairs]
-            if VIRTUALE_ACCOUNT_NAME not in acc_names_giro:
-                giro_pairs = _order_account_name_code_pairs(
-                    giro_pairs + [(VIRTUALE_ACCOUNT_NAME, "")],
-                    virtuale_last=True,
-                )
-                acc_names_giro = [n for n, _c in giro_pairs]
+            giro_pairs_full, giro_pairs_acc2 = _giro_combo_pair_lists()
+            acc_names_giro = [n for n, _c in giro_pairs_full]
+            acc_names_giro2 = [n for n, _c in giro_pairs_acc2]
             cb_acc1.configure(values=acc_names_giro)
-            cb_acc2.configure(values=acc_names_giro)
-            if not newreg_acc2_var.get() and acc_opts_cache:
-                names = [n for n, _c in acc_opts_cache]
-                pick = names[1] if len(names) > 1 else names[0]
-                if pick == newreg_acc1_var.get() and len(names) > 1:
-                    pick = names[0]
+            cb_acc2.configure(values=acc_names_giro2)
+            if not newreg_acc2_var.get() and giro_pairs_acc2:
+                names2 = [n for n, _c in giro_pairs_acc2]
+                pick = names2[1] if len(names2) > 1 else names2[0]
+                if pick == newreg_acc1_var.get() and len(names2) > 1:
+                    pick = names2[0]
                 newreg_acc2_var.set(pick)
                 newreg_last_account_touched[0] = "acc2"
+            acc2_nm_fix = newreg_acc2_var.get().strip()
+            acc2_cd_fix = next((c for n, c in giro_pairs_full if n == acc2_nm_fix), "")
+            if acc2_cd_fix and account_is_credit_card_by_code(cur_db(), acc2_cd_fix):
+                for n, _c in giro_pairs_acc2:
+                    if n != newreg_acc1_var.get().strip():
+                        newreg_acc2_var.set(n)
+                        break
             if _is_virtuale_account(newreg_acc1_var.get()) and _is_virtuale_account(newreg_acc2_var.get()):
                 if newreg_last_account_touched[0] == "acc1":
                     newreg_acc2_var.set("Cassa")
                 else:
                     newreg_acc1_var.set("Cassa")
             if newreg_acc1_var.get().strip() and newreg_acc1_var.get().strip() == newreg_acc2_var.get().strip():
-                if acc_opts_cache:
-                    for n, _c in acc_opts_cache:
-                        if n != newreg_acc1_var.get().strip():
-                            if newreg_last_account_touched[0] == "acc2":
-                                newreg_acc1_var.set(n)
-                            else:
-                                newreg_acc2_var.set(n)
-                            break
+                pool = (
+                    giro_pairs_full
+                    if newreg_last_account_touched[0] == "acc2"
+                    else giro_pairs_acc2
+                )
+                for n, _c in pool:
+                    if n != newreg_acc1_var.get().strip():
+                        if newreg_last_account_touched[0] == "acc2":
+                            newreg_acc1_var.set(n)
+                        else:
+                            newreg_acc2_var.set(n)
+                        break
                 if newreg_acc1_var.get().strip() == newreg_acc2_var.get().strip():
                     nuovi_status_var.set("Attenzione: i due conti del giroconto devono essere diversi.")
             _apply_giro_default_note()
@@ -12504,28 +15063,30 @@ th {{ background:#efefef; text-align:left; }}
             _cancel_saldo_procedure()
         _show_aggiorna_saldo_btn_if_needed()
 
-        # Cassa o Virtuale: nessun assegno; carta di credito: niente campo assegno, valore fisso.
+        # Cassa o Virtuale: nessun assegno. Carta: valore fisso CCarta visibile (sola lettura). Altri conti: assegno libero.
         if _is_cassa_first_account() or _is_virtuale_account(newreg_acc1_var.get()):
             lbl_assegno.grid_remove()
             ent_chq.grid_remove()
             newreg_cheque_var.set("")
             try:
-                ent_chq.configure(takefocus=False)
+                ent_chq.configure(takefocus=False, state="normal")
             except Exception:
                 pass
         elif _is_primary_account_credit_card():
-            lbl_assegno.grid_remove()
-            ent_chq.grid_remove()
+            lbl_assegno.grid(row=4, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
+            ent_chq.grid(row=4, column=1, sticky="w", pady=_newreg_py)
             newreg_cheque_var.set(CREDIT_CARD_CHEQUE_LABEL)
             try:
-                ent_chq.configure(takefocus=False)
+                ent_chq.configure(takefocus=False, state="readonly")
             except Exception:
                 pass
         else:
             lbl_assegno.grid(row=4, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
             ent_chq.grid(row=4, column=1, sticky="w", pady=_newreg_py)
+            if (newreg_cheque_var.get() or "").strip().lower() == CREDIT_CARD_CHEQUE_LABEL.strip().lower():
+                newreg_cheque_var.set("")
             try:
-                ent_chq.configure(takefocus=True)
+                ent_chq.configure(takefocus=True, state="normal")
             except Exception:
                 pass
 
@@ -12681,8 +15242,19 @@ th {{ background:#efefef; text-align:left; }}
             return False
         return b == _newreg_form_snapshot()
 
+    def _newreg_importo_implica_conferma() -> bool:
+        """True se il campo importo è compilato (serve conferma come per «Concludi immissione»)."""
+        raw_amt = (newreg_amount_var.get() or "").strip()
+        if not raw_amt or raw_amt in ("+", "-"):
+            return False
+        try:
+            amt = normalize_euro_input(raw_amt)
+        except Exception:
+            return True
+        return amt != Decimal("0.00")
+
     def _populate_form_defaults(*, keep_last: bool) -> None:
-        nonlocal cat_opts_cache, acc_opts_cache, cat_note_by_code_cache, cat_sign_by_code_cache, cat_raw_name_by_code_cache
+        nonlocal cat_opts_cache, acc_opts_cache, cat_note_by_code_cache, cat_sign_by_code_cache, cat_raw_name_by_code_cache, last_date_iso, last_cat_code, last_acc1_code, last_acc2_code
         cat_opts_cache, acc_opts_cache, cat_note_by_code_cache, cat_sign_by_code_cache, cat_raw_name_by_code_cache = _cat_and_acc_options()
         cb_cat.configure(values=[n for n, _c in cat_opts_cache])
         cb_acc1.configure(values=[n for n, _c in acc_opts_cache])
@@ -12723,6 +15295,10 @@ th {{ background:#efefef; text-align:left; }}
             )
             newreg_acc1_var.set(next((n for n, _c in acc_opts_cache if n == "Cassa"), acc_opts_cache[0][0] if acc_opts_cache else ""))
             newreg_acc2_var.set("")
+            last_date_iso = date.today().isoformat()
+            last_cat_code = ""
+            last_acc1_code = ""
+            last_acc2_code = ""
         newreg_amount_var.set("-")
         newreg_sign_var.set("+")
         newreg_cheque_var.set("")
@@ -12767,6 +15343,12 @@ th {{ background:#efefef; text-align:left; }}
                      else (next((c for n, c in acc_opts_cache if n == acc2_name), "") if giro else ""))
         if giro and (not acc2_code or acc2_code == acc1_code):
             messagebox.showerror("Nuova registrazione", "Nel giroconto il secondo conto è obbligatorio e diverso dal primo.")
+            return None
+        if giro and acc2_code and account_is_credit_card_by_code(cur_db(), acc2_code):
+            messagebox.showerror(
+                "Nuova registrazione",
+                "Nelle girate conto/conto il secondo conto non può essere un conto carta di credito.",
+            )
             return None
         raw_amt = (newreg_amount_var.get() or "").strip()
         if not raw_amt or raw_amt in ("+", "-"):
@@ -12857,30 +15439,8 @@ th {{ background:#efefef; text-align:left; }}
         preview = f"Data {to_italian_date(d_iso)}, {cat_name}, {acc1_name}" + (f", {acc2_name}" if giro else "") + f", {amt_preview} EUR"
         return rec, preview
 
-    def _commit_new_record(*, finish: bool) -> None:
+    def _run_new_record_save_confirmed(rec: dict, preview: str, *, dialog_title: str) -> bool:
         nonlocal last_date_iso, last_cat_code, last_acc1_code, last_acc2_code
-        if finish and virtuale_discharge_active[0]:
-            messagebox.showwarning(
-                "Saldo virtuale",
-                f"Il saldo virtuale è di {format_euro_it(virtuale_saldo[0])} €.\n"
-                "Occorre azzerarlo prima di uscire dall'immissione dati.",
-            )
-            return
-        if finish and _newreg_form_unchanged():
-            if messagebox.askyesno("Concludi immissione", "Confermi di passare alla pagina Movimenti?"):
-                notebook.select(movimenti_frame)
-            else:
-                try:
-                    ent_date.focus_set()
-                except Exception:
-                    pass
-            return
-        payload = _collect_new_record_payload()
-        if payload is None:
-            if finish and messagebox.askyesno("Concludi immissione", "Dati incompleti/non validi. Chiudere comunque e tornare a Movimenti?"):
-                notebook.select(movimenti_frame)
-            return
-        rec, preview = payload
         c_ins = str(rec.get("account_primary_code", "")).strip()
         c_ins2 = str(rec.get("account_secondary_code", "")).strip()
         if (c_ins and account_code_is_frozen(cur_db(), c_ins)) or (c_ins2 and account_code_is_frozen(cur_db(), c_ins2)):
@@ -12888,10 +15448,9 @@ th {{ background:#efefef; text-align:left; }}
                 "Nuova registrazione",
                 "Uno dei conti selezionati è congelato: non è possibile registrare movimenti su quel conto.",
             )
-            return
-        title = "Concludi immissione" if finish else "Conferma immissione"
-        if not messagebox.askyesno(title, f"Confermi l'inserimento della registrazione?\n\n{preview}"):
-            return
+            return False
+        if not messagebox.askyesno(dialog_title, f"Confermi l'inserimento della registrazione?\n\n{preview}"):
+            return False
         has_virtuale_rec = (_is_virtuale_account(str(rec.get("account_primary_name", "")))
                            or _is_virtuale_account(str(rec.get("account_secondary_name", ""))))
         if has_virtuale_rec:
@@ -12903,7 +15462,7 @@ th {{ background:#efefef; text-align:left; }}
                     cb_cat.focus_set()
                 except Exception:
                     pass
-                return
+                return False
         y_bucket = _ensure_year_bucket(int(rec["year"]))
         y_bucket["records"].append(rec)
         try:
@@ -12914,7 +15473,7 @@ th {{ background:#efefef; text-align:left; }}
             )
         except Exception as exc:
             messagebox.showerror("Nuova registrazione", str(exc))
-            return
+            return False
         amt_dec = to_decimal(rec["amount_eur"])
         has_virtuale = (_is_virtuale_account(str(rec.get("account_primary_name", "")))
                         or _is_virtuale_account(str(rec.get("account_secondary_name", ""))))
@@ -12935,9 +15494,36 @@ th {{ background:#efefef; text-align:left; }}
         last_acc1_code = str(rec["account_primary_code"])
         last_acc2_code = str(rec.get("account_secondary_code", ""))
         nuovi_status_var.set("")
-        # Sempre ripulire il modulo (inclusa la Nota) per la registrazione successiva,
-        # anche se si passa subito a Movimenti con «Concludi immissione».
-        _populate_form_defaults(keep_last=True)
+        return True
+
+    def _commit_new_record(*, finish: bool) -> None:
+        if finish and virtuale_discharge_active[0]:
+            messagebox.showwarning(
+                "Saldo virtuale",
+                f"Il saldo virtuale è di {format_euro_it(virtuale_saldo[0])} €.\n"
+                "Occorre azzerarlo prima di uscire dall'immissione dati.",
+            )
+            return
+        if finish and not _newreg_importo_implica_conferma():
+            _populate_form_defaults(keep_last=False)
+            notebook.select(movimenti_frame)
+            return
+        payload = _collect_new_record_payload()
+        if payload is None:
+            if finish and messagebox.askyesno(
+                "Concludi immissione",
+                "Dati incompleti/non validi. Chiudere comunque e tornare a Movimenti?",
+            ):
+                _populate_form_defaults(keep_last=False)
+                notebook.select(movimenti_frame)
+            return
+        rec, preview = payload
+        title = "Concludi immissione" if finish else "Conferma immissione"
+        if not _run_new_record_save_confirmed(rec, preview, dialog_title=title):
+            return
+        # Dopo ogni inserimento andato a buon fine: ripulire il modulo; se resti sulla pagina,
+        # mantieni data/categoria/conto dell'ultima registrazione; se passi ai Movimenti, default alla prossima visita.
+        _populate_form_defaults(keep_last=not finish)
         if finish:
             notebook.select(movimenti_frame)
         else:
@@ -12945,6 +15531,30 @@ th {{ background:#efefef; text-align:left; }}
                 ent_date.focus_set()
             except Exception:
                 pass
+
+    def _nuovi_leave_guard(_dest: tk.Widget) -> bool:
+        """Prima di lasciare «Nuove registrazioni»: conferma salvataggio se importo compilato; reset default."""
+        if nuovi_submode[0] != "new":
+            _populate_form_defaults(keep_last=False)
+            return True
+        if not _newreg_importo_implica_conferma():
+            _populate_form_defaults(keep_last=False)
+            return True
+        payload = _collect_new_record_payload()
+        if payload is None:
+            if messagebox.askyesno(
+                "Nuove registrazioni",
+                "Dati incompleti o non validi. Uscire senza salvare?",
+                parent=root,
+            ):
+                _populate_form_defaults(keep_last=False)
+                return True
+            return False
+        rec, preview = payload
+        if not _run_new_record_save_confirmed(rec, preview, dialog_title="Concludi immissione"):
+            return False
+        _populate_form_defaults(keep_last=False)
+        return True
 
     def _clear_values() -> None:
         if not messagebox.askyesno("Cancella valori", "Confermi cancellazione valori immessi?"):
@@ -13660,18 +16270,27 @@ th {{ background:#efefef; text-align:left; }}
         if is_giro:
             lbl_per_acc2.grid(row=5, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
             row_per_acc2.grid(row=5, column=1, columnspan=2, sticky="w", pady=_per_py)
-            if not per_acc2_var.get() and acc_opts_cache:
-                names = [n for n, _c in acc_opts_cache]
-                pick = names[1] if len(names) > 1 else names[0]
-                if pick == per_acc1_var.get() and len(names) > 1:
-                    pick = names[0]
+            gpf, gpa2 = _giro_combo_pair_lists()
+            cb_per_acc1.configure(values=[n for n, _ in gpf])
+            cb_per_acc2.configure(values=[n for n, _ in gpa2])
+            if not per_acc2_var.get() and gpa2:
+                names2 = [n for n, _ in gpa2]
+                pick = names2[1] if len(names2) > 1 else names2[0]
+                if pick == per_acc1_var.get() and len(names2) > 1:
+                    pick = names2[0]
                 per_acc2_var.set(pick)
+            acc2_nm_pf = per_acc2_var.get().strip()
+            acc2_cd_pf = next((c for n, c in gpf if n == acc2_nm_pf), "")
+            if acc2_cd_pf and account_is_credit_card_by_code(cur_db(), acc2_cd_pf):
+                for n, _c in gpa2:
+                    if n != per_acc1_var.get().strip():
+                        per_acc2_var.set(n)
+                        break
             if per_acc1_var.get().strip() and per_acc1_var.get().strip() == per_acc2_var.get().strip():
-                if acc_opts_cache:
-                    for n, _c in acc_opts_cache:
-                        if n != per_acc1_var.get().strip():
-                            per_acc2_var.set(n)
-                            break
+                for n, _c in gpa2:
+                    if n != per_acc1_var.get().strip():
+                        per_acc2_var.set(n)
+                        break
             if not (per_note_var.get() or "").strip() or (per_note_var.get() or "").strip() == "-":
                 per_note_var.set("Giroconto")
         else:
@@ -13868,6 +16487,12 @@ th {{ background:#efefef; text-align:left; }}
             messagebox.showerror(
                 "Registrazioni periodiche",
                 "Nel giroconto il secondo conto è obbligatorio e diverso dal primo.",
+            )
+            return None
+        if giro and acc2_code and account_is_credit_card_by_code(cur_db(), acc2_code):
+            messagebox.showerror(
+                "Registrazioni periodiche",
+                "Nelle girate conto/conto il secondo conto non può essere un conto carta di credito.",
             )
             return None
         raw_amt = (per_amount_var.get() or "").strip()
@@ -14788,7 +17413,7 @@ th {{ background:#efefef; text-align:left; }}
             periodiche_panel.pack_forget()
             per_follow_grid_selection[0] = False
             _nuovi_sync_subtab_style()
-            _populate_form_defaults(keep_last=False)
+            _populate_form_defaults(keep_last=True)
             nuovi_immissione_title_var.set(newreg_no_var.get())
             try:
                 ent_date.focus_set()
@@ -15094,6 +17719,7 @@ th {{ background:#efefef; text-align:left; }}
     bind_return_and_kp_enter(btn_confirm, lambda _e: (_commit_new_record(finish=False), "break")[1])
     btn_finish.configure(command=lambda: _commit_new_record(finish=True))
     btn_clear.configure(command=_clear_values)
+    nuovi_leave_guard_ref[0] = _nuovi_leave_guard
     btn_nuova_reg.bind("<Button-1>", lambda _e: _show_mode("new"))
     btn_reg_periodiche.bind("<Button-1>", lambda _e: _show_mode("periodiche"))
     btn_aggiorna_saldo.configure(command=_on_aggiorna_saldo_cassa_click)
@@ -15654,7 +18280,7 @@ th {{ background:#efefef; text-align:left; }}
 
     ver_btn_start_auto = tk.Label(
         ver_setup_inner,
-        text="Ricerca automatica PDF e avvio",
+        text="Verifica automatica da PDF",
         cursor="hand2",
         highlightthickness=0,
         font=_VER_ACTION_BTN_FONT,
@@ -15667,7 +18293,7 @@ th {{ background:#efefef; text-align:left; }}
     )
     ver_btn_start_manual = tk.Label(
         ver_setup_inner,
-        text="Immissione manuale dati…",
+        text="Verifica manuale",
         cursor="hand2",
         highlightthickness=0,
         font=_VER_ACTION_BTN_FONT,
@@ -15753,6 +18379,17 @@ th {{ background:#efefef; text-align:left; }}
         saved = _ver_load_pending_from_db(acc_code)
         return _ver_saved_has_verification_in_sospeso(saved)
 
+    def _ver_report_pdf_load_failure(title: str, msg: str) -> None:
+        """Mostra il fallimento PDF sia come popup sia come diagnostica persistente nella schermata."""
+        txt = (msg or "").strip()
+        if txt:
+            ver_pdf_auto_diag_var.set(txt)
+        try:
+            parent = _ver_activate_ui_for_modal_dialog()
+            messagebox.showwarning(title, txt or "Caricamento PDF non riuscito.", parent=parent)
+        except tk.TclError:
+            pass
+
     def _ver_declined_memory_blocks_new_verification_until_resolved(acc_code: str) -> bool:
         """Dopo Annulla ripresa + No cancellazione: blocca ogni avvio «nuovo» (manuale o PDF) finché la memoria resta."""
         dcl = ver_accounts_declined_memory_keep[0]
@@ -15817,14 +18454,12 @@ th {{ background:#efefef; text-align:left; }}
         except Exception:
             pass
         if not p or not p.is_file():
-            ver_pdf_auto_diag_var.set("")
             if _ver_account_expects_auto_estratto_pdf(cur_db(), acc_code):
                 ver_setup_pdf_path_after_auto_fail[0] = True
                 _ver_setup_start_buttons_state()
-            messagebox.showwarning(
+            _ver_report_pdf_load_failure(
                 "Verifica — ricerca automatica PDF",
                 diag + "\n\nIndicare il PDF nel campo sotto (o «Sfoglia…») e premere «Avvia con PDF selezionato».",
-                parent=root,
             )
             return
         ver_pdf_auto_diag_var.set("")
@@ -15834,6 +18469,11 @@ th {{ background:#efefef; text-align:left; }}
             pass
         picked_path = p
         expected_acc_code = acc_code
+        ver_pdf_auto_diag_var.set(f"PDF trovato: {picked_path.name}. Lettura e verifica in corso...")
+        try:
+            root.update_idletasks()
+        except Exception:
+            pass
 
         def _defer_ver_start() -> None:
             ver_auto_start_defer_after[0] = None
@@ -15888,7 +18528,7 @@ th {{ background:#efefef; text-align:left; }}
             return
         _ver_on_start()
 
-    def _ver_on_start_resume() -> None:
+    def _ver_on_start_resume(*, explicit_manual: bool = False) -> None:
         """Avvio immissione manuale; se per il conto c'è memoria salvata (PDF e/o sospesi), passa a ``_ver_on_start()``."""
         acc_name = ver_account_name_var.get().strip()
         if not acc_name:
@@ -15919,9 +18559,9 @@ th {{ background:#efefef; text-align:left; }}
         _ver_on_start()
 
     ver_btn_start_auto.bind("<Button-1>", lambda _e: _ver_on_start_auto())
-    ver_btn_start_manual.bind("<Button-1>", lambda _e: _ver_on_start_resume())
+    ver_btn_start_manual.bind("<Button-1>", lambda _e: _ver_on_start_resume(explicit_manual=True))
     ver_btn_start_with_pdf.bind("<Button-1>", lambda _e: _ver_on_start_with_selected_pdf_path())
-    ver_btn_start_resume.bind("<Button-1>", lambda _e: _ver_on_start_resume())
+    ver_btn_start_resume.bind("<Button-1>", lambda _e: _ver_on_start_resume(explicit_manual=False))
 
     def _ver_update_reset_saved_button_visibility(_e: object = None) -> None:
         """Riservato al layout verifica; la cancellazione memoria è solo dal dialogo di ripresa."""
@@ -16063,6 +18703,7 @@ th {{ background:#efefef; text-align:left; }}
         reject_zero=True,
         on_enter=lambda: _ver_on_amt_enter(None),
         cursor_after_sign_on_focus=True,
+        external_focusout=True,
     )
 
     def _ver_amt_set_cursor_after_sign() -> None:
@@ -16109,10 +18750,10 @@ th {{ background:#efefef; text-align:left; }}
             if not raw.startswith(("+", "-")):
                 return False
         try:
-            normalize_euro_input(raw)
+            val = normalize_euro_input(raw)
         except Exception:
             return False
-        return True
+        return val != Decimal("0.00")
 
     def _ver_on_amt_enter(_e: object = None) -> str | None:
         if _ver_candidate_pick_ui_active():
@@ -16128,6 +18769,14 @@ th {{ background:#efefef; text-align:left; }}
             return "break"
         try:
             val = normalize_euro_input(raw)
+            if val == Decimal("0.00"):
+                messagebox.showerror("Importo", "Importo a zero non ammesso.", parent=verifica_frame)
+                try:
+                    ver_ent_amt.focus_set()
+                    _ver_amt_set_cursor_after_sign()
+                except tk.TclError:
+                    pass
+                return "break"
             formatted = format_euro_it(val)
             if val >= 0 and not formatted.startswith("+"):
                 formatted = "+" + formatted
@@ -16488,6 +19137,8 @@ th {{ background:#efefef; text-align:left; }}
     ver_cand_pending_item: list[dict | None] = [None]
     # True solo se _ver_show_candidates ha nascosto ver_input_frame (evita pack errati in _ver_hide_candidates).
     ver_input_hidden_for_candidate_pick: list[bool] = [False]
+    # Indice in ``ver_pending_items`` quando la griglia candidati serve ad abbinare un sospeso già esistente (senza duplicare la riga).
+    ver_pending_resolve_idx: list[int | None] = [None]
 
     def _ver_cand_title_extra(chq_raw: str, note_raw: str) -> str:
         parts: list[str] = []
@@ -16540,7 +19191,7 @@ th {{ background:#efefef; text-align:left; }}
         cat_by_year = year_categories_map(d)
         ver_cand_tree.delete(*ver_cand_tree.get_children())
         acc_code_c = ver_account_code_var.get().strip()
-        for i, (reg_n, rec) in enumerate(candidates[:20]):
+        for i, (reg_n, rec) in enumerate(candidates[:80]):
             y_acc = acc_by_year.get(rec.get("year"), [])
             y_cat = cat_by_year.get(rec.get("year"), [])
             cat_name = category_name_for_record(rec, y_cat)
@@ -16599,6 +19250,7 @@ th {{ background:#efefef; text-align:left; }}
         ver_cand_pending_item[0] = None
         ver_cand_title_var.set("")
         ver_cand_dato_var.set("")
+        ver_pending_resolve_idx[0] = None
         _ver_update_submit_visibility()
         _ver_update_pending_action_buttons_visibility()
         _ver_place_pending_host()
@@ -16624,7 +19276,13 @@ th {{ background:#efefef; text-align:left; }}
         pend = ver_cand_pending_item[0] or {}
         log_row = {k: v for k, v in pend.items() if k != "verified"}
         log_row["verified"] = True
-        ver_pending_items[0].append(log_row)
+        pr = ver_pending_resolve_idx[0]
+        ver_pending_resolve_idx[0] = None
+        if pr is not None and isinstance(pr, int) and 0 <= pr < len(ver_pending_items[0]):
+            ver_pending_items[0][pr].update(log_row)
+            ver_pending_items[0][pr]["verified"] = True
+        else:
+            ver_pending_items[0].append(log_row)
         _ver_refresh_pending_tree()
         try:
             amt_ok = Decimal(str(pend.get("amount", "0")))
@@ -16652,24 +19310,33 @@ th {{ background:#efefef; text-align:left; }}
         i_bp0 = ver_bancoposta_idx[0]
         pdf_here = bool(q_bp0) and 0 <= i_bp0 < len(q_bp0)
         item = ver_cand_pending_item[0]
+        pr = ver_pending_resolve_idx[0]
+        ver_pending_resolve_idx[0] = None
         if item is not None:
-            row = dict(item)
-            row["verified"] = False
-            ver_pending_items[0].append(row)
-            _ver_refresh_pending_tree()
-            ver_status_var.set("Nessuna registrazione autorizzata. Dato aggiunto ai sospesi.")
-            try:
-                amt_bad = Decimal(str(item.get("amount", "0")))
-            except Exception:
-                amt_bad = Decimal("0")
-            if not pdf_here:
-                ver_status_var.set(
-                    f"Nessuna corrispondenza autorizzata per {_ver_amount_label_for_popup(amt_bad)} — dato in sospeso."
-                )
+            if pr is None:
+                row = dict(item)
+                row["verified"] = False
+                ver_pending_items[0].append(row)
+                _ver_refresh_pending_tree()
+                ver_status_var.set("Nessuna registrazione autorizzata. Dato aggiunto ai sospesi.")
+                try:
+                    amt_bad = Decimal(str(item.get("amount", "0")))
+                except Exception:
+                    amt_bad = Decimal("0")
+                if not pdf_here:
+                    ver_status_var.set(
+                        f"Nessuna corrispondenza autorizzata per {_ver_amount_label_for_popup(amt_bad)} — dato in sospeso."
+                    )
+                else:
+                    ver_status_var.set(
+                        f"Estratto PDF: nessuna corrispondenza autorizzata — "
+                        f"{_ver_amount_label_for_popup(amt_bad)} in sospeso."
+                    )
             else:
+                _ver_refresh_pending_tree()
                 ver_status_var.set(
-                    f"Estratto PDF: nessuna corrispondenza autorizzata — "
-                    f"{_ver_amount_label_for_popup(amt_bad)} in sospeso."
+                    "Nessuna corrispondenza dalla griglia — la voce resta nell'elenco sospesi; "
+                    "puoi modificare importo/nota o riprovare."
                 )
         else:
             ver_status_var.set("")
@@ -16779,6 +19446,19 @@ th {{ background:#efefef; text-align:left; }}
         padx=10,
         pady=4,
         bg=_VER_PENDING_BTN_CLEARSEL_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    ver_btn_abbina_pending = tk.Label(
+        ver_pending_btns,
+        text="Cerca corrispondenze",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=12,
+        pady=4,
+        bg=_VER_PENDING_BTN_NEW_BG,
         fg="#ffffff",
         relief=tk.RAISED,
         bd=1,
@@ -17410,6 +20090,15 @@ th {{ background:#efefef; text-align:left; }}
             except Exception:
                 bal = Decimal("0")
         amt = (-bal).quantize(Decimal("0.01"))
+        stmt_for_msg = pd.get("stmt_balance")
+        try:
+            if stmt_for_msg is not None:
+                stmt_for_msg_dec = Decimal(str(stmt_for_msg))
+            else:
+                stmt_for_msg_dec = bal
+        except Exception:
+            stmt_for_msg_dec = bal
+        estratto_positive_eur = "+" + format_euro_it(abs(stmt_for_msg_dec.quantize(Decimal("0.01")))) + " €"
         if abs(amt) < Decimal("0.005"):
             if confirm_dialog or done_message:
                 messagebox.showinfo("Verifica carta", "Il saldo della carta risulta già a zero: nessuna girata necessaria.", parent=parent)
@@ -17454,13 +20143,15 @@ th {{ background:#efefef; text-align:left; }}
             if not messagebox.askyesno(
                 "Girata di chiusura carta",
                 f"Verrà inserita una Girata conto/conto:\n"
+                f"• Saldo estratto conto (importo dovuto come in estratto, in positivo): {estratto_positive_eur}\n"
                 f"• Dal conto: {nm_cc}\n"
                 f"• Al conto: {nm_ref}\n"
-                f"• Importo: {('+' if amt >= 0 else '')}{format_euro_it(amt)} €\n\n"
-                "L'importo è calcolato sul saldo contabile attuale della carta: la verifica coincidente con l'estratto "
-                "non modifica da sola quel saldo; questa girata lo aggiorna trasferendo l'effetto sul conto di riferimento "
-                "(senza inversione di segno sul secondo conto nelle schermate di verifica). "
-                "Se l'importo coincide con il saldo della carta, dopo la registrazione il saldo carta risulta in genere a zero."
+                f"• Importo registrazione (scarico carta / addebito sul conto di riferimento): "
+                f"{('+' if amt >= 0 else '')}{format_euro_it(amt)} €\n\n"
+                "L'importo della registrazione è l'opposto del saldo contabile carta (addebiti negativi in app); "
+                "con verifica coincidente coincide in genere con l'importo dovuto sull'estratto in valore assoluto. "
+                "La girata riduce il saldo carta e il conto di riferimento della stessa cifra "
+                "(senza inversione di segno sul secondo conto nelle schermate di verifica)."
                 f"{uv_tail}\n\n"
                 "Procedere?",
                 parent=parent,
@@ -17809,29 +20500,26 @@ th {{ background:#efefef; text-align:left; }}
 
         try:
             ver_btn_start_resume.configure(
-                text="Avvia verifica"
+                text="Verifica manuale"
             )
         except tk.TclError:
             pass
 
-        if not has_stem:
-            ver_btn_start_resume.grid(row=2, column=0, columnspan=2, sticky="w", padx=(0, 8), pady=(6, 2))
+        try:
+            ver_btn_start_resume.grid_remove()
+        except tk.TclError:
+            pass
+        ver_btn_start_auto.grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 2))
+        ver_btn_start_manual.grid(row=2, column=1, sticky="w", padx=(0, 8), pady=(6, 2))
+        if ver_setup_pdf_path_after_auto_fail[0] and ver_bancoposta_pdf_var.get().strip():
+            ver_btn_start_with_pdf.grid(
+                row=2, column=2, sticky="w", padx=(0, 8), pady=(6, 2)
+            )
         else:
             try:
-                ver_btn_start_resume.grid_remove()
+                ver_btn_start_with_pdf.grid_remove()
             except tk.TclError:
                 pass
-            ver_btn_start_auto.grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 2))
-            ver_btn_start_manual.grid(row=2, column=1, sticky="w", padx=(0, 8), pady=(6, 2))
-            if ver_setup_pdf_path_after_auto_fail[0] and ver_bancoposta_pdf_var.get().strip():
-                ver_btn_start_with_pdf.grid(
-                    row=2, column=2, sticky="w", padx=(0, 8), pady=(6, 2)
-                )
-            else:
-                try:
-                    ver_btn_start_with_pdf.grid_remove()
-                except tk.TclError:
-                    pass
 
         _ver_update_reset_saved_button_visibility()
 
@@ -17972,6 +20660,14 @@ th {{ background:#efefef; text-align:left; }}
         primary_hit = bool(c1) and account_codes_match_for_verification(c1, ac)
         secondary_hit = bool(c2) and account_codes_match_for_verification(c2, ac)
         if primary_hit and secondary_hit:
+            # Coincidenza codice/sessione sia per int("8")==int("08") sia per stringhe identiche: senza questo
+            # tratto il lato errato sulla girata (importo invertito in verifica, nessuna corrispondenza).
+            p_exact_str = bool(c1) and c1 == ac
+            s_exact_str = bool(c2) and c2 == ac
+            if p_exact_str and not s_exact_str:
+                return True, "primary"
+            if s_exact_str and not p_exact_str:
+                return True, "secondary"
             sp = _ver_account_stars(rec, "primary")
             ss = _ver_account_stars(rec, "secondary")
             if ss > sp:
@@ -17990,7 +20686,7 @@ th {{ background:#efefef; text-align:left; }}
         return verification_flag_star_equivalent_count(str(rec.get(fk) or ""))
 
     def _ver_record_amount_for_account(rec: dict, side: str) -> Decimal:
-        """Importo con segno dal punto di vista del conto: + se primary, - se secondary (giroconto)."""
+        """Importo con segno dal punto di vista del conto; sul secondary della girata: ``amount_eur`` invertito."""
         amt = to_decimal(rec.get("amount_eur", "0"))
         if giro_record_secondary_amount_flip(rec, side):
             return -amt
@@ -18054,7 +20750,8 @@ th {{ background:#efefef; text-align:left; }}
             reg_n, rec = item
             d = float(_dist_days(rec))
             ov = float(_ver_note_overlap_candidates(verify_note, str(rec.get("note") or "")))
-            score = d - word_day_equiv * ov
+            bias = float(reg_n) / 1_000_000_000.0
+            score = d - word_day_equiv * ov - bias
             return (score, -ov, -int(reg_n))
 
         return sorted(candidates, key=_key)
@@ -18111,30 +20808,47 @@ th {{ background:#efefef; text-align:left; }}
         floor_reg: int | None,
         floor_date_iso: str,
         cutoff_iso: str,
+        exclude_after_cutoff: bool = True,
     ) -> bool:
         """False se il movimento non va considerato nelle procedure di verifica (fuori dal fascio utile).
 
-        Con almeno un ``**`` sul conto: solo registrazioni con numero globale >= all'**ultimo** ``**`` e,
-        se quella riga ha una data contabile, data >= a quella data (così non rientrano immissioni
-        posteriori per numero ma ancorate a periodi precedenti al confine).
-        Senza ``**`` sul conto (prima verifica o mai marcato): rientrano le registrazioni fino alla data di
-        chiusura estratto inclusa; si escludono solo quelle con data contabile successiva alla chiusura.
-        Le già marcate con ``*`` restano sempre nello scope.
+        Con ``**``: solo registrazioni con numero globale >= alla riga con l'ultimo ``**``.
+        Per ``reg_n`` strettamente maggiore a quello non si usa il confronto con la sola ``date_iso`` sulla
+        riga ``**``: altrimenti movimenti immessi per ultimi ma ancora nell'estratto con data più «vecchia»
+        resterebbero fuori dall'abbinamento. Per ``reg_n == floor_reg`` (riga sul confine ``**``), resta il
+        criterio data >= alla data sulla riga ``**``.
+        Senza ``**``: fino alla chiusura estratto inclusa (data > chiusura esclusa salvo righe già con ``*``).
+
+        ``exclude_after_cutoff=False``: per il solo riepilogo risultati (elenco non verificate, somma,
+        proiezione) sono incluse anche le registrazioni con data dopo la chiusura dell'estratto; le eccezioni
+        sul confine ``**`` e la numerazione globale si applicano in ``_ver_verification_summary``.
         """
         if floor_reg is not None:
             if reg_n < floor_reg:
                 return False
+            # Dopo il ``**`` nell'ordine globale dei numeri registrazione: come senza ``**`` rispetto al cutoff,
+            # ma senza filtrare con la data sulla riga marcata ``**``.
+            if reg_n > floor_reg:
+                if _ver_account_stars(rec, side) >= 1:
+                    return True
+                if exclude_after_cutoff:
+                    d_after = str(rec.get("date_iso") or "").strip()
+                    if d_after and cutoff_iso and d_after > cutoff_iso:
+                        return False
+                return True
             fd = str(floor_date_iso or "").strip()
             if fd:
                 d = str(rec.get("date_iso") or "").strip()
                 if d and d < fd:
                     return False
             return True
-        if _ver_account_stars(rec, side) >= 1:
+        if exclude_after_cutoff:
+            if _ver_account_stars(rec, side) >= 1:
+                return True
+            d = str(rec.get("date_iso") or "").strip()
+            if d and d > cutoff_iso:
+                return False
             return True
-        d = str(rec.get("date_iso") or "").strip()
-        if d and d > cutoff_iso:
-            return False
         return True
 
     def _ver_search_match(
@@ -18153,8 +20867,8 @@ th {{ background:#efefef; text-align:left; }}
             carattere dopo normalizzazione, con contenuto non vuoto su entrambi i lati), oppure
             con ``pdf_assisted=True`` se tra i candidati con lo stesso importo **uno solo** ha la
             data contabile uguale alla data operazione della riga PDF;
-          ('contains', rec, candidates)  se match parziale su assegno/nota (solo verifica manuale,
-            non con ``pdf_assisted``);
+          ('contains', rec, candidates)  se match parziale su assegno/nota (utile per griglia e ordinamento;
+            con ``pdf_assisted`` l'abbinamento automatico resta comunque limitato a exact sopra o importo+data);
           ('candidates', None, candidates)  se stesso importo ma senza altro campo identico
             (sempre verifica manuale a scelta dalla lista);
           ('none', None, [])  se nessun match
@@ -18218,9 +20932,11 @@ th {{ background:#efefef; text-align:left; }}
             note_exact = bool(note_norm) and bool(rec_note) and rec_note == note_norm
             if chq_exact or note_exact:
                 return ("exact", rec, [])
-            # Da PDF: nessun match «simile» automatico o a un click — solo uguaglianza esatta sopra
-            # o scelta dalla griglia candidati.
-            if contains_hit is None and not pdf_assisted:
+            # Corrispondenza «simile» (assegno/nota): non abbinamento automatico in senso stretto quando
+            # ``pdf_assisted`` (la scelta dalla griglia o l'exact data+importo sotto restano gli unici automatismi PDF),
+            # ma calcoliamo sempre ``contains_hit`` così dopo un estratto PDF compaiono griglia «contains» /
+            # ordinamento ``candidates`` anche con booking_date salvato sui sospesi.
+            if contains_hit is None:
                 chq_contains = chq_norm and len(chq_norm) >= 3 and (chq_norm in rec_chq or rec_chq in chq_norm)
                 note_contains = note_norm and len(note_norm) >= 3 and (note_norm in rec_note or rec_note in note_norm)
                 if chq_contains or note_contains:
@@ -18601,16 +21317,24 @@ th {{ background:#efefef; text-align:left; }}
                 try:
                     filtered, ext_closing, n_pdf_raw = _ver_filtered_bancoposta_rows_from_pdf(pth, cutoff_raw)
                 except ImportError as exc:
+                    msg = (
+                        "Per leggere gli estratti PDF è necessario il modulo pypdf.\n"
+                        f"Dettaglio: {exc}"
+                    )
+                    ver_pdf_auto_diag_var.set(msg)
                     messagebox.showerror(
                         "Verifica",
-                        "Per leggere gli estratti PDF è necessario il modulo pypdf.\n"
-                        f"Dettaglio: {exc}",
+                        msg,
+                        parent=_ver_activate_ui_for_modal_dialog(),
                     )
                     return
                 except Exception as exc:
+                    msg = f"Lettura del PDF estratto non riuscita:\n{exc}"
+                    ver_pdf_auto_diag_var.set(msg)
                     messagebox.showerror(
                         "Verifica",
-                        f"Lettura del PDF estratto non riuscita:\n{exc}",
+                        msg,
+                        parent=_ver_activate_ui_for_modal_dialog(),
                     )
                     return
                 ver_bancoposta_closing[0] = ext_closing
@@ -18641,7 +21365,8 @@ th {{ background:#efefef; text-align:left; }}
                             "Per caricare comunque tutte le righe lette (solo diagnostica): "
                             "VER_PDF_SKIP_CUTOFF_FILTER=1 nell'ambiente all'avvio."
                         )
-                    messagebox.showwarning("Verifica", msg)
+                    _ver_report_pdf_load_failure("Verifica", msg)
+                    return
             else:
                 ver_bancoposta_queue[0] = []
                 ver_bancoposta_idx[0] = -1
@@ -18743,8 +21468,7 @@ th {{ background:#efefef; text-align:left; }}
                 except Exception:
                     pass
                 ver_stmt_balance_var.set(str(stmt_final_mb))
-                if not account_is_credit_card_by_code(cur_db(), acc_code):
-                    _ver_place_double_star(acc_code)
+                _ver_place_double_star(acc_code)
                 try:
                     persist_db_after_edit(None)
                 except Exception:
@@ -18827,6 +21551,10 @@ th {{ background:#efefef; text-align:left; }}
             return
         except Exception as exc:
             messagebox.showerror("Verifica", str(exc), parent=verifica_frame)
+            ver_ent_amt.focus_set()
+            return
+        if amt == Decimal("0.00"):
+            messagebox.showerror("Importo", "Importo a zero non ammesso.", parent=verifica_frame)
             ver_ent_amt.focus_set()
             return
         ver_manual_any_amount_submitted[0] = True
@@ -19034,11 +21762,12 @@ th {{ background:#efefef; text-align:left; }}
         return before_ids != after_ids
 
     def _ver_update_pending_action_buttons_visibility(_e: object = None) -> None:
-        """Risultati manuale: «Nuovo dato»; con PDF automatico no «Nuovo». Modifica/Elimina/Annulla se riga sospesa selezionata. Lavoro: Modifica/Elimina/Annulla (no «Nuovo»)."""
+        """Pagina risultati: Nuovo / Modifica / Cerca corrispondenze / Elimina / Annulla; immissione: stessi (no Nuovo da PDF-only)."""
         try:
             ver_btn_annulla_sel_pending.pack_forget()
             ver_btn_del_pending.pack_forget()
             ver_btn_edit_pending.pack_forget()
+            ver_btn_abbina_pending.pack_forget()
             ver_btn_new_ver_data.pack_forget()
             on_res = _ver_ui_on_results_page()
             if on_res and ver_results_new_data_visible[0]:
@@ -19063,6 +21792,7 @@ th {{ background:#efefef; text-align:left; }}
                 except (ValueError, IndexError):
                     return
                 if 0 <= idx_w < len(ver_pending_items[0]) and not _ver_item_is_verified(ver_pending_items[0][idx_w]):
+                    ver_btn_abbina_pending.pack(side=tk.LEFT, padx=(0, 8))
                     ver_btn_edit_pending.pack(side=tk.LEFT, padx=(0, 8))
                     ver_btn_del_pending.pack(side=tk.LEFT, padx=(0, 8))
                     ver_btn_annulla_sel_pending.pack(side=tk.LEFT, padx=(0, 8))
@@ -19078,6 +21808,7 @@ th {{ background:#efefef; text-align:left; }}
                 return
             if 0 <= idx < len(ver_pending_items[0]) and _ver_item_is_verified(ver_pending_items[0][idx]):
                 return
+            ver_btn_abbina_pending.pack(side=tk.LEFT, padx=(0, 8))
             ver_btn_edit_pending.pack(side=tk.LEFT, padx=(0, 8))
             ver_btn_del_pending.pack(side=tk.LEFT, padx=(0, 8))
             ver_btn_annulla_sel_pending.pack(side=tk.LEFT, padx=(0, 8))
@@ -19294,10 +22025,162 @@ th {{ background:#efefef; text-align:left; }}
             return
         _ver_apply_edit_to_pending_item_index(idx)
 
+    def _ver_pending_resolve_match_selected() -> None:
+        """Ripete la ricerca abbinamenti sul sospeso selezionato: griglia candidati o verifica automatica se univoca."""
+        if _ver_candidate_pick_ui_active():
+            messagebox.showinfo(
+                "Verifica",
+                "Concludi prima la scelta sulla griglia candidati (Conferma o Nessuna corrispondenza).",
+                parent=_ver_activate_ui_for_modal_dialog(),
+            )
+            return
+        parent = _ver_activate_ui_for_modal_dialog()
+        sel = ver_pending_tree.selection()
+        if not sel:
+            messagebox.showwarning(
+                "Verifica",
+                "Seleziona una riga «In sospeso» nell'elenco.",
+                parent=parent,
+            )
+            return
+        if sel[0] == "__pdf_current__":
+            messagebox.showinfo(
+                "Verifica",
+                "Per la voce estratto PDF corrente usa i campi in alto e Verifica.",
+                parent=parent,
+            )
+            return
+        try:
+            sel_i = int(sel[0])
+        except (ValueError, IndexError):
+            return
+        if sel_i < 0 or sel_i >= len(ver_pending_items[0]):
+            return
+        item = ver_pending_items[0][sel_i]
+        if _ver_item_is_verified(item):
+            messagebox.showinfo("Verifica", "La riga selezionata risulta già verificata.", parent=parent)
+            return
+        acc_code = ver_account_code_var.get().strip()
+        if not acc_code:
+            return
+        try:
+            amt = Decimal(str(item.get("amount", "0")))
+        except Exception:
+            messagebox.showerror("Verifica", "Importo non valido nel dato sospeso.", parent=parent)
+            return
+        chq = str(item.get("cheque") or "").strip()
+        note = str(item.get("note") or "").strip()
+        if not chq and not note:
+            messagebox.showwarning(
+                "Verifica",
+                "Il dato sospeso non ha né assegno né nota — usare «Modifica» per completare.",
+                parent=parent,
+            )
+            return
+        bd_raw = str(item.get("booking_date") or item.get("booking") or "").strip()
+        q_pdf = ver_bancoposta_queue[0]
+        pdf_session_active = bool(q_pdf) and len(q_pdf) > 0
+        pdf_assisted = bool(bd_raw) and pdf_session_active
+        result_type, matched_rec, candidates = _ver_search_match(
+            acc_code,
+            amt,
+            chq,
+            note,
+            pdf_assisted=pdf_assisted,
+            pdf_booking_date=bd_raw or None,
+        )
+        ver_manual_any_amount_submitted[0] = True
+        ver_pending_resolve_idx[0] = sel_i
+        if result_type == "exact" and matched_rec is not None:
+            _touches, side = _ver_record_touches_account(matched_rec, acc_code)
+            _ver_mark_record_verified(matched_rec, side)
+            persist_db_after_edit(None)
+            _movements_dirty[0] = True
+            item["verified"] = True
+            ver_pending_resolve_idx[0] = None
+            try:
+                _ver_save_pending_to_db()
+            except Exception:
+                pass
+            _, rmap = _build_reg_index_maps()
+            rnn = int(rmap.get(record_legacy_stable_key(matched_rec), 0))
+            ver_status_var.set(f"Registrazione verificata automaticamente (reg. {rnn}).")
+            _ver_refresh_pending_tree()
+            return
+        if result_type == "contains" and matched_rec is not None:
+            if pdf_assisted:
+                if candidates:
+                    ver_status_var.set(
+                        "Estratto PDF: più candidati possibili — scegli dalla lista o «Nessuna corrispondenza»."
+                    )
+                    _ver_show_candidates(
+                        amt,
+                        chq,
+                        note,
+                        candidates,
+                        pdf_booking_date=bd_raw,
+                        pdf_note_full=str(item.get("note") or ""),
+                    )
+                    return
+                ver_pending_resolve_idx[0] = None
+                messagebox.showwarning(
+                    "Verifica",
+                    "Per questa riga l'estratto non consente ancora un abbinamento dalla griglia.",
+                    parent=parent,
+                )
+                return
+            _, reg_map_tmp = _build_reg_index_maps()
+            reg_n_tmp = reg_map_tmp.get(record_legacy_stable_key(matched_rec), 0)
+            merged_cands: list[tuple[int, dict]] = [(reg_n_tmp, matched_rec)]
+            seen_rn = {reg_n_tmp}
+            for c in candidates or []:
+                if c[0] not in seen_rn:
+                    seen_rn.add(c[0])
+                    merged_cands.append(c)
+            ver_status_var.set(
+                "Corrispondenza parziale: scegli la registrazione nella griglia o «Nessuna corrispondenza»."
+            )
+            _ver_show_candidates(
+                amt,
+                chq,
+                note,
+                merged_cands,
+                pdf_booking_date=bd_raw,
+                pdf_note_full=str(item.get("note") or ""),
+            )
+            return
+        if result_type == "candidates" and candidates:
+            if pdf_assisted:
+                ver_status_var.set(
+                    "Estratto PDF: scegli la registrazione dalla lista o «Nessuna corrispondenza»."
+                )
+            else:
+                ver_status_var.set(
+                    "Scegli la registrazione nella griglia candidati o «Nessuna corrispondenza»."
+                )
+            _ver_show_candidates(
+                amt,
+                chq,
+                note,
+                candidates,
+                pdf_booking_date=bd_raw,
+                pdf_note_full=str(item.get("note") or ""),
+            )
+            return
+        ver_pending_resolve_idx[0] = None
+        messagebox.showinfo(
+            "Verifica",
+            "Nessuna registrazione nello scope di verifica con questo importo. "
+            "Controllare data di chiusura / confine «**» o modificare il dato sospeso.",
+            parent=parent,
+        )
+
     ver_btn_del_pending.bind("<Button-1>", lambda _e: _ver_del_pending())
     ver_btn_edit_pending.bind("<Button-1>", lambda _e: _ver_edit_pending())
+    ver_btn_abbina_pending.bind("<Button-1>", lambda _e: _ver_pending_resolve_match_selected())
     ver_btn_annulla_sel_pending.bind("<Button-1>", lambda _e: _ver_on_annulla_sel_pending_click())
     ver_pending_tree.bind("<<TreeviewSelect>>", _ver_update_pending_action_buttons_visibility)
+    ver_pending_tree.bind("<Double-1>", lambda _e: _ver_pending_resolve_match_selected())
 
     # ---- Terminazione immissione e posizionamento ** ----
     def _ver_ask_stmt_balance(*, initial_balance: Decimal | None = None) -> Decimal | None:
@@ -19331,7 +22214,7 @@ th {{ background:#efefef; text-align:left; }}
             bg=_VER_BG,
             justify=tk.LEFT,
         ).pack(padx=16, pady=(16, 8))
-        bal_var = tk.StringVar(value="-")
+        bal_var = tk.StringVar(value="+")
         if eff_initial is not None:
             try:
                 ib = eff_initial.quantize(Decimal("0.01"))
@@ -19349,7 +22232,7 @@ th {{ background:#efefef; text-align:left; }}
             bal_var,
             allow_leading_sign=True,
             require_leading_sign=True,
-            reject_zero=True,
+            reject_zero=False,
             cursor_after_sign_on_focus=True,
         )
         if eff_initial is not None:
@@ -19377,9 +22260,6 @@ th {{ background:#efefef; text-align:left; }}
                 val = normalize_euro_input(raw)
             except Exception:
                 bal_err_var.set("Importo non valido.")
-                return
-            if val == Decimal("0.00"):
-                bal_err_var.set("Importo a zero non ammesso.")
                 return
             result[0] = val
             dlg.destroy()
@@ -19472,8 +22352,7 @@ th {{ background:#efefef; text-align:left; }}
             _ver_refresh_pending_tree()
         except Exception:
             pass
-        if not account_is_credit_card_by_code(cur_db(), acc_code):
-            _ver_place_double_star(acc_code)
+        _ver_place_double_star(acc_code)
         persist_db_after_edit(None)
         _movements_dirty[0] = True
         _ver_show_results(acc_code, stmt_balance)
@@ -19661,8 +22540,7 @@ th {{ background:#efefef; text-align:left; }}
         except Exception:
             pass
         ver_results_after_persist_cb[0] = None
-        if not account_is_credit_card_by_code(cur_db(), acc_code):
-            _ver_place_double_star(acc_code)
+        _ver_place_double_star(acc_code)
         persist_db_after_edit(None)
         _movements_dirty[0] = True
         _ver_show_results(acc_code, stmt_balance)
@@ -19672,8 +22550,9 @@ th {{ background:#efefef; text-align:left; }}
     def _ver_place_double_star(acc_code: str) -> None:
         """Trova l'ultima registrazione verificata (*) consecutiva dall'ultimo ** e pone ** su di essa.
 
-        Per i conti carta di credito non si usa: il ``**`` va sulla girata di chiusura verifica (vedi
-        ``_ver_place_double_star_on_cc_settlement``).
+        Vale anche per i conti carta, così resta un confine di ricerca dopo la verifica (ultima * in periodo).
+        Se in seguito si registra la girata di chiusura carta dall'app, ``_ver_place_double_star_on_cc_settlement``
+        abbassa eventuali ** precedenti a * e colloca ** sulla girata di chiusura.
         """
         ac = str(acc_code or "").strip() or str(ver_session_account_code[0] or "").strip()
         if not ac:
@@ -19828,18 +22707,31 @@ th {{ background:#efefef; text-align:left; }}
             touches, side = _ver_record_touches_account(rec, ac)
             if not touches:
                 continue
-            if not _ver_record_in_verification_scope(
+            stars_uv = _ver_account_stars(rec, side)
+            in_scope_rs = _ver_record_in_verification_scope(
                 reg_n=reg_n,
                 rec=rec,
                 side=side,
                 floor_reg=floor_reg,
                 floor_date_iso=floor_date_iso,
                 cutoff_iso=cutoff_iso,
-            ):
+                exclude_after_cutoff=False,
+            )
+            if not in_scope_rs:
+                # Anche dopo chiusura estratto: include solo righe fuori fascia ``**`` per num. glob.,
+                # ma con data dopo la chiusura (non si applica alla ricerca abbinamenti).
+                if (
+                    floor_reg is not None
+                    and reg_n < floor_reg
+                    and stars_uv < 1
+                ):
+                    d_sup = str(rec.get("date_iso") or "").strip()
+                    if d_sup and cutoff_iso and d_sup > cutoff_iso:
+                        in_scope_rs = True
+            if not in_scope_rs:
                 continue
             count_total_touching += 1
-            stars = _ver_account_stars(rec, side)
-            if stars >= 1:
+            if stars_uv >= 1:
                 count_verified += 1
                 continue
             rec_date = str(rec.get("date_iso", ""))
@@ -19896,8 +22788,15 @@ th {{ background:#efefef; text-align:left; }}
         pd, unverified_before, unverified_after, count_total_touching, count_verified = _ver_verification_summary(
             d, ac, cutoff_raw=cutoff_raw, stmt_balance=stmt_balance
         )
+        # Stesso «saldo estratto» delle righe riepilogo: serve a «Chiudi verifica»/girata carta anche se un flusso
+        # aveva solo chiamato _ver_show_results senza impostare la StringVar (es. memoria dopo batch manuale).
+        try:
+            ver_stmt_balance_var.set(format_money(stmt_balance))
+        except Exception:
+            ver_stmt_balance_var.set(str(stmt_balance))
         count_unverified = int(pd["count_unverified"])
         n_before_closure = len(unverified_before)
+        n_after_closure = len(unverified_after)
         acc_nm = ver_account_name_var.get()
         if count_unverified == 0:
             ver_results_title.configure(
@@ -19913,8 +22812,8 @@ th {{ background:#efefef; text-align:left; }}
                     f"Registrazioni non verificate del conto {acc_nm} al {cutoff_raw}. "
                     f"Registrazioni del conto {count_total_touching}. "
                     f"Verifiche positive: {count_verified}. "
-                    f"Non verificate: {count_unverified}, di cui anteriori alla data di chiusura: "
-                    f"{n_before_closure}."
+                    f"Non verificate: {count_unverified} "
+                    f"(anteriori alla chiusura: {n_before_closure}, successive: {n_after_closure})."
                 )
             )
         ver_unver_tree.delete(*ver_unver_tree.get_children())
@@ -20105,21 +23004,22 @@ th {{ background:#efefef; text-align:left; }}
         acc_name = ver_account_name_var.get()
         cutoff_raw = ver_cutoff_date_var.get().strip()
 
-        pending_rows = ""
+        pending_pdf: list[tuple[str, str, str, str]] = []
         for item in ver_pending_items[0]:
             if _ver_item_is_verified(item):
                 continue
             amt_s, _ = _ver_grid_amount_from_amount_str(item.get("amount", "0"))
             date_disp = _ver_format_pending_item_date(item)
-            pending_rows += (
-                f"<tr><td>{html_module.escape(date_disp)}</td>"
-                f"<td>{html_module.escape(amt_s)}</td>"
-                f"<td>{html_module.escape(item.get('cheque', ''))}</td>"
-                f"<td>{html_module.escape(item.get('note', ''))}</td>"
-                f"<td>In sospeso</td></tr>\n"
+            pending_pdf.append(
+                (
+                    date_disp,
+                    amt_s,
+                    str(item.get("cheque", "") or ""),
+                    str(item.get("note", "") or ""),
+                )
             )
 
-        unver_rows = ""
+        unver_pdf: list[tuple[str, ...]] = []
         for iid in ver_unver_tree.get_children():
             lv = ver_unver_tree.item(iid, "values")
             amt_cell = ""
@@ -20127,96 +23027,26 @@ th {{ background:#efefef; text-align:left; }}
                 av = ver_unver_amt_tree.item(iid, "values")
                 amt_cell = str(av[0]) if av else ""
             full_vals = lv[:4] + (amt_cell,) + lv[4:]
-            row_cells = "".join(f"<td>{html_module.escape(str(v))}</td>" for v in full_vals)
-            unver_rows += f"<tr>{row_cells}</tr>\n"
+            unver_pdf.append(tuple(str(v) for v in full_vals))
 
         d = cur_db()
-        uh_e = html_module.escape(print_user_header_text(d, session_holder[0]))
+        uh = print_user_header_text(d, session_holder[0])
 
         pd = ver_print_data[0] or {}
-        current_balance = pd.get("current_balance", Decimal("0"))
-        count_unverified = pd.get("count_unverified", 0)
-        sum_unverified = pd.get("sum_unverified", Decimal("0"))
-        projected = pd.get("projected", Decimal("0"))
-        stmt_balance = pd.get("stmt_balance", Decimal("0"))
-        diff = pd.get("diff", Decimal("0"))
-        match_ok = pd.get("match_ok", False)
+        match_ok = bool(pd.get("match_ok", False))
 
-        if match_ok:
-            verdict_html = '<p style="margin-top:3mm; font-weight:700; font-size:12pt; color:#2e7d32;">✓ Verifica coincidente</p>'
-        else:
-            verdict_html = '<p style="margin-top:3mm; font-weight:700; font-size:12pt; color:#c62828;">✗ Scostamento: sono necessari controlli</p>'
-
-        spec_rows = _ver_summary_row_definitions(
-            current_balance=current_balance,
-            count_unverified=int(count_unverified),
-            sum_unverified=sum_unverified,
-            projected=projected,
-            stmt_balance=stmt_balance,
-            diff=diff,
+        ok = save_verifica_results_pdf(
+            d,
+            verifica_frame,
+            user_header=uh,
+            acc_name=acc_name,
+            cutoff_display=cutoff_raw,
+            pending_rows=pending_pdf,
+            unver_rows=unver_pdf,
+            pd=pd,
+            match_ok=match_ok,
         )
-        diff_color = _ver_summary_diff_line_color(bool(match_ok))
-        summary_parts: list[str] = []
-        for desc, val in spec_rows:
-            if desc == "Differenza":
-                summary_parts.append(
-                    f'<tr class="diff-row"><td><strong>{html_module.escape(desc)}</strong></td>'
-                    f'<td class="amt" style="color:{diff_color};"><strong>'
-                    f"{html_module.escape(_ver_summary_signed_eur(val))}</strong></td></tr>\n"
-                )
-            else:
-                ac = _ver_summary_amount_line_color(val)
-                summary_parts.append(
-                    f"<tr><td>{html_module.escape(desc)}</td>"
-                    f'<td class="amt" style="color:{ac};">{html_module.escape(_ver_summary_signed_eur(val))}</td></tr>\n'
-                )
-        summary_rows = "".join(summary_parts)
-
-        html_doc = f"""<!DOCTYPE html>
-<html lang="it"><head><meta charset="utf-8"/><title>Verifica {html_module.escape(acc_name)}</title>
-<style>
-body {{ font-family: system-ui, -apple-system, sans-serif; color:#1a1a1a; padding:8mm; font-size:12pt; }}
-h2 {{ margin:0 0 3mm 0; font-size:14pt; }}
-h3 {{ font-size:13pt; }}
-p {{ margin:0 0 2mm 0; }}
-.user-hdr {{ text-align:center; font-weight:700; font-size:14pt; margin:0 0 4mm 0; }}
-table {{ width:100%; border-collapse:collapse; margin:0 0 4mm 0; }}
-th, td {{ border:1px solid #999; padding:4px 6px; vertical-align:top; text-align:left; }}
-th {{ background:#efefef; }}
-table.summary {{ width:auto; min-width:50%; margin:4mm 0; font-size:12pt; }}
-table.summary td {{ border:none; padding:3px 14px 3px 0; }}
-table.summary td.amt {{ text-align:right; font-family:monospace; padding-left:24px; white-space:nowrap; }}
-table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
-</style></head><body>
-<p class="user-hdr">{uh_e}</p>
-<h2>Verifica conto: {html_module.escape(acc_name)} — Chiusura: {html_module.escape(cutoff_raw)}</h2>
-<p>{html_module.escape(_linea_data_ora_stampa())}</p>
-"""
-        if pending_rows:
-            html_doc += """<h3>Dati di verifica in sospeso</h3>
-<table><tr><th>Data</th><th>Importo</th><th>Assegno</th><th>Nota</th><th>Stato</th></tr>
-""" + pending_rows + "</table>\n"
-        else:
-            html_doc += (
-                '<p style="margin:0 0 3mm 0; font-size:12pt; color:#2e7d32; font-weight:600;">'
-                "Tutti i dati di verifica hanno trovato corrispondenza.</p>\n"
-            )
-
-        if unver_rows:
-            html_doc += f"""<h3>Registrazioni non verificate</h3>
-<table><tr><th>#</th><th>Data</th><th>Categoria</th><th>Conto</th><th>Importo</th><th>Assegno</th><th>Nota</th><th>Periodo</th></tr>
-""" + unver_rows + "</table>\n"
-        else:
-            html_doc += '<p><em>Tutte le registrazioni sono state verificate.</em></p>\n'
-
-        html_doc += f'<h3>Riepilogo</h3>\n<table class="summary">\n{summary_rows}</table>\n'
-        html_doc += verdict_html
-        html_doc += "\n</body></html>"
-
-        try:
-            _print_ricerca_via_browser(html_doc)
-        except Exception as exc:
-            messagebox.showerror("Stampa verifica", str(exc))
+        if not ok:
             return
         # Resta sulla pagina risultati: uscita dalla verifica solo con «Chiudi verifica».
 
@@ -20227,6 +23057,11 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         """Riesegue la verifica su ogni sospeso. Ritorna il numero di match riusciti."""
         acc_code = ver_account_code_var.get()
         matched = 0
+        # Con coda PDF ancora attiva, stesse regole «assistite» della riga corrente; dopo fine coda le voci
+        # possono avere booking_date salvato ma la riconciliazione va come verifica manuale (contains / candidati),
+        # altrimenti il match data+importo resterebbe troppo rigido per registrazioni inserite a posteriori.
+        q_pdf = ver_bancoposta_queue[0]
+        pdf_session_active = bool(q_pdf) and len(q_pdf) > 0
         for item in list(ver_pending_items[0]):
             if _ver_item_is_verified(item):
                 continue
@@ -20237,13 +23072,14 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
             chq = item.get("cheque", "")
             note = item.get("note", "")
             bd_raw = str(item.get("booking_date") or item.get("booking") or "").strip()
+            pdf_assisted_retry = bool(bd_raw) and pdf_session_active
             result_type, matched_rec, candidates = _ver_search_match(
                 acc_code,
                 amt,
                 chq,
                 note,
-                pdf_assisted=bool(bd_raw),
-                pdf_booking_date=bd_raw or None,
+                pdf_assisted=pdf_assisted_retry,
+                pdf_booking_date=(bd_raw or None) if pdf_assisted_retry else None,
             )
             verify_rec: dict | None = None
             if result_type == "exact" and matched_rec is not None:
@@ -20285,8 +23121,7 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
             _ver_refresh_pending_tree()
         except Exception:
             pass
-        if not account_is_credit_card_by_code(cur_db(), acc_code):
-            _ver_place_double_star(acc_code)
+        _ver_place_double_star(acc_code)
         try:
             persist_db_after_edit(None)
         except Exception:
@@ -20423,6 +23258,14 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                     sb_try = normalize_euro_input(raw_sb.replace(" ", ""))
                 except Exception:
                     sb_try = None
+            # Fallback se la StringVar non era stata impostata (prima bastava vedere solo il riepilogo a schermo).
+            if sb_try is None:
+                vp = ver_print_data[0]
+                if isinstance(vp, dict) and vp.get("stmt_balance") is not None:
+                    try:
+                        sb_try = Decimal(str(vp["stmt_balance"]))
+                    except Exception:
+                        sb_try = None
             if sb_try is not None and _ver_all_verified(acc_code):
                 pd0, _, _, _, _ = _ver_verification_summary(
                     d_pre,
@@ -20454,6 +23297,12 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
                 except Exception:
                     bal_x = Decimal("0")
             amt_x = (-bal_x).quantize(Decimal("0.01"))
+            stmt_pdf = pd_cc.get("stmt_balance")
+            try:
+                stmt_pdf_d = Decimal(str(stmt_pdf)) if stmt_pdf is not None else bal_x
+            except Exception:
+                stmt_pdf_d = bal_x
+            estratto_pos_txt = "+" + format_euro_it(abs(stmt_pdf_d.quantize(Decimal("0.01")))) + " €"
             n_uv = int(pd_cc.get("count_unverified", 0) or 0)
             uv_tail = (
                 f"\n\nSul conto carta risultano ancora {n_uv} registrazioni non verificate "
@@ -20463,12 +23312,16 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
             )
             close_msg = (
                 "Chiudendo la verifica verrà registrata una Girata conto/conto sul conto di riferimento "
-                "(saldo carta non a zero):\n"
+                "(saldo carta non a zero):\n\n"
+                f"• Saldo estratto conto (come in estratto, in positivo): {estratto_pos_txt}\n"
                 f"• Dal conto: {nm_cc}\n"
                 f"• Al conto: {nm_ref}\n"
-                f"• Importo: {('+' if amt_x >= 0 else '')}{format_euro_it(amt_x)} €\n\n"
-                "L'importo è calcolato sul saldo contabile attuale della carta; la girata lo riallinea sul conto di riferimento "
-                "(senza inversione di segno sul secondo conto nelle schermate di verifica)."
+                f"• Importo registrazione (scarico carta / addebito sul conto di riferimento): "
+                f"{('+' if amt_x >= 0 else '')}{format_euro_it(amt_x)} €\n\n"
+                "L'importo della registrazione è l'opposto del saldo contabile carta in Conti di casa "
+                "(gli acquisti figurano negativamente); coincide in genere con l'importo dovuto dell'estratto "
+                "in valore assoluto. "
+                "(Senza inversione di segno sul secondo conto nelle schermate di verifica.)"
                 f"{uv_tail}\n\n"
                 "«Annulla» resta in questa pagina. «OK» salva la girata e chiude la sessione di verifica."
             )
@@ -20707,6 +23560,19 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         relief="flat",
     )
     _stat_sty.configure("StatCdc.Treeview.Heading", font=(_stat_ffam, _stat_fsz, "bold"))
+    _stat_sty.configure(
+        "BudSumm.Treeview",
+        font=(_stat_ffam, _stat_fsz),
+        rowheight=max(_stat_rowh, int(_stat_fsz * 2.65)),
+        borderwidth=0,
+        relief="flat",
+    )
+    # Aqua taglia le heading multilinea del Treeview: intestazioni vere su Label (vedi _bud_pack_section_tree).
+    _stat_sty.configure(
+        "BudSumm.Treeview.Heading",
+        font=(_stat_ffam, 1),
+        padding=(0, 0),
+    )
     _stat_sty.configure(
         "StatHistoryCdc.Treeview",
         font=(_stat_ffam, _stat_fsz),
@@ -21342,6 +24208,7 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
         db = db_holder[0]
         cats_by_year = year_categories_map(db)
         sums: dict[str, Decimal] = {}
+        twin_cat = frozenset(import_cancel_twin_balance_keys(db))
 
         for c in cats_by_year.get(ry, []) or []:
             nm = category_display_name(str(c.get("name") or "")).strip()
@@ -21351,13 +24218,13 @@ table.summary tr.diff-row td {{ border-top:1px solid #333; padding-top:5px; }}
 
         for yb in db.get("years", []) or []:
             for rec in yb.get("records", []) or []:
-                if rec.get("is_cancelled"):
+                if record_skip_for_category_statistics_budget(rec, twin_cat):
                     continue
                 d_iso = str(rec.get("date_iso") or "").strip()[:10]
                 if not d_iso or d_iso < start_iso or d_iso > end_iso:
                     continue
-                y = int(rec.get("year") or yb.get("year") or ry)
-                cat_name = category_name_for_record(rec, cats_by_year.get(y, [])).strip()
+                py = record_category_plan_year(rec, yb, fallback_year=ry)
+                cat_name = category_name_for_record(rec, cats_by_year.get(py, [])).strip()
                 if not cat_name or _stat_category_excluded_from_summary(cat_name):
                     continue
                 sums[cat_name] = sums.get(cat_name, Decimal("0")) + to_decimal(rec.get("amount_eur") or "0")
@@ -21977,6 +24844,7 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
         counts_by_cat: dict[str, list[int]] = {}
         tot_pos_by_month = [Decimal("0")] * 12
         tot_neg_abs_by_month = [Decimal("0")] * 12
+        twin_cat = frozenset(import_cancel_twin_balance_keys(db))
 
         for c in cats_by_year.get(ry, []) or []:
             nm = category_display_name(str(c.get("name") or "")).strip()
@@ -21987,7 +24855,7 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
 
         for yb in db.get("years", []) or []:
             for rec in yb.get("records", []) or []:
-                if rec.get("is_cancelled"):
+                if record_skip_for_category_statistics_budget(rec, twin_cat):
                     continue
                 d_iso = str(rec.get("date_iso") or "").strip()
                 if len(d_iso) < 7:
@@ -22000,8 +24868,8 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
                     continue
                 if m < 1 or m > 12:
                     continue
-                rec_year = int(rec.get("year") or yb.get("year") or ry)
-                cat_name = category_name_for_record(rec, cats_by_year.get(rec_year, [])).strip()
+                py = record_category_plan_year(rec, yb, fallback_year=ry)
+                cat_name = category_name_for_record(rec, cats_by_year.get(py, [])).strip()
                 if not cat_name or _stat_category_excluded_from_summary(cat_name):
                     continue
                 amt = to_decimal(rec.get("amount_eur") or "0")
@@ -22278,22 +25146,17 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
             menu.grab_release()
 
     def _stat_category_history_available_categories() -> list[str]:
+        """Solo categorie presenti in almeno una registrazione non annullata (niente voci «vuote» dal solo piano)."""
         db = db_holder[0]
         cats_by_year = year_categories_map(db)
+        twin_cat = frozenset(import_cancel_twin_balance_keys(db))
         out: set[str] = set()
-        for cats in cats_by_year.values():
-            for c in cats or []:
-                nm = category_display_name(str(c.get("name") or "")).strip()
-                if not nm or is_hidden_dotazione_category_name(nm) or _stat_category_excluded_from_summary(nm):
-                    continue
-                out.add(nm)
-
         for yb in db.get("years", []) or []:
             for rec in yb.get("records", []) or []:
-                if rec.get("is_cancelled"):
+                if record_skip_for_category_statistics_budget(rec, twin_cat):
                     continue
-                rec_year = int(rec.get("year") or yb.get("year") or 0)
-                cat_name = category_name_for_record(rec, cats_by_year.get(rec_year, [])).strip()
+                py = record_category_plan_year(rec, yb)
+                cat_name = category_name_for_record(rec, cats_by_year.get(py, [])).strip()
                 if not cat_name or is_hidden_dotazione_category_name(cat_name) or _stat_category_excluded_from_summary(cat_name):
                     continue
                 out.add(cat_name)
@@ -22323,6 +25186,7 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
         present_years: set[int] = set()
         sums_by_year: dict[int, Decimal] = {y: Decimal("0") for y in years}
         selected_key = selected.lower()
+        twin_cat = frozenset(import_cancel_twin_balance_keys(db))
 
         for y in years:
             for c in cats_by_year.get(y, []) or []:
@@ -22333,7 +25197,7 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
 
         for yb in db.get("years", []) or []:
             for rec in yb.get("records", []) or []:
-                if rec.get("is_cancelled"):
+                if record_skip_for_category_statistics_budget(rec, twin_cat):
                     continue
                 d_iso = str(rec.get("date_iso") or "").strip()
                 if len(d_iso) < 4 or not d_iso[:4].isdigit():
@@ -22341,8 +25205,8 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
                 y = int(d_iso[:4])
                 if y not in sums_by_year:
                     continue
-                rec_year = int(rec.get("year") or yb.get("year") or y)
-                cat_name = category_name_for_record(rec, cats_by_year.get(rec_year, [])).strip()
+                py = record_category_plan_year(rec, yb, fallback_year=y)
+                cat_name = category_name_for_record(rec, cats_by_year.get(py, [])).strip()
                 if cat_name.lower() != selected_key:
                     continue
                 sums_by_year[y] += to_decimal(rec.get("amount_eur") or "0")
@@ -22359,6 +25223,73 @@ window.addEventListener("load", function () {{ setTimeout(function () {{ window.
             rows.append((str(y), _stat_cell_eur(value), _stat_category_history_bar(value, max_abs)))
         rows.append(("Totale", _stat_cell_eur(total), ""))
         return ["Anno", selected, "Andamento annuale"], rows, selected
+
+    def _stat_category_history_aggregate_rows_for_needle(
+        needle: str,
+    ) -> tuple[list[str], list[tuple[str, str, str]], str]:
+        """Come ``_stat_category_history_rows_for_selected``, ma somma importi di tutte le categorie il cui nome contiene la stringa (case insensitive)."""
+        db = db_holder[0]
+        nl = (needle or "").strip().lower()
+        if not nl:
+            return ["Anno", "Saldo categorie aggregate", "Andamento annuale"], [], ""
+        years = sorted(
+            {
+                int(yb.get("year", 0) or 0)
+                for yb in db.get("years", []) or []
+                if int(yb.get("year", 0) or 0) > 0
+            },
+            reverse=True,
+        )
+        if not years:
+            return ["Anno", f"Σ «{needle.strip()}»", "Andamento annuale"], [], needle.strip()
+
+        cats_by_year = year_categories_map(db)
+        present_years: set[int] = set()
+        sums_by_year: dict[int, Decimal] = {y: Decimal("0") for y in years}
+        twin_cat = frozenset(import_cancel_twin_balance_keys(db))
+
+        for y in years:
+            for c in cats_by_year.get(y, []) or []:
+                nm = category_display_name(str(c.get("name") or "")).strip()
+                if not nm or is_hidden_dotazione_category_name(nm) or _stat_category_excluded_from_summary(nm):
+                    continue
+                if nl in nm.lower():
+                    present_years.add(y)
+                    break
+
+        for yb in db.get("years", []) or []:
+            for rec in yb.get("records", []) or []:
+                if record_skip_for_category_statistics_budget(rec, twin_cat):
+                    continue
+                d_iso = str(rec.get("date_iso") or "").strip()
+                if len(d_iso) < 4 or not d_iso[:4].isdigit():
+                    continue
+                y = int(d_iso[:4])
+                if y not in sums_by_year:
+                    continue
+                py = record_category_plan_year(rec, yb, fallback_year=y)
+                cat_name = category_name_for_record(rec, cats_by_year.get(py, [])).strip()
+                if not cat_name or is_hidden_dotazione_category_name(cat_name) or _stat_category_excluded_from_summary(
+                    cat_name
+                ):
+                    continue
+                if nl not in cat_name.lower():
+                    continue
+                sums_by_year[y] += to_decimal(rec.get("amount_eur") or "0")
+
+        max_abs = max((abs(v) for v in sums_by_year.values()), default=Decimal("0"))
+        rows_out: list[tuple[str, str, str]] = []
+        total = Decimal("0")
+        lbl = f"Σ «{(needle or '').strip()}»"
+        for y in years:
+            if y not in present_years:
+                rows_out.append((str(y), "—", ""))
+                continue
+            value = sums_by_year.get(y, Decimal("0"))
+            total += value
+            rows_out.append((str(y), _stat_cell_eur(value), _stat_category_history_bar(value, max_abs)))
+        rows_out.append(("Totale", _stat_cell_eur(total), ""))
+        return ["Anno", lbl, "Andamento annuale"], rows_out, (needle or "").strip()
 
     def _stat_category_history_print_data() -> tuple[str, list[tuple[int, Decimal | None]], Decimal, Decimal] | None:
         selected = str(stat_category_history_var.get() or "").strip()
@@ -22535,6 +25466,183 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
 </body></html>"""
         _print_stat_via_browser(html)
 
+    def _stat_aggregate_category_history_print_data(
+        needle: str,
+    ) -> tuple[str, list[tuple[int, Decimal | None]], Decimal, Decimal] | None:
+        heads, rows, ok = _stat_category_history_aggregate_rows_for_needle(needle)
+        if not ok or not rows:
+            return None
+        values: list[tuple[int, Decimal | None]] = []
+        total = Decimal("0")
+        max_abs = Decimal("0")
+        for year_label, value_label, _bar_label in rows:
+            if year_label == "Totale":
+                continue
+            if not str(year_label).isdigit():
+                continue
+            if value_label == "—":
+                values.append((int(year_label), None))
+                continue
+            try:
+                value = parse_amount(value_label.replace("€", "").strip())
+            except Exception:
+                value = Decimal("0")
+            values.append((int(year_label), value))
+            total += value
+            max_abs = max(max_abs, abs(value))
+        return heads[1], values, total, max_abs
+
+    def _stat_print_aggregate_category_history_table(intro_plain: str, needle: str) -> bool:
+        data = _stat_aggregate_category_history_print_data(needle)
+        if data is None:
+            return False
+        col_heading, pdf_rows, total, max_abs = data
+        main_title = f"Categorie aggregate per anno — {needle}"
+        try:
+            from fpdf import FPDF
+            from fpdf.enums import XPos, YPos
+        except ImportError:
+            return False
+        try:
+            pdf = FPDF(orientation="P", unit="mm", format="A4")
+            pdf.set_margins(12, 10, 12)
+            pdf.set_auto_page_break(auto=True, margin=10)
+            pdf.add_page()
+            pdf.set_title(_pdf_safe_text(main_title)[:128])
+            pdf.set_font("Helvetica", "B", 13)
+            pdf.cell(0, 7, _pdf_safe_text(main_title), align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_font("Helvetica", "", 8)
+            pdf.multi_cell(0, 4.0, _pdf_safe_text(intro_plain), align="C")
+            pdf.ln(2)
+
+            epw = pdf.epw
+            table_w = min(epw, 142.0)
+            x0 = pdf.l_margin + (epw - table_w) / 2.0
+            w_year = 14.0
+            w_val = 37.0
+            w_bar = table_w - w_year - w_val
+            row_h = 4.6
+            head_h = 5.2
+            ch_pdf = _pdf_safe_text(col_heading)
+
+            def _draw_header_agg() -> None:
+                pdf.set_x(x0)
+                pdf.set_font("Helvetica", "B", 7.2)
+                pdf.set_text_color(0, 0, 0)
+                pdf.set_fill_color(227, 242, 253)
+                pdf.cell(w_year, head_h, "Anno", border=1, align="L", fill=True)
+                pdf.cell(w_val, head_h, ch_pdf[:96], border=1, align="R", fill=True)
+                pdf.cell(w_bar, head_h, "Andamento annuale", border=1, align="L", fill=True)
+                pdf.ln(head_h)
+
+            _draw_header_agg()
+            for year_label, value in pdf_rows:
+                if pdf.get_y() > 278:
+                    pdf.add_page()
+                    _draw_header_agg()
+                pdf.set_x(x0)
+                pdf.set_font("Helvetica", "", 7.2)
+                pdf.set_text_color(0, 0, 0)
+                pdf.cell(w_year, row_h, str(year_label), border=1, align="L")
+                if value is None:
+                    pdf.set_text_color(80, 80, 80)
+                    pdf.cell(w_val, row_h, "-", border=1, align="R")
+                    pdf.cell(w_bar, row_h, "", border=1, align="L")
+                    pdf.ln(row_h)
+                    continue
+                pdf.set_text_color(0, 100, 0) if value > 0 else pdf.set_text_color(178, 34, 34) if value < 0 else pdf.set_text_color(0, 0, 0)
+                pdf.cell(w_val, row_h, _pdf_safe_text(_stat_cell_eur(value)), border=1, align="R")
+                bar_x = pdf.get_x()
+                bar_y = pdf.get_y()
+                pdf.set_text_color(0, 0, 0)
+                pdf.cell(w_bar, row_h, "", border=1, align="L")
+                if max_abs > 0 and value != 0:
+                    if value > 0:
+                        pdf.set_fill_color(46, 125, 50)
+                    else:
+                        pdf.set_fill_color(178, 34, 34)
+                    bw = max(1.5, float(abs(value) / max_abs) * (w_bar - 5.0))
+                    pdf.rect(bar_x + 2.0, bar_y + 1.2, bw, row_h - 2.4, style="F")
+                pdf.ln(row_h)
+
+            if pdf.get_y() > 278:
+                pdf.add_page()
+            pdf.set_x(x0)
+            pdf.set_font("Helvetica", "B", 7.4)
+            pdf.set_fill_color(240, 240, 240)
+            pdf.set_text_color(0, 0, 0)
+            pdf.cell(w_year, row_h, "TOTALE", border=1, align="L", fill=True)
+            pdf.set_text_color(0, 100, 0) if total > 0 else pdf.set_text_color(178, 34, 34) if total < 0 else pdf.set_text_color(0, 0, 0)
+            pdf.cell(w_val, row_h, _pdf_safe_text(_stat_cell_eur(total)), border=1, align="R", fill=True)
+            pdf.set_text_color(0, 0, 0)
+            pdf.cell(w_bar, row_h, "", border=1, align="L", fill=True)
+
+            fd, out_path = tempfile.mkstemp(suffix=".pdf", prefix="categorie_aggregate_anno_")
+            os.close(fd)
+            pdf.output(out_path)
+            _open_generated_pdf(out_path)
+            return True
+        except Exception:
+            return False
+
+    def _stat_print_aggregate_category_history_via_browser(intro_plain: str, needle: str) -> None:
+        data = _stat_aggregate_category_history_print_data(needle)
+        if data is None:
+            messagebox.showinfo("Stampa", "Nessun dato da stampare.", parent=root)
+            return
+        col_heading, rows_pdf, total, max_abs = data
+        trs: list[str] = []
+        for year_label, value in rows_pdf:
+            if value is None:
+                trs.append(f"<tr><td>{year_label}</td><td class='amt muted'>-</td><td></td></tr>")
+                continue
+            cls = "pos" if value > 0 else "neg" if value < 0 else "zero"
+            pct = 0 if max_abs <= 0 else max(1, int(abs(value) / max_abs * 100))
+            trs.append(
+                "<tr>"
+                f"<td>{year_label}</td>"
+                f"<td class='amt {cls}'>{html_module.escape(_stat_cell_eur(value))}</td>"
+                f"<td><div class='barwrap'><div class='bar {cls}' style='width:{pct}%'></div></div></td>"
+                "</tr>"
+            )
+        tcls = "pos" if total > 0 else "neg" if total < 0 else "zero"
+        trs.append(
+            "<tr class='tot'>"
+            "<td>TOTALE</td>"
+            f"<td class='amt {tcls}'>{html_module.escape(_stat_cell_eur(total))}</td>"
+            "<td></td>"
+            "</tr>"
+        )
+        intro_html = "<br/>".join(html_module.escape(line) for line in intro_plain.splitlines())
+        h1_txt = f"Categorie aggregate per anno — {needle}"
+        th2_esc = html_module.escape(col_heading)
+        html = f"""<!DOCTYPE html>
+<html lang="it"><head><meta charset="utf-8"/>
+<title>{html_module.escape(h1_txt)}</title>
+<style>
+body {{ font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 9mm; font-size: 8.4pt; }}
+h1 {{ font-size: 12pt; text-align: center; margin: 0 0 4px 0; }}
+.meta {{ text-align: center; font-size: 7.5pt; color: #333; margin-bottom: 8px; }}
+table {{ border-collapse: collapse; width: 142mm; margin: 0 auto; }}
+th:first-child, td:first-child {{ width: 14mm; }}
+th:nth-child(2), td:nth-child(2) {{ width: 37mm; }}
+th, td {{ border: 1px solid #999; padding: 2px 5px; line-height: 1.05; }}
+th {{ background: #e3f2fd; }}
+td.amt {{ text-align: right; white-space: nowrap; }}
+.pos {{ color: #2e7d32; }} .neg {{ color: #b22222; }} .zero {{ color: #222; }} .muted {{ color: #555; }}
+.barwrap {{ height: 8px; width: 100%; }}
+.bar {{ height: 8px; }}
+.bar.pos {{ background: #2e7d32; }} .bar.neg {{ background: #b22222; }} .bar.zero {{ background: #777; }}
+tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
+</style></head><body>
+<h1>{html_module.escape(h1_txt)}</h1>
+<div class="meta">{intro_html}</div>
+<table><thead><tr><th>Anno</th><th>{th2_esc}</th><th>Andamento annuale</th></tr></thead>
+<tbody>{''.join(trs)}</tbody></table>
+<script>window.addEventListener("load", function () {{ setTimeout(function () {{ window.print(); }}, 400); }});</script>
+</body></html>"""
+        _print_stat_via_browser(html)
+
     def _stat_refresh_category_history_choices() -> None:
         choices = _stat_category_history_available_categories()
         stat_history_category_cb.configure(values=choices)
@@ -22618,6 +25726,199 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             )
             return
         _stat_enter_category_history_mode()
+
+    def _stat_open_aggregate_categories_table() -> None:
+        """Somma delle categorie il cui nome (display) contiene la stringa — stesso periodo delle tabelle categoria."""
+        from tkinter import simpledialog
+
+        summary = _stat_category_summary_data()
+        if summary is None:
+            messagebox.showinfo("Categorie aggregate", "Scegli un periodo valido.", parent=root)
+            return
+        pos_l, neg_l, zero_names, annual, period_label, avg_divisor = summary
+        tot_pos = sum((v for _n, v in pos_l), Decimal("0"))
+        tot_neg = sum((v for _n, v in neg_l), Decimal("0"))
+        sums: dict[str, Decimal] = {}
+        for n, v in pos_l:
+            sums[n] = v
+        for n, v in neg_l:
+            sums[n] = v
+        for n in zero_names:
+            sums.setdefault(n, Decimal("0"))
+
+        raw = simpledialog.askstring(
+            "Categorie aggregate",
+            "Filtra le categorie il cui nome contiene (senza distinguere maiuscole/minuscole):",
+            parent=root,
+        )
+        if raw is None:
+            return
+        needle = str(raw).strip()
+        if not needle:
+            messagebox.showinfo("Categorie aggregate", "Immettere una stringa non vuota.", parent=root)
+            return
+        nl = needle.lower()
+        matched = [n for n in sums.keys() if nl in n.lower()]
+        agg = sum((sums[m] for m in matched), Decimal("0"))
+
+        top = tk.Toplevel(root)
+        top.title("Categorie aggregate")
+        try:
+            top.transient(root)
+            top.grab_set()
+        except tk.TclError:
+            pass
+        pad = ttk.Frame(top, padding=12)
+        pad.pack(fill=tk.BOTH, expand=True)
+
+        lbl_top = (
+            f"Periodo: {period_label} — somma delle categorie con «{needle}» nel nome"
+            + (f" ({len(matched)} categorie)." if matched else ".")
+        )
+        ttk.Label(pad, text=lbl_top, wraplength=520).pack(anchor=tk.W, pady=(0, 8))
+        pct_heading = "% sul totale positive"
+        if agg < 0:
+            pct_heading = "% sul totale negative"
+        elif agg == 0:
+            pct_heading = "% sul tot."
+        cols = ("lab", "val", "pct") + (("avg",) if annual else ())
+        headings = ("Aggregato", "Valore", pct_heading) + (("Media mensile",) if annual else ())
+        tv = ttk.Treeview(
+            pad,
+            columns=cols,
+            show="headings",
+            selectmode="none",
+            height=2,
+            style="StatCdc.Treeview",
+        )
+        for cid, hd in zip(cols, headings):
+            anchor = tk.W if cid == "lab" else tk.E
+            tv.heading(cid, text=hd, anchor=anchor)
+            wlab = 300 if cid == "lab" else 165
+            tv.column(cid, width=wlab, minwidth=60, anchor=anchor, stretch=False)
+        tv.tag_configure("statpos", foreground=COLOR_AMOUNT_POS)
+        tv.tag_configure("statneg", foreground=COLOR_AMOUNT_NEG)
+        tv.tag_configure("statzero", foreground="#333333")
+        pct_s = _stat_format_pct_category(agg, tot_pos if agg > 0 else tot_neg) if agg != 0 else "—"
+        if agg > 0 and tot_pos == 0:
+            pct_s = "—"
+        elif agg < 0 and tot_neg == 0:
+            pct_s = "—"
+        vals: tuple[str, ...] = (
+            "Σ «" + needle + "»",
+            _stat_cell_eur(agg),
+            pct_s,
+        )
+        if annual:
+            vals += (
+                _stat_cell_eur((agg / avg_divisor).quantize(Decimal("0.01"))) if agg != 0 else "",
+            )
+        row_tag = _stat_tag_from_delta(agg)
+        tv.insert("", tk.END, values=vals, tags=(row_tag,))
+        tv.pack(anchor=tk.W, fill=tk.X, pady=(0, 8))
+
+        bf = ttk.Frame(pad)
+        bf.pack(anchor=tk.E)
+        ttk.Button(bf, text="Chiudi", command=top.destroy).pack(side=tk.RIGHT)
+
+    def _stat_open_aggregate_category_history_table() -> None:
+        """Somma categorie per anno (nome contiene stringa). Stesso algoritmo della tabella «Categorie per anno» per tipologia categorie aggregate."""
+        from tkinter import simpledialog
+
+        if not bool(stat_category_history_mode.get()):
+            return
+        raw = simpledialog.askstring(
+            "Categorie aggregate",
+            "Filtra le categorie il cui nome contiene (senza distinguere maiuscole/minuscole):",
+            parent=root,
+        )
+        if raw is None:
+            return
+        needle = str(raw).strip()
+        if not needle:
+            messagebox.showinfo("Categorie aggregate", "Immettere una stringa non vuota.", parent=root)
+            return
+        heads, rows, needle_ok = _stat_category_history_aggregate_rows_for_needle(needle)
+        if not needle_ok or not rows:
+            if needle_ok:
+                messagebox.showinfo(
+                    "Categorie aggregate",
+                    "Nessun anno con dati disponibili nel database.",
+                    parent=root,
+                )
+            return
+        top = tk.Toplevel(root)
+        top.title("Categorie aggregate per anno")
+        try:
+            top.transient(root)
+            top.grab_set()
+        except tk.TclError:
+            pass
+        pad = ttk.Frame(top, padding=12)
+        pad.pack(fill=tk.BOTH, expand=True)
+
+        lbl_top = (
+            f'Somma per anno di tutte le categorie il cui nome contiene «{needle_ok}» '
+            '(stessi anni e indicatori della vista «Categorie per anno»).'
+        )
+        ttk.Label(pad, text=lbl_top, wraplength=560).pack(anchor=tk.W, pady=(0, 8))
+
+        box = ttk.Frame(pad)
+        tv = ttk.Treeview(
+            box,
+            columns=("year", "value", "bar"),
+            show="headings",
+            height=min(max(8, len(rows)), 22),
+            selectmode="none",
+            style="StatHistoryCdc.Treeview",
+        )
+        vsb = ttk.Scrollbar(box, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=vsb.set)
+        tv.heading("year", text=heads[0], anchor=tk.W)
+        tv.heading("value", text=heads[1], anchor=tk.E)
+        tv.heading("bar", text=heads[2], anchor=tk.W)
+        tv.column("year", width=72, minwidth=62, stretch=False, anchor=tk.W)
+        tv.column("value", width=165, minwidth=140, stretch=False, anchor=tk.E)
+        tv.column("bar", width=430, minwidth=260, stretch=True, anchor=tk.W)
+        tv.tag_configure("statpos", foreground=COLOR_AMOUNT_POS)
+        tv.tag_configure("statneg", foreground=COLOR_AMOUNT_NEG)
+        tv.tag_configure("statzero", foreground="#333333")
+        tv.tag_configure("stattotal", font=(_stat_ffam, _stat_fsz, "bold"), foreground="#111111")
+
+        tv.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        box.columnconfigure(0, weight=1)
+        box.rowconfigure(0, weight=1)
+        box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        for year_label, value_label, bar_label in rows:
+            if year_label == "Totale":
+                tv.insert("", tk.END, values=("Σ TOTALE", value_label, bar_label), tags=("stattotal",))
+                continue
+            tag = "statzero"
+            if value_label != "—":
+                try:
+                    v = parse_amount(value_label.replace("€", "").strip())
+                    tag = "statpos" if v > 0 else "statneg" if v < 0 else "statzero"
+                except Exception:
+                    tag = "statzero"
+            tv.insert("", tk.END, values=(year_label, value_label, bar_label), tags=(tag,))
+
+        bf = ttk.Frame(pad)
+        bf.pack(anchor=tk.E)
+
+        def _print_aggregate_category_history_sheet() -> None:
+            dd = cur_db()
+            intro_plain = (
+                f"{print_user_header_text(dd, session_holder[0])} — {to_italian_date(date.today().isoformat())}\n"
+                f"{_linea_data_ora_stampa()}"
+            )
+            if _stat_print_aggregate_category_history_table(intro_plain, needle_ok):
+                return
+            _stat_print_aggregate_category_history_via_browser(intro_plain, needle_ok)
+
+        ttk.Button(bf, text="Stampa…", command=_print_aggregate_category_history_sheet).pack(side=tk.RIGHT, padx=(0, 8))
+        ttk.Button(bf, text="Chiudi", command=top.destroy).pack(side=tk.RIGHT)
 
     _STAT_TK_PRINT_RED = "#c62828"
     _STAT_TK_PRINT_RED_ACT = "#8e0000"
@@ -22715,6 +26016,58 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     stat_categories_by_year_btn.bind(
         "<Leave>", lambda _e: stat_categories_by_year_btn.configure(bg=_STAT_TK_BARS_BLUE)
     )
+
+    stat_aggregate_categories_btn = tk.Label(
+        stat_mode_actions,
+        text="Categorie aggregate",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=8,
+        pady=2,
+        bg=_STAT_TK_BARS_BLUE,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    stat_aggregate_categories_btn.bind(
+        "<Button-1>",
+        lambda _e: _stat_open_aggregate_categories_table(),
+    )
+    stat_aggregate_categories_btn.bind(
+        "<Enter>",
+        lambda _e: stat_aggregate_categories_btn.configure(bg=_STAT_TK_BARS_BLUE_ACT),
+    )
+    stat_aggregate_categories_btn.bind(
+        "<Leave>",
+        lambda _e: stat_aggregate_categories_btn.configure(bg=_STAT_TK_BARS_BLUE),
+    )
+
+    stat_aggregate_category_history_btn = tk.Label(
+        stat_mode_actions,
+        text="Categorie aggregate",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=8,
+        pady=2,
+        bg=_STAT_TK_BARS_BLUE,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    stat_aggregate_category_history_btn.bind(
+        "<Button-1>",
+        lambda _e: _stat_open_aggregate_category_history_table(),
+    )
+    stat_aggregate_category_history_btn.bind(
+        "<Enter>",
+        lambda _e: stat_aggregate_category_history_btn.configure(bg=_STAT_TK_BARS_BLUE_ACT),
+    )
+    stat_aggregate_category_history_btn.bind(
+        "<Leave>",
+        lambda _e: stat_aggregate_category_history_btn.configure(bg=_STAT_TK_BARS_BLUE),
+    )
     stat_history_category_cb.bind("<<ComboboxSelected>>", lambda _e: _stat_refresh_category_history_table())
 
     def _stat_config_report_button(btn: tk.Label, *, selected: bool, active: bool = False) -> None:
@@ -22776,11 +26129,27 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 stat_bars_flussi_btn.pack_forget()
                 if history_mode:
                     stat_category_chart_btn.pack_forget()
-                elif not stat_category_chart_btn.winfo_ismapped():
+                    stat_aggregate_categories_btn.pack_forget()
+                    if not stat_aggregate_category_history_btn.winfo_ismapped():
+                        stat_aggregate_category_history_btn.pack(
+                            side=tk.LEFT,
+                            padx=(0, 8),
+                            after=stat_categories_by_year_btn,
+                        )
+                else:
+                    stat_aggregate_category_history_btn.pack_forget()
+                if not history_mode and not stat_category_chart_btn.winfo_ismapped():
                     stat_category_chart_btn.pack(side=tk.LEFT, padx=(0, 8), after=stat_print_btn)
                 if not stat_categories_by_year_btn.winfo_ismapped():
                     after_btn = stat_print_btn if history_mode else stat_category_chart_btn
                     stat_categories_by_year_btn.pack(side=tk.LEFT, padx=(0, 8), after=after_btn)
+                if not history_mode:
+                    if not stat_aggregate_categories_btn.winfo_ismapped():
+                        stat_aggregate_categories_btn.pack(
+                            side=tk.LEFT,
+                            padx=(0, 8),
+                            after=stat_categories_by_year_btn,
+                        )
             except tk.TclError:
                 pass
             try:
@@ -22801,6 +26170,8 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         try:
             stat_category_chart_btn.pack_forget()
             stat_categories_by_year_btn.pack_forget()
+            stat_aggregate_categories_btn.pack_forget()
+            stat_aggregate_category_history_btn.pack_forget()
             if not stat_bars_btn.winfo_ismapped():
                 stat_bars_btn.pack(side=tk.LEFT, padx=(0, 8), after=stat_print_btn)
             if not stat_bars_flussi_btn.winfo_ismapped():
@@ -22835,7 +26206,1399 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     stat_report_mode.trace_add("write", _stat_apply_report_mode)
     _stat_apply_report_mode()
 
-    ttk.Label(budget_frame, text="Pagina in preparazione").pack(anchor=tk.W)
+    # ----- Budget: tabellone annuale (movimenti reali vs budget modificabile) -----
+    _bud_top_fr = ttk.Frame(budget_frame, style="MovCdc.TFrame")
+    _bud_top_fr.pack(anchor=tk.W, fill=tk.X, pady=(0, 6))
+    ttk.Label(_bud_top_fr, text="Anno di riferimento:", style="MovCdc.TLabel").pack(side=tk.LEFT)
+    _bud_year_candidates = sorted(
+        {int(yb["year"]) for yb in (db_holder[0].get("years") or []) if yb.get("year") is not None},
+        key=int,
+    )
+    if not _bud_year_candidates:
+        _bud_year_candidates = [date.today().year]
+    _bud_default_year = PLAN_REFERENCE_YEAR if PLAN_REFERENCE_YEAR in _bud_year_candidates else _bud_year_candidates[-1]
+    migrate_ensure_budget_ui_prefs(db_holder[0])
+    _bud_pref_last = budget_prefs_get_last_saved_snapshot(db_holder[0])
+    if _bud_pref_last is not None:
+        _ply, _pnm = _bud_pref_last
+        if _ply in _bud_year_candidates and _pnm in budget_snapshot_names_for_year(db_holder[0], _ply):
+            budget_snapshot_load(db_holder[0], _ply, _pnm)
+            _bud_default_year = _ply
+    budget_year_var = tk.StringVar(value=str(_bud_default_year))
+    budget_year_cb = ttk.Combobox(
+        _bud_top_fr,
+        textvariable=budget_year_var,
+        width=7,
+        state="readonly",
+        values=[str(y) for y in _bud_year_candidates],
+    )
+    budget_year_cb.pack(side=tk.LEFT, padx=(8, 0))
+    ttk.Label(
+        _bud_top_fr,
+        text="Doppio clic su «BUD» per modificare un mese. Tasto destro sulla riga: uguale budget mensile (media su 12) o grafico.",
+        style="MovCdc.TLabel",
+        font=("TkDefaultFont", 10),
+    ).pack(side=tk.LEFT, padx=(16, 0))
+
+    _bud_bar_actions = tk.Frame(_bud_top_fr, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
+    _bud_bar_actions.pack(side=tk.RIGHT, padx=(8, 0))
+
+    def _bud_current_year_int() -> int:
+        try:
+            return int(str(budget_year_var.get()).strip())
+        except (TypeError, ValueError):
+            return int(_bud_default_year)
+
+    def _bud_snapshot_year_branch_for_print(mode: str, snap_name: str | None) -> dict | None:
+        y = _bud_current_year_int()
+        if mode == "live":
+            return None
+        if mode == "original":
+            return {}
+        if mode == "snapshot" and (snap_name or "").strip():
+            bsnap = cur_db().get("budget_snapshots")
+            if isinstance(bsnap, dict):
+                ysn = bsnap.get(str(y))
+                if isinstance(ysn, dict):
+                    data = ysn.get((snap_name or "").strip())
+                    if isinstance(data, dict):
+                        return copy.deepcopy(data)
+        raise ValueError("Scenario non valido.")
+
+    def _bud_after_budget_mutation() -> None:
+        persist_db_after_edit(None, refresh_movements=False)
+
+    def _bud_snap_save_dlg() -> None:
+        from tkinter import simpledialog
+
+        y = _bud_current_year_int()
+        nm = simpledialog.askstring(
+            "Salva scenario budget",
+            "Nome dello scenario (salva le regolazioni manuali attuali dell’anno selezionato):",
+            parent=root,
+            initialvalue=f"{y} - ",
+        )
+        if nm is None:
+            return
+        ok, err = budget_snapshot_save(cur_db(), y, nm.strip())
+        if not ok and err.startswith("Esiste"):
+            if not messagebox.askyesno(
+                "Scenario",
+                f"{err}\nSostituire il salvataggio esistente?",
+                parent=root,
+            ):
+                return
+            ok, err = budget_snapshot_save(cur_db(), y, nm.strip(), overwrite=True)
+        if not ok:
+            messagebox.showwarning("Scenario", err, parent=root)
+            return
+        _bud_after_budget_mutation()
+        messagebox.showinfo("Scenario", f"Scenario «{nm.strip()}» salvato.", parent=root)
+
+    def _bud_snap_load_dlg() -> None:
+        y = _bud_current_year_int()
+        names = budget_snapshot_names_for_year(cur_db(), y)
+        if not names:
+            messagebox.showinfo("Scenario", "Nessuno scenario salvato per questo anno.", parent=root)
+            return
+        top = tk.Toplevel(root)
+        top.title(f"Applica scenario budget — anno {y}")
+        top.transient(root)
+        try:
+            top.grab_set()
+        except tk.TclError:
+            pass
+        frm = ttk.Frame(top, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            frm,
+            text=f"Anno contabile: {y}. Scegli lo scenario da applicare al budget (le regolazioni salvate).",
+            wraplength=420,
+        ).pack(anchor=tk.W)
+        r = ttk.Frame(frm)
+        r.pack(fill=tk.X, pady=(10, 4))
+        ttk.Label(r, text="Scenario:").pack(side=tk.LEFT)
+        cb = ttk.Combobox(r, width=36, state="readonly", values=names)
+        cb.pack(side=tk.LEFT, padx=(8, 0), fill=tk.X, expand=True)
+        cb.current(0)
+
+        def on_ap() -> None:
+            ix = cb.current()
+            if ix < 0 or ix >= len(names):
+                messagebox.showwarning("Scenario", "Seleziona uno scenario dall’elenco.", parent=top)
+                return
+            nm = names[ix]
+            ok, err = budget_snapshot_load(cur_db(), y, nm)
+            if not ok:
+                messagebox.showerror("Scenario", err, parent=top)
+                return
+            top.destroy()
+            _budget_refresh_grid()
+            _bud_after_budget_mutation()
+
+        bf = ttk.Frame(frm)
+        bf.pack(fill=tk.X, pady=(12, 0))
+        ttk.Button(bf, text="Annulla", command=top.destroy).pack(side=tk.RIGHT)
+        ttk.Button(bf, text="Applica", command=on_ap).pack(side=tk.RIGHT, padx=(0, 8))
+
+    def _bud_snap_delete_dlg() -> None:
+        y = _bud_current_year_int()
+        names = budget_snapshot_names_for_year(cur_db(), y)
+        if not names:
+            messagebox.showinfo("Scenario", "Nessuno scenario da eliminare.", parent=root)
+            return
+        top = tk.Toplevel(root)
+        top.title(f"Elimina scenario budget — anno {y}")
+        top.transient(root)
+        try:
+            top.grab_set()
+        except tk.TclError:
+            pass
+        frm = ttk.Frame(top, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            frm,
+            text=(
+                f"Anno contabile: {y}. Rimuove lo scenario dall’archivio. "
+                "Se il budget mostrato coincide con quello salvato, dopo conferma verrà ripristinato il budget di base."
+            ),
+            wraplength=420,
+        ).pack(anchor=tk.W)
+        r = ttk.Frame(frm)
+        r.pack(fill=tk.X, pady=(10, 4))
+        ttk.Label(r, text="Scenario:").pack(side=tk.LEFT)
+        cb = ttk.Combobox(r, width=36, state="readonly", values=names)
+        cb.pack(side=tk.LEFT, padx=(8, 0), fill=tk.X, expand=True)
+        cb.current(0)
+
+        def on_del() -> None:
+            ix = cb.current()
+            if ix < 0 or ix >= len(names):
+                messagebox.showwarning("Scenario", "Seleziona uno scenario dall’elenco.", parent=top)
+                return
+            nm = names[ix]
+            if not messagebox.askyesno(
+                "Scenario",
+                f"Eliminare lo scenario «{nm}» dall’archivio?",
+                parent=top,
+            ):
+                return
+            db = cur_db()
+            matches_screen = budget_named_snapshot_matches_current_sheet(db, y, nm)
+            if matches_screen:
+                if not messagebox.askyesno(
+                    "Scenario",
+                    "Il budget attualmente mostrato coincide con questo scenario.\n\n"
+                    "Dopo l’eliminazione dall’archivio verrà applicato il budget di base: "
+                    "ogni mese torna uguale ai movimenti dello stesso mese dell’anno precedente "
+                    "(come «Ripristina budget di base»).\n\n"
+                    "Continuare?",
+                    parent=top,
+                ):
+                    return
+            ok, err = budget_snapshot_delete(db, y, nm)
+            if not ok:
+                messagebox.showerror("Scenario", err, parent=top)
+                return
+            top.destroy()
+            if matches_screen:
+                budget_clear_all_overrides_for_year(db, y)
+                _budget_refresh_grid()
+            _bud_after_budget_mutation()
+
+        bf = ttk.Frame(frm)
+        bf.pack(fill=tk.X, pady=(12, 0))
+        ttk.Button(bf, text="Annulla", command=top.destroy).pack(side=tk.RIGHT)
+        ttk.Button(bf, text="Elimina", command=on_del).pack(side=tk.RIGHT, padx=(0, 8))
+
+    def _bud_reset_original() -> None:
+        y = _bud_current_year_int()
+        if not messagebox.askyesno(
+            "Budget",
+            "Ripristinare il budget di base per questo anno?\n"
+            "(Ogni cella budget torna uguale ai movimenti dello stesso mese dell’anno precedente; "
+            "si perdono le regolazioni manuali non salvate come scenario.)",
+            parent=root,
+        ):
+            return
+        budget_clear_all_overrides_for_year(cur_db(), y)
+        _budget_refresh_grid()
+        _bud_after_budget_mutation()
+
+    def _bud_print_dlg() -> None:
+        y = _bud_current_year_int()
+        names = budget_snapshot_names_for_year(cur_db(), y)
+        top = tk.Toplevel(root)
+        top.title(f"Stampa tabellone budget — anno {y} (PDF A4)")
+        top.transient(root)
+        try:
+            top.grab_set()
+        except tk.TclError:
+            pass
+        frm = ttk.Frame(top, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            frm,
+            text=(
+                f"Anno contabile: {y}. "
+                "Movimenti e differenze nel PDF riflettono sempre i dati attuali nel database; "
+                "solo le colonne budget seguono l’opzione sotto (incluso uno scenario salvato)."
+            ),
+            wraplength=480,
+        ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
+        mode_var = tk.StringVar(value="live")
+        ttk.Label(frm, text="Contenuto:").grid(row=1, column=0, sticky=tk.NW)
+        r0 = ttk.Frame(frm)
+        r0.grid(row=1, column=1, sticky=tk.W, padx=(8, 0))
+        ttk.Radiobutton(r0, text="Situazione attuale nel database", variable=mode_var, value="live").pack(anchor=tk.W)
+        ttk.Radiobutton(
+            r0,
+            text="Budget di base (stesso mese dell’anno precedente, senza regole manuali)",
+            variable=mode_var,
+            value="original",
+        ).pack(anchor=tk.W)
+        snap_frame = ttk.Frame(r0)
+        snap_frame.pack(anchor=tk.W, fill=tk.X)
+        ttk.Radiobutton(snap_frame, text="Scenario salvato:", variable=mode_var, value="snapshot").pack(side=tk.LEFT)
+        snap_cb = ttk.Combobox(snap_frame, width=28, state="readonly", values=names or ["—"])
+        snap_cb.pack(side=tk.LEFT, padx=(6, 0))
+        if names:
+            snap_cb.current(0)
+        else:
+            snap_cb.set("—")
+
+        def on_gen() -> None:
+            mode = mode_var.get()
+            sn = (snap_cb.get() or "").strip()
+            if mode == "snapshot" and (not names or sn in ("—", "")):
+                messagebox.showwarning("Stampa", "Seleziona uno scenario salvato.", parent=top)
+                return
+            try:
+                ym_part = _bud_snapshot_year_branch_for_print(
+                    mode,
+                    sn if mode == "snapshot" else None,
+                )
+            except ValueError as exc:
+                messagebox.showerror("Stampa", str(exc), parent=top)
+                return
+            title = f"Budget — anno {y}"
+            if mode == "original":
+                title += " (budget di base)"
+            elif mode == "snapshot":
+                title += f" (scenario «{sn}»)"
+            try:
+                fd, pdf_path = tempfile.mkstemp(prefix="conti_budget_tab_", suffix=".pdf", dir=tempfile.gettempdir())
+                os.close(fd)
+                budget_export_tabellone_pdf(
+                    cur_db(),
+                    y,
+                    pdf_path,
+                    title_line=title,
+                    ym_override=ym_part,
+                )
+                _open_generated_pdf(str(Path(pdf_path).resolve()))
+                top.destroy()
+            except Exception as exc:
+                messagebox.showerror("Stampa", str(exc), parent=top)
+
+        bf = ttk.Frame(frm)
+        bf.grid(row=2, column=0, columnspan=2, pady=(14, 0), sticky=tk.EW)
+        ttk.Button(bf, text="Chiudi", command=top.destroy).pack(side=tk.RIGHT)
+        ttk.Button(bf, text="Genera PDF", command=on_gen).pack(side=tk.RIGHT, padx=(0, 8))
+
+    def _bud_open_scenario_menu(event: tk.Event | None = None) -> None:
+        m = tk.Menu(root, tearoff=0)
+        m.add_command(label="Salva situazione con nome…", command=_bud_snap_save_dlg)
+        m.add_command(label="Applica scenario salvato…", command=_bud_snap_load_dlg)
+        m.add_command(label="Elimina scenario…", command=_bud_snap_delete_dlg)
+        m.add_separator()
+        m.add_command(label="Ripristina budget di base (anno prec.)", command=_bud_reset_original)
+        try:
+            if event is not None and getattr(event, "x_root", None) is not None:
+                m.tk_popup(int(event.x_root), int(event.y_root) + 4)
+            else:
+                x = _bud_scen_btn.winfo_rootx()
+                y = _bud_scen_btn.winfo_rooty() + _bud_scen_btn.winfo_height()
+                m.tk_popup(x, y)
+        finally:
+            m.grab_release()
+
+    _BUD_BTN_SCEN_BG, _BUD_BTN_SCEN_BG_ACT = "#1565c0", "#0d47a1"
+    _BUD_BTN_TABC_BG, _BUD_BTN_TABC_BG_ACT = "#00695c", "#004d40"
+    _BUD_BTN_SINT_BG, _BUD_BTN_SINT_BG_ACT = "#6a1b9a", "#4a148c"
+    _BUD_BTN_PDFT_BG, _BUD_BTN_PDFT_BG_ACT = "#c62828", "#8e0000"
+    _BUD_BTN_PDFS_BG, _BUD_BTN_PDFS_BG_ACT = "#e65100", "#bf360c"
+
+    def _bud_wire_lbl_btn(w: tk.Label, bg: str, bg_act: str) -> None:
+        def _en(_e: tk.Event | None = None) -> None:
+            w.configure(bg=bg_act)
+
+        def _lv(_e: tk.Event | None = None) -> None:
+            w.configure(bg=bg)
+
+        w.bind("<Enter>", _en)
+        w.bind("<Leave>", _lv)
+
+    _bud_pdf_tab_btn = tk.Label(
+        _bud_bar_actions,
+        text="Stampa tabellone",
+        bg=_BUD_BTN_PDFT_BG,
+        fg="#ffffff",
+        font=("TkDefaultFont", 10),
+        padx=12,
+        pady=5,
+        cursor="hand2",
+        relief=tk.RAISED,
+        bd=1,
+        highlightthickness=0,
+    )
+    _bud_wire_lbl_btn(_bud_pdf_tab_btn, _BUD_BTN_PDFT_BG, _BUD_BTN_PDFT_BG_ACT)
+    _bud_pdf_tab_btn.bind("<Button-1>", lambda _e: _bud_print_dlg())
+
+    lbl_budget_heading = tk.Label(
+        budget_frame,
+        text="",
+        bg=MOVIMENTI_PAGE_BG,
+        fg="#0d47a1",
+        anchor=tk.W,
+        justify=tk.LEFT,
+        font=("TkDefaultFont", 11, "bold"),
+        wraplength=920,
+    )
+    lbl_budget_heading.pack(anchor=tk.W, fill=tk.X, pady=(0, 4))
+
+    _bud_body = ttk.Frame(budget_frame, style="MovCdc.TFrame")
+    _bud_body.pack(fill=tk.BOTH, expand=True)
+
+    _bud_grid_outer = ttk.Frame(_bud_body, style="MovCdc.TFrame")
+
+    _bud_summary_wrap = tk.Frame(_bud_body, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
+    _bud_summ_canvas = tk.Canvas(
+        _bud_summary_wrap,
+        highlightthickness=0,
+        bg=MOVIMENTI_PAGE_BG,
+        takefocus=True,
+    )
+    _bud_summ_scroll = ttk.Scrollbar(_bud_summary_wrap, orient=tk.VERTICAL, command=_bud_summ_canvas.yview)
+    _bud_summ_canvas.configure(yscrollcommand=_bud_summ_scroll.set)
+    _bud_summ_inner = ttk.Frame(_bud_summ_canvas, style="MovCdc.TFrame")
+    _bud_summ_canvas_win = _bud_summ_canvas.create_window((0, 0), window=_bud_summ_inner, anchor=tk.NW)
+    _bud_summary_load_seq: list[int] = [0]
+
+    def _bud_summ_resize(_event: tk.Event | None = None) -> None:
+        try:
+            cw = max(320, int(_bud_summ_canvas.winfo_width()))
+            _bud_summ_canvas.itemconfigure(_bud_summ_canvas_win, width=cw)
+        except tk.TclError:
+            return
+        _bud_summ_canvas.configure(scrollregion=_bud_summ_canvas.bbox("all"))
+
+    _bud_summ_inner.bind("<Configure>", lambda _e: _bud_summ_resize())
+    _bud_summ_canvas.bind("<Configure>", lambda _e: _bud_summ_resize())
+
+    def _bud_summ_wheel(_event: tk.Event) -> None:
+        if platform.system() == "Darwin":
+            d = int(getattr(_event, "delta", 0) or 0)
+            if d:
+                steps = max(-25, min(25, int(round(-d / 40.0))))
+                if steps == 0:
+                    steps = -1 if d > 0 else 1
+                _bud_summ_canvas.yview_scroll(steps, "units")
+        elif getattr(_event, "num", None) == 4:
+            _bud_summ_canvas.yview_scroll(-5, "units")
+        elif getattr(_event, "num", None) == 5:
+            _bud_summ_canvas.yview_scroll(5, "units")
+
+    def _bud_summ_wheel_route(_event: tk.Event) -> str:
+        _bud_summ_wheel(_event)
+        return "break"
+
+    def _bud_summ_bind_wheel_recursive(w: tk.Misc) -> None:
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            try:
+                w.bind(seq, _bud_summ_wheel_route)
+            except tk.TclError:
+                pass
+        try:
+            for ch in w.winfo_children():
+                _bud_summ_bind_wheel_recursive(ch)
+        except tk.TclError:
+            pass
+
+    _bud_summary_wrap.bind("<Enter>", lambda _e: _bud_summ_canvas.focus_set())
+
+    _bud_view_mode: list[str] = ["tabellone"]
+
+    def _bud_pack_section_tree(
+        parent: tk.Misc,
+        section_title: str,
+        heads: list[str],
+        rows: list[list[str]],
+        *,
+        period_col_width: int,
+        value_col_width: int,
+    ) -> None:
+        ttk.Label(parent, text=section_title, style="MovCdc.TLabel", font=("TkDefaultFont", 10, "bold")).pack(
+            anchor=tk.W, pady=(10, 4)
+        )
+        col_ids = tuple(f"budSy{i}" for i in range(len(heads)))
+        # Altezza visibile in righe dati (cap 18). Con cap 10 la tab. 2 con «Inizio anno» + 12 mesi mostrava solo fino a settembre.
+        htree = max(4, min(18, len(rows)))
+        table_box = ttk.Frame(parent, style="MovCdc.TFrame")
+        table_box.pack(fill=tk.X, expand=False)
+        _hdr_bg = (_stat_sty.lookup("Treeview.Heading", "background") or "").strip() or "#e8e8e8"
+        _hdr_fg = (_stat_sty.lookup("Treeview.Heading", "foreground") or "").strip() or "#000000"
+        _hdr_sep = "#c4c4c4"
+        _hdr_font = (_stat_ffam, max(8, _stat_fsz - 1), "bold")
+        hdr_bar = tk.Frame(table_box, bg=_hdr_sep, highlightthickness=0)
+        hdr_bar.pack(fill=tk.X)
+        for i, head in enumerate(heads):
+            w = period_col_width if i == 0 else value_col_width
+            ha = tk.W if i == 0 else tk.E
+            ju = tk.LEFT if i == 0 else tk.RIGHT
+            pad_left = 1 if i > 0 else 0
+            tk.Label(
+                hdr_bar,
+                text=head,
+                bg=_hdr_bg,
+                fg=_hdr_fg,
+                font=_hdr_font,
+                anchor=ha,
+                justify=ju,
+                padx=6,
+                pady=7,
+                wraplength=max(40, w - 14),
+                highlightthickness=0,
+            ).grid(row=0, column=i, sticky="nsew", padx=(pad_left, 0), pady=(0, 1))
+            hdr_bar.columnconfigure(i, minsize=w, weight=0)
+        tv = ttk.Treeview(
+            table_box,
+            columns=col_ids,
+            show="headings",
+            selectmode="none",
+            height=htree,
+            style="BudSumm.Treeview",
+        )
+        for i, cid in enumerate(col_ids):
+            ha = tk.W if i == 0 else tk.E
+            tv.heading(cid, text=" ", anchor=ha)
+            w = period_col_width if i == 0 else value_col_width
+            tv.column(cid, width=w, anchor=ha, stretch=False)
+        for r in rows:
+            tv.insert("", tk.END, values=tuple(r))
+        tv.pack(fill=tk.BOTH, expand=False)
+
+    def _bud_refresh_summary_view() -> None:
+        if _bud_view_mode[0] != "sintesi":
+            return
+        _bud_summary_load_seq[0] += 1
+        seq_run = _bud_summary_load_seq[0]
+        for _ch in _bud_summ_inner.winfo_children():
+            _ch.destroy()
+        ttk.Label(
+            _bud_summ_inner,
+            text="Caricamento sintesi…",
+            style="MovCdc.TLabel",
+            font=("TkDefaultFont", 10),
+        ).pack(anchor=tk.W, pady=12)
+        _bud_summ_resize()
+        _bud_summ_bind_wheel_recursive(_bud_summ_inner)
+
+        def _bud_summary_body_after_payload() -> None:
+            if _bud_view_mode[0] != "sintesi" or seq_run != _bud_summary_load_seq[0]:
+                return
+            y_now = _bud_current_year_int()
+            try:
+                pl = budget_summary_payload(cur_db(), y_now, ym_override=None)
+            except Exception as exc:
+                for _ch in _bud_summ_inner.winfo_children():
+                    _ch.destroy()
+                ttk.Label(_bud_summ_inner, text=f"Sintesi: {exc!s}", style="MovCdc.TLabel").pack(anchor=tk.W, pady=8)
+                _bud_summ_resize()
+                _bud_summ_bind_wheel_recursive(_bud_summ_inner)
+                return
+            if _bud_view_mode[0] != "sintesi" or seq_run != _bud_summary_load_seq[0]:
+                return
+            for _ch in _bud_summ_inner.winfo_children():
+                _ch.destroy()
+            if pl is None:
+                ttk.Label(_bud_summ_inner, text="Nessuna categoria in uso per l’anno selezionato.", style="MovCdc.TLabel").pack(
+                    anchor=tk.W, pady=8
+                )
+                _bud_summ_resize()
+                _bud_summ_bind_wheel_recursive(_bud_summ_inner)
+                return
+            btn_pdf_s = tk.Label(
+                _bud_summ_inner,
+                text="Stampa sintesi PDF…",
+                bg=_BUD_BTN_PDFS_BG,
+                fg="#ffffff",
+                font=("TkDefaultFont", 10),
+                padx=12,
+                pady=5,
+                cursor="hand2",
+                relief=tk.RAISED,
+                bd=1,
+                highlightthickness=0,
+            )
+            _bud_wire_lbl_btn(btn_pdf_s, _BUD_BTN_PDFS_BG, _BUD_BTN_PDFS_BG_ACT)
+            btn_pdf_s.bind("<Button-1>", lambda _e: _bud_print_summary_dlg())
+            btn_pdf_s.pack(anchor=tk.W, pady=(0, 8))
+            _bud_pack_section_tree(
+                _bud_summ_inner,
+                "1) MOVIMENTI — mensile e cumulo",
+                pl["h1"],
+                pl["rows1"],
+                period_col_width=128,
+                value_col_width=140,
+            )
+            _bud_pack_section_tree(
+                _bud_summ_inner,
+                "2) SALDI — inizio anno e mesi con movimenti",
+                pl["h2"],
+                pl["rows2"],
+                period_col_width=128,
+                value_col_width=140,
+            )
+            _bud_pack_section_tree(
+                _bud_summ_inner,
+                "3) ENTRATE / USCITE",
+                pl["h3"],
+                pl["rows3"],
+                period_col_width=320,
+                value_col_width=140,
+            )
+            _bud_summ_resize()
+            _bud_summ_bind_wheel_recursive(_bud_summ_inner)
+
+            def _bud_summary_chart_idle() -> None:
+                if _bud_view_mode[0] != "sintesi" or seq_run != _bud_summary_load_seq[0]:
+                    return
+                try:
+                    from matplotlib.figure import Figure
+                    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+                    fig = Figure(figsize=(7.5, 4.6), dpi=88)
+                    ax_a = fig.add_subplot(2, 1, 1)
+                    xs = list(range(1, 13))
+                    cm = pl["cum_mov"]
+                    cb = pl["cum_bud"]
+                    sa = pl["saldo_act"]
+                    sb = pl["saldo_bud"]
+                    mlab = list(pl["monthes_short"])
+                    ax_a.plot(xs, [float(cm[i]) for i in range(12)], "o-", color="#1565c0", label="Cumulo movimenti", linewidth=1.4)
+                    ax_a.plot(xs, [float(cb[i]) for i in range(12)], "s-", color="#2e7d32", label="Cumulo budget", linewidth=1.4)
+                    ax_a.axhline(0.0, color="#999999", linewidth=0.5)
+                    ax_a.set_xticks(xs)
+                    ax_a.set_xticklabels(mlab, fontsize=8, rotation=35, ha="right")
+                    ax_a.set_title("Da tab. 1 — cumulo rete mensile")
+                    ax_a.legend(loc="best", fontsize=8)
+                    ax_a.grid(True, alpha=0.3)
+                    ax_b = fig.add_subplot(2, 1, 2)
+                    ax_b.plot(xs, [float(sa[i]) for i in range(12)], "o-", color="#c62828", label="Saldo assoluto consolidato", linewidth=1.4)
+                    ax_b.plot(xs, [float(sb[i]) for i in range(12)], "s--", color="#6a1b9a", label="Previsto da budget", linewidth=1.4)
+                    ax_b.axhline(0.0, color="#999999", linewidth=0.5)
+                    ax_b.set_xticks(xs)
+                    ax_b.set_xticklabels(mlab, fontsize=8, rotation=35, ha="right")
+                    ax_b.set_title("Da tab. 2 — saldi a fine mese")
+                    ax_b.legend(loc="best", fontsize=8)
+                    ax_b.grid(True, alpha=0.3)
+                    fig.tight_layout()
+                    canv = FigureCanvasTkAgg(fig, master=_bud_summ_inner)
+                    canv.draw()
+                    canv.get_tk_widget().pack(fill=tk.BOTH, expand=True, pady=(8, 12))
+                except Exception as exc:
+                    ttk.Label(_bud_summ_inner, text=f"Grafico: {exc!s}", style="MovCdc.TLabel").pack(anchor=tk.W, pady=4)
+                _bud_summ_resize()
+                _bud_summ_bind_wheel_recursive(_bud_summ_inner)
+
+            root.after_idle(_bud_summary_chart_idle)
+
+        root.after(1, _bud_summary_body_after_payload)
+
+    def _bud_print_summary_dlg() -> None:
+        y = _bud_current_year_int()
+        title = budget_display_title_for_year(cur_db(), y)
+        try:
+            fd, pdf_path = tempfile.mkstemp(prefix="conti_budget_sintesi_", suffix=".pdf", dir=tempfile.gettempdir())
+            os.close(fd)
+            budget_export_summary_pdf(cur_db(), y, pdf_path, title_line=title, ym_override=None)
+            _open_generated_pdf(str(Path(pdf_path).resolve()))
+        except Exception as exc:
+            messagebox.showerror("Sintesi budget", str(exc), parent=root)
+
+    def _bud_show_tabellone() -> None:
+        _bud_view_mode[0] = "tabellone"
+        _bud_summary_wrap.pack_forget()
+        _bud_grid_outer.pack(fill=tk.BOTH, expand=True)
+        _bud_tab_btn.configure(relief=tk.SUNKEN, bd=2)
+        _bud_sin_btn.configure(relief=tk.RAISED, bd=1)
+        try:
+            _bud_summ_canvas.yview_moveto(0)
+        except tk.TclError:
+            pass
+
+    def _bud_show_sintesi() -> None:
+        _bud_view_mode[0] = "sintesi"
+        _bud_grid_outer.pack_forget()
+        _bud_summary_wrap.pack(fill=tk.BOTH, expand=True)
+        _bud_summ_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        _bud_summ_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        _bud_sin_btn.configure(relief=tk.SUNKEN, bd=2)
+        _bud_tab_btn.configure(relief=tk.RAISED, bd=1)
+        _bud_refresh_summary_view()
+
+    _bud_tab_btn = tk.Label(
+        _bud_bar_actions,
+        text="Tabellone",
+        bg=_BUD_BTN_TABC_BG,
+        fg="#ffffff",
+        font=("TkDefaultFont", 10, "bold"),
+        padx=12,
+        pady=5,
+        cursor="hand2",
+        relief=tk.SUNKEN,
+        bd=2,
+        highlightthickness=0,
+    )
+    _bud_wire_lbl_btn(_bud_tab_btn, _BUD_BTN_TABC_BG, _BUD_BTN_TABC_BG_ACT)
+    _bud_tab_btn.bind("<Button-1>", lambda _e: _bud_show_tabellone())
+    _bud_tab_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+    _bud_sin_btn = tk.Label(
+        _bud_bar_actions,
+        text="Sintesi",
+        bg=_BUD_BTN_SINT_BG,
+        fg="#ffffff",
+        font=("TkDefaultFont", 10, "bold"),
+        padx=12,
+        pady=5,
+        cursor="hand2",
+        relief=tk.RAISED,
+        bd=1,
+        highlightthickness=0,
+    )
+    _bud_wire_lbl_btn(_bud_sin_btn, _BUD_BTN_SINT_BG, _BUD_BTN_SINT_BG_ACT)
+    _bud_sin_btn.bind("<Button-1>", lambda _e: _bud_show_sintesi())
+    _bud_sin_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+    _bud_scen_btn = tk.Label(
+        _bud_bar_actions,
+        text="Scenari / ripristino",
+        bg=_BUD_BTN_SCEN_BG,
+        fg="#ffffff",
+        font=("TkDefaultFont", 10),
+        padx=12,
+        pady=5,
+        cursor="hand2",
+        relief=tk.RAISED,
+        bd=1,
+        highlightthickness=0,
+    )
+    _bud_wire_lbl_btn(_bud_scen_btn, _BUD_BTN_SCEN_BG, _BUD_BTN_SCEN_BG_ACT)
+    _bud_scen_btn.bind("<Button-1>", lambda e: _bud_open_scenario_menu(e))
+    _bud_scen_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+    _bud_pdf_tab_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+    _bud_grid_outer.pack(fill=tk.BOTH, expand=True)
+
+    # Griglia 2×2: angolo e intestazione fissa | corpo con bordo destro e barra H sotto il settore destro
+    _bud_grid_outer.columnconfigure(0, weight=0, minsize=0)
+    _bud_grid_outer.columnconfigure(1, weight=1)
+    _bud_grid_outer.columnconfigure(2, weight=0)
+    _bud_grid_outer.rowconfigure(0, weight=0)
+    _bud_grid_outer.rowconfigure(1, weight=1)
+    _bud_grid_outer.rowconfigure(2, weight=0)
+
+    _bud_col_names = tuple(f"bud_c{i}" for i in range(28))
+    _bud_heads: list[str] = [
+        "CATEGORIE",
+        "TOTALE",
+        "PARZIALE",
+        "DIFFERENZE",
+    ]
+    for _mf in _BUDGET_MONTH_FULL_IT:
+        _bud_heads.append(_mf)
+        _bud_heads.append("")
+
+    _bud_names_l = tuple(f"budL{i}" for i in range(4))
+    _bud_names_r = tuple(f"budR{i}" for i in range(24))
+    _bud_heads_l = _bud_heads[:4]
+    _bud_heads_r = _bud_heads[4:]
+    _bud_frozen_sub_r: tuple[str, ...] = tuple(
+        lab for _ in range(12) for lab in ("MOVIMENTI", "BUDGET")
+    )
+
+    def _bud_apply_col_config(
+        tv: ttk.Treeview,
+        names: tuple[str, ...],
+        heads: list[str],
+        *,
+        left: bool,
+        right_cols_anchor: str,
+    ) -> None:
+        for _i, _cid in enumerate(names):
+            h = heads[_i]
+            if left:
+                if _i == 0:
+                    tv.heading(_cid, text=h, anchor=tk.W)
+                else:
+                    tv.heading(_cid, text=h, anchor=tk.CENTER)
+            elif h:
+                tv.heading(_cid, text=h, anchor=tk.E)
+            else:
+                tv.heading(_cid, text=h)
+            if left and _i == 0:
+                tv.column(_cid, width=200, minwidth=100, stretch=True, anchor=tk.W)
+            elif left:
+                _col_anchor = tk.CENTER if _i in (1, 2) else tk.E
+                tv.column(_cid, width=108, minwidth=80, stretch=False, anchor=_col_anchor)
+            else:
+                is_mov = _i % 2 == 0
+                tv.column(
+                    _cid,
+                    width=118 if is_mov else 90,
+                    minwidth=72 if is_mov else 64,
+                    stretch=False,
+                    anchor=right_cols_anchor,
+                )
+
+    _BUD_TOP_HEIGHT = 3  # Sotto-intestazione MOV/BUD + TOTALI + DIFFERENZE (oltre alla riga heading)
+    _BUD_BODY_HEIGHT = 20
+
+    _BUD_TOP_FIXED_BG = "#7eb3db"
+
+    _bud_tl_view_style = "BudTlCdc.Treeview"
+    _stat_sty.configure(
+        _bud_tl_view_style,
+        font=(_stat_ffam, _stat_fsz),
+        rowheight=_stat_rowh,
+        borderwidth=0,
+        relief="flat",
+    )
+    _stat_sty.configure(
+        _bud_tl_view_style + ".Heading",
+        font=(_stat_ffam, _stat_fsz, "bold"),
+        background=_BUD_TOP_FIXED_BG,
+        relief="flat",
+    )
+
+    _bud_tr_view_style = "BudTrCdc.Treeview"
+    _stat_sty.configure(
+        _bud_tr_view_style,
+        font=(_stat_ffam, _stat_fsz),
+        rowheight=_stat_rowh,
+        borderwidth=0,
+        relief="flat",
+    )
+    _stat_sty.configure(
+        _bud_tr_view_style + ".Heading",
+        font=(_stat_ffam, _stat_fsz, "bold"),
+        background=_BUD_TOP_FIXED_BG,
+        relief="flat",
+    )
+    try:
+        _stat_sty.configure(_bud_tr_view_style + ".Heading", anchor=tk.E)
+    except tk.TclError:
+        pass
+
+    budget_tv_tl = ttk.Treeview(
+        _bud_grid_outer,
+        columns=_bud_names_l,
+        show="headings",
+        height=_BUD_TOP_HEIGHT,
+        selectmode="none",
+        style=_bud_tl_view_style,
+    )
+    _bud_apply_col_config(budget_tv_tl, _bud_names_l, _bud_heads_l, left=True, right_cols_anchor=tk.E)
+
+    budget_tv_tr = ttk.Treeview(
+        _bud_grid_outer,
+        columns=_bud_names_r,
+        show="headings",
+        height=_BUD_TOP_HEIGHT,
+        selectmode="none",
+        style=_bud_tr_view_style,
+    )
+    _bud_apply_col_config(budget_tv_tr, _bud_names_r, _bud_heads_r, left=False, right_cols_anchor=tk.CENTER)
+
+    budget_tv_bl = ttk.Treeview(
+        _bud_grid_outer,
+        columns=_bud_names_l,
+        show="",
+        height=_BUD_BODY_HEIGHT,
+        selectmode="browse",
+        style="StatCdc.Treeview",
+    )
+    _bud_apply_col_config(budget_tv_bl, _bud_names_l, _bud_heads_l, left=True, right_cols_anchor=tk.E)
+
+    budget_tv_br = ttk.Treeview(
+        _bud_grid_outer,
+        columns=_bud_names_r,
+        show="",
+        height=_BUD_BODY_HEIGHT,
+        selectmode="browse",
+        style="StatCdc.Treeview",
+    )
+    _bud_apply_col_config(budget_tv_br, _bud_names_r, _bud_heads_r, left=False, right_cols_anchor=tk.E)
+
+    budget_tr_r_vlines: list[tk.Frame] = []
+    budget_br_r_vlines: list[tk.Frame] = []
+    _bud_grid_outer_cfg_after: list[str | None] = [None]
+    _bud_vline_fp: dict[int, tuple[int, tuple[int, ...]]] = {}
+
+    def _bud_r_content_width(tv: ttk.Treeview) -> int:
+        tw = 0
+        for cid in _bud_names_r:
+            try:
+                tw += int(tv.column(cid, "width"))
+            except (tk.TclError, ValueError, TypeError):
+                pass
+        return max(1, tw)
+
+    def _bud_vline_anchor_iid(tv: ttk.Treeview) -> str:
+        if tv.exists("bud_r_sub"):
+            return "bud_r_sub"
+        ch = tv.get_children()
+        return str(ch[0]) if ch else ""
+
+    def _bud_math_boundary_screen_x(
+        tv: ttk.Treeview, boundary_after_month: int, vw: int, lo_override: float | None
+    ) -> int:
+        """Ascissa in coordinate del widget del bordo destro della colonna BUD del mese ``boundary_after_month`` (0..10)."""
+        acc = 0
+        for mm in range(boundary_after_month + 1):
+            for j in (0, 1):
+                cid = _bud_names_r[2 * mm + j]
+                try:
+                    acc += int(tv.column(cid, "width"))
+                except (tk.TclError, ValueError, TypeError):
+                    pass
+        cw = _bud_r_content_width(tv)
+        if lo_override is not None:
+            lo = float(lo_override)
+        else:
+            try:
+                lo = float(tv.xview()[0])
+            except (tk.TclError, ValueError, TypeError):
+                lo = 0.0
+        scroll_px = lo * max(0, cw - vw)
+        return int(acc - scroll_px)
+
+    def _bud_ensure_r_vlines(store: list[tk.Frame], parent: ttk.Treeview) -> None:
+        if store:
+            return
+        for _ in range(11):
+            store.append(tk.Frame(parent, bg="#7a9ab8", width=1, highlightthickness=0))
+
+    def _bud_position_r_month_vlines(
+        tv: ttk.Treeview, store: list[tk.Frame], lo_override: float | None = None
+    ) -> None:
+        """Segmenti verticali tra una coppia mese (MOV+BUD) e la successiva (non tra MOV e BUD).
+
+        Si basa preferibilmente su ``bbox`` (stesso sistema di coordinate del disegno delle celle)
+        e usa il fallback analitico solo se la cella non è misurabile (fuori viewport / riga assente).
+        """
+        _bud_ensure_r_vlines(store, tv)
+        try:
+            tv.update_idletasks()
+        except tk.TclError:
+            pass
+        try:
+            vw = max(1, int(tv.winfo_width()))
+        except (tk.TclError, ValueError, TypeError):
+            vw = 1
+        aid = _bud_vline_anchor_iid(tv)
+        placements: list[int] = []
+        for m in range(11):
+            x_vis: int | None = None
+            if aid:
+                try:
+                    cid = _bud_names_r[2 * m + 1]
+                    bb = tv.bbox(aid, cid)
+                    if bb and len(bb) >= 4 and int(bb[2]) > 0:
+                        x_vis = int(bb[0] + bb[2])
+                except tk.TclError:
+                    pass
+            if x_vis is None:
+                x_vis = _bud_math_boundary_screen_x(tv, m, vw, lo_override)
+            placements.append(x_vis)
+        fp = (vw, tuple(placements))
+        tid = id(tv)
+        if _bud_vline_fp.get(tid) == fp:
+            return
+        _bud_vline_fp[tid] = fp
+        for i, x_vis in enumerate(placements):
+            if i >= len(store):
+                break
+            ln = store[i]
+            if -2 <= x_vis <= vw + 2:
+                ln.place(x=x_vis, y=0, relheight=1.0)
+            else:
+                try:
+                    ln.place_forget()
+                except tk.TclError:
+                    pass
+
+    def _bud_on_grid_outer_configure(_e: tk.Event | None = None) -> None:
+        """Ridisegna linee su resize finestra. Non su <Configure> del Treeview: place() sulle linee
+        rilancerebbe <Configure> sul tree e creerebbe un loop (CPU / rotella sistema)."""
+        jid = _bud_grid_outer_cfg_after[0]
+        if jid is not None:
+            try:
+                root.after_cancel(jid)
+            except (tk.TclError, ValueError, TypeError):
+                pass
+            _bud_grid_outer_cfg_after[0] = None
+
+        def _fire() -> None:
+            _bud_grid_outer_cfg_after[0] = None
+            try:
+                _bud_refresh_both_r_vlines()
+            except Exception:
+                pass
+
+        _bud_grid_outer_cfg_after[0] = root.after(50, _fire)
+
+    def _bud_refresh_both_r_vlines() -> None:
+        try:
+            _bud_position_r_month_vlines(budget_tv_tr, budget_tr_r_vlines)
+            _bud_position_r_month_vlines(budget_tv_br, budget_br_r_vlines)
+        except Exception:
+            pass
+
+    def _bud_xscroll_cmd(*args: object) -> None:
+        budget_tv_tr.xview(*args)
+        budget_tv_br.xview(*args)
+        try:
+            lo = float(budget_tv_tr.xview()[0])
+        except (tk.TclError, ValueError, TypeError):
+            lo = 0.0
+        try:
+            _bud_position_r_month_vlines(budget_tv_tr, budget_tr_r_vlines, lo)
+            _bud_position_r_month_vlines(budget_tv_br, budget_br_r_vlines, lo)
+        except Exception:
+            pass
+
+    def _bud_yscroll_cmd(*args: object) -> None:
+        budget_tv_bl.yview(*args)
+        budget_tv_br.yview(*args)
+
+    def _bud_tr_xscroll_set(first: str, last: str) -> None:
+        _budget_xsb.set(first, last)
+        try:
+            lo = float(first)
+        except (ValueError, TypeError):
+            lo = 0.0
+        try:
+            budget_tv_br.xview_moveto(lo)
+        except (tk.TclError, ValueError, TypeError):
+            pass
+        try:
+            _bud_position_r_month_vlines(budget_tv_tr, budget_tr_r_vlines, lo)
+            _bud_position_r_month_vlines(budget_tv_br, budget_br_r_vlines, lo)
+        except Exception:
+            pass
+
+    def _bud_br_xscroll_set(first: str, last: str) -> None:
+        _budget_xsb.set(first, last)
+        try:
+            lo = float(first)
+        except (ValueError, TypeError):
+            lo = 0.0
+        try:
+            budget_tv_tr.xview_moveto(lo)
+        except (tk.TclError, ValueError, TypeError):
+            pass
+        try:
+            _bud_position_r_month_vlines(budget_tv_tr, budget_tr_r_vlines, lo)
+            _bud_position_r_month_vlines(budget_tv_br, budget_br_r_vlines, lo)
+        except Exception:
+            pass
+
+    def _bud_bl_yscroll_set(first: str, last: str) -> None:
+        _budget_ysb.set(first, last)
+        try:
+            budget_tv_br.yview_moveto(float(first))
+        except (tk.TclError, ValueError, TypeError):
+            pass
+
+    def _bud_br_yscroll_set(first: str, last: str) -> None:
+        _budget_ysb.set(first, last)
+        try:
+            budget_tv_bl.yview_moveto(float(first))
+        except (tk.TclError, ValueError, TypeError):
+            pass
+
+    _budget_xsb = ttk.Scrollbar(_bud_grid_outer, orient=tk.HORIZONTAL, command=_bud_xscroll_cmd)
+    _budget_ysb = ttk.Scrollbar(_bud_grid_outer, orient=tk.VERTICAL, command=_bud_yscroll_cmd)
+    budget_tv_tr.configure(xscrollcommand=_bud_tr_xscroll_set)
+    budget_tv_br.configure(xscrollcommand=_bud_br_xscroll_set)
+    budget_tv_bl.configure(yscrollcommand=_bud_bl_yscroll_set)
+    budget_tv_br.configure(yscrollcommand=_bud_br_yscroll_set)
+
+    budget_tv_tl.grid(row=0, column=0, sticky="nsew", padx=(0, 1), pady=(0, 1))
+    budget_tv_tr.grid(row=0, column=1, sticky="nsew", padx=(0, 0), pady=(0, 1))
+    budget_tv_bl.grid(row=1, column=0, sticky="nsew", padx=(0, 1), pady=(0, 0))
+    budget_tv_br.grid(row=1, column=1, sticky="nsew", padx=(0, 0), pady=(0, 0))
+    _budget_ysb.grid(row=1, column=2, sticky="ns")
+    _budget_xsb.grid(row=2, column=1, sticky="ew")
+
+    for _tv in (budget_tv_tl, budget_tv_tr):
+        _tv.tag_configure(
+            "budget_subhead",
+            background=_BUD_TOP_FIXED_BG,
+            font=(_stat_ffam, _stat_fsz, "bold"),
+        )
+        _tv.tag_configure(
+            "budget_tot",
+            background=_BUD_TOP_FIXED_BG,
+            font=(_stat_ffam, _stat_fsz, "bold"),
+        )
+        _tv.tag_configure(
+            "budget_diff",
+            background=_BUD_TOP_FIXED_BG,
+            font=(_stat_ffam, _stat_fsz, "bold"),
+        )
+    for _tv in (budget_tv_bl, budget_tv_br):
+        _tv.tag_configure("budget_subhead", background=CDC_GRID_HEADING_BG)
+        _tv.tag_configure("budget_tot", background=CDC_GRID_HEADING_BG)
+        _tv.tag_configure(
+            "budget_diff",
+            background="#e1f5fe",
+            font=(_stat_ffam, _stat_fsz),
+        )
+        _tv.tag_configure("budget_cat0", background=CDC_GRID_STRIPE0_BG)
+        _tv.tag_configure("budget_cat1", background=CDC_GRID_STRIPE1_BG)
+    budget_tv_bl.tag_configure("budget_catname", font=(_stat_ffam, _stat_fsz, "bold"))
+
+    _bud_grid_outer.bind("<Configure>", _bud_on_grid_outer_configure, add=True)
+    root.after(0, _bud_refresh_both_r_vlines)
+
+    _bud_select_sync: list[bool] = [False]
+    _bud_select_suppress: list[bool] = [False]
+    _bud_last_sel_by_tree: dict[int, tuple[str, ...]] = {}
+
+    def _budget_on_bud_tree_select(event: tk.Event) -> None:
+        if _bud_select_suppress[0]:
+            return
+        if _bud_select_sync[0]:
+            return
+        w = event.widget
+        if w not in (budget_tv_tl, budget_tv_tr, budget_tv_bl, budget_tv_br):
+            return
+        wid = id(w)
+        prev_sel = _bud_last_sel_by_tree.get(wid, ())
+        if w is budget_tv_tl:
+            partner = budget_tv_tr
+        elif w is budget_tv_tr:
+            partner = budget_tv_tl
+        elif w is budget_tv_bl:
+            partner = budget_tv_br
+        else:
+            partner = budget_tv_bl
+        sel = w.selection()
+
+        def _note_sel_and_see_if_needed() -> None:
+            try:
+                cur = w.selection()
+            except tk.TclError:
+                return
+            _bud_last_sel_by_tree[wid] = cur
+            if (
+                cur
+                and prev_sel != cur
+                and w in (budget_tv_bl, budget_tv_br)
+            ):
+                try:
+                    w.see(cur[0])
+                except tk.TclError:
+                    pass
+
+        if not sel:
+            osel = partner.selection()
+            if osel:
+                _bud_select_sync[0] = True
+                try:
+                    partner.selection_remove(*osel)
+                finally:
+                    _bud_select_sync[0] = False
+            _bud_last_sel_by_tree[wid] = ()
+            return
+        iid = sel[0]
+        if not partner.exists(iid):
+            _bud_last_sel_by_tree[wid] = sel
+            return
+        # Se il partner ha già la stessa tupla di selezione, non chiamare selection_set:
+        # su macOS/Tk può reinviare <<TreeviewSelect>> all'infinito (spinning beachball).
+        try:
+            if partner.selection() == sel:
+                _note_sel_and_see_if_needed()
+                return
+        except tk.TclError:
+            return
+        _bud_select_sync[0] = True
+        try:
+            partner.selection_set(iid)
+            try:
+                partner.focus(iid)
+            except tk.TclError:
+                pass
+        finally:
+            _bud_select_sync[0] = False
+        _note_sel_and_see_if_needed()
+
+    for _btv in (budget_tv_tl, budget_tv_tr, budget_tv_bl, budget_tv_br):
+        _btv.bind("<<TreeviewSelect>>", _budget_on_bud_tree_select, add="+")
+
+    def _budget_fmt_eur(v: Decimal) -> str:
+        return format_euro_it(v)
+
+    def _budget_clear_trees() -> None:
+        for tv in (budget_tv_tl, budget_tv_tr, budget_tv_bl, budget_tv_br):
+            for iid in tv.get_children():
+                tv.delete(iid)
+
+    def _budget_refresh_grid() -> None:
+        try:
+            y_head = int(str(budget_year_var.get()).strip())
+        except (TypeError, ValueError):
+            y_head = int(_bud_default_year)
+        _bud_select_suppress[0] = True
+        try:
+            _bud_last_sel_by_tree.clear()
+            _bud_vline_fp.pop(id(budget_tv_tr), None)
+            _bud_vline_fp.pop(id(budget_tv_br), None)
+            d = cur_db()
+            y_ref = y_head
+            mov_y = budget_collect_movement_totals_by_cat_month(d, y_ref)
+            y_prev = y_ref - 1
+            mov_prev = budget_collect_movement_totals_by_cat_month(d, y_prev) if y_prev > 0 else {}
+            cats_ordered = budget_categories_in_use_ordered(d, y_ref)
+            _budget_clear_trees()
+            if not cats_ordered:
+                budget_tv_bl.insert(
+                    "",
+                    tk.END,
+                    iid="bud_r_empty",
+                    values=("Nessuna categoria in uso.", "", "", ""),
+                    tags=("budget_diff",),
+                )
+                budget_tv_br.insert(
+                    "", tk.END, iid="bud_r_empty", values=("",) * 24, tags=("budget_diff",)
+                )
+                _bud_refresh_both_r_vlines()
+                return
+
+            cat_rows: list[tuple[str, str, list[Decimal], list[Decimal]]] = []
+            for code, name_stored in cats_ordered:
+                label = category_display_name(name_stored).strip().upper()
+                mov_m = [mov_y.get((code, m), Decimal("0")) for m in range(1, 13)]
+                bud_m: list[Decimal] = []
+                for m in range(1, 13):
+                    base_b = mov_prev.get((code, m), Decimal("0"))
+                    ov = budget_get_manual_override(d, y_ref, code, m)
+                    bud_m.append(ov if ov is not None else base_b)
+                cat_rows.append((code, label, mov_m, bud_m))
+
+            tot_mov_m = [
+                sum(cat_rows[i][2][j] for i in range(len(cat_rows))) for j in range(12)
+            ]
+            tot_bud_m = [
+                sum(cat_rows[i][3][j] for i in range(len(cat_rows))) for j in range(12)
+            ]
+            tot_mov_sum = sum(sum(r[2]) for r in cat_rows)
+            tot_bud_sum = sum(sum(r[3]) for r in cat_rows)
+            grand_diff = tot_mov_sum - tot_bud_sum
+
+            def _pack_row_vals(mov_row_m: list[Decimal], bud_row_m: list[Decimal]) -> tuple[str, ...]:
+                tr_m = sum(mov_row_m)
+                tr_b = sum(bud_row_m)
+                cells: list[str] = [
+                    _budget_fmt_eur(tr_m),
+                    _budget_fmt_eur(tr_b),
+                    _budget_fmt_eur(tr_m - tr_b),
+                ]
+                for m in range(12):
+                    cells.append(_budget_fmt_eur(mov_row_m[m]))
+                    cells.append(_budget_fmt_eur(bud_row_m[m]))
+                return tuple(cells)
+
+            tot_vals = ("TOTALI",) + _pack_row_vals(tot_mov_m, tot_bud_m)
+            diff_mov_cols: list[Decimal] = [tot_mov_m[j] - tot_bud_m[j] for j in range(12)]
+            diff_row_label = ("DIFFERENZE", _budget_fmt_eur(grand_diff), "", "")
+            diff_tail: list[str] = []
+            for j in range(12):
+                diff_tail.append(_budget_fmt_eur(diff_mov_cols[j]))
+                diff_tail.append("")
+            diff_vals = diff_row_label + tuple(diff_tail)
+            budget_tv_tl.insert(
+                "", tk.END, iid="bud_r_sub", values=("", "MOVIMENTI", "BUDGET", ""), tags=("budget_subhead",)
+            )
+            budget_tv_tr.insert("", tk.END, iid="bud_r_sub", values=_bud_frozen_sub_r, tags=("budget_subhead",))
+            budget_tv_tl.insert("", tk.END, iid="bud_r_tot", values=tot_vals[:4], tags=("budget_tot",))
+            budget_tv_tr.insert("", tk.END, iid="bud_r_tot", values=tot_vals[4:], tags=("budget_tot",))
+            budget_tv_tl.insert("", tk.END, iid="bud_r_diff", values=diff_vals[:4], tags=("budget_diff",))
+            budget_tv_tr.insert("", tk.END, iid="bud_r_diff", values=diff_vals[4:], tags=("budget_diff",))
+
+            for idx, (code, label, mov_m, bud_m) in enumerate(cat_rows):
+                tag = "budget_cat0" if idx % 2 == 0 else "budget_cat1"
+                row_vals = (label,) + _pack_row_vals(mov_m, bud_m)
+                budget_tv_bl.insert(
+                    "",
+                    tk.END,
+                    iid=f"budget_row_{code}",
+                    values=row_vals[:4],
+                    tags=(tag, "budget_catname"),
+                )
+                budget_tv_br.insert(
+                    "",
+                    tk.END,
+                    iid=f"budget_row_{code}",
+                    values=row_vals[4:],
+                    tags=(tag,),
+                )
+            _bud_refresh_both_r_vlines()
+        finally:
+            try:
+                lbl_budget_heading.configure(text=budget_display_title_for_year(cur_db(), y_head))
+            except tk.TclError:
+                pass
+            if _bud_view_mode[0] == "sintesi":
+                try:
+                    _bud_refresh_summary_view()
+                except tk.TclError:
+                    pass
+            _bud_select_suppress[0] = False
+
+    def _budget_on_year_write(*_a: object) -> None:
+        _budget_refresh_grid()
+
+    budget_year_var.trace_add("write", _budget_on_year_write)
+
+    def _budget_on_category_context(event: tk.Event) -> str | None:
+        w = event.widget
+        if w not in (budget_tv_bl, budget_tv_br):
+            return None
+        row_id = w.identify_row(event.y)
+        if not row_id:
+            return None
+        rid = str(row_id)
+        if not rid.startswith("budget_row_"):
+            return None
+        code = rid[len("budget_row_") :]
+        try:
+            disp_name = str(budget_tv_bl.item(rid, "values")[0])
+        except tk.TclError:
+            return None
+        y_now = _bud_current_year_int()
+        m = tk.Menu(root, tearoff=0)
+
+        def _apply_avg() -> None:
+            if not messagebox.askyesno(
+                "Budget",
+                f"Impostare tutti i 12 importi budget della categoria «{disp_name}» al valore medio "
+                f"dei budget mensili già mostrati in tabella per {y_now}?\n"
+                f"(media = somma dei 12 budget ÷ 12; ogni cella BUD viene uniformata a questo importo)",
+                parent=root,
+            ):
+                return
+            budget_category_apply_monthly_average(cur_db(), y_now, code)
+            _budget_refresh_grid()
+            _bud_after_budget_mutation()
+
+        def _chart() -> None:
+            budget_open_mov_bud_bar_chart_for_category(
+                parent=root,
+                db=cur_db(),
+                year=y_now,
+                cat_code=code,
+                cat_display=disp_name,
+            )
+
+        m.add_command(label="Budget 12 mesi = media del budget mensile…", command=_apply_avg)
+        m.add_command(label="Grafico a barre movimenti / budget…", command=_chart)
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+        return "break"
+
+    for _bud_ctx_ev in ("<Button-3>", "<Button-2>"):
+        budget_tv_bl.bind(_bud_ctx_ev, _budget_on_category_context, add="+")
+        budget_tv_br.bind(_bud_ctx_ev, _budget_on_category_context, add="+")
+
+    def _budget_on_double_click(event: tk.Event) -> None:
+        w = event.widget
+        if w not in (budget_tv_bl, budget_tv_br):
+            return
+        if w.identify_region(event.x, event.y) != "cell":
+            return
+        col_s = w.identify_column(event.x)
+        try:
+            col_1b_local = int(col_s.replace("#", ""))
+        except ValueError:
+            return
+        col_1b = col_1b_local + (4 if w is budget_tv_br else 0)
+        if col_1b < 6 or col_1b % 2 != 0:
+            return
+        month = (col_1b - 6) // 2 + 1
+        if month < 1 or month > 12:
+            return
+        row_id = w.identify_row(event.y)
+        if not row_id:
+            return
+        rid = str(row_id)
+        if not rid.startswith("budget_row_"):
+            return
+        code = rid[len("budget_row_") :]
+        dloc = cur_db()
+        try:
+            y_now = int(str(budget_year_var.get()).strip())
+        except (TypeError, ValueError):
+            y_now = int(_bud_default_year)
+        mov_prev_loc = (
+            budget_collect_movement_totals_by_cat_month(dloc, y_now - 1) if y_now > 1 else {}
+        )
+        base_bud = mov_prev_loc.get((code, month), Decimal("0"))
+        cur_ov = budget_get_manual_override(dloc, y_now, code, month)
+        cur_eff = cur_ov if cur_ov is not None else base_bud
+        disp_name = budget_tv_bl.item(row_id, "values")[0]
+        from tkinter import simpledialog
+
+        raw = simpledialog.askstring(
+            "Modifica budget",
+            f"{disp_name}\nMese {month:02d}/{y_now}\n\n"
+            "Importo budget (€, usa . o , come decimale).\n"
+            f"Default storico ({y_now - 1}): {_budget_fmt_eur(base_bud)}",
+            initialvalue=_budget_fmt_eur(cur_eff),
+            parent=root,
+        )
+        if raw is None:
+            return
+        try:
+            new_v = normalize_euro_input(raw.strip())
+        except Exception as exc:
+            messagebox.showerror("Budget", str(exc), parent=root)
+            return
+        new_v = new_v.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        base_q = base_bud.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if new_v == base_q:
+            budget_clear_manual_override(dloc, y_now, code, month)
+        else:
+            budget_set_manual_override(dloc, y_now, code, month, new_v)
+
+        def _persist_after_budget_dialog() -> None:
+            persist_db_after_edit(None, refresh_movements=False)
+
+        root.after_idle(_persist_after_budget_dialog)
+
+    budget_tv_bl.bind("<Double-1>", _budget_on_double_click)
+    budget_tv_br.bind("<Double-1>", _budget_on_double_click)
+
+    _budget_on_tab_enter_fn[0] = _budget_refresh_grid
+    _budget_refresh_grid()
 
     ttk.Label(
         aiuto_frame,

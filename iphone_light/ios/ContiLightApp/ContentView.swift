@@ -105,7 +105,7 @@ struct ContentView: View {
     /// Messaggio lungo (come più ``showinfo`` sul desktop) dopo materializzazione periodiche.
     @State private var periodicStartupAlertText = ""
     @State private var periodicStartupAlertPresented = false
-    /// Evita ``refreshLightSessionIfLoggedIn`` a ogni micro-rientro in primo piano (ogni run può riscrivere i .enc se Dropbox è in ritardo → conflicted copies).
+    /// Throttle per ``refreshLightSessionIfLoggedIn`` (solo lettura + decifra; non riscrive `.enc`). Evita hammer al provider file.
     @State private var lastScenePhaseRefreshAt: Date = .distantPast
 
     private enum MovimentiFiltriPick: Hashable {
@@ -181,10 +181,9 @@ struct ContentView: View {
         .onChange(of: scenePhase) { _, phase in
             if phase == .active, dataFolderURL != nil {
                 refreshKeyStatus()
-                // La sessione resta in memoria dopo il login: senza questo passaggio le correzioni
-                // fatte sul desktop (nuovo *_light.enc su Dropbox) non compaiono finché non si riesce.
+                // Rilegge il `*_light.enc` con path risolto di nuovo e attesa Dropbox (come «Aggiorna»), così dopo sync non resta la copia precedente in memoria.
                 Task { @MainActor in
-                    if Date().timeIntervalSince(lastScenePhaseRefreshAt) >= 5 {
+                    if Date().timeIntervalSince(lastScenePhaseRefreshAt) >= 3 {
                         await refreshLightSessionIfLoggedIn()
                     }
                 }
@@ -898,8 +897,9 @@ struct ContentView: View {
         }
     }
 
-    /// Ricarica silenziosamente il file light dalla cartella (es. dopo sync Dropbox) senza toccare messaggi di login.
-    private func refreshLightSessionIfLoggedIn(forceReResolveEnc: Bool = false) async {
+    /// Ricarica silenziosamente il file light dalla cartella (stesso compito del tasto Aggiorna quando `forceReResolveEnc` è attivo).
+    /// Default: risolve di nuovo il path `*_light.enc` (Importo allineato al file su disco dopo sync Dropbox / Files).
+    private func refreshLightSessionIfLoggedIn(forceReResolveEnc: Bool = true) async {
         guard loggedInSessionDb != nil, let folder = dataFolderURL else { return }
         let emailTrim = email.trimmingCharacters(in: .whitespacesAndNewlines)
         let passwordTrim = password.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1059,8 +1059,12 @@ struct ContentView: View {
                     dropboxWaitPaths.append(fullEncURL)
                 }
                 let waited = ContiDatabase.waitForPathsStableIfDropbox(dropboxWaitPaths)
-                let syncWaitNote: String = waited >= 1.0
-                    ? String(format: "Attesa sincronizzazione Dropbox: %.1fs.", waited)
+                // Su iOS/Dropbox Files la prima «stabilità» può essere un file ancora non aggiornato dal cloud; breve pausa + seconda passata sull’`.enc`.
+                Thread.sleep(forTimeInterval: 0.45)
+                let waited2 = ContiDatabase.waitForFileStableIfDropbox(encRef)
+                let totalWait = waited + waited2
+                let syncWaitNote: String = totalWait >= 1.0
+                    ? String(format: "Attesa sincronizzazione Dropbox: %.1fs.", totalWait)
                     : ""
 
                 do {
@@ -1158,7 +1162,7 @@ struct ContentView: View {
         }
         message = msg
         if let dbObj = packet.sessionDb {
-            // Evita che `.active` immediato dopo il login lanci ``refreshLightSessionIfLoggedIn`` in parallelo al Task ritardato (doppia riscrittura .enc / conflict Dropbox).
+            // Evita che `.active` immediato dopo il login lanci una seconda lettura in concorrenza col Task ritardato sotto.
             lastScenePhaseRefreshAt = Date()
             movimentiPath = NavigationPath()
             filterCategoryKey = ""
@@ -1177,10 +1181,10 @@ struct ContentView: View {
                 periodicStartupAlertText = pm
                 periodicStartupAlertPresented = true
             }
-            // Una sola ricarica ritardata: due passaggi ravvicinati riscrivevano spesso i .enc (sync + Dropbox) e generavano conflicted copies su ``*_light.enc``.
+            // Ricarica dopo che Dropbox/Files ha potuto finire la copia locale del `*_light.enc` (stesso effetto del tasto Aggiorna).
             Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 2_500_000_000)
-                await refreshLightSessionIfLoggedIn(forceReResolveEnc: true)
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                await refreshLightSessionIfLoggedIn()
             }
         } else {
             closeCurrentSessionAndReleaseLock()

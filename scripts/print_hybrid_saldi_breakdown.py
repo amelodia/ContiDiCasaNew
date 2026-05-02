@@ -50,11 +50,7 @@ def _resolve_db_enc_key(
         return None, None
     data_workspace.set_data_workspace_root(saved)
     key_path = data_workspace.default_key_file()
-    cands = sorted(
-        (p for p in saved.glob("conti_utente_*.enc") if p.is_file()),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
+    cands = data_workspace.primary_user_enc_files_sorted(saved)
     if not cands:
         return None, None
     return cands[0], key_path

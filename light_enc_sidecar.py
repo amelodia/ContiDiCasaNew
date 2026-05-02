@@ -4,8 +4,9 @@ Sidecar cifrato per l'app iOS light: ``*_light.enc`` nella stessa cartella del f
 - Il desktop, dopo ogni salvataggio del DB completo, rigenera il file light con solo le
   registrazioni nella finestra mobile (ultimi 365 giorni + date future), più metadati
   completi (profilo, categorie/conti per anno incluso).
-- All'avvio il desktop importa dal file light le righe create sul telefono, riconosciute
-  dal campo ``conti_light_record_id`` (UUID), e le fonde nel DB principale.
+- All'avvio il desktop legge ``*_light.enc``, fonde le sole righe nuove (``conti_light_record_id``) nel DB
+  completo e, se qualcosa è stato importato, salva completo + sidecar. Se il merge è vuoto e il file light
+  esiste già, **non** riscrive il sidecar (meno versioni Dropbox). Se ``*_light.enc`` manca, lo crea all'avvio.
 - Il JSON light include ``light_saldi`` (saldi allineati al **footer Saldi** del desktop: assoluti, alla data,
   di cui spese future, spese per carte di credito sulle colonne di riferimento, disponibilità (assoluti+CC, senza spese future); conti congelati esclusi)
   calcolati sul **DB completo**, così l'app iOS non ricostruisce i saldi dai soli movimenti nella finestra mobile.

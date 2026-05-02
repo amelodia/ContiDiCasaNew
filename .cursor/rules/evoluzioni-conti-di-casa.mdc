@@ -25,9 +25,13 @@ Punti collegati: `ent_amt`, filtri Movimenti, `ent_per_amt`, dialog **Modifica i
 
 ## Nuova registrazione — Nota (Girata conto/conto, 2° conto Cassa)
 
-- Preimpostazione: **`Aut ` + `gg/mm` + uno spazio finale** (es. `Aut 15/03 `) per continuare a digitare dopo la data.
+- Preimpostazione: **`Aut ` + `gg/mm` + uno spazio finale** (es. `Aut 15/03 `) per continuare a digitare dopo la data, **salvo** se il **primo conto** è **Cassa** o **conto carta** (in tal caso niente «Aut», modello **Giroconto** come negli altri casi).
 - Al **focus** sul campo Nota, se il contenuto è quello modello, cursore **dopo lo spazio** finale.
-- La nota **non deve riproporre** il testo della registrazione precedente: dopo ogni inserimento riuscito eseguire sempre `_populate_form_defaults(keep_last=True)`, **anche** se l'utente sceglie «Concludi immissione» (prima di passare a Movimenti).
+- Dopo ogni inserimento riuscito: `_populate_form_defaults(keep_last=True)` per **data, categoria e conti** della registrazione appena inserita mentre si resta sulla pagina; uscita dalla scheda **Nuove registrazioni** → `keep_last=False` (default iniziale). **Concludi immissione** senza importo significativo: nessun dialogo, passaggio a Movimenti; con importo: stessa conferma d’inserimento di **Conferma immissione**. **Barra schede**: con importo compilato, stessa conferma prima di lasciare la pagina.
+
+## Girata conto/conto — secondo conto
+
+- Il **secondo conto** di una girata **non** può essere un **conto carta** di credito (liste tendina e validazione al salvataggio, analogamente su Conti light).
 
 ## Memoria virtuale (conto Virtuale)
 

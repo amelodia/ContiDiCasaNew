@@ -53,11 +53,7 @@ def main() -> int:
         print(f"Manca la chiave: {key_path}", file=sys.stderr)
         return 4
 
-    cands = sorted(
-        (p for p in saved.glob("conti_utente_*.enc") if p.is_file()),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
+    cands = data_workspace.primary_user_enc_files_sorted(saved)
     if not cands:
         print(f"Nessun conti_utente_*.enc in {saved}", file=sys.stderr)
         return 5
