@@ -4099,7 +4099,8 @@ def compute_spese_cc_footer_amounts(db: dict, saldo_assoluti: list[Decimal]) -> 
 def saldi_footer_amount_vectors(db: dict, *, today_iso: str | None = None) -> dict[str, object] | None:
     """Vettori allineati a ``refresh_balance_footer`` / ``_saldi_snapshot_for_print`` (dopo filtro conti congelati).
 
-    La colonna ``disponibilita`` nel JSON light è la riga «Disponibilità» desktop: saldo assoluto + spese CC (senza spese future).
+    Nel JSON light ``disponibilita_oggi`` è saldo assoluto - impegni futuri; ``disponibilita_assoluta``
+    è saldo assoluto + impegni per carte. ``disponibilita`` resta come alias storico della disponibilità assoluta.
 
     Usato dal sidecar ``*_light.enc`` (``compute_light_saldi_snapshot``) e dall’app iOS per coerenza con i Saldi desktop.
     """
@@ -4130,6 +4131,7 @@ def saldi_footer_amount_vectors(db: dict, *, today_iso: str | None = None) -> di
     saldo_oggi: list[Decimal] = []
     spese_future: list[Decimal] = []
     spese_cc: list[Decimal] = []
+    disponibilita_oggi: list[Decimal] = []
     disponibilita: list[Decimal] = []
     is_cc: list[bool] = []
     for i in _keep:
@@ -4148,10 +4150,12 @@ def saldi_footer_amount_vectors(db: dict, *, today_iso: str | None = None) -> di
         saldo_oggi.append(oggi)
         spese_future.append(sf)
         spese_cc.append(scc)
+        disponibilita_oggi.append(Decimal("0") if cc else oggi)
         is_cc.append(cc)
         disponibilita.append(disp)
     total_abs = sum((saldo_assoluti[i] for i in range(len(is_cc)) if not is_cc[i]), Decimal("0"))
     total_sf = sum((spese_future[i] for i in range(len(is_cc)) if not is_cc[i]), Decimal("0"))
+    total_disp_oggi = total_abs - total_sf
     total_scc = sum((spese_cc[i] for i in range(len(is_cc)) if not is_cc[i]), Decimal("0"))
     total_disp = total_abs + total_scc
     return {
@@ -4161,14 +4165,20 @@ def saldi_footer_amount_vectors(db: dict, *, today_iso: str | None = None) -> di
         "saldo_assoluti": saldo_assoluti,
         "saldo_oggi": saldo_oggi,
         "spese_future": spese_future,
+        "disponibilita_oggi": disponibilita_oggi,
         "spese_cc": spese_cc,
+        "impegni_carte": spese_cc,
         "disponibilita": disponibilita,
+        "disponibilita_assoluta": disponibilita,
         "is_credit_card": is_cc,
         "totals": {
             "saldo_assoluti_non_cc": total_abs,
             "spese_future_non_cc": total_sf,
+            "disponibilita_oggi_non_cc": total_disp_oggi,
             "spese_cc_non_cc": total_scc,
+            "impegni_carte_non_cc": total_scc,
             "disponibilita_non_cc": total_disp,
+            "disponibilita_assoluta_non_cc": total_disp,
         },
         "snapshot_date_iso": today,
     }
@@ -4760,7 +4770,7 @@ def _print_balances_fpdf(snap: dict) -> bool:
         tw = epw * _sh
         x_table = pdf.l_margin + (epw - tw) / 2.0
         w_conti = tw * 0.14
-        w_amt = (tw - w_conti) / 4.0
+        w_amt = (tw - w_conti) / 5.0
         font_boost = 1.4
         line_h = (6.5 if n > 12 else 7.0) * _sh * font_boost
         fs_head = round(7 * _sh * font_boost, 2)
@@ -4791,11 +4801,13 @@ def _print_balances_fpdf(snap: dict) -> bool:
         pdf.set_font("Helvetica", "B", fs_head)
         pdf.cell(w_amt, line_h * 1.3, "Saldi assol.", border=1, align="C")
         pdf.set_font("Helvetica", "B", fs_head)
-        pdf.cell(w_amt, line_h * 1.3, "Di cui sp.fut.", border=1, align="C")
+        pdf.cell(w_amt, line_h * 1.3, "Impegni fut.", border=1, align="C")
         pdf.set_font("Helvetica", "B", fs_head)
-        pdf.cell(w_amt, line_h * 1.3, "Spese CC", border=1, align="C")
+        pdf.cell(w_amt, line_h * 1.3, "Dispon. oggi", border=1, align="C")
+        pdf.set_font("Helvetica", "B", fs_head)
+        pdf.cell(w_amt, line_h * 1.3, "Impegni carte", border=1, align="C")
         pdf.set_font("Helvetica", "", fs_head)
-        pdf.cell(w_amt, line_h * 1.3, "Dispon.", border=1, align="C")
+        pdf.cell(w_amt, line_h * 1.3, "Dispon. assol.", border=1, align="C")
         pdf.ln(line_h * 1.3)
 
         for i, nm in enumerate(names):
@@ -4810,8 +4822,10 @@ def _print_balances_fpdf(snap: dict) -> bool:
                 dash_amt_cell(w_amt)
                 dash_amt_cell(w_amt)
                 dash_amt_cell(w_amt)
+                dash_amt_cell(w_amt)
             else:
                 amt_cell(snap["amts_spese_future"][i], w_amt, bold=True)
+                amt_cell(snap["amts_disponibilita_oggi"][i], w_amt, bold=False)
                 amt_cell(snap["amts_spese_cc"][i], w_amt, bold=True)
                 amt_cell(snap["amts_disponibilita"][i], w_amt, bold=False)
             pdf.ln(line_h)
@@ -4824,6 +4838,7 @@ def _print_balances_fpdf(snap: dict) -> bool:
         for amt, bold in (
             (snap["total_abs"], True),
             (snap["total_spese_future"], True),
+            (snap["total_disponibilita_oggi"], False),
             (snap["total_spese_cc"], True),
             (snap["total_disponibilita"], False),
         ):
@@ -12825,7 +12840,7 @@ th {{ background:#efefef; text-align:left; }}
     balance_left = tk.Frame(balance_footer_row, bg=MOVIMENTI_PAGE_BG)
     balance_left.pack(side=tk.LEFT, anchor="n")
     _saldo_hdr_font = ("TkDefaultFont", 12, "bold")
-    _SALDO_ROW_LONGEST = "Spese per carte di credito"
+    _SALDO_ROW_LONGEST = "Disponibilità assoluta"
     # Stesso corpo/grassetto degli importi nella tabella accanto (12 bold) per allineamento verticale riga per riga.
     _saldo_title_col_font = tkfont.Font(root, font=_saldo_hdr_font)
     # Larghezza fissa (px) dal testo più lungo, misurata all’avvio con quel font.
@@ -12833,7 +12848,7 @@ th {{ background:#efefef; text-align:left; }}
     # Altezza riga comune (tabella nel canvas + colonna titoli): stesso minsize su entrambe le griglie.
     _saldo_grid_row_h = int(_saldo_title_col_font.metrics("linespace")) + 2
     # Altezza iniziale; dopo refresh viene impostata su winfo_reqheight della tabella (evita taglio ultima riga).
-    _saldo_canvas_body_h = 5 * (_saldo_grid_row_h + 2) + 8
+    _saldo_canvas_body_h = 6 * (_saldo_grid_row_h + 2) + 8
     balance_lbl_col = tk.Frame(
         balance_footer_row, width=_saldo_lbl_col_px, highlightthickness=0, bg=MOVIMENTI_PAGE_BG
     )
@@ -12841,7 +12856,7 @@ th {{ background:#efefef; text-align:left; }}
     # anchor=n: allinea il top della colonna titoli al top della tabella (canvas create_window nw), non al centro del canvas alto 92.
     balance_lbl_col.pack(side=tk.LEFT, anchor="n", padx=(2, 1))
     balance_lbl_col.grid_columnconfigure(0, weight=1)
-    for _sr in range(5):
+    for _sr in range(6):
         balance_lbl_col.grid_rowconfigure(_sr, minsize=_saldo_grid_row_h)
     tk.Label(
         balance_lbl_col,
@@ -12861,7 +12876,7 @@ th {{ background:#efefef; text-align:left; }}
     ).grid(row=1, column=0, sticky="e", pady=(0, 1))
     tk.Label(
         balance_lbl_col,
-        text="Di cui, spese future",
+        text="Di cui, impegni futuri",
         font=_saldo_title_col_font,
         anchor="e",
         bg=MOVIMENTI_PAGE_BG,
@@ -12869,21 +12884,29 @@ th {{ background:#efefef; text-align:left; }}
     ).grid(row=2, column=0, sticky="e", pady=(0, 1))
     tk.Label(
         balance_lbl_col,
-        text=_SALDO_ROW_LONGEST,
+        text="Disponibilità oggi",
         font=_saldo_title_col_font,
         anchor="e",
         bg=MOVIMENTI_PAGE_BG,
         fg="#1a1a1a",
     ).grid(row=3, column=0, sticky="e", pady=(0, 1))
+    tk.Label(
+        balance_lbl_col,
+        text="Impegni per carte",
+        font=_saldo_title_col_font,
+        anchor="e",
+        bg=MOVIMENTI_PAGE_BG,
+        fg="#1a1a1a",
+    ).grid(row=4, column=0, sticky="e", pady=(0, 1))
     balance_lbl_disponibilita = tk.Label(
         balance_lbl_col,
-        text="Disponibilità",
+        text=_SALDO_ROW_LONGEST,
         font=_saldo_title_col_font,
         anchor="e",
         bg=MOVIMENTI_PAGE_BG,
         fg="#1a1a1a",
     )
-    balance_lbl_disponibilita.grid(row=4, column=0, sticky="e", pady=(0, 1))
+    balance_lbl_disponibilita.grid(row=5, column=0, sticky="e", pady=(0, 1))
     balance_scroll_block = tk.Frame(balance_footer_row, bg=MOVIMENTI_PAGE_BG)
     balance_scroll_block.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, anchor="n")
     balance_center = tk.Frame(balance_scroll_block, bg=MOVIMENTI_PAGE_BG)
@@ -12963,12 +12986,17 @@ th {{ background:#efefef; text-align:left; }}
         spese_cc = [spese_cc_full[i] for i in _keep_sp]
         saldo_oggi = [saldo_assoluti[j] - amts_future[j] for j in range(len(names))]
         spese_future = [saldo_assoluti[j] - saldo_oggi[j] for j in range(len(names))]
+        disponibilita_oggi = [
+            Decimal("0") if is_cc[i] else saldo_oggi[i]
+            for i in range(len(names))
+        ]
         disponibilita = [
             (a + sc) if not is_cc[i] else Decimal("0")
             for i, (a, sf, sc) in enumerate(zip(saldo_assoluti, spese_future, spese_cc))
         ]
         total_abs = sum((saldo_assoluti[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
         total_spese_future = sum((spese_future[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
+        total_disponibilita_oggi = total_abs - total_spese_future
         total_spese_cc = sum((spese_cc[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
         total_disponibilita = total_abs + total_spese_cc
         return {
@@ -12977,10 +13005,12 @@ th {{ background:#efefef; text-align:left; }}
             "column_is_credit_card": is_cc,
             "amts_abs": saldo_assoluti,
             "amts_spese_future": spese_future,
+            "amts_disponibilita_oggi": disponibilita_oggi,
             "amts_spese_cc": spese_cc,
             "amts_disponibilita": disponibilita,
             "total_abs": total_abs,
             "total_spese_future": total_spese_future,
+            "total_disponibilita_oggi": total_disponibilita_oggi,
             "total_spese_cc": total_spese_cc,
             "total_disponibilita": total_disponibilita,
             "date_it": to_italian_date(date.today().isoformat()),
@@ -12993,9 +13023,9 @@ th {{ background:#efefef; text-align:left; }}
         for_native: bool = False,
         native_text_width_pt: float | None = None,
     ) -> str:
-        """Stampa A4: tabella trasposta — righe = conti, colonne = saldi assoluti / di cui spese future / spese CC / disponibilità + TOTALE.
+        """Stampa A4: tabella trasposta — righe = conti, colonne = le 5 righe Saldi + TOTALE.
 
-        Con ``native_text_width_pt=iw`` (solo macOS) colgroup e larghezza tabella sono in **punti** (Conti 14%, quattro colonne importo).
+        Con ``native_text_width_pt=iw`` (solo macOS) colgroup e larghezza tabella sono in **punti** (Conti 14%, cinque colonne importo).
         """
         valuta = snap["valuta"]
         names: list[str] = snap["names"]
@@ -13017,9 +13047,9 @@ th {{ background:#efefef; text-align:left; }}
         cell_pad = "1px 2px"
         line_h = 1.05
         body_pad_css = "0" if for_native else f"{body_pad_v} {body_pad_h}"
-        # Larghezze colonne: 14% Conti, resto diviso equamente tra le quattro colonne importo.
+        # Larghezze colonne: 14% Conti, resto diviso equamente tra le cinque colonne importo.
         pct_conti = 14
-        pct_amt = (100.0 - float(pct_conti)) / 4.0
+        pct_amt = (100.0 - float(pct_conti)) / 5.0
         native_root_style = ""
         native_wrap_style = ""
         native_table_style = ""
@@ -13036,8 +13066,8 @@ th {{ background:#efefef; text-align:left; }}
             _inner_tw = max(100.0, _tw - 2.0 * _edge_gutter_pt)
             _pad_h = _side + _edge_gutter_pt
             w_c = _inner_tw * pct_conti / 100.0
-            w_a = max(1.0, (_inner_tw - w_c) / 4.0)
-            _col_amt = "".join(f'<col style="width:{w_a:.2f}pt" />' for _ in range(4))
+            w_a = max(1.0, (_inner_tw - w_c) / 5.0)
+            _col_amt = "".join(f'<col style="width:{w_a:.2f}pt" />' for _ in range(5))
             colgroup_html = (
                 "<colgroup>"
                 f'<col class="col-conti" style="width:{w_c:.2f}pt" />'
@@ -13059,7 +13089,7 @@ th {{ background:#efefef; text-align:left; }}
             )
         else:
             _pct_amt_s = f"{pct_amt:.2f}".rstrip("0").rstrip(".")
-            _col_amt_pct = "".join(f'<col style="width:{_pct_amt_s}%" />' for _ in range(4))
+            _col_amt_pct = "".join(f'<col style="width:{_pct_amt_s}%" />' for _ in range(5))
             colgroup_html = (
                 "<colgroup>"
                 f'<col class="col-conti" style="width:{pct_conti}%" />'
@@ -13110,9 +13140,10 @@ th {{ background:#efefef; text-align:left; }}
         header_cells = (
             '<th class="hdr-name">Conti</th>'
             '<th class="col-hdr col-hdr-b"><strong>Saldi assoluti</strong></th>'
-            '<th class="col-hdr col-hdr-b"><strong>Di cui, spese future</strong></th>'
-            '<th class="col-hdr col-hdr-b"><strong>Spese per carte<br/>di credito</strong></th>'
-            '<th class="col-hdr col-hdr-n">Disponibilità</th>'
+            '<th class="col-hdr col-hdr-b"><strong>Di cui, impegni futuri</strong></th>'
+            '<th class="col-hdr col-hdr-n">Disponibilità<br/>oggi</th>'
+            '<th class="col-hdr col-hdr-b"><strong>Impegni<br/>per carte</strong></th>'
+            '<th class="col-hdr col-hdr-n">Disponibilità<br/>assoluta</th>'
         )
 
         body_lines: list[str] = []
@@ -13122,6 +13153,7 @@ th {{ background:#efefef; text-align:left; }}
                 conti_cell(nm)
                 + td_num(snap["amts_abs"][i], bold=True)
                 + (td_cc_dash(bold=True) if cc else td_num(snap["amts_spese_future"][i], bold=True))
+                + (td_cc_dash(bold=False) if cc else td_num(snap["amts_disponibilita_oggi"][i], bold=False))
                 + (td_cc_dash(bold=True) if cc else td_num(snap["amts_spese_cc"][i], bold=True))
                 + (td_cc_dash(bold=False) if cc else td_num(snap["amts_disponibilita"][i], bold=False))
             )
@@ -13131,6 +13163,7 @@ th {{ background:#efefef; text-align:left; }}
             + conti_cell("TOTALE")
             + td_num(snap["total_abs"], bold=True)
             + td_num(snap["total_spese_future"], bold=True)
+            + td_num(snap["total_disponibilita_oggi"], bold=False)
             + td_num(snap["total_spese_cc"], bold=True)
             + td_num(snap["total_disponibilita"], bold=False)
             + "</tr>"
@@ -13632,7 +13665,7 @@ th {{ background:#efefef; text-align:left; }}
     btn_stampa_saldi.bind("<Leave>", lambda _e: btn_stampa_saldi.configure(bg=_PRINT_RED))
 
     def _align_stampa_saldi_to_middle_row() -> None:
-        """Centro verticale del tasto = centro dell’etichetta «Disponibilità» (non solo minsize teorico)."""
+        """Centro verticale del tasto = centro dell’etichetta «Disponibilità assoluta» (non solo minsize teorico)."""
         try:
             root.update_idletasks()
             bh = btn_stampa_saldi.winfo_height()
@@ -13642,7 +13675,7 @@ th {{ background:#efefef; text-align:left; }}
             if lh <= 1:
                 lh = balance_lbl_disponibilita.winfo_reqheight()
             if lh <= 0 or bh <= 0:
-                mid = (4 + 0.5) * _saldo_grid_row_h
+                mid = (5 + 0.5) * _saldo_grid_row_h
                 ptop = max(0, int(mid - bh / 2))
             else:
                 ly = balance_lbl_disponibilita.winfo_rooty() + lh / 2
@@ -13686,16 +13719,21 @@ th {{ background:#efefef; text-align:left; }}
             spese_cc = [spese_cc_full[i] for i in _keep_saldi]
             saldo_oggi = [saldo_assoluti[j] - amts_future[j] for j in range(len(names))]
             spese_future = [saldo_assoluti[j] - saldo_oggi[j] for j in range(len(names))]
+            disponibilita_oggi = [
+                Decimal("0") if is_cc[i] else saldo_oggi[i]
+                for i in range(len(names))
+            ]
             disponibilita = [
                 (a + sc) if not is_cc[i] else Decimal("0")
                 for i, (a, sf, sc) in enumerate(zip(saldo_assoluti, spese_future, spese_cc))
             ]
             total_assoluti = sum((saldo_assoluti[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
             total_spese_future = sum((spese_future[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
+            total_disponibilita_oggi = total_assoluti - total_spese_future
             total_spese_cc = sum((spese_cc[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
             total_disponibilita = total_assoluti + total_spese_cc
 
-            # Riga 1 assoluti; 2 di cui spese future (solo informativa); 3 spese CC; 4 Disponibilità = riga 1 + riga 3 (senza riga 2). TOTALE senza conti carta.
+            # Righe saldi: 1 assoluti; 2 impegni futuri; 3 disponibilità oggi; 4 impegni carte; 5 disponibilità assoluta.
             table = tk.Frame(balance_center_canvas, highlightthickness=0, bd=0)
             balance_center_canvas.create_window((0, 0), window=table, anchor="nw")
 
@@ -13751,23 +13789,30 @@ th {{ background:#efefef; text-align:left; }}
                 else:
                     amount_cell(2, i + 1, amt)
 
-            amount_cell(3, 0, total_spese_cc)
-            for i, amt in enumerate(spese_cc):
+            amount_cell(3, 0, total_disponibilita_oggi)
+            for i, amt in enumerate(disponibilita_oggi):
                 if is_cc[i]:
                     dash_cell(3, i + 1)
                 else:
                     amount_cell(3, i + 1, amt)
 
-            amount_cell(4, 0, total_disponibilita)
-            for i, amt in enumerate(disponibilita):
+            amount_cell(4, 0, total_spese_cc)
+            for i, amt in enumerate(spese_cc):
                 if is_cc[i]:
                     dash_cell(4, i + 1)
                 else:
                     amount_cell(4, i + 1, amt)
-            for _sr in range(5):
+
+            amount_cell(5, 0, total_disponibilita)
+            for i, amt in enumerate(disponibilita):
+                if is_cc[i]:
+                    dash_cell(5, i + 1)
+                else:
+                    amount_cell(5, i + 1, amt)
+            for _sr in range(6):
                 table.grid_rowconfigure(_sr, minsize=_saldo_grid_row_h)
             table.update_idletasks()
-            # Altezza viewport canvas = tabella reale (pady delle celle + minsize possono superare 5*row_h).
+            # Altezza viewport canvas = tabella reale (pady delle celle + minsize possono superare 6*row_h).
             try:
                 _tbl_h = max(1, table.winfo_reqheight())
                 balance_center_canvas.configure(height=_tbl_h + 4)

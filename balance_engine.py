@@ -486,10 +486,13 @@ def light_saldi_snapshot_from_footer_vectors(vectors: dict[str, Any]) -> dict[st
     oggi_vals: list[Decimal] = list(vectors["saldo_oggi"])
     sf_vals: list[Decimal] = list(vectors["spese_future"])
     scc_vals: list[Decimal] = list(vectors["spese_cc"])
-    disp_vals: list[Decimal] = list(vectors["disponibilita"])
+    raw_disp_oggi = vectors.get("disponibilita_oggi")
+    disp_oggi_vals: list[Decimal] = list(raw_disp_oggi) if raw_disp_oggi else []
+    disp_vals: list[Decimal] = list(vectors.get("disponibilita_assoluta") or vectors["disponibilita"])
     is_cc = list(vectors["is_credit_card"])
     rows: list[dict[str, object]] = []
     for i in range(len(names)):
+        disp_oggi = disp_oggi_vals[i] if i < len(disp_oggi_vals) else (Decimal("0") if bool(is_cc[i]) else oggi_vals[i])
         rows.append(
             {
                 "account_code": str(codes[i]).strip() or str(i + 1),
@@ -497,23 +500,37 @@ def light_saldi_snapshot_from_footer_vectors(vectors: dict[str, Any]) -> dict[st
                 "saldo_assoluto": str(abs_vals[i]),
                 "saldo_alla_data": str(oggi_vals[i]),
                 "spese_future": str(sf_vals[i]),
+                "disponibilita_oggi": str(disp_oggi),
                 "spese_cc": str(scc_vals[i]),
+                "impegni_carte": str(scc_vals[i]),
                 "disponibilita": str(disp_vals[i]),
+                "disponibilita_assoluta": str(disp_vals[i]),
                 "credit_card": bool(is_cc[i]),
             }
         )
     totals = vectors["totals"]
     if not isinstance(totals, dict):
         totals = {}
+    total_abs = totals.get("saldo_assoluti_non_cc", Decimal("0"))
+    total_sf = totals.get("spese_future_non_cc", Decimal("0"))
+    total_scc = totals.get("spese_cc_non_cc", Decimal("0"))
+    total_disp = totals.get("disponibilita_non_cc", Decimal("0"))
     return {
         "snapshot_date_iso": str(vectors["snapshot_date_iso"]),
         "year_basis": int(vectors["year_basis"]),
         "rows": rows,
         "totals": {
-            "saldo_assoluti_non_cc": str(totals.get("saldo_assoluti_non_cc", Decimal("0"))),
-            "spese_future_non_cc": str(totals.get("spese_future_non_cc", Decimal("0"))),
-            "spese_cc_non_cc": str(totals.get("spese_cc_non_cc", Decimal("0"))),
-            "disponibilita_non_cc": str(totals.get("disponibilita_non_cc", Decimal("0"))),
+            "saldo_assoluti_non_cc": str(total_abs),
+            "spese_future_non_cc": str(total_sf),
+            "disponibilita_oggi_non_cc": str(totals.get("disponibilita_oggi_non_cc", total_abs - total_sf)),
+            "spese_cc_non_cc": str(total_scc),
+            "impegni_carte_non_cc": str(
+                totals.get("impegni_carte_non_cc", total_scc)
+            ),
+            "disponibilita_non_cc": str(total_disp),
+            "disponibilita_assoluta_non_cc": str(
+                totals.get("disponibilita_assoluta_non_cc", total_disp)
+            ),
         },
     }
 

@@ -53,7 +53,7 @@ public struct ContiSaldRiga: Identifiable, Hashable, Sendable {
     /// Registrazioni con data successiva al cutoff (stesso significato del desktop).
     public let speseFuture: Decimal
     public let speseCC: Decimal
-    /// Per conti non-carta: saldo assoluto + spese future + spese CC; per carta: zero in tabella desktop.
+    /// Per conti non-carta: saldo assoluto + impegni per carte; per carta: zero in tabella desktop.
     public let disponibilita: Decimal
 }
 
@@ -1061,17 +1061,28 @@ public enum ContiDatabase {
     }
 
     /// Totali riga «non carta» dal blocco ``light_saldi`` (opzionale, file generato da desktop/iOS recente).
-    public static func lightSaldiTotalsNonCc(sessionDb: Any?) -> (abs: Decimal, sf: Decimal, scc: Decimal, disp: Decimal)? {
+    public static func lightSaldiTotalsNonCc(sessionDb: Any?) -> (
+        abs: Decimal,
+        sf: Decimal,
+        dispOggi: Decimal,
+        scc: Decimal,
+        disp: Decimal
+    )? {
         guard let db = dictionaryFromAnyRoot(sessionDb) else { return nil }
         guard let block = dictionaryFromAnyRoot(db["light_saldi"]),
               let t = dictionaryFromAnyRoot(block["totals"])
         else { return nil }
         guard let abs = parseLooseDecimal(stringFromJSON(t["saldo_assoluti_non_cc"])),
-              let sf = parseLooseDecimal(stringFromJSON(t["spese_future_non_cc"])),
-              let scc = parseLooseDecimal(stringFromJSON(t["spese_cc_non_cc"])),
-              let disp = parseLooseDecimal(stringFromJSON(t["disponibilita_non_cc"]))
+              let sf = parseLooseDecimal(stringFromJSON(t["spese_future_non_cc"]))
         else { return nil }
-        return (abs, sf, scc, disp)
+        let scc = parseLooseDecimal(stringFromJSON(t["impegni_carte_non_cc"]))
+            ?? parseLooseDecimal(stringFromJSON(t["spese_cc_non_cc"]))
+            ?? .zero
+        let disp = parseLooseDecimal(stringFromJSON(t["disponibilita_assoluta_non_cc"]))
+            ?? parseLooseDecimal(stringFromJSON(t["disponibilita_non_cc"]))
+            ?? (abs + scc)
+        let dispOggi = parseLooseDecimal(stringFromJSON(t["disponibilita_oggi_non_cc"])) ?? (abs - sf)
+        return (abs, sf, dispOggi, scc, disp)
     }
 
     /// Aggiorna ``light_saldi`` in memoria dopo una nuova registrazione (stesse regole del desktop). Da chiamare al salvataggio iOS prima di ricifrare.
@@ -1677,9 +1688,15 @@ public enum ContiDatabase {
             let sf = a - d
             m["spese_future"] = decimalStringForLightJson(sf)
             let isCc = boolFromJSON(m["credit_card"])
-            let scc = parseLooseDecimal(stringFromJSON(m["spese_cc"])) ?? .zero
+            let scc = parseLooseDecimal(stringFromJSON(m["impegni_carte"]))
+                ?? parseLooseDecimal(stringFromJSON(m["spese_cc"]))
+                ?? .zero
+            let dispOggi = isCc ? Decimal.zero : d
             let disp = isCc ? Decimal.zero : (a + scc)
+            m["disponibilita_oggi"] = decimalStringForLightJson(dispOggi)
+            m["impegni_carte"] = decimalStringForLightJson(scc)
             m["disponibilita"] = decimalStringForLightJson(disp)
+            m["disponibilita_assoluta"] = decimalStringForLightJson(disp)
             newRows.append(m)
         }
         rows = newRows
@@ -1699,8 +1716,11 @@ public enum ContiDatabase {
         block["totals"] = [
             "saldo_assoluti_non_cc": decimalStringForLightJson(tAbs),
             "spese_future_non_cc": decimalStringForLightJson(tSf),
+            "disponibilita_oggi_non_cc": decimalStringForLightJson(tAbs - tSf),
             "spese_cc_non_cc": decimalStringForLightJson(tScc),
+            "impegni_carte_non_cc": decimalStringForLightJson(tScc),
             "disponibilita_non_cc": decimalStringForLightJson(tAbs + tScc),
+            "disponibilita_assoluta_non_cc": decimalStringForLightJson(tAbs + tScc),
         ]
     }
 
@@ -1733,6 +1753,7 @@ public enum ContiDatabase {
             let scc = i < speseCcFull.count ? speseCcFull[i] : .zero
             let cc = i < ccFlags.count ? ccFlags[i] : false
             let oggi = a - sf
+            let dispOggi = cc ? Decimal.zero : oggi
             let disp = cc ? Decimal.zero : (a + scc)
             let code = stringFromJSON(accounts[i]["code"]).trimmingCharacters(in: .whitespacesAndNewlines)
             rows.append([
@@ -1741,8 +1762,11 @@ public enum ContiDatabase {
                 "saldo_assoluto": decimalStringForLightJson(a),
                 "saldo_alla_data": decimalStringForLightJson(oggi),
                 "spese_future": decimalStringForLightJson(sf),
+                "disponibilita_oggi": decimalStringForLightJson(dispOggi),
                 "spese_cc": decimalStringForLightJson(scc),
+                "impegni_carte": decimalStringForLightJson(scc),
                 "disponibilita": decimalStringForLightJson(disp),
+                "disponibilita_assoluta": decimalStringForLightJson(disp),
                 "credit_card": cc,
             ])
         }
@@ -1763,8 +1787,11 @@ public enum ContiDatabase {
             "totals": [
                 "saldo_assoluti_non_cc": decimalStringForLightJson(tAbs),
                 "spese_future_non_cc": decimalStringForLightJson(tSf),
+                "disponibilita_oggi_non_cc": decimalStringForLightJson(tAbs - tSf),
                 "spese_cc_non_cc": decimalStringForLightJson(tScc),
+                "impegni_carte_non_cc": decimalStringForLightJson(tScc),
                 "disponibilita_non_cc": decimalStringForLightJson(tAbs + tScc),
+                "disponibilita_assoluta_non_cc": decimalStringForLightJson(tAbs + tScc),
             ],
         ]
     }
@@ -2647,8 +2674,12 @@ public enum ContiDatabase {
                 ?? .zero
             let isCc = boolFromJSON(r["credit_card"])
             let sf = parseLooseDecimal(stringFromJSON(r["spese_future"])) ?? (abs - alla)
-            let scc = parseLooseDecimal(stringFromJSON(r["spese_cc"])) ?? .zero
-            let disp = parseLooseDecimal(stringFromJSON(r["disponibilita"])) ?? (isCc ? .zero : (abs + scc))
+            let scc = parseLooseDecimal(stringFromJSON(r["impegni_carte"]))
+                ?? parseLooseDecimal(stringFromJSON(r["spese_cc"]))
+                ?? .zero
+            let disp = parseLooseDecimal(stringFromJSON(r["disponibilita_assoluta"]))
+                ?? parseLooseDecimal(stringFromJSON(r["disponibilita"]))
+                ?? (isCc ? .zero : (abs + scc))
             let id = code.isEmpty ? "acc-\(i)" : "acc-\(code)"
             return ContiSaldRiga(
                 id: id,
