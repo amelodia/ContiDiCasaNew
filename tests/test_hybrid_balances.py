@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from decimal import Decimal
 
-from balance_engine import compute_absolute_balances, consolidated_base_balances
+from balance_engine import compute_absolute_balances, consolidated_base_balances, new_records_effect
 
 
 def _legacy_raw_record(
@@ -79,6 +79,43 @@ class HybridBalancesTests(unittest.TestCase):
         self.assertEqual(
             consolidated_base_balances(db, 2),
             [Decimal("2000.00"), Decimal("1000.00")],
+        )
+
+    def test_new_records_effect_includes_app_records_and_giroconto_secondary_side(self) -> None:
+        db = _db_with_consolidated_2026_balance()
+        db["years"][1]["records"].extend(
+            [
+                {
+                    "year": 2026,
+                    "amount_eur": "-30.00",
+                    "category_code": "2",
+                    "category_name": "-Spese",
+                    "account_primary_code": "1",
+                    "raw_record": "",
+                },
+                {
+                    "year": 2026,
+                    "amount_eur": "100.00",
+                    "category_code": "1",
+                    "category_name": "=Girata conto/conto",
+                    "account_primary_code": "1",
+                    "account_secondary_code": "2",
+                    "raw_record": "",
+                },
+                {
+                    "year": 2026,
+                    "amount_eur": "999.00",
+                    "category_code": "2",
+                    "category_name": "-Spese",
+                    "account_primary_code": "1",
+                    "raw_record": _legacy_raw_record(amount_eur="999.00"),
+                },
+            ]
+        )
+
+        self.assertEqual(
+            new_records_effect(db),
+            [Decimal("70.00"), Decimal("-100.00")],
         )
 
     def test_uses_consolidated_2026_saldo_without_replaying_pre_2026_records(self) -> None:

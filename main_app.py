@@ -2540,10 +2540,9 @@ def _category_code_int(rec: dict) -> int | None:
 
 def is_giroconto_record(rec: dict) -> bool:
     """Giroconto conto↔conto: stessa logica dei controlli in import_legacy (nome + fallback codice 1)."""
-    cat_name = (rec.get("category_name") or "").upper()
-    if "GIRATA.CONTO/CONTO" in cat_name or "GIRATA CONTO/CONTO" in cat_name:
-        return True
-    return _category_code_int(rec) == 1
+    import balance_engine
+
+    return balance_engine.is_giroconto_record(rec)
 
 
 def giro_record_secondary_amount_flip(rec: dict, side: str) -> bool:
@@ -2561,7 +2560,9 @@ def giro_record_secondary_amount_flip(rec: dict, side: str) -> bool:
 
 def is_dotazione_record(rec: dict) -> bool:
     """Solo dati legacy/import: categoria codice 0. In app non è prevista: valorizzare un conto con una girata conto/conto."""
-    return _category_code_int(rec) == 0
+    import balance_engine
+
+    return balance_engine.is_dotazione_record(rec)
 
 
 def record_skip_for_category_statistics_budget(rec: dict, twin_keys: frozenset) -> bool:
@@ -2715,35 +2716,9 @@ def compute_new_records_effect(db: dict) -> list[Decimal]:
     """Effetto netto sui conti delle sole registrazioni create nell'app (raw_record vuoto).
     Le registrazioni di scarico Virtuale (is_virtuale_discharge) sono escluse perché non
     toccano i saldi reali dei conti."""
-    if not db.get("years"):
-        return []
-    latest_year = max(y["year"] for y in db["years"])
-    year_data = next(y for y in db["years"] if y["year"] == latest_year)
-    accounts = year_data["accounts"]
-    n_accounts = len(accounts)
+    import balance_engine
 
-    balances = [Decimal("0") for _ in accounts]
-    for yd in db["years"]:
-        for rec in yd.get("records", []):
-            if rec.get("is_cancelled"):
-                continue
-            if (rec.get("raw_record") or "").strip():
-                continue
-            if rec.get("is_virtuale_discharge"):
-                continue
-            y = int(rec["year"])
-            if is_dotazione_record(rec) and y != LEGACY_DOTAZIONE_YEAR:
-                continue
-            amount = to_decimal(rec["amount_eur"])
-            c1 = rec.get("account_primary_code", "")
-            c2 = rec.get("account_secondary_code", "")
-            c1_idx = account_column_index_in_latest_chart(accounts, c1)
-            c2_idx = account_column_index_in_latest_chart(accounts, c2)
-            if 0 <= c1_idx < n_accounts:
-                balances[c1_idx] += amount
-            if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts:
-                balances[c2_idx] -= amount
-    return balances
+    return balance_engine.new_records_effect(db)
 
 
 def compute_cancelled_imported_records_balance_adjustment(

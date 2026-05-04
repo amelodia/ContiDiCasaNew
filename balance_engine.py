@@ -17,6 +17,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 PLAN_REFERENCE_YEAR = 2026
+LEGACY_DOTAZIONE_YEAR = 1990
 
 
 def _latest_year_bucket(db: dict) -> dict | None:
@@ -44,6 +45,40 @@ def _canonical_account_code(code: str) -> str:
     if s.isdigit():
         return str(int(s))
     return s
+
+
+def _to_decimal(value: object) -> Decimal:
+    return Decimal(str(value).replace(",", "."))
+
+
+def _category_code_int(rec: dict) -> int | None:
+    raw = str(rec.get("category_code", "")).strip()
+    if not raw.isdigit():
+        return None
+    return int(raw)
+
+
+def is_giroconto_record(rec: dict) -> bool:
+    """True per giroconto conto/conto, con le stesse regole storiche del desktop."""
+    cat_name = str(rec.get("category_name") or "").upper()
+    if "GIRATA.CONTO/CONTO" in cat_name or "GIRATA CONTO/CONTO" in cat_name:
+        return True
+    return _category_code_int(rec) == 1
+
+
+def is_dotazione_record(rec: dict) -> bool:
+    return _category_code_int(rec) == 0
+
+
+def account_column_index(accounts: list[dict], code_raw: object) -> int:
+    """Indice colonna conto nell'ordine corrente, cercando per codice e non per posizione."""
+    wanted = _canonical_account_code(str(code_raw or ""))
+    if not wanted:
+        return -1
+    for i, account in enumerate(accounts):
+        if _canonical_account_code(str(account.get("code", ""))) == wanted:
+            return i
+    return -1
 
 
 def consolidated_base_balances(db: dict, n_accounts: int) -> list[Decimal] | None:
@@ -89,6 +124,40 @@ def consolidated_base_balances(db: dict, n_accounts: int) -> list[Decimal] | Non
             code_key = str(i + 1)
         out.append(by_code.get(code_key, Decimal("0")))
     return out
+
+
+def new_records_effect(db: dict) -> list[Decimal]:
+    """Effetto netto sui conti delle registrazioni create nell'app.
+
+    Sono escluse righe annullate, righe importate legacy (``raw_record`` pieno) e scarichi
+    del saldo virtuale. Le girate conto/conto incidono anche sul conto secondario.
+    """
+    latest = _latest_year_bucket(db)
+    if not latest:
+        return []
+    accounts = latest.get("accounts") or []
+    n_accounts = len(accounts)
+    balances = [Decimal("0") for _ in accounts]
+
+    for yd in db.get("years") or []:
+        for rec in yd.get("records") or []:
+            if rec.get("is_cancelled"):
+                continue
+            if (rec.get("raw_record") or "").strip():
+                continue
+            if rec.get("is_virtuale_discharge"):
+                continue
+            y = int(rec.get("year", 0) or 0)
+            if is_dotazione_record(rec) and y != LEGACY_DOTAZIONE_YEAR:
+                continue
+            amount = _to_decimal(rec.get("amount_eur", "0"))
+            c1_idx = account_column_index(accounts, rec.get("account_primary_code", ""))
+            c2_idx = account_column_index(accounts, rec.get("account_secondary_code", ""))
+            if 0 <= c1_idx < n_accounts:
+                balances[c1_idx] += amount
+            if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts:
+                balances[c2_idx] -= amount
+    return balances
 
 
 def compute_absolute_balances(db: dict, *, today_iso: str) -> list[Decimal] | None:
