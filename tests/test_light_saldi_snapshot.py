@@ -3,10 +3,27 @@ from __future__ import annotations
 import unittest
 from decimal import Decimal
 
-from balance_engine import light_saldi_snapshot_from_footer_vectors
+from balance_engine import compose_saldi_five_row_vectors, light_saldi_snapshot_from_footer_vectors
 
 
 class LightSaldiSnapshotTests(unittest.TestCase):
+    def test_five_row_formula_centralizes_desktop_saldi_presentation(self) -> None:
+        rows = compose_saldi_five_row_vectors(
+            [Decimal("100.00"), Decimal("-30.00")],
+            [Decimal("10.00"), Decimal("0")],
+            [Decimal("-30.00"), Decimal("0")],
+            [False, True],
+        )
+
+        self.assertEqual(rows["saldo_oggi"], [Decimal("90.00"), Decimal("-30.00")])
+        self.assertEqual(rows["disponibilita_oggi"], [Decimal("90.00"), Decimal("0")])
+        self.assertEqual(rows["disponibilita"], [Decimal("70.00"), Decimal("0")])
+        self.assertEqual(rows["totals"]["saldo_assoluti_non_cc"], Decimal("100.00"))
+        self.assertEqual(rows["totals"]["spese_future_non_cc"], Decimal("10.00"))
+        self.assertEqual(rows["totals"]["disponibilita_oggi_non_cc"], Decimal("90.00"))
+        self.assertEqual(rows["totals"]["spese_cc_non_cc"], Decimal("-30.00"))
+        self.assertEqual(rows["totals"]["disponibilita_non_cc"], Decimal("70.00"))
+
     def test_snapshot_serializes_footer_vectors_for_ios_light(self) -> None:
         snapshot = light_saldi_snapshot_from_footer_vectors(
             {

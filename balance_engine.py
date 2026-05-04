@@ -19,6 +19,13 @@ from typing import Any
 PLAN_REFERENCE_YEAR = 2026
 LEGACY_DOTAZIONE_YEAR = 1990
 LEGACY_DAT_RECORD_LEN = 121
+SALDI_FIVE_ROW_DEFINITIONS = (
+    {"key": "saldo_assoluti", "label": "Saldi assoluti", "hide_for_credit_card": False},
+    {"key": "spese_future", "label": "Di cui, impegni futuri", "hide_for_credit_card": True},
+    {"key": "disponibilita_oggi", "label": "Disponibilita oggi", "hide_for_credit_card": True},
+    {"key": "spese_cc", "label": "Impegni per carte", "hide_for_credit_card": True},
+    {"key": "disponibilita", "label": "Disponibilita assoluta", "hide_for_credit_card": True},
+)
 
 
 def _latest_year_bucket(db: dict) -> dict | None:
@@ -153,6 +160,64 @@ def credit_card_footer_amounts(db: dict, saldo_assoluti: list[Decimal]) -> list[
             continue
         out[ref_index] = out[ref_index] + saldo_assoluti[i]
     return out
+
+
+def compose_saldi_five_row_vectors(
+    saldo_assoluti: list[Decimal],
+    spese_future: list[Decimal],
+    spese_cc: list[Decimal],
+    is_credit_card: list[bool],
+) -> dict[str, object]:
+    """Formula unica delle 5 righe Saldi, dopo filtro delle colonne visibili."""
+    n = len(saldo_assoluti)
+    sf_vals = [(spese_future[i] if i < len(spese_future) else Decimal("0")) for i in range(n)]
+    scc_vals = [(spese_cc[i] if i < len(spese_cc) else Decimal("0")) for i in range(n)]
+    cc_flags = [(is_credit_card[i] if i < len(is_credit_card) else False) for i in range(n)]
+    saldo_oggi = [
+        saldo_assoluti[i] - sf_vals[i]
+        for i in range(n)
+    ]
+    disponibilita_oggi = [
+        Decimal("0") if cc_flags[i] else saldo_oggi[i]
+        for i in range(n)
+    ]
+    disponibilita = [
+        Decimal("0") if cc_flags[i] else saldo_assoluti[i] + scc_vals[i]
+        for i in range(n)
+    ]
+    total_abs = sum(
+        (saldo_assoluti[i] for i in range(n) if not cc_flags[i]),
+        Decimal("0"),
+    )
+    total_sf = sum(
+        (sf_vals[i] for i in range(n) if not cc_flags[i]),
+        Decimal("0"),
+    )
+    total_scc = sum(
+        (scc_vals[i] for i in range(n) if not cc_flags[i]),
+        Decimal("0"),
+    )
+    total_disp_oggi = total_abs - total_sf
+    total_disp = total_abs + total_scc
+    return {
+        "saldo_oggi": saldo_oggi,
+        "spese_future": sf_vals,
+        "disponibilita_oggi": disponibilita_oggi,
+        "spese_cc": scc_vals,
+        "impegni_carte": scc_vals,
+        "disponibilita": disponibilita,
+        "disponibilita_assoluta": disponibilita,
+        "totals": {
+            "saldo_assoluti_non_cc": total_abs,
+            "spese_future_non_cc": total_sf,
+            "disponibilita_oggi_non_cc": total_disp_oggi,
+            "spese_cc_non_cc": total_scc,
+            "impegni_carte_non_cc": total_scc,
+            "disponibilita_non_cc": total_disp,
+            "disponibilita_assoluta_non_cc": total_disp,
+        },
+        "row_definitions": list(SALDI_FIVE_ROW_DEFINITIONS),
+    }
 
 
 def record_contribution_vector(rec: dict, accounts: list[dict], n_accounts: int) -> list[Decimal]:

@@ -4128,11 +4128,8 @@ def saldi_footer_amount_vectors(db: dict, *, today_iso: str | None = None) -> di
     out_names: list[str] = []
     out_codes: list[str] = []
     saldo_assoluti: list[Decimal] = []
-    saldo_oggi: list[Decimal] = []
     spese_future: list[Decimal] = []
     spese_cc: list[Decimal] = []
-    disponibilita_oggi: list[Decimal] = []
-    disponibilita: list[Decimal] = []
     is_cc: list[bool] = []
     for i in _keep:
         out_names.append(str(names_full[i]).strip())
@@ -4144,42 +4141,34 @@ def saldi_footer_amount_vectors(db: dict, *, today_iso: str | None = None) -> di
         sf = amts_future_full[i] if i < len(amts_future_full) else Decimal("0")
         scc = spese_cc_full[i] if i < len(spese_cc_full) else Decimal("0")
         cc = bool(cc_full[i]) if i < len(cc_full) else False
-        oggi = a - sf
-        disp = Decimal("0") if cc else (a + scc)
         saldo_assoluti.append(a)
-        saldo_oggi.append(oggi)
         spese_future.append(sf)
         spese_cc.append(scc)
-        disponibilita_oggi.append(Decimal("0") if cc else oggi)
         is_cc.append(cc)
-        disponibilita.append(disp)
-    total_abs = sum((saldo_assoluti[i] for i in range(len(is_cc)) if not is_cc[i]), Decimal("0"))
-    total_sf = sum((spese_future[i] for i in range(len(is_cc)) if not is_cc[i]), Decimal("0"))
-    total_disp_oggi = total_abs - total_sf
-    total_scc = sum((spese_cc[i] for i in range(len(is_cc)) if not is_cc[i]), Decimal("0"))
-    total_disp = total_abs + total_scc
+    import balance_engine
+
+    five_rows = balance_engine.compose_saldi_five_row_vectors(
+        saldo_assoluti,
+        spese_future,
+        spese_cc,
+        is_cc,
+    )
+    totals = dict(five_rows["totals"])
     return {
         "year_basis": latest_year,
         "names": out_names,
         "account_codes": out_codes,
         "saldo_assoluti": saldo_assoluti,
-        "saldo_oggi": saldo_oggi,
-        "spese_future": spese_future,
-        "disponibilita_oggi": disponibilita_oggi,
-        "spese_cc": spese_cc,
-        "impegni_carte": spese_cc,
-        "disponibilita": disponibilita,
-        "disponibilita_assoluta": disponibilita,
+        "saldo_oggi": five_rows["saldo_oggi"],
+        "spese_future": five_rows["spese_future"],
+        "disponibilita_oggi": five_rows["disponibilita_oggi"],
+        "spese_cc": five_rows["spese_cc"],
+        "impegni_carte": five_rows["impegni_carte"],
+        "disponibilita": five_rows["disponibilita"],
+        "disponibilita_assoluta": five_rows["disponibilita_assoluta"],
         "is_credit_card": is_cc,
-        "totals": {
-            "saldo_assoluti_non_cc": total_abs,
-            "spese_future_non_cc": total_sf,
-            "disponibilita_oggi_non_cc": total_disp_oggi,
-            "spese_cc_non_cc": total_scc,
-            "impegni_carte_non_cc": total_scc,
-            "disponibilita_non_cc": total_disp,
-            "disponibilita_assoluta_non_cc": total_disp,
-        },
+        "totals": totals,
+        "row_definitions": five_rows["row_definitions"],
         "snapshot_date_iso": today,
     }
 
@@ -12984,35 +12973,29 @@ th {{ background:#efefef; text-align:left; }}
         amts_future = [amts_future[i] for i in _keep_sp]
         is_cc = [cc_full[i] for i in _keep_sp]
         spese_cc = [spese_cc_full[i] for i in _keep_sp]
-        saldo_oggi = [saldo_assoluti[j] - amts_future[j] for j in range(len(names))]
-        spese_future = [saldo_assoluti[j] - saldo_oggi[j] for j in range(len(names))]
-        disponibilita_oggi = [
-            Decimal("0") if is_cc[i] else saldo_oggi[i]
-            for i in range(len(names))
-        ]
-        disponibilita = [
-            (a + sc) if not is_cc[i] else Decimal("0")
-            for i, (a, sf, sc) in enumerate(zip(saldo_assoluti, spese_future, spese_cc))
-        ]
-        total_abs = sum((saldo_assoluti[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
-        total_spese_future = sum((spese_future[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
-        total_disponibilita_oggi = total_abs - total_spese_future
-        total_spese_cc = sum((spese_cc[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
-        total_disponibilita = total_abs + total_spese_cc
+        import balance_engine
+
+        five_rows = balance_engine.compose_saldi_five_row_vectors(
+            saldo_assoluti,
+            amts_future,
+            spese_cc,
+            is_cc,
+        )
+        totals = dict(five_rows["totals"])
         return {
             "valuta": "E",
             "names": [n.strip() for n in names],
             "column_is_credit_card": is_cc,
             "amts_abs": saldo_assoluti,
-            "amts_spese_future": spese_future,
-            "amts_disponibilita_oggi": disponibilita_oggi,
-            "amts_spese_cc": spese_cc,
-            "amts_disponibilita": disponibilita,
-            "total_abs": total_abs,
-            "total_spese_future": total_spese_future,
-            "total_disponibilita_oggi": total_disponibilita_oggi,
-            "total_spese_cc": total_spese_cc,
-            "total_disponibilita": total_disponibilita,
+            "amts_spese_future": five_rows["spese_future"],
+            "amts_disponibilita_oggi": five_rows["disponibilita_oggi"],
+            "amts_spese_cc": five_rows["spese_cc"],
+            "amts_disponibilita": five_rows["disponibilita"],
+            "total_abs": totals["saldo_assoluti_non_cc"],
+            "total_spese_future": totals["spese_future_non_cc"],
+            "total_disponibilita_oggi": totals["disponibilita_oggi_non_cc"],
+            "total_spese_cc": totals["spese_cc_non_cc"],
+            "total_disponibilita": totals["disponibilita_non_cc"],
             "date_it": to_italian_date(date.today().isoformat()),
             "user_header": print_user_header_text(cur_db(), session_holder[0]),
         }
@@ -13717,21 +13700,24 @@ th {{ background:#efefef; text-align:left; }}
             amts_future = [amts_future[i] for i in _keep_saldi]
             is_cc = [cc_full[i] for i in _keep_saldi]
             spese_cc = [spese_cc_full[i] for i in _keep_saldi]
-            saldo_oggi = [saldo_assoluti[j] - amts_future[j] for j in range(len(names))]
-            spese_future = [saldo_assoluti[j] - saldo_oggi[j] for j in range(len(names))]
-            disponibilita_oggi = [
-                Decimal("0") if is_cc[i] else saldo_oggi[i]
-                for i in range(len(names))
-            ]
-            disponibilita = [
-                (a + sc) if not is_cc[i] else Decimal("0")
-                for i, (a, sf, sc) in enumerate(zip(saldo_assoluti, spese_future, spese_cc))
-            ]
-            total_assoluti = sum((saldo_assoluti[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
-            total_spese_future = sum((spese_future[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
-            total_disponibilita_oggi = total_assoluti - total_spese_future
-            total_spese_cc = sum((spese_cc[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
-            total_disponibilita = total_assoluti + total_spese_cc
+            import balance_engine
+
+            five_rows = balance_engine.compose_saldi_five_row_vectors(
+                saldo_assoluti,
+                amts_future,
+                spese_cc,
+                is_cc,
+            )
+            totals = dict(five_rows["totals"])
+            spese_future = list(five_rows["spese_future"])
+            disponibilita_oggi = list(five_rows["disponibilita_oggi"])
+            spese_cc = list(five_rows["spese_cc"])
+            disponibilita = list(five_rows["disponibilita"])
+            total_assoluti = totals["saldo_assoluti_non_cc"]
+            total_spese_future = totals["spese_future_non_cc"]
+            total_disponibilita_oggi = totals["disponibilita_oggi_non_cc"]
+            total_spese_cc = totals["spese_cc_non_cc"]
+            total_disponibilita = totals["disponibilita_non_cc"]
 
             # Righe saldi: 1 assoluti; 2 impegni futuri; 3 disponibilità oggi; 4 impegni carte; 5 disponibilità assoluta.
             table = tk.Frame(balance_center_canvas, highlightthickness=0, bd=0)
