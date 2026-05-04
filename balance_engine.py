@@ -281,6 +281,23 @@ def imported_active_records_edit_adjustment(db: dict) -> list[Decimal]:
     return adj
 
 
+def compose_consolidated_absolute_balances(db: dict, n_accounts: int) -> list[Decimal] | None:
+    """Saldo assoluto ordinario: base consolidata + delta app + correzioni storico."""
+    base = consolidated_base_balances(db, n_accounts)
+    if base is None:
+        return None
+    new_fx = new_records_effect(db)
+    canc = cancelled_imported_records_adjustment(db)
+    edit_adj = imported_active_records_edit_adjustment(db)
+    return [
+        base[i]
+        + (new_fx[i] if i < len(new_fx) else Decimal("0"))
+        + (canc[i] if i < len(canc) else Decimal("0"))
+        + (edit_adj[i] if i < len(edit_adj) else Decimal("0"))
+        for i in range(n_accounts)
+    ]
+
+
 def compute_absolute_balances(db: dict, *, today_iso: str) -> list[Decimal] | None:
     """Saldi assoluti per conto, allineati al footer Saldi del desktop."""
     import main_app

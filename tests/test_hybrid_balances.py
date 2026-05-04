@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from balance_engine import (
     cancelled_imported_records_adjustment,
+    compose_consolidated_absolute_balances,
     compute_absolute_balances,
     imported_active_records_edit_adjustment,
     consolidated_base_balances,
@@ -174,6 +175,42 @@ class HybridBalancesTests(unittest.TestCase):
         self.assertEqual(
             imported_active_records_edit_adjustment(db),
             [Decimal("-15.00"), Decimal("0")],
+        )
+
+    def test_compose_consolidated_absolute_balances_adds_all_deltas(self) -> None:
+        db = _db_with_consolidated_2026_balance(
+            {
+                "year": 2025,
+                "amount_eur": "-40.00",
+                "category_code": "2",
+                "category_name": "-Spese",
+                "account_primary_code": "1",
+                "raw_record": _legacy_raw_record(amount_eur="-40.00"),
+                "is_cancelled": True,
+            },
+            {
+                "year": 2025,
+                "amount_eur": "-55.00",
+                "category_code": "2",
+                "category_name": "-Spese",
+                "account_primary_code": "1",
+                "raw_record": _legacy_raw_record(amount_eur="-40.00"),
+            },
+        )
+        db["years"][1]["records"].append(
+            {
+                "year": 2026,
+                "amount_eur": "-25.00",
+                "category_code": "2",
+                "category_name": "-Spese",
+                "account_primary_code": "1",
+                "raw_record": "",
+            }
+        )
+
+        self.assertEqual(
+            compose_consolidated_absolute_balances(db, 2),
+            [Decimal("1000.00"), Decimal("2000.00")],
         )
 
     def test_uses_consolidated_2026_saldo_without_replaying_pre_2026_records(self) -> None:

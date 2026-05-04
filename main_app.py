@@ -2924,26 +2924,16 @@ def hybrid_absolute_balances_for_saldi(db: dict, *, today_cancel_cutoff_iso: str
         return None
     today_c = (today_cancel_cutoff_iso or date.today().isoformat())[:10]
 
-    la = legacy_absolute_account_amounts(db, n_accounts)
-    if la is None:
+    import balance_engine
+
+    out = balance_engine.compose_consolidated_absolute_balances(db, n_accounts)
+    if out is None:
         _, _, replay = compute_balances_from_2022_asof(
             db,
             cutoff_date_iso=today_c,
             exclude_import_twin_actives=bool(import_cancel_twin_balance_keys(db)),
         )
         return replay
-
-    new_fx = compute_new_records_effect(db)
-    canc = compute_cancelled_imported_records_balance_adjustment(db, cutoff_date_iso=today_c)
-    edit_adj = compute_imported_active_records_edit_balance_adjustment(db)
-
-    out = [
-        la[i]
-        + (new_fx[i] if i < len(new_fx) else Decimal("0"))
-        + (canc[i] if i < len(canc) else Decimal("0"))
-        + (edit_adj[i] if i < len(edit_adj) else Decimal("0"))
-        for i in range(n_accounts)
-    ]
 
     tk = import_cancel_twin_balance_keys(db)
     if not tk:
