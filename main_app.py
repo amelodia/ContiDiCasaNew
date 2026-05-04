@@ -7837,7 +7837,7 @@ def _finalize_startup_db_with_light_sidecar(db: dict, primary_path: Path) -> Non
 
 
 def reset_contabili_for_nuova_utenza(db: dict) -> None:
-    """Azzera anni/registrazioni e metadati import; i dati tornano solo con Import legacy da Opzioni."""
+    """Azzera anni/registrazioni e metadati import; il DB corrente resta la fonte definitiva."""
     db["years"] = []
     for k in (
         "generated_at",
@@ -27841,7 +27841,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         d = cur_db()
         if not d.get("years"):
             plan_conti_status_var.set(
-                "Nessun anno contabile nel database: usa Import legacy oppure crea l’anno con la prima registrazione "
+                "Nessun anno contabile nel database: crea l’anno con la prima registrazione "
                 "(anno contabile scelto in immissione; il programma aggiunge l’anno al bisogno)."
             )
             return
@@ -29922,8 +29922,8 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     ttk.Label(
         estratti_inner,
         text=(
-            "Funzioni presenti ma non attivabili da questa pagina: import legacy, azzeramento di emergenza del saldo "
-            "virtuale, verifica coerenza file cifrati e copia manuale Dropbox verso Library."
+            "Funzioni tecniche non esposte da questa pagina: azzeramento di emergenza del saldo virtuale, "
+            "verifica coerenza file cifrati e copia manuale Dropbox verso Library."
         ),
         wraplength=980,
         foreground="#555555",

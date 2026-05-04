@@ -73,8 +73,8 @@ python3 main_app.py
 - La versione **light** per iPhone è un percorso **separato**: cartella **`iphone_light/`** (auth, crypto, CLI) e futura app nativa iOS. Le semplificazioni di interfaccia per il mobile vanno descritte in `iphone_light/LIGHT_UI_SPEC.md` e implementate lì / in Swift, **non** accorciando il desktop.
 
 All’apertura (flusso tipico):
-- se non esiste ancora un database cifrato per-utente, esegue **ImportLegacy** (output JSON in `legacy_import/`) e poi la configurazione posta / primo accesso;
-- altrimenti carica il `.enc` da `data/` e fonde eventuali righe dal file `*_light.enc`;
+- carica il database cifrato corrente, che è la fonte definitiva dei dati contabili;
+- fonde eventuali righe provenienti dal file `*_light.enc`;
 - mostra movimenti e saldi nell’interfaccia.
 
 ### Struttura pagine
@@ -90,8 +90,6 @@ Le pagine disponibili sono:
 
 ### Opzioni (prima implementazione)
 
-- ricarica import legacy con sovrascrittura del database nuova app
-- scelta cartella sorgente legacy
 - scelta file dati nuova app (`.enc` completo, tipicamente `conti_utente_<hash>.enc`)
 - scelta file chiave cifratura (`.key`, es. `conti_di_casa.key`)
 - **Sposta nella cartella…**: sposta insieme **tre file** nella cartella scelta — `.enc` completo, `*_light.enc` (stesso stem del completo + suffisso `_light`) e `.key` (stessi nomi file)

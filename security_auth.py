@@ -555,8 +555,8 @@ def run_login_dialog(
             "L’utenza che stai lasciando resta nei suoi file: le sue impostazioni (posta, sicurezza, "
             "registrazioni periodiche) restano legate a quell’account nel file .enc dedicato.\n"
             "Per la nuova utenza le opzioni ripartono vuote o predefinite e vanno configurate di nuovo in Opzioni.\n"
-            "I dati contabili (anni, registrazioni, piano conti) vengono azzerati; si ripopolano solo "
-            "con «Ricarica importi legacy» in Opzioni se lo attivi.\n\n"
+            "I dati contabili (anni, registrazioni, piano conti) vengono azzerati; il database corrente "
+            "resta la fonte definitiva e gli eventuali ripristini passano dai backup.\n\n"
             "Continuare?",
             parent=win,
         ):
@@ -601,7 +601,7 @@ def run_login_dialog(
             "Profilo di accesso aggiornato: accedi con la nuova email e password.\n\n"
             "Le impostazioni dell’account precedente restano sul relativo file dati (quell’utenza). "
             "Per questa nuova utenza configura in Opzioni posta, sicurezza e le altre opzioni.\n"
-            "I dati contabili sono vuoti finché non usi «Ricarica importi legacy» in Opzioni.",
+            "I dati contabili sono vuoti finché non inserisci nuove registrazioni o ripristini un backup.",
             parent=win,
         )
 
