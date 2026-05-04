@@ -95,6 +95,13 @@ class HybridBalancesTests(unittest.TestCase):
             [Decimal("2000.00"), Decimal("1000.00")],
         )
 
+    def test_consolidated_base_balances_reject_more_than_two_decimals(self) -> None:
+        db = _db_with_consolidated_2026_balance()
+        db["years"][1]["legacy_saldi"] = {"amounts": ["1000.001", "2000.00"]}
+
+        with self.assertRaises(ValueError):
+            consolidated_base_balances(db, 2)
+
     def test_new_records_effect_includes_app_records_and_giroconto_secondary_side(self) -> None:
         db = _db_with_consolidated_2026_balance()
         db["years"][1]["records"].extend(

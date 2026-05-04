@@ -110,7 +110,7 @@ def consolidated_base_balances(db: dict, n_accounts: int) -> list[Decimal] | Non
         if not code_key:
             continue
         try:
-            by_code[code_key] = Decimal(str(raw[i]))
+            by_code[code_key] = parse_euro_amount(raw[i])
         except InvalidOperation:
             by_code[code_key] = Decimal("0")
 
