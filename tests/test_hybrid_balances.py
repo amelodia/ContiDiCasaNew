@@ -6,6 +6,7 @@ from decimal import Decimal
 from balance_engine import (
     cancelled_imported_records_adjustment,
     compute_absolute_balances,
+    imported_active_records_edit_adjustment,
     consolidated_base_balances,
     new_records_effect,
     parse_euro_amount,
@@ -156,6 +157,23 @@ class HybridBalancesTests(unittest.TestCase):
         self.assertEqual(
             cancelled_imported_records_adjustment(db),
             [Decimal("40.00"), Decimal("0")],
+        )
+
+    def test_imported_active_records_edit_adjustment_uses_current_minus_original(self) -> None:
+        db = _db_with_consolidated_2026_balance(
+            {
+                "year": 2025,
+                "amount_eur": "-55.00",
+                "category_code": "2",
+                "category_name": "-Spese",
+                "account_primary_code": "1",
+                "raw_record": _legacy_raw_record(amount_eur="-40.00"),
+            }
+        )
+
+        self.assertEqual(
+            imported_active_records_edit_adjustment(db),
+            [Decimal("-15.00"), Decimal("0")],
         )
 
     def test_uses_consolidated_2026_saldo_without_replaying_pre_2026_records(self) -> None:

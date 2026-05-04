@@ -18,6 +18,7 @@ from typing import Any
 
 PLAN_REFERENCE_YEAR = 2026
 LEGACY_DOTAZIONE_YEAR = 1990
+LEGACY_DAT_RECORD_LEN = 121
 
 
 def _latest_year_bucket(db: dict) -> dict | None:
@@ -83,6 +84,47 @@ def account_column_index(accounts: list[dict], code_raw: object) -> int:
         if _canonical_account_code(str(account.get("code", ""))) == wanted:
             return i
     return -1
+
+
+def record_contribution_vector(rec: dict, accounts: list[dict], n_accounts: int) -> list[Decimal]:
+    """Effetto della singola registrazione sulle colonne conto."""
+    out = [Decimal("0") for _ in range(n_accounts)]
+    y = int(rec.get("year", 0) or 0)
+    if is_dotazione_record(rec) and y != LEGACY_DOTAZIONE_YEAR:
+        return out
+    amount = parse_euro_amount(rec.get("amount_eur", "0"))
+    c1_idx = account_column_index(accounts, rec.get("account_primary_code", ""))
+    c2_idx = account_column_index(accounts, rec.get("account_secondary_code", ""))
+    if 0 <= c1_idx < n_accounts:
+        out[c1_idx] += amount
+    if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts:
+        out[c2_idx] -= amount
+    return out
+
+
+def synthetic_record_from_legacy_dat_raw(raw_line: str, host_year: int) -> dict | None:
+    """Ricostruisce i campi contabili minimi dalla riga legacy `.dat` originale."""
+    line = raw_line if isinstance(raw_line, str) else str(raw_line)
+    if len(line) < LEGACY_DAT_RECORD_LEN:
+        return None
+    try:
+        from import_legacy import format_money, parse_amount
+
+        amount_eur = parse_amount(line[23:37])
+        amount_str = format_money(amount_eur)
+    except Exception:
+        return None
+    cat_code_raw = line[37:39].strip()
+    acc1_code = line[39:40].strip()
+    acc2_code = line[42:43].strip()
+    return {
+        "year": host_year,
+        "amount_eur": amount_str,
+        "category_code": cat_code_raw if cat_code_raw.isdigit() else "0",
+        "category_name": "",
+        "account_primary_code": acc1_code if acc1_code.isdigit() else "",
+        "account_secondary_code": acc2_code if acc2_code.isdigit() else "",
+    }
 
 
 def consolidated_base_balances(db: dict, n_accounts: int) -> list[Decimal] | None:
@@ -199,6 +241,43 @@ def cancelled_imported_records_adjustment(db: dict) -> list[Decimal]:
                 adj[c1_idx] += amount
             if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts:
                 adj[c2_idx] -= amount
+    return adj
+
+
+def imported_active_records_edit_adjustment(db: dict) -> list[Decimal]:
+    """Correzione per righe importate ancora attive ma modificate in app.
+
+    Aggiunge ``contributo_attuale - contributo_originale_raw`` per ogni riga importata
+    non annullata. Questo mantiene valido il saldo consolidato senza rigiocare tutto lo
+    storico pre-2026.
+    """
+    latest = _latest_year_bucket(db)
+    if not latest:
+        return []
+    accounts = latest.get("accounts") or []
+    n_accounts = len(accounts)
+    adj = [Decimal("0") for _ in accounts]
+
+    latest_year = int(latest.get("year", 0) or 0)
+    for yd in db.get("years") or []:
+        y = int(yd.get("year", 0) or 0)
+        if y > latest_year:
+            continue
+        for rec in yd.get("records") or []:
+            if rec.get("is_cancelled"):
+                continue
+            if rec.get("is_virtuale_discharge"):
+                continue
+            raw = str(rec.get("raw_record") or "").strip()
+            if len(raw) < LEGACY_DAT_RECORD_LEN:
+                continue
+            synth = synthetic_record_from_legacy_dat_raw(raw, y)
+            if synth is None:
+                continue
+            original = record_contribution_vector(synth, accounts, n_accounts)
+            current = record_contribution_vector(rec, accounts, n_accounts)
+            for i in range(n_accounts):
+                adj[i] += current[i] - original[i]
     return adj
 
 

@@ -2739,45 +2739,16 @@ def _record_contribution_to_balance_vector(
     rec: dict, accounts: list[dict], n_accounts: int
 ) -> list[Decimal]:
     """Effetto della singola registrazione sulle colonne conto (stesse regole di ``compute_balances_from_2022_asof``)."""
-    out = [Decimal("0") for _ in range(n_accounts)]
-    y = int(rec.get("year", 0))
-    if is_dotazione_record(rec) and y != LEGACY_DOTAZIONE_YEAR:
-        return out
-    amount = to_decimal(rec["amount_eur"])
-    c1 = rec.get("account_primary_code", "")
-    c2 = rec.get("account_secondary_code", "")
-    c1_idx = account_column_index_in_latest_chart(accounts, c1)
-    c2_idx = account_column_index_in_latest_chart(accounts, c2)
-    if 0 <= c1_idx < n_accounts:
-        out[c1_idx] += amount
-    if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts:
-        out[c2_idx] -= amount
-    return out
+    import balance_engine
+
+    return balance_engine.record_contribution_vector(rec, accounts, n_accounts)
 
 
 def _synthetic_record_from_legacy_dat_raw(raw_line: str, host_year: int) -> dict | None:
     """Ricostruisce i campi contabili minimi dalla riga .dat originale (121 caratteri) come in ``parse_dat``."""
-    line = raw_line if isinstance(raw_line, str) else str(raw_line)
-    if len(line) < _LEGACY_DAT_RECORD_LEN:
-        return None
-    try:
-        importo_euro_raw = line[23:37]
-        amount_eur = parse_amount(importo_euro_raw)
-        amount_str = format_money(amount_eur)
-    except Exception:
-        return None
-    cat_code_raw = line[37:39].strip()
-    acc1_code = line[39:40].strip()
-    acc2_code = line[42:43].strip()
-    cat_str = cat_code_raw if cat_code_raw.isdigit() else "0"
-    return {
-        "year": host_year,
-        "amount_eur": amount_str,
-        "category_code": cat_str,
-        "category_name": "",
-        "account_primary_code": acc1_code if acc1_code.isdigit() else "",
-        "account_secondary_code": acc2_code if acc2_code.isdigit() else "",
-    }
+    import balance_engine
+
+    return balance_engine.synthetic_record_from_legacy_dat_raw(raw_line, host_year)
 
 
 def legacy_dat_category_code_from_raw_record(rec: dict) -> str | None:
@@ -2813,35 +2784,9 @@ def compute_imported_active_records_edit_balance_adjustment(db: dict) -> list[De
     ``compute_new_records_effect`` non la vede (``raw_record`` pieno) e il saldo legacy resterebbe sbagliato:
     qui si aggiunge ``contrib(attuale) − contrib(originale_file)`` per ogni riga importata non annullata.
     """
-    if not db.get("years"):
-        return []
-    latest_year = max(y["year"] for y in db["years"])
-    year_data = next(y for y in db["years"] if y["year"] == latest_year)
-    accounts = year_data["accounts"]
-    n_accounts = len(accounts)
-    adj = [Decimal("0") for _ in range(n_accounts)]
-    for yd in db["years"]:
-        y = int(yd["year"])
-        if y > latest_year:
-            continue
-        for rec in yd.get("records") or []:
-            if rec.get("is_cancelled"):
-                continue
-            if rec.get("is_virtuale_discharge"):
-                continue
-            raw = str(rec.get("raw_record") or "").strip()
-            if not raw:
-                continue
-            if len(raw) < _LEGACY_DAT_RECORD_LEN:
-                continue
-            synth = _synthetic_record_from_legacy_dat_raw(raw, y)
-            if synth is None:
-                continue
-            v0 = _record_contribution_to_balance_vector(synth, accounts, n_accounts)
-            v1 = _record_contribution_to_balance_vector(rec, accounts, n_accounts)
-            for i in range(n_accounts):
-                adj[i] += v1[i] - v0[i]
-    return adj
+    import balance_engine
+
+    return balance_engine.imported_active_records_edit_adjustment(db)
 
 
 def _imported_record_balance_twin_key(rec: dict) -> tuple[str, str, str, str]:
