@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from decimal import Decimal
 
-from balance_engine import compute_absolute_balances
+from balance_engine import compute_absolute_balances, consolidated_base_balances
 
 
 def _legacy_raw_record(
@@ -53,6 +53,34 @@ def _db_with_consolidated_2026_balance(*records: dict) -> dict:
 
 
 class HybridBalancesTests(unittest.TestCase):
+    def test_consolidated_base_balances_follow_account_codes_after_reorder(self) -> None:
+        db = {
+            "years": [
+                {
+                    "year": 2026,
+                    "accounts": [
+                        {"code": "01", "name": "Cassa"},
+                        {"code": "02", "name": "Banca"},
+                    ],
+                    "legacy_saldi": {"amounts": ["1000.00", "2000.00"]},
+                    "records": [],
+                },
+                {
+                    "year": 2027,
+                    "accounts": [
+                        {"code": "2", "name": "Banca"},
+                        {"code": "1", "name": "Cassa"},
+                    ],
+                    "records": [],
+                },
+            ]
+        }
+
+        self.assertEqual(
+            consolidated_base_balances(db, 2),
+            [Decimal("2000.00"), Decimal("1000.00")],
+        )
+
     def test_uses_consolidated_2026_saldo_without_replaying_pre_2026_records(self) -> None:
         db = _db_with_consolidated_2026_balance(
             {

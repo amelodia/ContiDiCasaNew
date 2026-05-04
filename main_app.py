@@ -2242,12 +2242,9 @@ def account_balance_for_code_latest_chart(db: dict, account_code: str) -> Decima
 
 def _canonical_legacy_saldo_code_key(ck: str) -> str:
     """Chiave per mappare *sld* per codice conto: ``06`` e ``6`` coincidono (come nel resto del piano)."""
-    s = str(ck or "").strip()
-    if not s:
-        return ""
-    if s.isdigit():
-        return str(int(s))
-    return s
+    import balance_engine
+
+    return balance_engine._canonical_account_code(ck)
 
 
 def legacy_absolute_account_amounts(db: dict, n_accounts: int) -> list[Decimal] | None:
@@ -2257,45 +2254,9 @@ def legacy_absolute_account_amounts(db: dict, n_accounts: int) -> list[Decimal] 
     avere stessi codici ma **ordine diverso** (inserimenti, riordino). Non usare ``raw[i]`` con ``i`` indice colonna
     dell'ultimo anno senza mappare per ``code``.
     """
-    y_ref = year_bucket_for_calendar_year(db, PLAN_REFERENCE_YEAR)
-    if not y_ref:
-        return None
-    ls = y_ref.get("legacy_saldi")
-    if not isinstance(ls, dict):
-        return None
-    raw = ls.get("amounts")
-    if not isinstance(raw, list) or not raw:
-        return None
-    accs_ref = y_ref.get("accounts") or []
-    legacy_by_code: dict[str, Decimal] = {}
-    for j, a in enumerate(accs_ref):
-        if j >= len(raw):
-            break
-        ck = str(a.get("code", "")).strip()
-        if not ck:
-            continue
-        key = _canonical_legacy_saldo_code_key(ck)
-        if not key:
-            continue
-        try:
-            legacy_by_code[key] = Decimal(str(raw[j]))
-        except InvalidOperation:
-            legacy_by_code[key] = Decimal("0")
+    import balance_engine
 
-    yb = latest_year_bucket(db)
-    if not yb:
-        return None
-    accounts_latest = yb.get("accounts") or []
-    out: list[Decimal] = []
-    for i in range(n_accounts):
-        if i >= len(accounts_latest):
-            out.append(Decimal("0"))
-            continue
-        ck = str(accounts_latest[i].get("code", "")).strip()
-        if not ck:
-            ck = str(i + 1)
-        out.append(legacy_by_code.get(_canonical_legacy_saldo_code_key(ck), Decimal("0")))
-    return out
+    return balance_engine.consolidated_base_balances(db, n_accounts)
 
 
 def remove_category_from_all_years(db: dict, code: str) -> None:
