@@ -86,6 +86,75 @@ def account_column_index(accounts: list[dict], code_raw: object) -> int:
     return -1
 
 
+def account_codes_equal(a: object, b: object) -> bool:
+    return _canonical_account_code(str(a or "")) == _canonical_account_code(str(b or "")) != ""
+
+
+def account_has_non_cancelled_movement_touching_code(db: dict, account_code: str) -> bool:
+    """True se una registrazione attiva coinvolge il codice conto indicato."""
+    code = str(account_code or "").strip()
+    if not code:
+        return False
+    for yd in db.get("years") or []:
+        for rec in yd.get("records") or []:
+            if rec.get("is_cancelled"):
+                continue
+            if rec.get("is_virtuale_discharge"):
+                continue
+            if account_codes_equal(rec.get("account_primary_code", ""), code):
+                return True
+            if is_giroconto_record(rec) and account_codes_equal(rec.get("account_secondary_code", ""), code):
+                return True
+    return False
+
+
+def credit_card_column_flags(db: dict, n_accounts: int) -> list[bool]:
+    """True per indice conto se il conto corrente è marcato come carta di credito."""
+    if n_accounts <= 0:
+        return []
+    latest = _latest_year_bucket(db)
+    if not latest:
+        return [False] * n_accounts
+    accounts = latest.get("accounts") or []
+    return [bool(accounts[i].get("credit_card")) if i < len(accounts) else False for i in range(n_accounts)]
+
+
+def credit_card_commitments_by_account_index(db: dict) -> list[Decimal]:
+    """Impegni carta espliciti per conto; per ora non ci sono righe dedicate e resta un vettore zero."""
+    latest = _latest_year_bucket(db)
+    if not latest:
+        return []
+    return [Decimal("0") for _ in latest.get("accounts") or []]
+
+
+def credit_card_footer_amounts(db: dict, saldo_assoluti: list[Decimal]) -> list[Decimal]:
+    """Riga «Spese per carte di credito» per il footer Saldi."""
+    n_accounts = len(saldo_assoluti)
+    if n_accounts == 0:
+        return []
+    latest = _latest_year_bucket(db)
+    if not latest:
+        return []
+    accounts = latest.get("accounts") or []
+    base = credit_card_commitments_by_account_index(db)
+    out = [(base[i] if i < len(base) else Decimal("0")) for i in range(n_accounts)]
+    for i in range(min(n_accounts, len(accounts))):
+        account = accounts[i]
+        if not bool(account.get("credit_card")):
+            continue
+        ref_code = str(account.get("credit_card_reference_code") or "").strip()
+        if not ref_code:
+            continue
+        ref_index = account_column_index(accounts, ref_code)
+        if ref_index < 0 or ref_index >= n_accounts or ref_index == i:
+            continue
+        card_code = str(account.get("code", "") or "").strip()
+        if not account_has_non_cancelled_movement_touching_code(db, card_code):
+            continue
+        out[ref_index] = out[ref_index] + saldo_assoluti[i]
+    return out
+
+
 def record_contribution_vector(rec: dict, accounts: list[dict], n_accounts: int) -> list[Decimal]:
     """Effetto della singola registrazione sulle colonne conto."""
     out = [Decimal("0") for _ in range(n_accounts)]

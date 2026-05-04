@@ -3058,12 +3058,9 @@ def compute_credit_card_impegni_by_account_index(db: dict) -> list[Decimal]:
     Struttura pronta per la logica contabile sulle registrazioni carta; finché non definita,
     restituisce zeri.
     """
-    if not db.get("years"):
-        return []
-    latest_year = max(y["year"] for y in db["years"])
-    year_data = next(y for y in db["years"] if y["year"] == latest_year)
-    n_accounts = len(year_data.get("accounts") or [])
-    return [Decimal("0")] * n_accounts
+    import balance_engine
+
+    return balance_engine.credit_card_commitments_by_account_index(db)
 
 
 def _account_chart_index_for_code(accs: list[dict], ref_code: str) -> int | None:
@@ -3104,23 +3101,9 @@ def _account_codes_equal_for_records(a: str, b: str) -> bool:
 
 def account_has_non_cancelled_movement_touching_code(db: dict, account_code: str) -> bool:
     """True se esiste almeno una registrazione non annullata (esclusi scarichi virtuali) che coinvolge il codice."""
-    code = str(account_code or "").strip()
-    if not code:
-        return False
-    for yd in db.get("years") or []:
-        for rec in yd.get("records") or []:
-            if rec.get("is_cancelled"):
-                continue
-            if rec.get("is_virtuale_discharge"):
-                continue
-            c1 = str(rec.get("account_primary_code", "") or "").strip()
-            if _account_codes_equal_for_records(c1, code):
-                return True
-            if is_giroconto_record(rec):
-                c2 = str(rec.get("account_secondary_code", "") or "").strip()
-                if _account_codes_equal_for_records(c2, code):
-                    return True
-    return False
+    import balance_engine
+
+    return balance_engine.account_has_non_cancelled_movement_touching_code(db, account_code)
 
 
 def stats_account_code_in_year_chart(db: dict, year_int: int, acc_code: str) -> bool:
@@ -4108,29 +4091,9 @@ def compute_spese_cc_footer_amounts(db: dict, saldo_assoluti: list[Decimal]) -> 
     Più carte collegate allo **stesso** conto ordinario contribuiscono in **somma** a quella colonna;
     il valore è ricalcolato a ogni aggiornamento dei saldi (nessuna cache).
     """
-    n = len(saldo_assoluti)
-    if not db.get("years") or n == 0:
-        return []
-    base = compute_credit_card_impegni_by_account_index(db)
-    out = [(base[i] if i < len(base) else Decimal("0")) for i in range(n)]
-    latest_year = max(y["year"] for y in db["years"])
-    year_data = next(y for y in db["years"] if y["year"] == latest_year)
-    accs = year_data.get("accounts") or []
-    for i in range(min(n, len(accs))):
-        acc = accs[i]
-        if not bool(acc.get("credit_card")):
-            continue
-        ref = str(acc.get("credit_card_reference_code") or "").strip()
-        if not ref:
-            continue
-        j = _account_chart_index_for_code(accs, ref)
-        if j is None or j < 0 or j >= n or j == i:
-            continue
-        card_code = str(acc.get("code", "") or "").strip()
-        if not account_has_non_cancelled_movement_touching_code(db, card_code):
-            continue
-        out[j] = out[j] + saldo_assoluti[i]
-    return out
+    import balance_engine
+
+    return balance_engine.credit_card_footer_amounts(db, saldo_assoluti)
 
 
 def saldi_footer_amount_vectors(db: dict, *, today_iso: str | None = None) -> dict[str, object] | None:
@@ -4223,18 +4186,9 @@ def compute_light_saldi_snapshot(db: dict, *, today_iso: str | None = None) -> d
 
 def account_is_credit_card_column_flags(db: dict, n_names: int) -> list[bool]:
     """True per indice conto se il conto è carta di credito (piano ultimo anno, stesso ordine di ``names``)."""
-    if not db.get("years") or n_names <= 0:
-        return [False] * max(0, n_names)
-    latest_year = max(y["year"] for y in db["years"])
-    year_data = next(y for y in db["years"] if y["year"] == latest_year)
-    accs = year_data.get("accounts") or []
-    out: list[bool] = []
-    for i in range(n_names):
-        if i < len(accs):
-            out.append(bool(accs[i].get("credit_card")))
-        else:
-            out.append(False)
-    return out
+    import balance_engine
+
+    return balance_engine.credit_card_column_flags(db, n_names)
 
 
 def account_dict_for_code_latest_year(db: dict, acc_code: str) -> dict | None:
