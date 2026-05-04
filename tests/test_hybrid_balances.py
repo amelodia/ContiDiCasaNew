@@ -4,9 +4,11 @@ import unittest
 from decimal import Decimal
 
 from balance_engine import (
+    balances_at_date,
     cancelled_imported_records_adjustment,
     compose_consolidated_absolute_balances,
     compute_absolute_balances,
+    future_dated_records_effect,
     imported_active_records_edit_adjustment,
     consolidated_base_balances,
     new_records_effect,
@@ -210,6 +212,59 @@ class HybridBalancesTests(unittest.TestCase):
 
         self.assertEqual(
             compose_consolidated_absolute_balances(db, 2),
+            [Decimal("1000.00"), Decimal("2000.00")],
+        )
+
+    def test_future_dated_records_effect_tracks_records_after_cutoff(self) -> None:
+        db = _db_with_consolidated_2026_balance()
+        db["years"][1]["records"].extend(
+            [
+                {
+                    "year": 2026,
+                    "date_iso": "2026-05-05",
+                    "amount_eur": "-10.00",
+                    "category_code": "2",
+                    "category_name": "-Spese",
+                    "account_primary_code": "1",
+                    "raw_record": "",
+                },
+                {
+                    "year": 2026,
+                    "date_iso": "2026-05-04",
+                    "amount_eur": "-99.00",
+                    "category_code": "2",
+                    "category_name": "-Spese",
+                    "account_primary_code": "1",
+                    "raw_record": "",
+                },
+            ]
+        )
+
+        self.assertEqual(
+            future_dated_records_effect(db, today_iso="2026-05-04")[2],
+            [Decimal("-10.00"), Decimal("0")],
+        )
+
+    def test_balances_at_date_subtracts_future_dated_effect(self) -> None:
+        db = _db_with_consolidated_2026_balance()
+        db["years"][1]["records"].append(
+            {
+                "year": 2026,
+                "date_iso": "2026-05-05",
+                "amount_eur": "-10.00",
+                "category_code": "2",
+                "category_name": "-Spese",
+                "account_primary_code": "1",
+                "raw_record": "",
+            }
+        )
+
+        self.assertEqual(
+            balances_at_date(
+                db,
+                asof_iso="2026-05-04",
+                absolute_balances=[Decimal("990.00"), Decimal("2000.00")],
+            ),
             [Decimal("1000.00"), Decimal("2000.00")],
         )
 

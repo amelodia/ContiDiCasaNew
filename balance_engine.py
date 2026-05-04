@@ -102,6 +102,23 @@ def record_contribution_vector(rec: dict, accounts: list[dict], n_accounts: int)
     return out
 
 
+def record_legacy_stable_key(rec: dict) -> str:
+    key = rec.get("legacy_registration_key")
+    if isinstance(key, str) and key.strip():
+        return key
+    return f"{rec.get('year', '')}:{rec.get('source_folder', '')}:{rec.get('source_file', '')}:{rec.get('source_index', '')}"
+
+
+def imported_record_balance_twin_key(rec: dict) -> tuple[str, str, str, str]:
+    stable = str(rec.get("legacy_registration_key") or "").strip() or record_legacy_stable_key(rec)
+    return (
+        str(rec.get("year", "")).strip(),
+        str(rec.get("source_folder", "")).strip(),
+        str(rec.get("source_file", "")).strip(),
+        stable,
+    )
+
+
 def synthetic_record_from_legacy_dat_raw(raw_line: str, host_year: int) -> dict | None:
     """Ricostruisce i campi contabili minimi dalla riga legacy `.dat` originale."""
     line = raw_line if isinstance(raw_line, str) else str(raw_line)
@@ -296,6 +313,74 @@ def compose_consolidated_absolute_balances(db: dict, n_accounts: int) -> list[De
         + (edit_adj[i] if i < len(edit_adj) else Decimal("0"))
         for i in range(n_accounts)
     ]
+
+
+def future_dated_records_effect(
+    db: dict,
+    *,
+    today_iso: str,
+    excluded_import_twin_keys: set[tuple[str, str, str, str]] | None = None,
+) -> tuple[int, list[str], list[Decimal]]:
+    """Effetto netto delle sole registrazioni con data successiva a ``today_iso``."""
+    latest = _latest_year_bucket(db)
+    if not latest:
+        from datetime import date
+
+        return (date.today().year, [], [])
+    latest_year = int(latest.get("year", 0) or 0)
+    accounts = latest.get("accounts") or []
+    n_accounts = len(accounts)
+    excluded = excluded_import_twin_keys or set()
+    balances = [Decimal("0") for _ in accounts]
+
+    for yd in db.get("years") or []:
+        y = int(yd.get("year", 0) or 0)
+        if y > latest_year:
+            continue
+        for rec in yd.get("records") or []:
+            if rec.get("is_cancelled"):
+                continue
+            if rec.get("is_virtuale_discharge"):
+                continue
+            if (
+                excluded
+                and (rec.get("raw_record") or "").strip()
+                and imported_record_balance_twin_key(rec) in excluded
+            ):
+                continue
+            ry = int(rec.get("year", 0) or 0)
+            if is_dotazione_record(rec) and ry != LEGACY_DOTAZIONE_YEAR:
+                continue
+            rec_date = str(rec.get("date_iso", "") or "")
+            if not rec_date or rec_date <= today_iso:
+                continue
+            amount = parse_euro_amount(rec.get("amount_eur", "0"))
+            c1_idx = account_column_index(accounts, rec.get("account_primary_code", ""))
+            c2_idx = account_column_index(accounts, rec.get("account_secondary_code", ""))
+            if 0 <= c1_idx < n_accounts:
+                balances[c1_idx] += amount
+            if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts:
+                balances[c2_idx] -= amount
+
+    return latest_year, [str(a.get("name", "") or "") for a in accounts], balances
+
+
+def balances_at_date(
+    db: dict,
+    *,
+    asof_iso: str,
+    absolute_balances: list[Decimal],
+    excluded_import_twin_keys: set[tuple[str, str, str, str]] | None = None,
+) -> list[Decimal] | None:
+    """Saldo alla data: saldi assoluti meno effetto delle registrazioni future."""
+    _year, _names, future = future_dated_records_effect(
+        db,
+        today_iso=asof_iso,
+        excluded_import_twin_keys=excluded_import_twin_keys,
+    )
+    if len(future) != len(absolute_balances):
+        return None
+    return [absolute_balances[i] - future[i] for i in range(len(absolute_balances))]
 
 
 def compute_absolute_balances(db: dict, *, today_iso: str) -> list[Decimal] | None:

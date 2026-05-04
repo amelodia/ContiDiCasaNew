@@ -2814,13 +2814,9 @@ def _imported_record_balance_twin_key(rec: dict) -> tuple[str, str, str, str]:
     Non usare data/conti/importo: due registrazioni distinte possono avere gli stessi valori
     e devono pesare entrambe sui saldi quando una o entrambe vengono annullate.
     """
-    stable = str(rec.get("legacy_registration_key") or "").strip() or record_legacy_stable_key(rec)
-    return (
-        str(rec.get("year", "")).strip(),
-        str(rec.get("source_folder", "")).strip(),
-        str(rec.get("source_file", "")).strip(),
-        stable,
-    )
+    import balance_engine
+
+    return balance_engine.imported_record_balance_twin_key(rec)
 
 
 def import_cancel_twin_balance_keys(db: dict) -> set[tuple[str, str, str, str]]:
@@ -2960,13 +2956,14 @@ def hybrid_balances_saldo_in_data(db: dict, *, asof_iso: str) -> list[Decimal] |
     hyb = hybrid_absolute_balances_for_saldi(db, today_cancel_cutoff_iso=d)
     if hyb is None:
         return None
-    tk_flag = bool(import_cancel_twin_balance_keys(db))
-    _yr, _nm, fut = compute_balances_future_dated_only(
-        db, today_iso=d, exclude_import_twin_actives=tk_flag
+    import balance_engine
+
+    return balance_engine.balances_at_date(
+        db,
+        asof_iso=d,
+        absolute_balances=hyb,
+        excluded_import_twin_keys=import_cancel_twin_balance_keys(db),
     )
-    if len(fut) != len(hyb):
-        return None
-    return [hyb[i] - fut[i] for i in range(len(hyb))]
 
 
 def compute_balances_future_dated_only(
@@ -2976,56 +2973,15 @@ def compute_balances_future_dated_only(
     Effetto netto sui conti delle sole registrazioni con `date_iso` > `today_iso`.
     «Saldi alla data di oggi» = saldi assoluti − questi effetti (registrazioni future).
     """
-    if not db.get("years"):
-        return (date.today().year, [], [])
-    latest_year = max(y["year"] for y in db["years"])
-    year_data = next(y for y in db["years"] if y["year"] == latest_year)
-    accounts = year_data["accounts"]
-    n_accounts = len(accounts)
+    import balance_engine
 
-    twin_keys = import_cancel_twin_balance_keys(db) if exclude_import_twin_actives else set()
-
-    pool: list[dict] = []
-    for yd in db["years"]:
-        y = int(yd["year"])
-        if y > latest_year:
-            continue
-        pool.extend(yd["records"])
-    pool.sort(key=record_merge_sort_key)
-
-    balances = [Decimal("0") for _ in accounts]
-    for rec in pool:
-        if rec.get("is_cancelled"):
-            continue
-        if rec.get("is_virtuale_discharge"):
-            continue
-        if (
-            twin_keys
-            and (rec.get("raw_record") or "").strip()
-            and _imported_record_balance_twin_key(rec) in twin_keys
-        ):
-            continue
-        y = int(rec["year"])
-        if is_dotazione_record(rec) and y != LEGACY_DOTAZIONE_YEAR:
-            continue
-        r_date = str(rec.get("date_iso", ""))
-        if not r_date or r_date <= today_iso:
-            continue
-
-        amount = to_decimal(rec["amount_eur"])
-        c1 = rec.get("account_primary_code", "")
-        c2 = rec.get("account_secondary_code", "")
-
-        c1_idx = account_column_index_in_latest_chart(accounts, c1)
-        c2_idx = account_column_index_in_latest_chart(accounts, c2)
-
-        if 0 <= c1_idx < n_accounts:
-            balances[c1_idx] += amount
-        if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts:
-            balances[c2_idx] -= amount
-
-    names = [a["name"] for a in accounts]
-    return latest_year, names, balances
+    return balance_engine.future_dated_records_effect(
+        db,
+        today_iso=today_iso,
+        excluded_import_twin_keys=import_cancel_twin_balance_keys(db)
+        if exclude_import_twin_actives
+        else set(),
+    )
 
 
 def compute_balances_future_dated_only_batch(
