@@ -8,8 +8,8 @@ Regola attuale:
 - modifiche o annulli su registrazioni importate pre-2026 producono una correzione;
 - se manca la base consolidata, l'app usa il ricalcolo completo come fallback storico.
 
-Per ora le formule restano in ``main_app.py``. Questo modulo isola i chiamanti dal file UI
-monolitico e rende più semplice spostare i calcoli in modo incrementale.
+Questo modulo contiene il cuore dei calcoli saldi. ``main_app.py`` mantiene wrapper
+compatibili per l'UI e per i casi legacy non ancora separati.
 """
 from __future__ import annotations
 

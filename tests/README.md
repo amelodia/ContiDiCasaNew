@@ -8,4 +8,5 @@ Esecuzione:
 python3 -m unittest discover
 ```
 
-Per ora coprono funzioni pure e delicate: importi euro e sidecar light per iPhone.
+Per ora coprono funzioni pure e delicate: importi euro, saldi consolidati/alla data,
+regole di modifica storiche e sidecar light per iPhone.
