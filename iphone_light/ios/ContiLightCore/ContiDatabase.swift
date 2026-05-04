@@ -113,6 +113,22 @@ extension ContiDBError: LocalizedError {
 
 /// Caricamento DB e login allineati a `iphone_light/light_auth.py` + `crypto_db.py`.
 public enum ContiDatabase {
+    public typealias LightSaldiTotalsNonCc = (
+        abs: Decimal,
+        sf: Decimal,
+        dispOggi: Decimal,
+        scc: Decimal,
+        disp: Decimal
+    )
+
+    private typealias LightSaldiFiveRows = (
+        saldoOggi: [Decimal],
+        speseFuture: [Decimal],
+        disponibilitaOggi: [Decimal],
+        speseCc: [Decimal],
+        disponibilita: [Decimal],
+        totals: LightSaldiTotalsNonCc
+    )
 
     /// Oltre questa soglia (JSON in chiaro) il login usa solo `user_profile` (file .enc molto grande).
     /// Il file **sidecar** ``*_light.enc`` del desktop è piccolo: resta sotto soglia e si fa parse completo (Movimenti).
@@ -1061,13 +1077,7 @@ public enum ContiDatabase {
     }
 
     /// Totali riga «non carta» dal blocco ``light_saldi`` (opzionale, file generato da desktop/iOS recente).
-    public static func lightSaldiTotalsNonCc(sessionDb: Any?) -> (
-        abs: Decimal,
-        sf: Decimal,
-        dispOggi: Decimal,
-        scc: Decimal,
-        disp: Decimal
-    )? {
+    public static func lightSaldiTotalsNonCc(sessionDb: Any?) -> LightSaldiTotalsNonCc? {
         guard let db = dictionaryFromAnyRoot(sessionDb) else { return nil }
         guard let block = dictionaryFromAnyRoot(db["light_saldi"]),
               let t = dictionaryFromAnyRoot(block["totals"])
@@ -1678,49 +1688,90 @@ public enum ContiDatabase {
         return out
     }
 
-    private static func refreshLightSaldiRowDerivedFromAbsDay(_ block: inout [String: Any]) {
-        var rows = coerceToArrayOfStringKeyedDicts(block["rows"])
-        guard !rows.isEmpty else { return }
-        var newRows: [[String: Any]] = []
-        for var m in rows {
-            let a = parseLooseDecimal(stringFromJSON(m["saldo_assoluto"])) ?? .zero
-            let d = parseLooseDecimal(stringFromJSON(m["saldo_alla_data"])) ?? .zero
-            let sf = a - d
-            m["spese_future"] = decimalStringForLightJson(sf)
-            let isCc = boolFromJSON(m["credit_card"])
-            let scc = parseLooseDecimal(stringFromJSON(m["impegni_carte"]))
-                ?? parseLooseDecimal(stringFromJSON(m["spese_cc"]))
-                ?? .zero
-            let dispOggi = isCc ? Decimal.zero : d
-            let disp = isCc ? Decimal.zero : (a + scc)
-            m["disponibilita_oggi"] = decimalStringForLightJson(dispOggi)
-            m["impegni_carte"] = decimalStringForLightJson(scc)
-            m["disponibilita"] = decimalStringForLightJson(disp)
-            m["disponibilita_assoluta"] = decimalStringForLightJson(disp)
-            newRows.append(m)
-        }
-        rows = newRows
-        let isCcFlags = rows.map { boolFromJSON($0["credit_card"]) }
-        let absVals = rows.map { parseLooseDecimal(stringFromJSON($0["saldo_assoluto"])) ?? .zero }
-        let sfVals = rows.map { parseLooseDecimal(stringFromJSON($0["spese_future"])) ?? .zero }
-        let sccVals = rows.map { parseLooseDecimal(stringFromJSON($0["spese_cc"])) ?? .zero }
+    private static func composeLightSaldiFiveRows(
+        saldoAssoluti: [Decimal],
+        speseFuture: [Decimal],
+        speseCc: [Decimal],
+        isCreditCard: [Bool]
+    ) -> LightSaldiFiveRows {
+        let n = saldoAssoluti.count
+        let sfVals = (0 ..< n).map { i in i < speseFuture.count ? speseFuture[i] : .zero }
+        let sccVals = (0 ..< n).map { i in i < speseCc.count ? speseCc[i] : .zero }
+        let ccFlags = (0 ..< n).map { i in i < isCreditCard.count ? isCreditCard[i] : false }
+        let saldoOggi = (0 ..< n).map { saldoAssoluti[$0] - sfVals[$0] }
+        let disponibilitaOggi = (0 ..< n).map { ccFlags[$0] ? Decimal.zero : saldoOggi[$0] }
+        let disponibilita = (0 ..< n).map { ccFlags[$0] ? Decimal.zero : saldoAssoluti[$0] + sccVals[$0] }
+
         var tAbs = Decimal.zero
         var tSf = Decimal.zero
         var tScc = Decimal.zero
-        for i in 0 ..< rows.count where !isCcFlags[i] {
-            tAbs += absVals[i]
+        for i in 0 ..< n where !ccFlags[i] {
+            tAbs += saldoAssoluti[i]
             tSf += sfVals[i]
             tScc += sccVals[i]
         }
+        return (
+            saldoOggi: saldoOggi,
+            speseFuture: sfVals,
+            disponibilitaOggi: disponibilitaOggi,
+            speseCc: sccVals,
+            disponibilita: disponibilita,
+            totals: (
+                abs: tAbs,
+                sf: tSf,
+                dispOggi: tAbs - tSf,
+                scc: tScc,
+                disp: tAbs + tScc
+            )
+        )
+    }
+
+    private static func refreshLightSaldiRowDerivedFromAbsDay(_ block: inout [String: Any]) {
+        var rows = coerceToArrayOfStringKeyedDicts(block["rows"])
+        guard !rows.isEmpty else { return }
+        let absVals = rows.map { parseLooseDecimal(stringFromJSON($0["saldo_assoluto"])) ?? .zero }
+        let dayVals = rows.map {
+            parseLooseDecimal(stringFromJSON($0["saldo_alla_data"]))
+                ?? parseLooseDecimal(stringFromJSON($0["saldo_oggi"]))
+                ?? .zero
+        }
+        let sfVals = (0 ..< rows.count).map { i in
+            parseLooseDecimal(stringFromJSON(rows[i]["spese_future"])) ?? (absVals[i] - dayVals[i])
+        }
+        let sccVals = rows.map {
+            parseLooseDecimal(stringFromJSON($0["impegni_carte"]))
+                ?? parseLooseDecimal(stringFromJSON($0["spese_cc"]))
+                ?? .zero
+        }
+        let ccFlags = rows.map { boolFromJSON($0["credit_card"]) }
+        let fiveRows = composeLightSaldiFiveRows(
+            saldoAssoluti: absVals,
+            speseFuture: sfVals,
+            speseCc: sccVals,
+            isCreditCard: ccFlags
+        )
+        var newRows: [[String: Any]] = []
+        for (i, var m) in rows.enumerated() {
+            m["saldo_alla_data"] = decimalStringForLightJson(fiveRows.saldoOggi[i])
+            m["spese_future"] = decimalStringForLightJson(fiveRows.speseFuture[i])
+            m["disponibilita_oggi"] = decimalStringForLightJson(fiveRows.disponibilitaOggi[i])
+            m["spese_cc"] = decimalStringForLightJson(fiveRows.speseCc[i])
+            m["impegni_carte"] = decimalStringForLightJson(fiveRows.speseCc[i])
+            m["disponibilita"] = decimalStringForLightJson(fiveRows.disponibilita[i])
+            m["disponibilita_assoluta"] = decimalStringForLightJson(fiveRows.disponibilita[i])
+            newRows.append(m)
+        }
+        rows = newRows
+        let totals = fiveRows.totals
         block["rows"] = rows
         block["totals"] = [
-            "saldo_assoluti_non_cc": decimalStringForLightJson(tAbs),
-            "spese_future_non_cc": decimalStringForLightJson(tSf),
-            "disponibilita_oggi_non_cc": decimalStringForLightJson(tAbs - tSf),
-            "spese_cc_non_cc": decimalStringForLightJson(tScc),
-            "impegni_carte_non_cc": decimalStringForLightJson(tScc),
-            "disponibilita_non_cc": decimalStringForLightJson(tAbs + tScc),
-            "disponibilita_assoluta_non_cc": decimalStringForLightJson(tAbs + tScc),
+            "saldo_assoluti_non_cc": decimalStringForLightJson(totals.abs),
+            "spese_future_non_cc": decimalStringForLightJson(totals.sf),
+            "disponibilita_oggi_non_cc": decimalStringForLightJson(totals.dispOggi),
+            "spese_cc_non_cc": decimalStringForLightJson(totals.scc),
+            "impegni_carte_non_cc": decimalStringForLightJson(totals.scc),
+            "disponibilita_non_cc": decimalStringForLightJson(totals.disp),
+            "disponibilita_assoluta_non_cc": decimalStringForLightJson(totals.disp),
         ]
     }
 
@@ -1744,54 +1795,55 @@ public enum ContiDatabase {
 
         let speseCcFull = computeSpeseCcFooterAmounts(db: db, saldoAssoluti: saldoAbsFull, accounts: accounts)
         let ccFlags = (0 ..< n).map { i in i < accounts.count ? boolFromJSON(accounts[i]["credit_card"]) : false }
+        let fiveRows = composeLightSaldiFiveRows(
+            saldoAssoluti: saldoAbsFull,
+            speseFuture: fut,
+            speseCc: speseCcFull,
+            isCreditCard: ccFlags
+        )
         let keep = saldiVisibleIndices(db: db, latestAccounts: accounts, namesFull: namesFull)
 
         var rows: [[String: Any]] = []
         for i in keep {
             let a = saldoAbsFull[i]
-            let sf = fut[i]
-            let scc = i < speseCcFull.count ? speseCcFull[i] : .zero
             let cc = i < ccFlags.count ? ccFlags[i] : false
-            let oggi = a - sf
-            let dispOggi = cc ? Decimal.zero : oggi
-            let disp = cc ? Decimal.zero : (a + scc)
             let code = stringFromJSON(accounts[i]["code"]).trimmingCharacters(in: .whitespacesAndNewlines)
             rows.append([
                 "account_code": code.isEmpty ? String(i + 1) : code,
                 "account_name": namesFull[i],
                 "saldo_assoluto": decimalStringForLightJson(a),
-                "saldo_alla_data": decimalStringForLightJson(oggi),
-                "spese_future": decimalStringForLightJson(sf),
-                "disponibilita_oggi": decimalStringForLightJson(dispOggi),
-                "spese_cc": decimalStringForLightJson(scc),
-                "impegni_carte": decimalStringForLightJson(scc),
-                "disponibilita": decimalStringForLightJson(disp),
-                "disponibilita_assoluta": decimalStringForLightJson(disp),
+                "saldo_alla_data": decimalStringForLightJson(fiveRows.saldoOggi[i]),
+                "spese_future": decimalStringForLightJson(fiveRows.speseFuture[i]),
+                "disponibilita_oggi": decimalStringForLightJson(fiveRows.disponibilitaOggi[i]),
+                "spese_cc": decimalStringForLightJson(fiveRows.speseCc[i]),
+                "impegni_carte": decimalStringForLightJson(fiveRows.speseCc[i]),
+                "disponibilita": decimalStringForLightJson(fiveRows.disponibilita[i]),
+                "disponibilita_assoluta": decimalStringForLightJson(fiveRows.disponibilita[i]),
                 "credit_card": cc,
             ])
         }
-        var tAbs = Decimal.zero
-        var tSf = Decimal.zero
-        var tScc = Decimal.zero
-        for i in keep {
-            let cc = i < ccFlags.count ? ccFlags[i] : false
-            if cc { continue }
-            tAbs += saldoAbsFull[i]
-            tSf += fut[i]
-            tScc += i < speseCcFull.count ? speseCcFull[i] : .zero
-        }
+        let keptAbs = keep.map { saldoAbsFull[$0] }
+        let keptFuture = keep.map { fiveRows.speseFuture[$0] }
+        let keptCards = keep.map { fiveRows.speseCc[$0] }
+        let keptCc = keep.map { $0 < ccFlags.count ? ccFlags[$0] : false }
+        let totals = composeLightSaldiFiveRows(
+            saldoAssoluti: keptAbs,
+            speseFuture: keptFuture,
+            speseCc: keptCards,
+            isCreditCard: keptCc
+        ).totals
         return [
             "snapshot_date_iso": today,
             "year_basis": latestYear,
             "rows": rows,
             "totals": [
-                "saldo_assoluti_non_cc": decimalStringForLightJson(tAbs),
-                "spese_future_non_cc": decimalStringForLightJson(tSf),
-                "disponibilita_oggi_non_cc": decimalStringForLightJson(tAbs - tSf),
-                "spese_cc_non_cc": decimalStringForLightJson(tScc),
-                "impegni_carte_non_cc": decimalStringForLightJson(tScc),
-                "disponibilita_non_cc": decimalStringForLightJson(tAbs + tScc),
-                "disponibilita_assoluta_non_cc": decimalStringForLightJson(tAbs + tScc),
+                "saldo_assoluti_non_cc": decimalStringForLightJson(totals.abs),
+                "spese_future_non_cc": decimalStringForLightJson(totals.sf),
+                "disponibilita_oggi_non_cc": decimalStringForLightJson(totals.dispOggi),
+                "spese_cc_non_cc": decimalStringForLightJson(totals.scc),
+                "impegni_carte_non_cc": decimalStringForLightJson(totals.scc),
+                "disponibilita_non_cc": decimalStringForLightJson(totals.disp),
+                "disponibilita_assoluta_non_cc": decimalStringForLightJson(totals.disp),
             ],
         ]
     }

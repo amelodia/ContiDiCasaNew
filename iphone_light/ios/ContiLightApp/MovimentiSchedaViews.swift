@@ -57,7 +57,7 @@ struct ContiLightSaldiSchedaView: View {
     }
 
     /// Totali «non carta» come nel footer desktop (se presenti nel JSON light).
-    private var totalsNonCc: (abs: Decimal, sf: Decimal, scc: Decimal, disp: Decimal)? {
+    private var totalsNonCc: ContiDatabase.LightSaldiTotalsNonCc? {
         ContiDatabase.lightSaldiTotalsNonCc(sessionDb: sessionDb)
     }
 
