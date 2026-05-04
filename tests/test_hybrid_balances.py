@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from decimal import Decimal
 
-from main_app import hybrid_absolute_balances_for_saldi
+from balance_engine import compute_absolute_balances
 
 
 def _legacy_raw_record(
@@ -68,7 +68,7 @@ class HybridBalancesTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            hybrid_absolute_balances_for_saldi(db, today_cancel_cutoff_iso="2026-05-04"),
+            compute_absolute_balances(db, today_iso="2026-05-04"),
             [Decimal("1000.00"), Decimal("2000.00")],
         )
 
@@ -88,7 +88,7 @@ class HybridBalancesTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            hybrid_absolute_balances_for_saldi(db, today_cancel_cutoff_iso="2026-05-04"),
+            compute_absolute_balances(db, today_iso="2026-05-04"),
             [Decimal("974.50"), Decimal("2000.00")],
         )
 
@@ -107,7 +107,7 @@ class HybridBalancesTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            hybrid_absolute_balances_for_saldi(db, today_cancel_cutoff_iso="2026-05-04"),
+            compute_absolute_balances(db, today_iso="2026-05-04"),
             [Decimal("980.00"), Decimal("2000.00")],
         )
 
@@ -127,7 +127,7 @@ class HybridBalancesTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            hybrid_absolute_balances_for_saldi(db, today_cancel_cutoff_iso="2026-05-04"),
+            compute_absolute_balances(db, today_iso="2026-05-04"),
             [Decimal("1100.00"), Decimal("2000.00")],
         )
 

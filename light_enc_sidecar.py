@@ -144,11 +144,11 @@ def _attach_light_saldi_snapshot(light_db: dict, full_db: dict) -> None:
     if not (full_db.get("years") or []):
         return
     try:
-        import main_app as _m
+        import balance_engine as _be
     except Exception:
         return
     try:
-        snap = _m.compute_light_saldi_snapshot(full_db, today_iso=date.today().isoformat())
+        snap = _be.compute_light_saldi_snapshot(full_db, today_iso=date.today().isoformat())
     except Exception:
         return
     if isinstance(snap, dict) and snap.get("rows"):
