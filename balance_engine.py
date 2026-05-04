@@ -47,8 +47,12 @@ def _canonical_account_code(code: str) -> str:
     return s
 
 
-def _to_decimal(value: object) -> Decimal:
-    return Decimal(str(value).replace(",", "."))
+def parse_euro_amount(value: object) -> Decimal:
+    """Importo euro esatto: massimo due decimali, nessun arrotondamento implicito."""
+    amount = Decimal(str(value).strip().replace(",", "."))
+    if amount.as_tuple().exponent < -2:
+        raise ValueError("Gli importi euro possono avere al massimo due decimali.")
+    return amount
 
 
 def _category_code_int(rec: dict) -> int | None:
@@ -150,7 +154,7 @@ def new_records_effect(db: dict) -> list[Decimal]:
             y = int(rec.get("year", 0) or 0)
             if is_dotazione_record(rec) and y != LEGACY_DOTAZIONE_YEAR:
                 continue
-            amount = _to_decimal(rec.get("amount_eur", "0"))
+            amount = parse_euro_amount(rec.get("amount_eur", "0"))
             c1_idx = account_column_index(accounts, rec.get("account_primary_code", ""))
             c2_idx = account_column_index(accounts, rec.get("account_secondary_code", ""))
             if 0 <= c1_idx < n_accounts:

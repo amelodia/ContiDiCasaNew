@@ -3,7 +3,12 @@ from __future__ import annotations
 import unittest
 from decimal import Decimal
 
-from balance_engine import compute_absolute_balances, consolidated_base_balances, new_records_effect
+from balance_engine import (
+    compute_absolute_balances,
+    consolidated_base_balances,
+    new_records_effect,
+    parse_euro_amount,
+)
 
 
 def _legacy_raw_record(
@@ -53,6 +58,15 @@ def _db_with_consolidated_2026_balance(*records: dict) -> dict:
 
 
 class HybridBalancesTests(unittest.TestCase):
+    def test_parse_euro_amount_accepts_at_most_two_decimals_without_rounding(self) -> None:
+        self.assertEqual(parse_euro_amount("12"), Decimal("12"))
+        self.assertEqual(parse_euro_amount("12.3"), Decimal("12.3"))
+        self.assertEqual(parse_euro_amount("12,30"), Decimal("12.30"))
+
+    def test_parse_euro_amount_rejects_more_than_two_decimals(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_euro_amount("12.345")
+
     def test_consolidated_base_balances_follow_account_codes_after_reorder(self) -> None:
         db = {
             "years": [
