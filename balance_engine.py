@@ -407,8 +407,51 @@ def compute_footer_vectors(db: dict, *, today_iso: str | None = None) -> dict[st
     return main_app.saldi_footer_amount_vectors(db, today_iso=today_iso)
 
 
+def light_saldi_snapshot_from_footer_vectors(vectors: dict[str, Any]) -> dict[str, object] | None:
+    """Converte i vettori saldi desktop nel blocco JSON ``light_saldi``."""
+    if not vectors:
+        return None
+    names = list(vectors["names"])
+    codes = list(vectors["account_codes"])
+    abs_vals: list[Decimal] = list(vectors["saldo_assoluti"])
+    oggi_vals: list[Decimal] = list(vectors["saldo_oggi"])
+    sf_vals: list[Decimal] = list(vectors["spese_future"])
+    scc_vals: list[Decimal] = list(vectors["spese_cc"])
+    disp_vals: list[Decimal] = list(vectors["disponibilita"])
+    is_cc = list(vectors["is_credit_card"])
+    rows: list[dict[str, object]] = []
+    for i in range(len(names)):
+        rows.append(
+            {
+                "account_code": str(codes[i]).strip() or str(i + 1),
+                "account_name": names[i],
+                "saldo_assoluto": str(abs_vals[i]),
+                "saldo_alla_data": str(oggi_vals[i]),
+                "spese_future": str(sf_vals[i]),
+                "spese_cc": str(scc_vals[i]),
+                "disponibilita": str(disp_vals[i]),
+                "credit_card": bool(is_cc[i]),
+            }
+        )
+    totals = vectors["totals"]
+    if not isinstance(totals, dict):
+        totals = {}
+    return {
+        "snapshot_date_iso": str(vectors["snapshot_date_iso"]),
+        "year_basis": int(vectors["year_basis"]),
+        "rows": rows,
+        "totals": {
+            "saldo_assoluti_non_cc": str(totals.get("saldo_assoluti_non_cc", Decimal("0"))),
+            "spese_future_non_cc": str(totals.get("spese_future_non_cc", Decimal("0"))),
+            "spese_cc_non_cc": str(totals.get("spese_cc_non_cc", Decimal("0"))),
+            "disponibilita_non_cc": str(totals.get("disponibilita_non_cc", Decimal("0"))),
+        },
+    }
+
+
 def compute_light_saldi_snapshot(db: dict, *, today_iso: str | None = None) -> dict[str, Any] | None:
     """Blocco ``light_saldi`` da scrivere nel sidecar iPhone."""
-    import main_app
-
-    return main_app.compute_light_saldi_snapshot(db, today_iso=today_iso)
+    vectors = compute_footer_vectors(db, today_iso=today_iso)
+    if not vectors:
+        return None
+    return light_saldi_snapshot_from_footer_vectors(vectors)

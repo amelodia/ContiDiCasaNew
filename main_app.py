@@ -4216,42 +4216,9 @@ def compute_light_saldi_snapshot(db: dict, *, today_iso: str | None = None) -> d
     v = saldi_footer_amount_vectors(db, today_iso=today_iso)
     if not v:
         return None
-    names = list(v["names"])
-    codes = list(v["account_codes"])
-    abs_vals: list[Decimal] = list(v["saldo_assoluti"])
-    oggi_vals: list[Decimal] = list(v["saldo_oggi"])
-    sf_vals: list[Decimal] = list(v["spese_future"])
-    scc_vals: list[Decimal] = list(v["spese_cc"])
-    disp_vals: list[Decimal] = list(v["disponibilita"])
-    is_cc = list(v["is_credit_card"])
-    rows: list[dict[str, object]] = []
-    for i in range(len(names)):
-        rows.append(
-            {
-                "account_code": str(codes[i]).strip() or str(i + 1),
-                "account_name": names[i],
-                "saldo_assoluto": str(abs_vals[i]),
-                "saldo_alla_data": str(oggi_vals[i]),
-                "spese_future": str(sf_vals[i]),
-                "spese_cc": str(scc_vals[i]),
-                "disponibilita": str(disp_vals[i]),
-                "credit_card": bool(is_cc[i]),
-            }
-        )
-    t = v["totals"]
-    if not isinstance(t, dict):
-        t = {}
-    return {
-        "snapshot_date_iso": str(v["snapshot_date_iso"]),
-        "year_basis": int(v["year_basis"]),
-        "rows": rows,
-        "totals": {
-            "saldo_assoluti_non_cc": str(t.get("saldo_assoluti_non_cc", Decimal("0"))),
-            "spese_future_non_cc": str(t.get("spese_future_non_cc", Decimal("0"))),
-            "spese_cc_non_cc": str(t.get("spese_cc_non_cc", Decimal("0"))),
-            "disponibilita_non_cc": str(t.get("disponibilita_non_cc", Decimal("0"))),
-        },
-    }
+    import balance_engine
+
+    return balance_engine.light_saldi_snapshot_from_footer_vectors(v)
 
 
 def account_is_credit_card_column_flags(db: dict, n_names: int) -> list[bool]:
