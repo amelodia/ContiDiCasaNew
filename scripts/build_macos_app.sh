@@ -27,6 +27,9 @@ python3 "$ROOT/scripts/bump_version_build.py"
 rm -rf "$ROOT/build" "$ROOT/dist/ContiDiCasa" "$ROOT/dist/ContiDiCasa.app"
 
 mkdir -p "$ROOT/build"
+export PYINSTALLER_CONFIG_DIR="$ROOT/build/pyinstaller-cache"
+export MPLCONFIGDIR="$ROOT/build/matplotlib-cache"
+mkdir -p "$PYINSTALLER_CONFIG_DIR" "$MPLCONFIGDIR"
 if ! python3 "$ROOT/scripts/build_euro_icns.py" "$ROOT/build/ContiDiCasa.icns"; then
   echo "Avviso: generazione .icns non riuscita; il bundle userà l'icona predefinita." >&2
 fi
