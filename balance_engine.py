@@ -164,6 +164,44 @@ def new_records_effect(db: dict) -> list[Decimal]:
     return balances
 
 
+def cancelled_imported_records_adjustment(db: dict) -> list[Decimal]:
+    """Correzione per righe importate annullate dopo il saldo consolidato.
+
+    Il saldo consolidato contiene ancora l'effetto originario della riga importata:
+    annullarla in app deve quindi aggiungere l'effetto opposto.
+    """
+    latest = _latest_year_bucket(db)
+    if not latest:
+        return []
+    accounts = latest.get("accounts") or []
+    n_accounts = len(accounts)
+    adj = [Decimal("0") for _ in accounts]
+
+    latest_year = int(latest.get("year", 0) or 0)
+    for yd in db.get("years") or []:
+        y = int(yd.get("year", 0) or 0)
+        if y > latest_year:
+            continue
+        for rec in yd.get("records") or []:
+            if not rec.get("is_cancelled"):
+                continue
+            if not (rec.get("raw_record") or "").strip():
+                continue
+            if rec.get("is_virtuale_discharge"):
+                continue
+            ry = int(rec.get("year", 0) or 0)
+            if is_dotazione_record(rec) and ry != LEGACY_DOTAZIONE_YEAR:
+                continue
+            amount = -parse_euro_amount(rec.get("amount_eur", "0"))
+            c1_idx = account_column_index(accounts, rec.get("account_primary_code", ""))
+            c2_idx = account_column_index(accounts, rec.get("account_secondary_code", ""))
+            if 0 <= c1_idx < n_accounts:
+                adj[c1_idx] += amount
+            if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts:
+                adj[c2_idx] -= amount
+    return adj
+
+
 def compute_absolute_balances(db: dict, *, today_iso: str) -> list[Decimal] | None:
     """Saldi assoluti per conto, allineati al footer Saldi del desktop."""
     import main_app

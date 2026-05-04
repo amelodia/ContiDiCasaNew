@@ -2730,41 +2730,9 @@ def compute_cancelled_imported_records_balance_adjustment(
     contabile opposto. L'annullo è strutturale: deve togliere dal saldo anche registrazioni con data futura,
     perché il saldo *sld* le contiene già.
     """
-    if not db.get("years"):
-        return []
-    latest_year = max(y["year"] for y in db["years"])
-    year_data = next(y for y in db["years"] if y["year"] == latest_year)
-    accounts = year_data["accounts"]
-    n_accounts = len(accounts)
+    import balance_engine
 
-    pool: list[dict] = []
-    for yd in db["years"]:
-        y = int(yd["year"])
-        if y > latest_year:
-            continue
-        pool.extend(yd.get("records", []))
-
-    adj = [Decimal("0") for _ in range(n_accounts)]
-    for rec in pool:
-        if not rec.get("is_cancelled"):
-            continue
-        if not (rec.get("raw_record") or "").strip():
-            continue
-        if rec.get("is_virtuale_discharge"):
-            continue
-        y = int(rec["year"])
-        if is_dotazione_record(rec) and y != LEGACY_DOTAZIONE_YEAR:
-            continue
-        amount = -to_decimal(rec["amount_eur"])
-        c1 = rec.get("account_primary_code", "")
-        c2 = rec.get("account_secondary_code", "")
-        c1_idx = account_column_index_in_latest_chart(accounts, c1)
-        c2_idx = account_column_index_in_latest_chart(accounts, c2)
-        if 0 <= c1_idx < n_accounts:
-            adj[c1_idx] += amount
-        if is_giroconto_record(rec) and 0 <= c2_idx < n_accounts:
-            adj[c2_idx] -= amount
-    return adj
+    return balance_engine.cancelled_imported_records_adjustment(db)
 
 
 def _record_contribution_to_balance_vector(
