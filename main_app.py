@@ -1701,6 +1701,11 @@ def record_is_before_2022(rec: dict) -> bool:
     return rd < date(2022, 1, 1)
 
 
+def record_is_historical_category_note_only(rec: dict) -> bool:
+    """Registrazioni storiche pre-2022: si possono modificare solo categoria e nota, mai giroconto."""
+    return record_is_before_2022(rec) and not is_giroconto_record(rec)
+
+
 def record_contains_any_asterisk(rec: dict) -> bool:
     """True se qualunque campo stringa della registrazione contiene '*'."""
     for v in rec.values():
@@ -9754,7 +9759,7 @@ def build_ui(
                     want_msg = True
                     msg_text = "Conto congelato: la registrazione non è modificabile né eliminabile."
                 elif not record_is_within_recent_mod_delete_window(rec):
-                    if record_is_before_2022(rec) and not is_giroconto_record(rec):
+                    if record_is_historical_category_note_only(rec):
                         want_modifica = True
                         category_only_legacy = True
                     else:
@@ -9770,7 +9775,7 @@ def build_ui(
 
                 if category_only_legacy:
                     want_msg = True
-                    msg_text = "Registrazione storica: modificabile solo la categoria."
+                    msg_text = "Registrazione storica: modificabili solo categoria e nota."
 
         want_forza = (
             has_verifica_flags
@@ -10331,7 +10336,7 @@ def build_ui(
                 parent=root,
             )
             return
-        if not record_is_within_edit_age(rec):
+        if not record_is_within_edit_age(rec) and not record_is_historical_category_note_only(rec):
             return
         top = tk.Toplevel(root)
         top.title("Modifica nota")
@@ -10364,7 +10369,7 @@ def build_ui(
             return None
         _yd, rec = pair
         if not record_is_within_recent_mod_delete_window(rec) and not (
-            record_is_before_2022(rec) and not is_giroconto_record(rec)
+            record_is_historical_category_note_only(rec)
         ):
             return None
         return (sel[0], rec)
@@ -10429,8 +10434,11 @@ def build_ui(
                 ("Assegno", open_edit_cheque),
                 ("Nota", open_edit_note),
             ]
-        if record_is_before_2022(rec) and not giro:
-            return [("Categoria", open_edit_category)]
+        if record_is_historical_category_note_only(rec):
+            return [
+                ("Categoria", open_edit_category),
+                ("Nota", open_edit_note),
+            ]
         actions: list[tuple[str, Callable[[str], None]]] = [
             ("Data", open_edit_date),
             ("Categoria", open_edit_category),
@@ -19566,7 +19574,7 @@ th {{ background:#efefef; text-align:left; }}
             return None
         _yd, rec = pair
         if not record_is_within_recent_mod_delete_window(rec) and not (
-            record_is_before_2022(rec) and not is_giroconto_record(rec)
+            record_is_historical_category_note_only(rec)
         ):
             return None
         return (sel[0], rec)
@@ -19598,7 +19606,7 @@ th {{ background:#efefef; text-align:left; }}
                     has_verifica_flags = True
                 forza_ok_recency = record_is_within_forza_verifica_recency(rec)
                 if not record_is_within_recent_mod_delete_window(rec):
-                    if record_is_before_2022(rec) and not is_giroconto_record(rec):
+                    if record_is_historical_category_note_only(rec):
                         want_modifica = True
                         category_only_legacy = True
                     else:
@@ -19614,7 +19622,7 @@ th {{ background:#efefef; text-align:left; }}
 
                 if category_only_legacy:
                     want_msg = True
-                    msg_text = "Registrazione storica: modificabile solo la categoria."
+                    msg_text = "Registrazione storica: modificabili solo categoria e nota."
 
         want_forza = (
             has_verifica_flags
