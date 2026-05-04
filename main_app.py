@@ -1706,6 +1706,20 @@ def record_is_historical_category_note_only(rec: dict) -> bool:
     return record_is_before_2022(rec) and not is_giroconto_record(rec)
 
 
+def category_label_is_giroconto(label: str) -> bool:
+    n = " ".join((label or "").strip().lower().replace(".", " ").replace("/", " / ").split())
+    return ("girata conto / conto" in n) or ("girata conto conto" in n)
+
+
+def historical_record_can_change_category_to(rec: dict, category_label: str) -> bool:
+    """Per le storiche pre-2022 blocca sia uscita da Girata sia ingresso in Girata."""
+    if not record_is_before_2022(rec):
+        return True
+    if is_giroconto_record(rec):
+        return False
+    return not category_label_is_giroconto(category_label)
+
+
 def record_contains_any_asterisk(rec: dict) -> bool:
     """True se qualunque campo stringa della registrazione contiene '*'."""
     for v in rec.values():
@@ -9961,7 +9975,7 @@ def build_ui(
             )
             return
         category_only_legacy = record_is_before_2022(rec)
-        if category_only_legacy and is_giroconto_record(rec):
+        if category_only_legacy and not historical_record_can_change_category_to(rec, ""):
             messagebox.showwarning(
                 "Categoria",
                 "Le registrazioni storiche «GIRATA CONTO/CONTO» non possono essere riclassificate.",
@@ -9975,13 +9989,6 @@ def build_ui(
         choices: list[tuple[str, str]] = []
         disp_to_raw: dict[str, str] = {}
 
-        def _norm_cat_mov_label(s: str) -> str:
-            return " ".join((s or "").strip().lower().replace(".", " ").replace("/", " / ").split())
-
-        def _is_girata_display_name(s: str) -> bool:
-            n = _norm_cat_mov_label(s)
-            return ("girata conto / conto" in n) or ("girata conto conto" in n)
-
         for i, c in enumerate(year_categories):
             code = str(c.get("code", str(i)))
             if code == "0":
@@ -9989,7 +9996,7 @@ def build_ui(
             if is_hidden_dotazione_category_name(str(c.get("name", ""))):
                 continue
             disp = category_display_name(c.get("name", ""))
-            if category_only_legacy and _is_girata_display_name(disp):
+            if category_only_legacy and not historical_record_can_change_category_to(rec, disp):
                 continue
             raw_nm = str(c.get("name", "") or "")
             choices.append((disp, code))
@@ -9999,8 +10006,16 @@ def build_ui(
             messagebox.showerror("Categoria", "Nessuna categoria disponibile per questo anno.")
             return
 
-        consumi_disp = next((d for d, _c in choices if _norm_cat_mov_label(d) == "consumi ordinari"), None)
-        girata_disp = None if category_only_legacy else next((d for d, _c in choices if _is_girata_display_name(d)), None)
+        consumi_disp = next(
+            (
+                d
+                for d, _c in choices
+                if " ".join((d or "").strip().lower().replace(".", " ").replace("/", " / ").split())
+                == "consumi ordinari"
+            ),
+            None,
+        )
+        girata_disp = None if category_only_legacy else next((d for d, _c in choices if category_label_is_giroconto(d)), None)
         locked_heads = [x for x in (consumi_disp, girata_disp) if x]
         others = [(d, c) for d, c in choices if d not in locked_heads]
         others.sort(key=lambda it: it[0].lower())
@@ -10056,7 +10071,7 @@ def build_ui(
             if code is None:
                 messagebox.showerror("Categoria", "Selezione non valida.", parent=top)
                 return
-            if category_only_legacy and _is_girata_display_name(picked):
+            if category_only_legacy and not historical_record_can_change_category_to(rec, picked):
                 messagebox.showwarning(
                     "Categoria",
                     "Non è consentito applicare «GIRATA CONTO/CONTO» a una registrazione storica.",

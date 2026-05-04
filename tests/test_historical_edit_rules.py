@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import unittest
 
-from main_app import record_is_historical_category_note_only
+from main_app import (
+    category_label_is_giroconto,
+    historical_record_can_change_category_to,
+    record_is_historical_category_note_only,
+)
 
 
 class HistoricalEditRulesTests(unittest.TestCase):
@@ -36,6 +40,47 @@ class HistoricalEditRulesTests(unittest.TestCase):
                     "category_code": "2",
                     "category_name": "-Spese",
                 }
+            )
+        )
+
+    def test_giroconto_label_is_recognized_across_punctuation_variants(self) -> None:
+        self.assertTrue(category_label_is_giroconto("Girata conto/conto"))
+        self.assertTrue(category_label_is_giroconto("GIRATA.CONTO/CONTO"))
+        self.assertTrue(category_label_is_giroconto("Girata conto conto"))
+
+    def test_historical_record_cannot_change_from_giroconto(self) -> None:
+        self.assertFalse(
+            historical_record_can_change_category_to(
+                {
+                    "date_iso": "2021-12-31",
+                    "category_code": "1",
+                    "category_name": "=Girata conto/conto",
+                },
+                "-Spese",
+            )
+        )
+
+    def test_historical_record_cannot_change_to_giroconto(self) -> None:
+        self.assertFalse(
+            historical_record_can_change_category_to(
+                {
+                    "date_iso": "2021-12-31",
+                    "category_code": "2",
+                    "category_name": "-Spese",
+                },
+                "Girata conto/conto",
+            )
+        )
+
+    def test_historical_record_can_change_to_non_giroconto_category(self) -> None:
+        self.assertTrue(
+            historical_record_can_change_category_to(
+                {
+                    "date_iso": "2021-12-31",
+                    "category_code": "2",
+                    "category_name": "-Spese",
+                },
+                "-Casa",
             )
         )
 
