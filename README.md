@@ -1,119 +1,152 @@
-# CursorAppMacCdc
-Progetto CursorMAC CdC
+# Conti di casa
 
-## ImportLegacy (prima funzione)
+Applicazione desktop macOS/Python per la gestione dei conti di casa, con database cifrato, saldi consolidati e file light sincronizzabile con il client iPhone.
 
-Script Python per importare il database legacy annuale VB6 in un database unico JSON.
+Il repository nasce dalla migrazione dello storico VB6, ma oggi la fonte operativa e definitiva è il database cifrato corrente (`.enc`). L'import legacy resta nel codice come strumento tecnico/storico, non come funzione ordinaria da usare nell'app.
 
-### Cosa legge
-- `*dat.aco` (record fissi da 121 byte)
-- `*cat.aco` (categorie)
-- `*coc.aco` (conti)
-- `*not.aco` (nota esplicativa per ogni categoria)
+## Stato attuale
 
-### Comportamento valuta
-- anni `1990-2001`: sorgente in lire
-- anni `2002+`: sorgente in euro
-- il nuovo database salva sempre `amount_eur`, ma mantiene anche `amount_lire_original`
-- per la visualizzazione, i record ante 2002 espongono `display_currency=LIRE`
+- App desktop completa in `main_app.py`.
+- Database cifrato per utente: `conti_utente_<hash>.enc`.
+- Chiave Fernet: `conti_di_casa.key`.
+- File light iPhone: `conti_utente_<hash>_light.enc`, nella stessa cartella del database completo.
+- Backup locale Mac a ogni salvataggio in `~/Library/Application Support/ContiDiCasa/<stem>_backup.enc`.
+- Saldi desktop, stampa saldi e app iPhone allineati sulla presentazione a 5 righe.
+- Import legacy disabilitato nell'uso normale: il DB cifrato corrente e i suoi backup sono il riferimento per ripristini e continuita.
 
-### Regola Dotazione iniziale
-- le registrazioni con categoria `Dotazione iniziale` sono escluse dal 1991 in poi
-- l'unica eccezione importata e mantenuta e il 1990
+## Avvio desktop
 
-### Vincoli nuova app (immissione)
-- nuove registrazioni solo in euro
-- limiti importo: da `-999999999,99` a `+999999999,99`
-- parser importo: `.` e `,` sono entrambi accettati come separatore decimale in input
-- formattazione importo: stile italiano (`1.234,56`)
-- lunghezze massime:
-  - categoria: `20`
-  - nota categoria: `100`
-  - conto: `16`
-  - assegno: `8`
-  - nota registrazione: `100`
-
-### Import legacy conti con asterischi
-- gli asterischi adiacenti ai conti sono preservati:
-  - `account_primary_flags`, `account_secondary_flags`
-  - `account_primary_with_flags`, `account_secondary_with_flags`
-
-### Esecuzione
-
-L’output JSON predefinito è in **`legacy_import/`** (non in `data/`), così nella cartella dati restano solo file operativi (`.key`, `.enc` completo e `*_light.enc`).
-
-```bash
-python3 import_legacy.py \
-  --cdc-root "/Users/macand/Library/CloudStorage/Dropbox/CdC" \
-  --output "legacy_import/unified_legacy_import.json"
-```
-
-### Integrazione nel programma principale
-
-`ImportLegacy` è integrabile come modulo Python:
-
-```python
-from import_legacy import run_import_legacy
-
-result = run_import_legacy(
-    "/Users/macand/Library/CloudStorage/Dropbox/CdC",
-    "legacy_import/unified_legacy_import.json",
-)
-```
-
-### Avvio app desktop (prima UI)
+Da sorgente:
 
 ```bash
 python3 main_app.py
 ```
 
-### Desktop e versione light (iPhone)
+Creazione dell'app macOS:
 
-- **`main_app.py`** è l’app **desktop** (Tk): deve restare la versione **completa**.  
-- La versione **light** per iPhone è un percorso **separato**: cartella **`iphone_light/`** (auth, crypto, CLI) e futura app nativa iOS. Le semplificazioni di interfaccia per il mobile vanno descritte in `iphone_light/LIGHT_UI_SPEC.md` e implementate lì / in Swift, **non** accorciando il desktop.
+```bash
+scripts/build_macos_app.sh
+```
 
-All’apertura (flusso tipico):
-- carica il database cifrato corrente, che è la fonte definitiva dei dati contabili;
-- fonde eventuali righe provenienti dal file `*_light.enc`;
-- mostra movimenti e saldi nell’interfaccia.
+L'app generata si trova in:
 
-### Struttura pagine
+```text
+dist/ContiDiCasa.app
+```
 
-Le pagine disponibili sono:
-- Movimenti e correzioni (default all'avvio)
-- Nuove registrazioni
-- Verifica
-- Statistiche
-- Budget
-- Opzioni
-- Aiuto
+Su macOS, se l'app non e firmata, al primo avvio puo servire aprirla con tasto Ctrl sull'icona e poi **Apri**.
 
-### Opzioni (prima implementazione)
+## File dati
 
-- scelta file dati nuova app (`.enc` completo, tipicamente `conti_utente_<hash>.enc`)
-- scelta file chiave cifratura (`.key`, es. `conti_di_casa.key`)
-- **Sposta nella cartella…**: sposta insieme **tre file** nella cartella scelta — `.enc` completo, `*_light.enc` (stesso stem del completo + suffisso `_light`) e `.key` (stessi nomi file)
-
-### Layout cartella dati (Dropbox / sync)
-
-Nella stessa cartella (es. `data/` sul Mac):
+Nella cartella dati scelta dall'utente devono stare insieme:
 
 | File | Ruolo |
-|------|--------|
-| `conti_di_casa.key` | Chiave Fernet (o unico `.key` in cartella) |
-| `conti_utente_<hash>.enc` | Database completo cifrato per account |
-| `conti_utente_<hash>_light.enc` | Sidecar “light” (ultimi 365 giorni + metadati); rigenerato dal desktop a ogni salvataggio |
+|------|-------|
+| `conti_di_casa.key` | Chiave di cifratura Fernet. |
+| `conti_utente_<hash>.enc` | Database completo cifrato dell'utente. |
+| `conti_utente_<hash>_light.enc` | Sidecar light per iPhone, rigenerato dal desktop a ogni salvataggio. |
 
-Il desktop **non** usa più una sottocartella dedicata: il file light sta **accanto** al `.enc` completo.
+Il file light non sta piu in una sottocartella dedicata: deve stare accanto al `.enc` completo.
 
-**Copia di sicurezza locale (solo Mac, Library dell’utente che avvia l’app):** a ogni salvataggio viene scritto anche `~/Library/Application Support/ContiDiCasa/<stem>_backup.enc`, dove `<stem>` è il nome del file dati principale senza `.enc` (allineato al DB operativo, es. `conti_utente_<hash>_backup.enc`). Non è il file in Dropbox: resta sulla macchina dell’utente.
+Se si usa Dropbox o un'altra cartella sincronizzata, i percorsi del database e della chiave si impostano dalla pagina **Opzioni** dell'app desktop.
 
-**Ripristino se manca il database su Dropbox:** se nella cartella `data/` del progetto non c’è alcun `conti_utente_*.enc` ma esiste un backup in Library, all’avvio l’app propone di copiarlo in `data/` (nome dedotto dal file `*_backup.enc`), di rigenerare il file `*_light.enc` e di continuare. Da **Opzioni** è disponibile anche **«Ripristina da backup (Library Mac)…»** per copiare il backup sul percorso file dati attualmente impostato (anche fuori da `data/`) e aggiornare il light.
+## Vincoli di immissione
 
-Primo avvio / import: artefatti in **`legacy_import/`** (JSON dell’import e, se serve, bootstrap cifrato prima del file per-utente in `data/`). Non versionare quei file (vedi `.gitignore`).
+Le nuove registrazioni sono in euro, con due decimali.
 
-**Dropbox e path dei file:** se sposti la cartella dati (es. in `…/Dropbox/ContiCursor`), aggiorna in **Opzioni** i percorsi del file dati e della chiave; altrimenti l’app può ancora cercare `data/conti_di_casa.key` nella cartella del progetto. L’attesa «sincronizzazione» su un file **mancante** in Dropbox è limitata a pochi secondi (default 12s), non a minuti. Se il file esiste ed **è invariato da almeno ~45 secondi**, non si attende la finestra di stabilità (avvio quotidiano senza dialog). Variabili: `CONTI_CLOUD_WAIT_EXISTENCE_SECONDS`, `CONTI_DROPBOX_SKIP_STABILITY_IF_UNMODIFIED_SEC`, `CONTI_SKIP_CLOUD_SYNC_WAIT=1`.
+Limiti principali dei campi:
 
-**Posta all’avvio:** il wizard si apre solo se mancano ancora host SMTP/IMAP, credenziali o email amministratore. Se sono già salvate nel database, non viene richiesta ogni volta la «Verifica connessione» (puoi usarla da Opzioni quando serve).
+| Campo | Limite |
+|-------|--------|
+| Nome categoria | 20 caratteri |
+| Nota categoria | 100 caratteri |
+| Nome conto | 16 caratteri |
+| Assegno | 12 caratteri |
+| Nota registrazione | 100 caratteri |
 
-Nota: per la cifratura file serve il pacchetto Python `cryptography`. Per SMTP/IMAP con certificati su macOS: `python3 -m pip install certifi` se necessario.
+Limiti numerici e di struttura:
+
+- importo ammesso: da `-999999999,99` a `+999999999,99`;
+- categorie: massimo 100;
+- conti: massimo 20;
+- i nomi delle categorie sono salvati in maiuscolo, mantenendo l'eventuale segno iniziale `+` o `-`;
+- i nomi dei conti sono salvati in maiuscolo; nella creazione di un nuovo conto sono ammesse solo lettere;
+- le note di categoria e le note registrazione hanno la prima lettera forzata in maiuscolo;
+- il parser accetta `.` e `,` come separatore decimale in input;
+- la visualizzazione usa il formato italiano, per esempio `1.234,56`.
+
+## Saldi
+
+La presentazione dei saldi usa 5 righe:
+
+1. Saldi assoluti
+2. Di cui, impegni futuri
+3. Disponibilita oggi = saldi assoluti - impegni futuri
+4. Impegni per carte
+5. Disponibilita assoluta = saldi assoluti + impegni per carte
+
+La formula e centralizzata in `balance_engine.py` e riusata da:
+
+- footer saldi desktop;
+- stampa saldi;
+- generazione del blocco `light_saldi`;
+- app iPhone/Swift.
+
+I totali dei saldi escludono i conti carta quando previsto, cosi i conti non piu in uso presenti nello storico non interferiscono con i conti correnti.
+
+## Storico e regole legacy
+
+Le registrazioni storiche restano nel database e possono ancora incidere sui saldi quando vengono annullate o modificate nei casi ammessi.
+
+Regole principali:
+
+- il calcolo dei saldi parte dalla base consolidata e applica le variazioni successive;
+- le registrazioni pre-2026 non vengono ricalcolate da zero per ricostruire la base storica;
+- le modifiche ammesse su registrazioni pre-2026 continuano a produrre l'effetto contabile corretto;
+- sulle registrazioni pre-2022 sono possibili solo modifiche di categoria e note;
+- per le registrazioni pre-2022 non e consentito entrare in, o uscire da, `Girata conto/conto`.
+
+Tutti gli importi sono in euro con due decimali. Non sono previsti decimali ulteriori.
+
+## Versione iPhone light
+
+La versione iPhone e separata dalla desktop:
+
+- specifica: `iphone_light/LIGHT_UI_SPEC.md`;
+- documentazione tecnica: `iphone_light/README.md`;
+- sorgenti Swift: `iphone_light/ios/`;
+- moduli Python di supporto/prova: `iphone_light/*.py`.
+
+Il desktop resta l'app completa. Le semplificazioni mobile vanno realizzate nella parte iPhone, non togliendo funzioni al desktop.
+
+## Test
+
+Esecuzione:
+
+```bash
+python3 -m unittest discover
+python3 -m compileall -q .
+```
+
+I test coprono le parti piu delicate: importi euro, saldi consolidati, regole storiche, carte di credito e sidecar light.
+
+## Struttura essenziale
+
+| Percorso | Descrizione |
+|----------|-------------|
+| `main_app.py` | App desktop Tk. |
+| `balance_engine.py` | Logica condivisa dei saldi. |
+| `light_enc_sidecar.py` | Creazione e merge del file light. |
+| `security_auth.py` | Login, profilo utente e sicurezza. |
+| `periodiche.py` | Registrazioni periodiche. |
+| `import_legacy.py` | Import storico VB6, conservato come modulo tecnico. |
+| `iphone_light/` | Client light iPhone e strumenti di prova. |
+| `tests/` | Test automatici. |
+| `scripts/build_macos_app.sh` | Build macOS `.app`. |
+
+## Note per sviluppo prudente
+
+- Non usare l'import legacy come scorciatoia per correggere il database operativo.
+- Prima di modifiche sui saldi, eseguire i test automatici.
+- Tenere separati gli interventi desktop da quelli iPhone.
+- Evitare modifiche che cambino retroattivamente lo storico pre-2022, salvo regole esplicite gia previste.
