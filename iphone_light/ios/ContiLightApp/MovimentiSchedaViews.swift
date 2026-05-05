@@ -57,7 +57,7 @@ struct ContiLightSaldiSchedaView: View {
     }
 
     /// Totali «non carta» come nel footer desktop (se presenti nel JSON light).
-    private var totalsNonCc: (abs: Decimal, sf: Decimal, scc: Decimal, disp: Decimal)? {
+    private var totalsNonCc: (abs: Decimal, sf: Decimal, day: Decimal, scc: Decimal, disp: Decimal)? {
         ContiDatabase.lightSaldiTotalsNonCc(sessionDb: sessionDb)
     }
 
@@ -78,8 +78,24 @@ struct ContiLightSaldiSchedaView: View {
         return rows.filter { !$0.isCreditCard }.reduce(Decimal.zero) { $0 + $1.saldoAssoluto }
     }
 
-    private var sommaAllaData: Decimal {
-        rows.filter { !$0.isCreditCard }.reduce(Decimal.zero) { $0 + $1.saldoOggi }
+    private var sommaDisponibilitaOggi: Decimal {
+        if let t = totalsNonCc { return t.day }
+        return rows.filter { !$0.isCreditCard }.reduce(Decimal.zero) { $0 + $1.saldoOggi }
+    }
+
+    private var sommaImpegniFuturi: Decimal {
+        if let t = totalsNonCc { return t.sf }
+        return rows.filter { !$0.isCreditCard }.reduce(Decimal.zero) { $0 + $1.speseFuture }
+    }
+
+    private var sommaImpegniCarte: Decimal {
+        if let t = totalsNonCc { return t.scc }
+        return rows.filter { !$0.isCreditCard }.reduce(Decimal.zero) { $0 + $1.speseCC }
+    }
+
+    private var sommaDisponibilitaAssoluta: Decimal {
+        if let t = totalsNonCc { return t.disp }
+        return rows.filter { !$0.isCreditCard }.reduce(Decimal.zero) { $0 + $1.disponibilita }
     }
 
     var body: some View {
@@ -107,7 +123,7 @@ struct ContiLightSaldiSchedaView: View {
             } else {
                 Section("Totali (conti non carta)") {
                     HStack {
-                        Text("Somma saldi assoluti")
+                        Text("Saldi assoluti")
                             .foregroundStyle(.secondary)
                         Spacer()
                         Text(ContiDatabase.formatEuroTwoDecimals(sommaAssoluti))
@@ -116,44 +132,42 @@ struct ContiLightSaldiSchedaView: View {
                     }
                     .font(.subheadline.weight(.medium))
                     HStack {
-                        Text("Somma saldi alla data")
+                        Text("Di cui, impegni futuri")
                             .foregroundStyle(.secondary)
                         Spacer()
-                        Text(ContiDatabase.formatEuroTwoDecimals(sommaAllaData))
+                        Text(ContiDatabase.formatEuroTwoDecimals(sommaImpegniFuturi))
                             .monospacedDigit()
-                            .foregroundStyle(amountColor(sommaAllaData))
+                            .foregroundStyle(amountColor(sommaImpegniFuturi))
                     }
                     .font(.subheadline.weight(.medium))
-                    if let t = totalsNonCc {
-                        HStack {
-                            Text("Di cui, spese future (non carta)")
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Text(ContiDatabase.formatEuroTwoDecimals(t.sf))
-                                .monospacedDigit()
-                                .foregroundStyle(amountColor(t.sf))
-                        }
-                        .font(.subheadline.weight(.medium))
-                        HStack {
-                            Text("Spese per carte (colonne conti)")
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Text(ContiDatabase.formatEuroTwoDecimals(t.scc))
-                                .monospacedDigit()
-                                .foregroundStyle(amountColor(t.scc))
-                        }
-                        .font(.subheadline.weight(.medium))
-                        HStack {
-                            Text("Disponibilità (somma)")
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Text(ContiDatabase.formatEuroTwoDecimals(t.disp))
-                                .monospacedDigit()
-                                .foregroundStyle(amountColor(t.disp))
-                        }
-                        .font(.subheadline.weight(.medium))
+                    HStack {
+                        Text("Disponibilità oggi")
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(ContiDatabase.formatEuroTwoDecimals(sommaDisponibilitaOggi))
+                            .monospacedDigit()
+                            .foregroundStyle(amountColor(sommaDisponibilitaOggi))
                     }
-                    Text("Le carte non entrano nella somma «assoluti» (come sul desktop). Disponibilità = saldo assoluto + spese CC (la riga spese future non entra nel totale). Sulle colonne carta: —.")
+                    .font(.subheadline.weight(.medium))
+                    HStack {
+                        Text("Impegni per carte")
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(ContiDatabase.formatEuroTwoDecimals(sommaImpegniCarte))
+                            .monospacedDigit()
+                            .foregroundStyle(amountColor(sommaImpegniCarte))
+                    }
+                    .font(.subheadline.weight(.medium))
+                    HStack {
+                        Text("Disponibilità assoluta")
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(ContiDatabase.formatEuroTwoDecimals(sommaDisponibilitaAssoluta))
+                            .monospacedDigit()
+                            .foregroundStyle(amountColor(sommaDisponibilitaAssoluta))
+                    }
+                    .font(.subheadline.weight(.medium))
+                    Text("Le carte non entrano nella somma dei non-carta (come sul desktop). Disponibilità oggi = saldi assoluti - impegni futuri. Disponibilità assoluta = saldi assoluti + impegni per carte. Sulle colonne carta: —.")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -173,7 +187,7 @@ struct ContiLightSaldiSchedaView: View {
                                 }
                             }
                             HStack {
-                                Text("Assoluto")
+                                Text("Saldi assoluti")
                                     .foregroundStyle(.secondary)
                                 Spacer()
                                 Text(ContiDatabase.formatEuroTwoDecimals(r.saldoAssoluto))
@@ -182,16 +196,7 @@ struct ContiLightSaldiSchedaView: View {
                             }
                             .font(.subheadline)
                             HStack {
-                                Text("Alla data")
-                                    .foregroundStyle(.secondary)
-                                Spacer()
-                                Text(ContiDatabase.formatEuroTwoDecimals(r.saldoOggi))
-                                    .monospacedDigit()
-                                    .foregroundStyle(amountColor(r.saldoOggi))
-                            }
-                            .font(.subheadline)
-                            HStack {
-                                Text("Di cui, spese future")
+                                Text("Di cui, impegni futuri")
                                     .foregroundStyle(.secondary)
                                 Spacer()
                                 if r.isCreditCard {
@@ -205,7 +210,21 @@ struct ContiLightSaldiSchedaView: View {
                             }
                             .font(.subheadline)
                             HStack {
-                                Text("Spese CC")
+                                Text("Disponibilità oggi")
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                if r.isCreditCard {
+                                    Text("—")
+                                        .foregroundStyle(.tertiary)
+                                } else {
+                                    Text(ContiDatabase.formatEuroTwoDecimals(r.saldoOggi))
+                                        .monospacedDigit()
+                                        .foregroundStyle(amountColor(r.saldoOggi))
+                                }
+                            }
+                            .font(.subheadline)
+                            HStack {
+                                Text("Impegni per carte")
                                     .foregroundStyle(.secondary)
                                 Spacer()
                                 if r.isCreditCard {
@@ -219,7 +238,7 @@ struct ContiLightSaldiSchedaView: View {
                             }
                             .font(.subheadline)
                             HStack {
-                                Text("Disponibilità")
+                                Text("Disponibilità assoluta")
                                     .foregroundStyle(.secondary)
                                 Spacer()
                                 if r.isCreditCard {

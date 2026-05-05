@@ -53,7 +53,7 @@ public struct ContiSaldRiga: Identifiable, Hashable, Sendable {
     /// Registrazioni con data successiva al cutoff (stesso significato del desktop).
     public let speseFuture: Decimal
     public let speseCC: Decimal
-    /// Per conti non-carta: saldo assoluto + spese future + spese CC; per carta: zero in tabella desktop.
+    /// Per conti non-carta: saldo assoluto + impegni per carte; per carta: zero in tabella desktop.
     public let disponibilita: Decimal
 }
 
@@ -1061,7 +1061,7 @@ public enum ContiDatabase {
     }
 
     /// Totali riga «non carta» dal blocco ``light_saldi`` (opzionale, file generato da desktop/iOS recente).
-    public static func lightSaldiTotalsNonCc(sessionDb: Any?) -> (abs: Decimal, sf: Decimal, scc: Decimal, disp: Decimal)? {
+    public static func lightSaldiTotalsNonCc(sessionDb: Any?) -> (abs: Decimal, sf: Decimal, day: Decimal, scc: Decimal, disp: Decimal)? {
         guard let db = dictionaryFromAnyRoot(sessionDb) else { return nil }
         guard let block = dictionaryFromAnyRoot(db["light_saldi"]),
               let t = dictionaryFromAnyRoot(block["totals"])
@@ -1071,7 +1071,8 @@ public enum ContiDatabase {
               let scc = parseLooseDecimal(stringFromJSON(t["spese_cc_non_cc"])),
               let disp = parseLooseDecimal(stringFromJSON(t["disponibilita_non_cc"]))
         else { return nil }
-        return (abs, sf, scc, disp)
+        let day = parseLooseDecimal(stringFromJSON(t["saldo_oggi_non_cc"])) ?? (abs - sf)
+        return (abs, sf, day, scc, disp)
     }
 
     /// Aggiorna ``light_saldi`` in memoria dopo una nuova registrazione (stesse regole del desktop). Da chiamare al salvataggio iOS prima di ricifrare.
@@ -1699,6 +1700,7 @@ public enum ContiDatabase {
         block["totals"] = [
             "saldo_assoluti_non_cc": decimalStringForLightJson(tAbs),
             "spese_future_non_cc": decimalStringForLightJson(tSf),
+            "saldo_oggi_non_cc": decimalStringForLightJson(tAbs - tSf),
             "spese_cc_non_cc": decimalStringForLightJson(tScc),
             "disponibilita_non_cc": decimalStringForLightJson(tAbs + tScc),
         ]
@@ -1763,6 +1765,7 @@ public enum ContiDatabase {
             "totals": [
                 "saldo_assoluti_non_cc": decimalStringForLightJson(tAbs),
                 "spese_future_non_cc": decimalStringForLightJson(tSf),
+                "saldo_oggi_non_cc": decimalStringForLightJson(tAbs - tSf),
                 "spese_cc_non_cc": decimalStringForLightJson(tScc),
                 "disponibilita_non_cc": decimalStringForLightJson(tAbs + tScc),
             ],

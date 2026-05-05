@@ -372,6 +372,13 @@ def bind_return_and_kp_enter(widget: tk.Misc, callback: Callable[..., object], *
     widget.bind("<KP_Enter>", callback, add=add)
 
 
+def bind_return_tab_and_kp_enter(widget: tk.Misc, callback: Callable[..., object], *, add: bool = False) -> None:
+    """Invio/Tab chiudono l'immissione del campo ed eseguono lo stesso handler."""
+    widget.bind("<Return>", callback, add=add)
+    widget.bind("<KP_Enter>", callback, add=add)
+    widget.bind("<Tab>", callback, add=add)
+
+
 def read_virtuale_saldo() -> Decimal:
     """Saldo virtuale residuo da scaricare (persistente tra sessioni)."""
     try:
@@ -2104,7 +2111,7 @@ def resolve_estratto_pdf_for_account(
     db: dict, acc_code: str, cutoff_raw_ggmmyyyy: str
 ) -> tuple[Path | None, str]:
     """
-    Cerca il PDF nella **sola** cartella radice impostata in Opzioni (nessuna sottocartella anno): file
+    Cerca il PDF nella **sola** cartella radice impostata nella Verifica automatica (nessuna sottocartella anno): file
     ``<nomebase> <MM>.pdf`` / ``<nomebase><MM>.pdf`` o trimestre ``Tn``, con il **suffisso più alto** tra quelli
     presenti e ancora compatibili con la data di chiusura. Restituisce ``(percorso, testo_diagnostica)``.
     """
@@ -2114,9 +2121,9 @@ def resolve_estratto_pdf_for_account(
         lines.append(s)
 
     root_raw = (estratti_pdf_settings_from_db(db).get("root_folder") or "").strip()
-    ln(f"Cartella radice (Opzioni), valore in database: {root_raw or '(vuoto)'}")
+    ln(f"Cartella radice (Verifica automatica), valore in database: {root_raw or '(vuoto)'}")
     if not root_raw:
-        ln("Errore: impostare la cartella in Opzioni e premere «Salva cartella».")
+        ln("Errore: impostare la cartella nella Verifica automatica e premere «Conferma».")
         return None, "\n".join(lines)
 
     root = Path(root_raw).expanduser()
@@ -2381,8 +2388,9 @@ def parse_lire_amount_input(s: str) -> Decimal:
 
 
 def sanitize_single_line_text(value: str, *, max_len: int | None = None) -> str:
-    """Normalizza testo utente su una riga (rimuove CR/LF) e applica trim/lunghezza."""
-    out = (value or "").replace("\r", " ").replace("\n", " ").strip()
+    """Normalizza testo utente su una riga (rimuove caratteri di controllo) e applica trim/lunghezza."""
+    raw = value or ""
+    out = "".join((" " if (ord(ch) < 32 or ord(ch) == 127) else ch) for ch in raw).strip()
     return out[:max_len] if max_len is not None else out
 
 
@@ -4322,7 +4330,8 @@ def compute_spese_cc_footer_amounts(db: dict, saldo_assoluti: list[Decimal]) -> 
 def saldi_footer_amount_vectors(db: dict, *, today_iso: str | None = None) -> dict[str, object] | None:
     """Vettori allineati a ``refresh_balance_footer`` / ``_saldi_snapshot_for_print`` (dopo filtro conti congelati).
 
-    La colonna ``disponibilita`` nel JSON light è la riga «Disponibilità» desktop: saldo assoluto + spese CC (senza spese future).
+    La colonna ``saldo_oggi`` nel JSON light corrisponde a «Disponibilità oggi» desktop: saldo assoluto - impegni futuri.
+    La colonna ``disponibilita`` nel JSON light corrisponde a «Disponibilità assoluta» desktop: saldo assoluto + impegni per carte.
 
     Usato dal sidecar ``*_light.enc`` (``compute_light_saldi_snapshot``) e dall’app iOS per coerenza con i Saldi desktop.
     """
@@ -4375,6 +4384,7 @@ def saldi_footer_amount_vectors(db: dict, *, today_iso: str | None = None) -> di
         disponibilita.append(disp)
     total_abs = sum((saldo_assoluti[i] for i in range(len(is_cc)) if not is_cc[i]), Decimal("0"))
     total_sf = sum((spese_future[i] for i in range(len(is_cc)) if not is_cc[i]), Decimal("0"))
+    total_oggi = total_abs - total_sf
     total_scc = sum((spese_cc[i] for i in range(len(is_cc)) if not is_cc[i]), Decimal("0"))
     total_disp = total_abs + total_scc
     return {
@@ -4390,6 +4400,7 @@ def saldi_footer_amount_vectors(db: dict, *, today_iso: str | None = None) -> di
         "totals": {
             "saldo_assoluti_non_cc": total_abs,
             "spese_future_non_cc": total_sf,
+            "saldo_oggi_non_cc": total_oggi,
             "spese_cc_non_cc": total_scc,
             "disponibilita_non_cc": total_disp,
         },
@@ -4434,6 +4445,7 @@ def compute_light_saldi_snapshot(db: dict, *, today_iso: str | None = None) -> d
         "totals": {
             "saldo_assoluti_non_cc": str(t.get("saldo_assoluti_non_cc", Decimal("0"))),
             "spese_future_non_cc": str(t.get("spese_future_non_cc", Decimal("0"))),
+            "saldo_oggi_non_cc": str(t.get("saldo_oggi_non_cc", Decimal("0"))),
             "spese_cc_non_cc": str(t.get("spese_cc_non_cc", Decimal("0"))),
             "disponibilita_non_cc": str(t.get("disponibilita_non_cc", Decimal("0"))),
         },
@@ -5025,7 +5037,7 @@ def _print_balances_fpdf(snap: dict) -> bool:
         tw = epw * _sh
         x_table = pdf.l_margin + (epw - tw) / 2.0
         w_conti = tw * 0.14
-        w_amt = (tw - w_conti) / 4.0
+        w_amt = (tw - w_conti) / 5.0
         font_boost = 1.4
         line_h = (6.5 if n > 12 else 7.0) * _sh * font_boost
         fs_head = round(7 * _sh * font_boost, 2)
@@ -5056,11 +5068,13 @@ def _print_balances_fpdf(snap: dict) -> bool:
         pdf.set_font("Helvetica", "B", fs_head)
         pdf.cell(w_amt, line_h * 1.3, "Saldi assol.", border=1, align="C")
         pdf.set_font("Helvetica", "B", fs_head)
-        pdf.cell(w_amt, line_h * 1.3, "Di cui sp.fut.", border=1, align="C")
-        pdf.set_font("Helvetica", "B", fs_head)
-        pdf.cell(w_amt, line_h * 1.3, "Spese CC", border=1, align="C")
+        pdf.cell(w_amt, line_h * 1.3, "Impegni fut.", border=1, align="C")
         pdf.set_font("Helvetica", "", fs_head)
-        pdf.cell(w_amt, line_h * 1.3, "Dispon.", border=1, align="C")
+        pdf.cell(w_amt, line_h * 1.3, "Disp. oggi", border=1, align="C")
+        pdf.set_font("Helvetica", "B", fs_head)
+        pdf.cell(w_amt, line_h * 1.3, "Imp. carte", border=1, align="C")
+        pdf.set_font("Helvetica", "", fs_head)
+        pdf.cell(w_amt, line_h * 1.3, "Disp. assol.", border=1, align="C")
         pdf.ln(line_h * 1.3)
 
         for i, nm in enumerate(names):
@@ -5075,8 +5089,10 @@ def _print_balances_fpdf(snap: dict) -> bool:
                 dash_amt_cell(w_amt)
                 dash_amt_cell(w_amt)
                 dash_amt_cell(w_amt)
+                dash_amt_cell(w_amt)
             else:
                 amt_cell(snap["amts_spese_future"][i], w_amt, bold=True)
+                amt_cell(snap["amts_disp_oggi"][i], w_amt, bold=False)
                 amt_cell(snap["amts_spese_cc"][i], w_amt, bold=True)
                 amt_cell(snap["amts_disponibilita"][i], w_amt, bold=False)
             pdf.ln(line_h)
@@ -5089,6 +5105,7 @@ def _print_balances_fpdf(snap: dict) -> bool:
         for amt, bold in (
             (snap["total_abs"], True),
             (snap["total_spese_future"], True),
+            (snap["total_disp_oggi"], False),
             (snap["total_spese_cc"], True),
             (snap["total_disponibilita"], False),
         ):
@@ -9050,6 +9067,7 @@ def build_ui(
         style="MovCdc.TEntry",
     )
     cheque_entry.pack(side=tk.LEFT, padx=(0, 8))
+    bind_limited_single_line_text_entry(cheque_entry, text_cheque_preview_var, max_len=MAX_CHEQUE_LEN)
 
     ttk.Label(filters_text_inner, text="Nota", style="MovCdc.TLabel").pack(side=tk.LEFT, padx=(0, 6))
     note_entry = ttk.Entry(
@@ -9058,6 +9076,7 @@ def build_ui(
         width=28,
         style="MovCdc.TEntry",
     )
+    bind_limited_single_line_text_entry(note_entry, text_note_preview_var, max_len=MAX_RECORD_NOTE_LEN)
     bind_entry_first_char_uppercase(text_note_preview_var, note_entry)
 
     # Nota, Cerca e Pulisci filtri: pack differito dopo definizione di apply_movement_search / clear.
@@ -10396,6 +10415,7 @@ def build_ui(
         bf.grid(row=1, column=0, columnspan=2, pady=(12, 0))
         ttk.Button(bf, text="Annulla", command=top.destroy).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(bf, text="Salva", command=on_ok).pack(side=tk.LEFT)
+        bind_return_tab_and_kp_enter(ent_edit_cheque, lambda _e: (on_ok(), "break")[1])
 
     def open_edit_amount(stable_key: str) -> None:
         pair = find_record_year_and_ref(cur_db(), stable_key)
@@ -10489,14 +10509,16 @@ def build_ui(
         top.transient(root)
         frm = ttk.Frame(top, padding=12)
         frm.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(frm, text="Nota:").grid(row=0, column=0, sticky="nw")
-        tx = tk.Text(frm, width=52, height=5, font=("TkDefaultFont", 11))
-        tx.grid(row=0, column=1, sticky="w", padx=(8, 0))
-        tx.insert("1.0", str(rec.get("note") or ""))
+        ttk.Label(frm, text="Nota:").grid(row=0, column=0, sticky="w")
+        v = tk.StringVar(value=str(rec.get("note") or ""))
+        ent_edit_note = ttk.Entry(frm, textvariable=v, width=MAX_RECORD_NOTE_LEN, style="NewReg.TEntry")
+        ent_edit_note.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        bind_limited_single_line_text_entry(ent_edit_note, v, max_len=MAX_RECORD_NOTE_LEN)
+        bind_entry_first_char_uppercase(v, ent_edit_note)
 
         def on_ok() -> None:
             rec["note"] = format_record_note_stored(
-                sanitize_single_line_text(tx.get("1.0", "end-1c") or "", max_len=MAX_RECORD_NOTE_LEN)
+                sanitize_single_line_text(v.get() or "", max_len=MAX_RECORD_NOTE_LEN)
             )
             top.destroy()
             persist_db_after_edit(stable_key)
@@ -10505,6 +10527,7 @@ def build_ui(
         bf.grid(row=1, column=0, columnspan=2, pady=(12, 0))
         ttk.Button(bf, text="Annulla", command=top.destroy).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(bf, text="Salva", command=on_ok).pack(side=tk.LEFT)
+        bind_return_tab_and_kp_enter(ent_edit_note, lambda _e: (on_ok(), "break")[1])
 
     def _correzione_current_key_and_rec() -> tuple[str, dict] | None:
         sel = mov_tree.selection()
@@ -11827,6 +11850,9 @@ th {{ background:#efefef; text-align:left; }}
     # Enter nei filtri testuali = esegui Cerca
     for _w in (category_entry, account_entry, amount_filter_entry, cheque_entry, note_entry):
         bind_return_and_kp_enter(_w, apply_movement_search)
+    # Nei campi testuali assegno/nota anche Tab conferma la chiusura campo ed esegue Cerca.
+    bind_return_tab_and_kp_enter(cheque_entry, apply_movement_search, add=True)
+    bind_return_tab_and_kp_enter(note_entry, apply_movement_search, add=True)
 
     def clear_movement_text_filters() -> None:
         # Solo filtri testuali (categoria, conti, importo, …). Ordine, date future, preset intervallo
@@ -13085,16 +13111,16 @@ th {{ background:#efefef; text-align:left; }}
     balance_footer_row.pack(fill=tk.X, anchor=tk.W)
     balance_left = tk.Frame(balance_footer_row, bg=MOVIMENTI_PAGE_BG)
     balance_left.pack(side=tk.LEFT, anchor="n")
-    _saldo_hdr_font = ("TkDefaultFont", 12, "bold")
-    _SALDO_ROW_LONGEST = "Spese per carte di credito"
+    _saldo_hdr_font = ("TkDefaultFont", 11, "bold")
+    _SALDO_ROW_LONGEST = "Di cui, impegni futuri"
     # Stesso corpo/grassetto degli importi nella tabella accanto (12 bold) per allineamento verticale riga per riga.
     _saldo_title_col_font = tkfont.Font(root, font=_saldo_hdr_font)
     # Larghezza fissa (px) dal testo più lungo, misurata all’avvio con quel font.
     _saldo_lbl_col_px = max(1, int(_saldo_title_col_font.measure(_SALDO_ROW_LONGEST)) + 6)
     # Altezza riga comune (tabella nel canvas + colonna titoli): stesso minsize su entrambe le griglie.
-    _saldo_grid_row_h = int(_saldo_title_col_font.metrics("linespace")) + 2
+    _saldo_grid_row_h = int(_saldo_title_col_font.metrics("linespace")) + 1
     # Altezza iniziale; dopo refresh viene impostata su winfo_reqheight della tabella (evita taglio ultima riga).
-    _saldo_canvas_body_h = 5 * (_saldo_grid_row_h + 2) + 8
+    _saldo_canvas_body_h = 6 * (_saldo_grid_row_h + 1) + 6
     balance_lbl_col = tk.Frame(
         balance_footer_row, width=_saldo_lbl_col_px, highlightthickness=0, bg=MOVIMENTI_PAGE_BG
     )
@@ -13102,7 +13128,7 @@ th {{ background:#efefef; text-align:left; }}
     # anchor=n: allinea il top della colonna titoli al top della tabella (canvas create_window nw), non al centro del canvas alto 92.
     balance_lbl_col.pack(side=tk.LEFT, anchor="n", padx=(2, 1))
     balance_lbl_col.grid_columnconfigure(0, weight=1)
-    for _sr in range(5):
+    for _sr in range(6):
         balance_lbl_col.grid_rowconfigure(_sr, minsize=_saldo_grid_row_h)
     tk.Label(
         balance_lbl_col,
@@ -13122,7 +13148,7 @@ th {{ background:#efefef; text-align:left; }}
     ).grid(row=1, column=0, sticky="e", pady=(0, 1))
     tk.Label(
         balance_lbl_col,
-        text="Di cui, spese future",
+        text="Di cui, impegni futuri",
         font=_saldo_title_col_font,
         anchor="e",
         bg=MOVIMENTI_PAGE_BG,
@@ -13130,21 +13156,29 @@ th {{ background:#efefef; text-align:left; }}
     ).grid(row=2, column=0, sticky="e", pady=(0, 1))
     tk.Label(
         balance_lbl_col,
-        text=_SALDO_ROW_LONGEST,
+        text="Disponibilità oggi",
         font=_saldo_title_col_font,
         anchor="e",
         bg=MOVIMENTI_PAGE_BG,
         fg="#1a1a1a",
     ).grid(row=3, column=0, sticky="e", pady=(0, 1))
+    tk.Label(
+        balance_lbl_col,
+        text="Impegni per carte",
+        font=_saldo_title_col_font,
+        anchor="e",
+        bg=MOVIMENTI_PAGE_BG,
+        fg="#1a1a1a",
+    ).grid(row=4, column=0, sticky="e", pady=(0, 1))
     balance_lbl_disponibilita = tk.Label(
         balance_lbl_col,
-        text="Disponibilità",
+        text="Disponibilità assoluta",
         font=_saldo_title_col_font,
         anchor="e",
         bg=MOVIMENTI_PAGE_BG,
         fg="#1a1a1a",
     )
-    balance_lbl_disponibilita.grid(row=4, column=0, sticky="e", pady=(0, 1))
+    balance_lbl_disponibilita.grid(row=5, column=0, sticky="e", pady=(0, 1))
     balance_scroll_block = tk.Frame(balance_footer_row, bg=MOVIMENTI_PAGE_BG)
     balance_scroll_block.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, anchor="n")
     balance_center = tk.Frame(balance_scroll_block, bg=MOVIMENTI_PAGE_BG)
@@ -13230,6 +13264,7 @@ th {{ background:#efefef; text-align:left; }}
         ]
         total_abs = sum((saldo_assoluti[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
         total_spese_future = sum((spese_future[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
+        total_disp_oggi = total_abs - total_spese_future
         total_spese_cc = sum((spese_cc[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
         total_disponibilita = total_abs + total_spese_cc
         return {
@@ -13238,10 +13273,12 @@ th {{ background:#efefef; text-align:left; }}
             "column_is_credit_card": is_cc,
             "amts_abs": saldo_assoluti,
             "amts_spese_future": spese_future,
+            "amts_disp_oggi": saldo_oggi,
             "amts_spese_cc": spese_cc,
             "amts_disponibilita": disponibilita,
             "total_abs": total_abs,
             "total_spese_future": total_spese_future,
+            "total_disp_oggi": total_disp_oggi,
             "total_spese_cc": total_spese_cc,
             "total_disponibilita": total_disponibilita,
             "date_it": to_italian_date(date.today().isoformat()),
@@ -13254,9 +13291,9 @@ th {{ background:#efefef; text-align:left; }}
         for_native: bool = False,
         native_text_width_pt: float | None = None,
     ) -> str:
-        """Stampa A4: tabella trasposta — righe = conti, colonne = saldi assoluti / di cui spese future / spese CC / disponibilità + TOTALE.
+        """Stampa A4: tabella trasposta — righe = conti, colonne = saldi assoluti / impegni futuri / disponibilità oggi / impegni per carte / disponibilità assoluta + TOTALE.
 
-        Con ``native_text_width_pt=iw`` (solo macOS) colgroup e larghezza tabella sono in **punti** (Conti 14%, quattro colonne importo).
+        Con ``native_text_width_pt=iw`` (solo macOS) colgroup e larghezza tabella sono in **punti** (Conti 14%, cinque colonne importo).
         """
         valuta = snap["valuta"]
         names: list[str] = snap["names"]
@@ -13278,9 +13315,9 @@ th {{ background:#efefef; text-align:left; }}
         cell_pad = "1px 2px"
         line_h = 1.05
         body_pad_css = "0" if for_native else f"{body_pad_v} {body_pad_h}"
-        # Larghezze colonne: 14% Conti, resto diviso equamente tra le quattro colonne importo.
+        # Larghezze colonne: 14% Conti, resto diviso equamente tra le cinque colonne importo.
         pct_conti = 14
-        pct_amt = (100.0 - float(pct_conti)) / 4.0
+        pct_amt = (100.0 - float(pct_conti)) / 5.0
         native_root_style = ""
         native_wrap_style = ""
         native_table_style = ""
@@ -13297,8 +13334,8 @@ th {{ background:#efefef; text-align:left; }}
             _inner_tw = max(100.0, _tw - 2.0 * _edge_gutter_pt)
             _pad_h = _side + _edge_gutter_pt
             w_c = _inner_tw * pct_conti / 100.0
-            w_a = max(1.0, (_inner_tw - w_c) / 4.0)
-            _col_amt = "".join(f'<col style="width:{w_a:.2f}pt" />' for _ in range(4))
+            w_a = max(1.0, (_inner_tw - w_c) / 5.0)
+            _col_amt = "".join(f'<col style="width:{w_a:.2f}pt" />' for _ in range(5))
             colgroup_html = (
                 "<colgroup>"
                 f'<col class="col-conti" style="width:{w_c:.2f}pt" />'
@@ -13320,7 +13357,7 @@ th {{ background:#efefef; text-align:left; }}
             )
         else:
             _pct_amt_s = f"{pct_amt:.2f}".rstrip("0").rstrip(".")
-            _col_amt_pct = "".join(f'<col style="width:{_pct_amt_s}%" />' for _ in range(4))
+            _col_amt_pct = "".join(f'<col style="width:{_pct_amt_s}%" />' for _ in range(5))
             colgroup_html = (
                 "<colgroup>"
                 f'<col class="col-conti" style="width:{pct_conti}%" />'
@@ -13371,9 +13408,10 @@ th {{ background:#efefef; text-align:left; }}
         header_cells = (
             '<th class="hdr-name">Conti</th>'
             '<th class="col-hdr col-hdr-b"><strong>Saldi assoluti</strong></th>'
-            '<th class="col-hdr col-hdr-b"><strong>Di cui, spese future</strong></th>'
-            '<th class="col-hdr col-hdr-b"><strong>Spese per carte<br/>di credito</strong></th>'
-            '<th class="col-hdr col-hdr-n">Disponibilità</th>'
+            '<th class="col-hdr col-hdr-b"><strong>Di cui, impegni futuri</strong></th>'
+            '<th class="col-hdr col-hdr-n">Disponibilità oggi</th>'
+            '<th class="col-hdr col-hdr-b"><strong>Impegni per carte</strong></th>'
+            '<th class="col-hdr col-hdr-n">Disponibilità assoluta</th>'
         )
 
         body_lines: list[str] = []
@@ -13383,6 +13421,7 @@ th {{ background:#efefef; text-align:left; }}
                 conti_cell(nm)
                 + td_num(snap["amts_abs"][i], bold=True)
                 + (td_cc_dash(bold=True) if cc else td_num(snap["amts_spese_future"][i], bold=True))
+                + (td_cc_dash(bold=False) if cc else td_num(snap["amts_disp_oggi"][i], bold=False))
                 + (td_cc_dash(bold=True) if cc else td_num(snap["amts_spese_cc"][i], bold=True))
                 + (td_cc_dash(bold=False) if cc else td_num(snap["amts_disponibilita"][i], bold=False))
             )
@@ -13392,6 +13431,7 @@ th {{ background:#efefef; text-align:left; }}
             + conti_cell("TOTALE")
             + td_num(snap["total_abs"], bold=True)
             + td_num(snap["total_spese_future"], bold=True)
+            + td_num(snap["total_disp_oggi"], bold=False)
             + td_num(snap["total_spese_cc"], bold=True)
             + td_num(snap["total_disponibilita"], bold=False)
             + "</tr>"
@@ -13893,7 +13933,7 @@ th {{ background:#efefef; text-align:left; }}
     btn_stampa_saldi.bind("<Leave>", lambda _e: btn_stampa_saldi.configure(bg=_PRINT_RED))
 
     def _align_stampa_saldi_to_middle_row() -> None:
-        """Centro verticale del tasto = centro dell’etichetta «Disponibilità» (non solo minsize teorico)."""
+        """Centro verticale del tasto = centro dell’etichetta «Disponibilità assoluta» (non solo minsize teorico)."""
         try:
             root.update_idletasks()
             bh = btn_stampa_saldi.winfo_height()
@@ -13903,7 +13943,7 @@ th {{ background:#efefef; text-align:left; }}
             if lh <= 1:
                 lh = balance_lbl_disponibilita.winfo_reqheight()
             if lh <= 0 or bh <= 0:
-                mid = (4 + 0.5) * _saldo_grid_row_h
+                mid = (5 + 0.5) * _saldo_grid_row_h
                 ptop = max(0, int(mid - bh / 2))
             else:
                 ly = balance_lbl_disponibilita.winfo_rooty() + lh / 2
@@ -13953,19 +13993,20 @@ th {{ background:#efefef; text-align:left; }}
             ]
             total_assoluti = sum((saldo_assoluti[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
             total_spese_future = sum((spese_future[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
+            total_disponibilita_oggi = total_assoluti - total_spese_future
             total_spese_cc = sum((spese_cc[i] for i in range(len(names)) if not is_cc[i]), Decimal("0"))
             total_disponibilita = total_assoluti + total_spese_cc
 
-            # Riga 1 assoluti; 2 di cui spese future (solo informativa); 3 spese CC; 4 Disponibilità = riga 1 + riga 3 (senza riga 2). TOTALE senza conti carta.
+            # Riga 1 assoluti; 2 impegni futuri; 3 disponibilità oggi = 1-2; 4 impegni carte; 5 disponibilità assoluta = 1+4. TOTALE senza conti carta.
             table = tk.Frame(balance_center_canvas, highlightthickness=0, bd=0)
             balance_center_canvas.create_window((0, 0), window=table, anchor="nw")
 
-            header_font = ("TkDefaultFont", 12, "bold")
-            amount_font = ("TkDefaultFont", 12, "bold")
-            AMT_CELL_WIDTH = 18
+            header_font = ("TkDefaultFont", 11, "bold")
+            amount_font = ("TkDefaultFont", 11, "bold")
+            AMT_CELL_WIDTH = 16
 
             def header_cell(col: int, text: str) -> None:
-                pl, pr = (0, 2) if col == 0 else (0, 6)
+                pl, pr = (0, 2) if col == 0 else (0, 4)
                 tk.Label(
                     table,
                     text=text,
@@ -13975,7 +14016,7 @@ th {{ background:#efefef; text-align:left; }}
                 ).grid(row=0, column=col, sticky="e", padx=(pl, pr), pady=(0, 1))
 
             def amount_cell(row: int, col: int, amt: Decimal) -> None:
-                pl, pr = (0, 2) if col == 0 else (0, 6)
+                pl, pr = (0, 2) if col == 0 else (0, 4)
                 tk.Label(
                     table,
                     text=format_saldo_cell("E", amt),
@@ -13986,7 +14027,7 @@ th {{ background:#efefef; text-align:left; }}
                 ).grid(row=row, column=col, sticky="e", padx=(pl, pr), pady=(0, 1))
 
             def dash_cell(row: int, col: int) -> None:
-                pl, pr = (0, 2) if col == 0 else (0, 6)
+                pl, pr = (0, 2) if col == 0 else (0, 4)
                 tk.Label(
                     table,
                     text="—",
@@ -14012,23 +14053,30 @@ th {{ background:#efefef; text-align:left; }}
                 else:
                     amount_cell(2, i + 1, amt)
 
-            amount_cell(3, 0, total_spese_cc)
-            for i, amt in enumerate(spese_cc):
+            amount_cell(3, 0, total_disponibilita_oggi)
+            for i, amt in enumerate(saldo_oggi):
                 if is_cc[i]:
                     dash_cell(3, i + 1)
                 else:
                     amount_cell(3, i + 1, amt)
 
-            amount_cell(4, 0, total_disponibilita)
-            for i, amt in enumerate(disponibilita):
+            amount_cell(4, 0, total_spese_cc)
+            for i, amt in enumerate(spese_cc):
                 if is_cc[i]:
                     dash_cell(4, i + 1)
                 else:
                     amount_cell(4, i + 1, amt)
-            for _sr in range(5):
+
+            amount_cell(5, 0, total_disponibilita)
+            for i, amt in enumerate(disponibilita):
+                if is_cc[i]:
+                    dash_cell(5, i + 1)
+                else:
+                    amount_cell(5, i + 1, amt)
+            for _sr in range(6):
                 table.grid_rowconfigure(_sr, minsize=_saldo_grid_row_h)
             table.update_idletasks()
-            # Altezza viewport canvas = tabella reale (pady delle celle + minsize possono superare 5*row_h).
+            # Altezza viewport canvas = tabella reale (pady delle celle + minsize possono superare 6*row_h).
             try:
                 _tbl_h = max(1, table.winfo_reqheight())
                 balance_center_canvas.configure(height=_tbl_h + 4)
@@ -14439,6 +14487,7 @@ th {{ background:#efefef; text-align:left; }}
     ttk.Label(nuova_form, text="Nota", style="NewReg.TLabel").grid(row=5, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
     ent_note = ttk.Entry(nuova_form, textvariable=newreg_note_var, width=_NR_W_NOTE, style="NewReg.TEntry")
     ent_note.grid(row=5, column=1, sticky="w", pady=_newreg_py)
+    bind_limited_single_line_text_entry(ent_note, newreg_note_var, max_len=MAX_RECORD_NOTE_LEN)
     bind_entry_first_char_uppercase(newreg_note_var, ent_note)
 
     row_btns_outer = tk.Frame(nuova_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
@@ -16116,6 +16165,7 @@ th {{ background:#efefef; text-align:left; }}
     ttk.Label(per_form, text="Nota", style="NewReg.TLabel").grid(row=7, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
     ent_per_note = ttk.Entry(per_form, textvariable=per_note_var, width=_NR_W_NOTE, style="NewReg.TEntry")
     ent_per_note.grid(row=7, column=1, columnspan=3, sticky="w", pady=_per_py)
+    bind_limited_single_line_text_entry(ent_per_note, per_note_var, max_len=MAX_RECORD_NOTE_LEN)
     bind_entry_first_char_uppercase(per_note_var, ent_per_note)
 
     row_per_btns = tk.Frame(per_top_block, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
@@ -17272,7 +17322,7 @@ th {{ background:#efefef; text-align:left; }}
     bind_return_and_kp_enter(cb_per_acc1, _per_enter_from_acc1)
     bind_return_and_kp_enter(cb_per_acc2, _per_enter_from_acc2)
     bind_return_and_kp_enter(ent_per_amt, _per_enter_from_amt)
-    bind_return_and_kp_enter(ent_per_note, _per_enter_from_note)
+    bind_return_tab_and_kp_enter(ent_per_note, _per_enter_from_note)
 
     def _per_tree_select(_e: tk.Event | None = None) -> None:
         def _deferred() -> None:
@@ -17713,8 +17763,8 @@ th {{ background:#efefef; text-align:left; }}
         format_zero=False,
     )
     ent_amt.bind("<FocusOut>", _on_amt_focusout, add="+")
-    bind_return_and_kp_enter(ent_chq, _on_chq_enter)
-    bind_return_and_kp_enter(ent_note, _on_note_enter)
+    bind_return_tab_and_kp_enter(ent_chq, _on_chq_enter)
+    bind_return_tab_and_kp_enter(ent_note, _on_note_enter)
     btn_confirm.configure(command=lambda: _commit_new_record(finish=False))
     bind_return_and_kp_enter(btn_confirm, lambda _e: (_commit_new_record(finish=False), "break")[1])
     btn_finish.configure(command=lambda: _commit_new_record(finish=True))
@@ -17916,6 +17966,8 @@ th {{ background:#efefef; text-align:left; }}
     # Saldo finale PDF: resta disponibile per il popup anche dopo aver azzerato ``ver_bancoposta_closing`` a fine coda.
     ver_pdf_closing_balance_hint: list[Decimal | None] = [None]
     ver_pdf_auto_diag_var = tk.StringVar(value="")
+    _ep_init = estratti_pdf_settings_from_db(cur_db())
+    estratti_pdf_root_var = tk.StringVar(value=str(_ep_init.get("root_folder", "") or ""))
 
     # --- persistenza dati di verifica in sospeso ---
     def _ver_saved_has_bancoposta(saved: dict | None) -> bool:
@@ -18150,6 +18202,7 @@ th {{ background:#efefef; text-align:left; }}
 
     ver_setup_inner = tk.Frame(ver_setup_frame, bg=_VER_BG, highlightthickness=0)
     ver_setup_inner.pack(anchor=tk.CENTER)
+    ver_auto_folder_box_visible: list[bool] = [False]
 
     tk.Label(ver_setup_inner, text="Conto da verificare", font=_ver_ui_font, bg=_VER_BG).grid(
         row=0, column=0, sticky="w", padx=(0, 8), pady=2
@@ -18356,6 +18409,73 @@ th {{ background:#efefef; text-align:left; }}
     ver_btn_bancoposta_browse.grid(row=1, column=4, sticky="w", pady=(2, 4))
     ver_setup_inner.columnconfigure(1, weight=1)
 
+    ver_auto_folder_box = tk.Frame(ver_setup_inner, bg=_VER_BG, highlightthickness=0, bd=0)
+    ver_auto_folder_label = tk.Label(
+        ver_auto_folder_box,
+        text="Cartella dove collocare gli estratti conto pdf per verifica",
+        font=_ver_ui_font,
+        bg=_VER_BG,
+        fg="#1a1a1a",
+        anchor="w",
+        justify="left",
+    )
+    ver_auto_folder_label.grid(row=0, column=0, columnspan=3, sticky="w", pady=(1, 3))
+    ver_auto_folder_entry = ttk.Entry(
+        ver_auto_folder_box,
+        textvariable=estratti_pdf_root_var,
+        width=58,
+        style="NewReg.TEntry",
+    )
+    ver_auto_folder_entry.grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 2))
+    ver_auto_folder_btns = tk.Frame(ver_auto_folder_box, bg=_VER_BG, highlightthickness=0)
+    ver_auto_folder_btns.grid(row=1, column=1, sticky="w", pady=(0, 2))
+    ver_auto_folder_box.columnconfigure(0, weight=1)
+
+    ver_btn_auto_folder_browse = tk.Label(
+        ver_auto_folder_btns,
+        text="Seleziona",
+        cursor="hand2",
+        highlightthickness=0,
+        font=_VER_ACTION_BTN_FONT,
+        padx=12,
+        pady=6,
+        bg=_VER_FOOT_PRINT_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    ver_btn_auto_folder_browse.pack(side=tk.LEFT, padx=(0, 8))
+    ver_btn_auto_folder_confirm = tk.Label(
+        ver_auto_folder_btns,
+        text="Conferma",
+        cursor="hand2",
+        highlightthickness=0,
+        font=_VER_ACTION_BTN_FONT,
+        padx=12,
+        pady=6,
+        bg=_VER_PENDING_BTN_NEW_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    ver_btn_auto_folder_confirm.pack(side=tk.LEFT)
+    ver_auto_folder_note = tk.Label(
+        ver_auto_folder_box,
+        text=(
+            "La cartella deve contenere file pdf con i nomi previsti nelle correlazioni indicati nella pagina "
+            "Conti, seguite dalla numerazione mensile 01, 02, ..., 12."
+        ),
+        wraplength=780,
+        font=("TkDefaultFont", 9),
+        bg=_VER_BG,
+        fg="#444444",
+        justify="left",
+        anchor="w",
+    )
+    ver_auto_folder_note.grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 4))
+    ver_auto_folder_box.grid(row=3, column=0, columnspan=5, sticky="we", padx=(0, 8), pady=(4, 2))
+    ver_auto_folder_box.grid_remove()
+
     tk.Label(
         ver_setup_inner,
         textvariable=ver_pdf_auto_diag_var,
@@ -18365,7 +18485,7 @@ th {{ background:#efefef; text-align:left; }}
         justify=tk.LEFT,
         anchor="w",
         wraplength=780,
-    ).grid(row=3, column=0, columnspan=5, sticky="we", padx=(0, 8), pady=(2, 4))
+    ).grid(row=4, column=0, columnspan=5, sticky="we", padx=(0, 8), pady=(2, 4))
 
     ver_setup_saved_var = tk.StringVar(value="")
     ver_setup_saved_label = tk.Label(
@@ -18390,6 +18510,32 @@ th {{ background:#efefef; text-align:left; }}
         except tk.TclError:
             pass
 
+    def _ver_refresh_estratti_root_var_from_db() -> None:
+        try:
+            estratti_pdf_root_var.set(str(estratti_pdf_settings_from_db(cur_db()).get("root_folder") or ""))
+        except Exception:
+            pass
+
+    def _ver_show_auto_folder_box(show: bool) -> None:
+        if show:
+            _ver_refresh_estratti_root_var_from_db()
+            try:
+                ver_auto_folder_box.grid()
+            except tk.TclError:
+                pass
+            try:
+                ver_auto_folder_entry.focus_set()
+                ver_auto_folder_entry.icursor(tk.END)
+            except Exception:
+                pass
+            ver_auto_folder_box_visible[0] = True
+        else:
+            try:
+                ver_auto_folder_box.grid_remove()
+            except tk.TclError:
+                pass
+            ver_auto_folder_box_visible[0] = False
+
     def _ver_declined_memory_blocks_new_verification_until_resolved(acc_code: str) -> bool:
         """Dopo Annulla ripresa + No cancellazione: blocca ogni avvio «nuovo» (manuale o PDF) finché la memoria resta."""
         dcl = ver_accounts_declined_memory_keep[0]
@@ -18412,7 +18558,7 @@ th {{ background:#efefef; text-align:left; }}
         )
         return True
 
-    def _ver_on_start_auto() -> None:
+    def _ver_on_start_auto() -> bool:
         ver_pdf_auto_diag_var.set("")
         try:
             aid0 = ver_auto_start_defer_after[0]
@@ -18424,28 +18570,28 @@ th {{ background:#efefef; text-align:left; }}
         acc_name = ver_account_name_var.get().strip()
         if not acc_name:
             messagebox.showerror("Verifica", "Seleziona un conto da verificare.")
-            return
+            return False
         acc_code = _ver_account_code_for_name(acc_name)
         if not acc_code:
             messagebox.showerror("Verifica", f"Conto '{acc_name}' non trovato.")
-            return
+            return False
         if _ver_has_saved_session_for_account(acc_code):
             ver_setup_pdf_path_after_auto_fail[0] = False
             _ver_on_start()
-            return
+            return True
         if _ver_declined_memory_blocks_new_verification_until_resolved(acc_code):
-            return
+            return False
         cutoff_raw = ver_cutoff_date_var.get().strip()
         if not cutoff_raw:
             messagebox.showerror("Verifica", "Immetti la data di chiusura dell'estratto conto.")
             ver_cutoff_entry.focus_set()
-            return
+            return False
         try:
             parse_italian_ddmmyyyy_to_iso(cutoff_raw)
         except Exception:
             messagebox.showerror("Verifica", "Data non valida (formato gg/mm/aaaa).")
             ver_cutoff_entry.focus_set()
-            return
+            return False
         ver_setup_pdf_path_after_auto_fail[0] = False
         _ver_setup_start_buttons_state()
         p, diag = resolve_estratto_pdf_for_account(cur_db(), acc_code, cutoff_raw)
@@ -18461,7 +18607,7 @@ th {{ background:#efefef; text-align:left; }}
                 "Verifica — ricerca automatica PDF",
                 diag + "\n\nIndicare il PDF nel campo sotto (o «Sfoglia…») e premere «Avvia con PDF selezionato».",
             )
-            return
+            return False
         ver_pdf_auto_diag_var.set("")
         try:
             root.update_idletasks()
@@ -18484,6 +18630,72 @@ th {{ background:#efefef; text-align:left; }}
             _ver_on_start()
 
         ver_auto_start_defer_after[0] = root.after(350, _defer_ver_start)
+        return True
+
+    def _ver_browse_estratti_pdf_root_for_auto() -> None:
+        init = (estratti_pdf_root_var.get() or "").strip()
+        picked = filedialog.askdirectory(
+            parent=verifica_frame,
+            initialdir=init if init and Path(init).is_dir() else str(Path.home()),
+            title="Cartella radice estratti PDF",
+        )
+        if picked:
+            estratti_pdf_root_var.set(picked)
+
+    def _ver_confirm_auto_folder_and_start() -> None:
+        raw = (estratti_pdf_root_var.get() or "").strip()
+        if not raw:
+            messagebox.showwarning(
+                "Verifica automatica",
+                "Indicare prima la cartella radice degli estratti conto PDF.",
+                parent=verifica_frame,
+            )
+            _ver_show_auto_folder_box(True)
+            return
+        try:
+            root_dir = Path(raw).expanduser().resolve()
+        except Exception:
+            root_dir = Path(raw).expanduser()
+        if not root_dir.is_dir():
+            messagebox.showwarning(
+                "Verifica automatica",
+                "La cartella indicata non esiste o non e accessibile.\n\nSelezionare un percorso valido e riprovare.",
+                parent=verifica_frame,
+            )
+            _ver_show_auto_folder_box(True)
+            return
+        if not messagebox.askyesno(
+            "Verifica automatica",
+            "Confermare questa cartella per la verifica automatica ed avviare la ricerca PDF?",
+            parent=verifica_frame,
+        ):
+            _ver_show_auto_folder_box(True)
+            return
+        try:
+            estratti_pdf_settings_from_db(cur_db())["root_folder"] = str(root_dir)
+            save_encrypted_db_dual(
+                cur_db(),
+                Path(data_file_var.get()).expanduser().resolve(),
+                Path(key_file_var.get()).expanduser().resolve(),
+            )
+            estratti_pdf_root_var.set(str(root_dir))
+        except Exception as exc:
+            messagebox.showwarning(
+                "Verifica automatica",
+                f"Impossibile registrare la cartella nel database cifrato:\n{exc}\n\nRiprova.",
+                parent=verifica_frame,
+            )
+            _ver_show_auto_folder_box(True)
+            return
+        _ver_show_auto_folder_box(False)
+        if not _ver_on_start_auto():
+            messagebox.showwarning(
+                "Verifica automatica",
+                "Ricerca automatica non avviata: controllare i dati e riprovare.",
+                parent=verifica_frame,
+            )
+            _ver_show_auto_folder_box(True)
+            return
 
     def _ver_on_start_with_selected_pdf_path() -> None:
         """Dopo ricerca automatica PDF fallita: avvio usando il percorso nel campo / scelto con Sfoglia."""
@@ -18558,7 +18770,9 @@ th {{ background:#efefef; text-align:left; }}
         ver_bancoposta_pdf_var.set("")
         _ver_on_start()
 
-    ver_btn_start_auto.bind("<Button-1>", lambda _e: _ver_on_start_auto())
+    ver_btn_start_auto.bind("<Button-1>", lambda _e: _ver_show_auto_folder_box(True))
+    ver_btn_auto_folder_browse.bind("<Button-1>", lambda _e: _ver_browse_estratti_pdf_root_for_auto())
+    ver_btn_auto_folder_confirm.bind("<Button-1>", lambda _e: _ver_confirm_auto_folder_and_start())
     ver_btn_start_manual.bind("<Button-1>", lambda _e: _ver_on_start_resume(explicit_manual=True))
     ver_btn_start_with_pdf.bind("<Button-1>", lambda _e: _ver_on_start_with_selected_pdf_path())
     ver_btn_start_resume.bind("<Button-1>", lambda _e: _ver_on_start_resume(explicit_manual=False))
@@ -18877,12 +19091,14 @@ th {{ background:#efefef; text-align:left; }}
     )
     ver_ent_chq = ttk.Entry(ver_input_frame, textvariable=ver_inp_chq_var, width=12, style="NewReg.TEntry")
     ver_ent_chq.grid(row=0, column=5, sticky="w", padx=(0, 16), pady=2)
+    bind_limited_single_line_text_entry(ver_ent_chq, ver_inp_chq_var, max_len=MAX_CHEQUE_LEN)
 
     tk.Label(ver_input_frame, text="Nota", font=_ver_ui_font, bg=_VER_BG).grid(
         row=0, column=6, sticky="w", padx=(0, 6), pady=2
     )
     ver_ent_note = ttk.Entry(ver_input_frame, textvariable=ver_inp_note_var, width=28, style="NewReg.TEntry")
     ver_ent_note.grid(row=0, column=7, sticky="w", padx=(0, 8), pady=2)
+    bind_limited_single_line_text_entry(ver_ent_note, ver_inp_note_var, max_len=MAX_RECORD_NOTE_LEN)
     bind_entry_first_char_uppercase(ver_inp_note_var, ver_ent_note)
 
     def _ver_on_chq_enter(_e: object = None) -> str | None:
@@ -18920,8 +19136,8 @@ th {{ background:#efefef; text-align:left; }}
         _ver_on_submit()
         return "break"
 
-    bind_return_and_kp_enter(ver_ent_chq, _ver_on_chq_enter)
-    bind_return_and_kp_enter(ver_ent_note, _ver_on_note_enter)
+    bind_return_tab_and_kp_enter(ver_ent_chq, _ver_on_chq_enter)
+    bind_return_tab_and_kp_enter(ver_ent_note, _ver_on_note_enter)
 
     ver_input_actions = tk.Frame(ver_input_frame, bg=_VER_BG, highlightthickness=0)
     # Seconda riga: su pagina risultati / finestra stretta i tasti in coda alla riga 0 restavano tagliati (col. 8+).
@@ -20449,6 +20665,7 @@ th {{ background:#efefef; text-align:left; }}
                     w.grid_remove()
                 except tk.TclError:
                     pass
+            _ver_show_auto_folder_box(False)
             _ver_update_reset_saved_button_visibility()
             return
 
@@ -20490,11 +20707,13 @@ th {{ background:#efefef; text-align:left; }}
                 return
 
         if not cutoff_ok and not has_saved_memory_for_start:
+            _ver_show_auto_folder_box(False)
             _ver_update_reset_saved_button_visibility()
             return
 
         # Memoria su questo conto: nessun tasto di avvio qui — il dialogo di ripresa è in ``_ver_schedule_memory_resume_prompt`` / ``_ver_on_start``.
         if has_saved_memory_for_start:
+            _ver_show_auto_folder_box(False)
             _ver_update_reset_saved_button_visibility()
             return
 
@@ -29888,10 +30107,6 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 2))
 
     legacy_path_var = tk.StringVar(value=str(DEFAULT_CDC_ROOT))
-    _ep_init = estratti_pdf_settings_from_db(cur_db())
-    estratti_pdf_root_var = tk.StringVar(value=str(_ep_init.get("root_folder", "") or ""))
-    estratti_pdf_feedback_var = tk.StringVar(value="")
-    _estratti_pdf_save_feedback_after: list[int | None] = [None]
 
     def browse_data_folder() -> None:
         picked = filedialog.askdirectory(
@@ -30045,119 +30260,15 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     data_restore_row = ttk.Frame(opzioni_inner)
     data_restore_row.grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 0))
 
-    estratti_outer = ttk.LabelFrame(opz_scrollable, padding=10)
-    estratti_outer.configure(
-        labelwidget=ttk.Label(
-            estratti_outer,
-            text="Cartella dove collocare gli estratti conto pdf per verifica",
-            font=_OPZ_TITLE_FONT,
-        )
-    )
-    estratti_outer.pack(fill=tk.X, padx=(28, 10), pady=(0, 10))
-    estratti_inner = ttk.Frame(estratti_outer)
-    estratti_inner.pack(fill=tk.X)
-
-    estratti_path_row = ttk.Frame(estratti_inner)
-    estratti_path_row.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 2))
-    estratti_path_row.columnconfigure(0, weight=0)
-    estratti_pdf_entry = ttk.Entry(estratti_path_row, textvariable=estratti_pdf_root_var, width=_OPZ_PATH_ENTRY_WIDTH)
-    estratti_pdf_entry.grid(row=0, column=0, sticky="w", padx=(0, 8))
-
-    def browse_estratti_pdf_root() -> None:
-        init = (estratti_pdf_root_var.get() or "").strip()
-        picked = filedialog.askdirectory(
-            initialdir=init if init and Path(init).is_dir() else str(Path.home()),
-            title="Cartella radice estratti PDF",
-        )
-        if picked:
-            estratti_pdf_root_var.set(picked)
-            estratti_pdf_feedback_var.set("")
-
-    def save_estratti_pdf_root() -> None:
-        raw = (estratti_pdf_root_var.get() or "").strip()
-        try:
-            to_store = str(Path(raw).expanduser().resolve()) if raw else ""
-        except Exception:
-            to_store = raw
-        if not messagebox.askyesno(
-            "Salva cartella estratti PDF",
-            "Il percorso della cartella degli estratti conto PDF verrà salvato nel database cifrato.\n\n"
-            + (to_store if to_store else "(campo vuoto: verrà rimossa la cartella configurata)")
-            + "\n\nProcedere?",
-            parent=root,
-        ):
-            return
-        estratti_pdf_settings_from_db(cur_db())["root_folder"] = to_store
-        try:
-            save_encrypted_db_dual(
-                cur_db(),
-                Path(data_file_var.get()).expanduser().resolve(),
-                Path(key_file_var.get()).expanduser().resolve(),
-            )
-            estratti_pdf_root_var.set(to_store)
-            msg = "Cartella radice estratti PDF: salvata nel database cifrato."
-            status_var.set(msg)
-            estratti_pdf_feedback_var.set("Salvato nel file .enc (vedi anche dialogo).")
-            aid = _estratti_pdf_save_feedback_after[0]
-            if aid is not None:
-                try:
-                    root.after_cancel(aid)
-                except Exception:
-                    pass
-
-            def _clr_estratti_pdf_fb() -> None:
-                estratti_pdf_feedback_var.set("")
-                _estratti_pdf_save_feedback_after[0] = None
-
-            _estratti_pdf_save_feedback_after[0] = root.after(15000, _clr_estratti_pdf_fb)
-            messagebox.showinfo(
-                "Estratti PDF — salvataggio",
-                "Il percorso della cartella radice è stato registrato nel database cifrato.\n\n"
-                + (to_store if to_store else "(nessun percorso: campo vuoto)"),
-                parent=root,
-            )
-        except Exception as exc:
-            messagebox.showerror("Estratti PDF", str(exc), parent=root)
-
-    _estr_btns = ttk.Frame(estratti_path_row)
-    _estr_btns.grid(row=0, column=1, sticky="w")
-    _opz_action_label(
-        _estr_btns,
-        "Seleziona",
-        browse_estratti_pdf_root,
-        width=_OPZ_PATH_BTN_WIDTH,
-    ).pack(side=tk.LEFT, padx=(0, 8))
-    _opz_action_label(
-        _estr_btns,
-        "Salva cartella",
-        save_estratti_pdf_root,
-        color=_OPZ_RED,
-        active_color=_OPZ_RED_ACTIVE,
-        width=_OPZ_PATH_BTN_WIDTH,
-    ).pack(side=tk.LEFT, padx=(0, 8))
     ttk.Label(
-        _estr_btns,
-        textvariable=estratti_pdf_feedback_var,
-        font=("TkDefaultFont", 10, "bold"),
-        foreground="#555555",
-    ).pack(side=tk.LEFT, padx=(4, 0))
-    ttk.Label(
-        estratti_inner,
-        text="La cartella deve contenere file pdf con i nomi previsti nelle correlazioni indicati nella pagina Conti, seguite dalla numerazione mensile 01, 02, ..., 12.",
-        wraplength=980,
-        font=("TkDefaultFont", 9),
-        foreground="#444444",
-    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 6))
-
-    ttk.Label(
-        estratti_inner,
+        opzioni_inner,
         text=(
             "Funzioni presenti ma non attivabili da questa pagina: import legacy, azzeramento di emergenza del saldo "
             "virtuale, verifica coerenza file cifrati e copia manuale Dropbox verso Library."
         ),
         wraplength=980,
         foreground="#555555",
-    ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+    ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
     def opzioni_restore_from_library_backup(*, confirm_existing: bool = True) -> None:
         primary = Path(data_file_var.get()).expanduser().resolve()
@@ -30214,7 +30325,6 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             )
         except Exception:
             pass
-        estratti_pdf_feedback_var.set("")
         status_var.set("Ripristino da Library completato; file light aggiornato.")
         messagebox.showinfo(
             "Ripristino",
