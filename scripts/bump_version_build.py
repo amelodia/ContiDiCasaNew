@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Incrementa APP_VERSION_BUILD (terzo numero) in app_version.py.
 
-Esegui prima di PyInstaller o manualmente dopo modifiche sostanziali.
-``scripts/build_macos_app.sh`` invoca questo script automaticamente.
+Esegui manualmente quando serve. Durante la compilazione PyInstaller
+(``ContiDiCasa.spec``) viene invocato automaticamente.
 """
 from __future__ import annotations
 

@@ -9,9 +9,15 @@ private enum ContiLightFolderBookmark {
     private static let key = "ContiLight.dataFolderSecurityBookmark"
 
     static func save(_ url: URL) {
-        // Su iOS: minimalBookmark + metadati riduce bookmark «stale» dopo riavvio; niente withSecurityScope (solo macOS).
+        // iOS/iPadOS: `.withSecurityScope` non è disponibile; usare bookmark minimale.
+        // macOS: usare bookmark security-scoped.
+        #if os(iOS)
+        let bookmarkOptions: URL.BookmarkCreationOptions = [.minimalBookmark]
+        #else
+        let bookmarkOptions: URL.BookmarkCreationOptions = [.withSecurityScope]
+        #endif
         guard let data = try? url.bookmarkData(
-            options: .minimalBookmark,
+            options: bookmarkOptions,
             includingResourceValuesForKeys: [.isDirectoryKey],
             relativeTo: nil
         ) else { return }
@@ -74,6 +80,8 @@ struct ContentView: View {
 
     /// Cartella che contiene `.key` e i `.enc` (stessa cartella `data/` del desktop).
     @State private var dataFolderURL: URL?
+    /// URL selezionato nel document picker salvato nei bookmark (`UserDefaults`): su iPadOS Dropbox l’accesso sicuro vale per quel URL, non per la cartella genitore.
+    @State private var securityScopedBookmarkURL: URL?
     @State private var keyStatusText = ""
     @State private var lightFileStatusText = ""
     @State private var fullFileStatusText = ""
@@ -95,6 +103,7 @@ struct ContentView: View {
     /// `""` = tutte le categorie / tutti i conti.
     @State private var filterCategoryKey = ""
     @State private var filterAccountKey = ""
+    @State private var dataFilePickRequest: DataFilePickRequest?
     @State private var folderPickRequest: FolderPickRequest?
     /// Navigazione interna alla sheet Filtri (tap → lista, senza NavigationLink lento).
     @State private var filtriNavigationPath = NavigationPath()
@@ -107,6 +116,10 @@ struct ContentView: View {
     @State private var periodicStartupAlertPresented = false
     /// Throttle per ``refreshLightSessionIfLoggedIn`` (solo lettura + decifra; non riscrive `.enc`). Evita hammer al provider file.
     @State private var lastScenePhaseRefreshAt: Date = .distantPast
+    /// Tentativi ritardati di refresh post-login (utile quando Dropbox/Files idrata il file con ritardo).
+    @State private var postLoginHydrationRefreshTask: Task<Void, Never>?
+    /// Sequenza attiva del tasto Aggiorna (doppio passaggio), per evitare sovrapposizioni.
+    @State private var isManualRefreshSequenceRunning = false
 
     private enum MovimentiFiltriPick: Hashable {
         case category
@@ -130,6 +143,7 @@ struct ContentView: View {
                     ContiLightNuovoMovimentoSchedaView(
                         sessionDb: loggedInSessionDb as? [String: Any],
                         dataFolderURL: dataFolderURL,
+                        securityScopedBookmarkURL: securityScopedBookmarkURL,
                         keyURL: sessionKeyURL,
                         lightEncURL: sessionLightEncURL,
                         email: email,
@@ -146,6 +160,7 @@ struct ContentView: View {
                     ContiLightNuovoMovimentoSchedaView(
                         sessionDb: loggedInSessionDb as? [String: Any],
                         dataFolderURL: dataFolderURL,
+                        securityScopedBookmarkURL: securityScopedBookmarkURL,
                         keyURL: sessionKeyURL,
                         lightEncURL: sessionLightEncURL,
                         email: email,
@@ -165,6 +180,8 @@ struct ContentView: View {
         .background(Color(uiColor: .systemGroupedBackground))
         .onChange(of: loggedInSessionDb == nil) { _, noSession in
             if noSession {
+                postLoginHydrationRefreshTask?.cancel()
+                postLoginHydrationRefreshTask = nil
                 movimentiPath = NavigationPath()
                 sessionKeyURL = nil
                 sessionLightEncURL = nil
@@ -172,8 +189,10 @@ struct ContentView: View {
             }
         }
         .onAppear {
-            if dataFolderURL == nil, let restored = ContiLightFolderBookmark.restore() {
-                dataFolderURL = restored
+            if dataFolderURL == nil, securityScopedBookmarkURL == nil, let restored = ContiLightFolderBookmark.restore() {
+                securityScopedBookmarkURL = restored
+                let isDir = (try? restored.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+                dataFolderURL = isDir ? restored : restored.deletingLastPathComponent()
             }
             applySavedLoginEmailIfNeeded()
             refreshKeyStatus()
@@ -188,6 +207,8 @@ struct ContentView: View {
                     }
                 }
             } else if phase == .background {
+                postLoginHydrationRefreshTask?.cancel()
+                postLoginHydrationRefreshTask = nil
                 closeCurrentSessionAndReleaseLock()
             }
         }
@@ -217,23 +238,52 @@ struct ContentView: View {
         }
     }
 
-    /// Se `EuroBrand` non è nel target, mostra un’icona SF Symbol (evita build/runtime fragili).
+    /// Logo euro (`EuroBrand.imageset`/asset + file `euro_brand.jpg` nel bundle come riserva).
+    /// In una `Form`, senza `.renderingMode(.original)`, l’immagine può risultare invisibile (template tint).
     @ViewBuilder
     private var loginBrandMark: some View {
-        if UIImage(named: "EuroBrand") != nil {
-            Image("EuroBrand")
+        if let euro = resolvedLoginEuroUIImage() {
+            Image(uiImage: euro)
+                .renderingMode(.original)
                 .resizable()
+                .interpolation(.high)
                 .scaledToFit()
-                .frame(width: 72, height: 72)
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .accessibilityLabel("Simbolo euro")
+                .frame(width: 92, height: 92)
+                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                .shadow(color: .black.opacity(0.12), radius: 8, x: 0, y: 4)
+                .accessibilityLabel("Marchio euro Conti di casa")
         } else {
             Image(systemName: "eurosign.circle.fill")
-                .font(.system(size: 56))
+                .font(.system(size: 62))
                 .symbolRenderingMode(.hierarchical)
                 .foregroundStyle(.secondary)
-                .accessibilityLabel("Simbolo euro")
+                .accessibilityLabel("Marchio euro")
         }
+    }
+
+    private func resolvedLoginEuroUIImage() -> UIImage? {
+        // 1) JPEG esplicitamente nel bundle (aggiungi `euro_brand.jpg` al target in Xcode → Build Phases → Copy Bundle Resources)
+        if let p = Bundle.main.path(forResource: "euro_brand", ofType: "jpg"),
+           let img = UIImage(contentsOfFile: p)?.withRenderingMode(.alwaysOriginal) {
+            return img
+        }
+        // 2) Asset catalog Imageset «EuroBrand» (nome immagine Xcode)
+        if let img = UIImage(named: "EuroBrand")?.withRenderingMode(.alwaysOriginal) {
+            return img
+        }
+        for name in ["euro", "euro.jpg", "AppIcon-1024"] {
+            if let img = UIImage(named: name)?.withRenderingMode(.alwaysOriginal) {
+                return img
+            }
+        }
+        // 3) Fallback file generici eventualmente inclusi nel target
+        for (file, ext) in [("euro", "jpg"), ("euro", "jpeg"), ("euro", "png")] {
+            if let path = Bundle.main.path(forResource: file, ofType: ext),
+               let img = UIImage(contentsOfFile: path)?.withRenderingMode(.alwaysOriginal) {
+                return img
+            }
+        }
+        return nil
     }
 
     private var loginFootnoteText: String {
@@ -241,8 +291,8 @@ struct ContentView: View {
         if !trimmed.isEmpty { return message }
         if dataFolderURL == nil {
             return """
-            Scegli la cartella dati (stesso .key, *_light.enc e .enc completo del desktop, nella stessa cartella), \
-            poi email e password. L’app apre il .enc light corretto per la tua email.
+            Scegli la cartella dati (stesso file .key, file *_light.enc e eventuale .enc completo del desktop nella stessa cartella),
+            poi email e password. L'app usa il file .enc light corretto per la tua email.
             """
         }
         return "Cartella dati già memorizzata. Inserisci email e password, poi tocca Accedi."
@@ -283,6 +333,7 @@ struct ContentView: View {
                         HStack {
                             if isBusy {
                                 ProgressView()
+                                    .progressViewStyle(.circular)
                             }
                             Label(
                                 "Accedi con \(ContiLightBiometricLogin.biometricLabel())",
@@ -297,6 +348,7 @@ struct ContentView: View {
                     HStack {
                         if isBusy {
                             ProgressView()
+                                .progressViewStyle(.circular)
                         }
                         Text(isBusy ? "Accesso…" : "Accedi")
                     }
@@ -307,12 +359,15 @@ struct ContentView: View {
             if dataFolderURL == nil {
                 Section("Cartella dati") {
                     Text(
-                        "Apri la cartella dati del desktop: qui ci sono il .key, il file *_light.enc e (opzionale) il .enc completo. Non selezionare un singolo file."
+                        "Preferisci Scegli cartella dati: serve accesso sia al file .key sia al file *_light.enc. Dropbox reinstallato dovrebbe mostrare bene la cartella. Oppure scegli un solo file; per usare .key e *_light.enc insieme scegli la cartella."
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    Button("Scegli cartella…") {
+                    Button("Scegli cartella dati…") {
                         folderPickRequest = FolderPickRequest()
+                    }
+                    Button("Oppure scegli un file (.key o .enc)…") {
+                        dataFilePickRequest = DataFilePickRequest()
                     }
                 }
             } else {
@@ -340,9 +395,13 @@ struct ContentView: View {
                     Button("Cambia cartella…") {
                         folderPickRequest = FolderPickRequest()
                     }
+                    Button("Oppure ripunta con un file (.key/.enc)…") {
+                        dataFilePickRequest = DataFilePickRequest()
+                    }
                     Button("Rimuovi cartella salvata", role: .destructive) {
                         ContiLightFolderBookmark.clear()
                         dataFolderURL = nil
+                        securityScopedBookmarkURL = nil
                         keyStatusText = ""
                         lightFileStatusText = ""
                         fullFileStatusText = ""
@@ -367,13 +426,16 @@ struct ContentView: View {
                         folderPickRequest = nil
                         let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
                         guard isDirectory else {
-                            message = """
-                            Hai selezionato un file, non una cartella. Nel selettore, apri la cartella dei dati \
-                            (es. `data`) e premi «Apri» sulla cartella — non sul file .key o .enc.
-                            """
+                            message = "Nel selettore cartella devi scegliere la cartella stessa dei dati, non un singolo file. Oppure usa Oppure ripunta con un file."
                             return
                         }
+                        guard url.startAccessingSecurityScopedResource() else {
+                            message = "Accesso alla cartella negato. Riprovare da Dropbox in File oppure usare Oppure ripunta con un file scegliendo *_light.enc o .key nella stessa cartella."
+                            return
+                        }
+                        url.stopAccessingSecurityScopedResource()
                         ContiLightFolderBookmark.save(url)
+                        securityScopedBookmarkURL = url
                         dataFolderURL = url
                         refreshKeyStatus()
                         message = "Cartella impostata. Inserisci email e password, poi Accedi."
@@ -382,6 +444,36 @@ struct ContentView: View {
                 onCancel: {
                     Task { @MainActor in
                         folderPickRequest = nil
+                    }
+                }
+            )
+            .ignoresSafeArea()
+        }
+        .sheet(item: $dataFilePickRequest) { _ in
+            DocumentDataFilePickerRepresentable(
+                onPick: { url in
+                    Task { @MainActor in
+                        dataFilePickRequest = nil
+                        let ext = url.pathExtension.lowercased()
+                        guard ext == "key" || ext == "enc" else {
+                            message = "Seleziona un file .key o *_light.enc nella cartella dati Dropbox. Per .key e *_light.enc insieme preferisci Scegli cartella dati."
+                            return
+                        }
+                        guard url.startAccessingSecurityScopedResource() else {
+                            message = "Accesso al file negato da iPadOS/Dropbox. Riprova scegliendo di nuovo un file .key o *_light.enc nella cartella dati (stesso account Dropbox del desktop)."
+                            return
+                        }
+                        url.stopAccessingSecurityScopedResource()
+                        ContiLightFolderBookmark.save(url)
+                        securityScopedBookmarkURL = url
+                        dataFolderURL = url.deletingLastPathComponent()
+                        refreshKeyStatus()
+                        message = "Punto ai file dalla scelta sopra (accesso sicuro solo a questo file). Per .key e *_light.enc insieme preferisci Scegli cartella dati. Inserisci email e password, poi Accedi."
+                    }
+                },
+                onCancel: {
+                    Task { @MainActor in
+                        dataFilePickRequest = nil
                     }
                 }
             )
@@ -396,13 +488,14 @@ struct ContentView: View {
             fullFileStatusText = ""
             return
         }
-        guard folder.startAccessingSecurityScopedResource() else {
-            keyStatusText = "Accesso alla cartella negato."
+        let scope = securityScopedBookmarkURL ?? folder
+        guard scope.startAccessingSecurityScopedResource() else {
+            keyStatusText = "Accesso ai file negato (permessi iPadOS / Dropbox)."
             lightFileStatusText = ""
             fullFileStatusText = ""
             return
         }
-        defer { folder.stopAccessingSecurityScopedResource() }
+        defer { scope.stopAccessingSecurityScopedResource() }
         if let k = ContiDatabase.preferredKeyFileURL(inFolder: folder) {
             keyStatusText = "Chiave: \(k.lastPathComponent)"
         } else {
@@ -443,7 +536,7 @@ struct ContentView: View {
             fullFileStatusText = "File completo: inserisci email per verificare il percorso dedicato."
         }
         // Aggiorna il bookmark su disco: evita che al prossimo avvio iOS lo consideri obsoleto e «perda» la cartella.
-        ContiLightFolderBookmark.renew(from: folder)
+        ContiLightFolderBookmark.renew(from: scope)
     }
 
     /// Categorie distinte (testo mostrato in lista), ordinate.
@@ -677,16 +770,17 @@ struct ContentView: View {
                 .accessibilityLabel("Saldi")
                 Button {
                     Task { @MainActor in
-                        await refreshLightSessionIfLoggedIn(forceReResolveEnc: true)
+                        await refreshFromToolbarUpdateButton()
                     }
                 } label: {
                     if isRefreshingSession {
                         ProgressView()
+                            .progressViewStyle(.circular)
                     } else {
                         Image(systemName: "arrow.clockwise")
                     }
                 }
-                .disabled(isRefreshingSession || isBusy)
+                .disabled(isRefreshingSession || isBusy || isManualRefreshSequenceRunning)
                 .accessibilityLabel("Aggiorna dati dal file")
             }
         }
@@ -841,6 +935,7 @@ struct ContentView: View {
 
     private func loginWithPassword() {
         guard let folder = dataFolderURL else { return }
+        let scoped = securityScopedBookmarkURL ?? folder
         guard !isBusy else { return }
         let emailTrim = email.trimmingCharacters(in: .whitespacesAndNewlines)
         let passwordTrim = password.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -859,6 +954,7 @@ struct ContentView: View {
                 emailTrim: emailTrim,
                 passwordTrim: passwordTrim,
                 folderURL: folderURL,
+                scopedAccessURL: scoped,
                 lightEncURLIfKnown: nil
             )
             applyLoginPacket(packet, emailTrim: emailTrim, passwordTrim: passwordTrim)
@@ -868,6 +964,7 @@ struct ContentView: View {
     /// Accesso con Face ID / Touch ID: recupera la password dal Keychain dopo il prompt biometrico.
     private func loginWithBiometrics() {
         guard let folder = dataFolderURL else { return }
+        let scoped = securityScopedBookmarkURL ?? folder
         guard !isBusy else { return }
         let emailTrim = email.trimmingCharacters(in: .whitespacesAndNewlines)
         email = emailTrim
@@ -891,6 +988,7 @@ struct ContentView: View {
                 emailTrim: emailTrim,
                 passwordTrim: passwordTrim,
                 folderURL: folder,
+                scopedAccessURL: scoped,
                 lightEncURLIfKnown: nil
             )
             applyLoginPacket(packet, emailTrim: emailTrim, passwordTrim: passwordTrim)
@@ -901,6 +999,7 @@ struct ContentView: View {
     /// Default: risolve di nuovo il path `*_light.enc` (Importo allineato al file su disco dopo sync Dropbox / Files).
     private func refreshLightSessionIfLoggedIn(forceReResolveEnc: Bool = true) async {
         guard loggedInSessionDb != nil, let folder = dataFolderURL else { return }
+        let scoped = securityScopedBookmarkURL ?? folder
         let emailTrim = email.trimmingCharacters(in: .whitespacesAndNewlines)
         let passwordTrim = password.trimmingCharacters(in: .whitespacesAndNewlines)
         // Niente lettura biometrica qui (eviterebbe prompt a ogni ritorno in primo piano).
@@ -921,6 +1020,7 @@ struct ContentView: View {
             emailTrim: emailTrim,
             passwordTrim: passwordTrim,
             folderURL: folder,
+            scopedAccessURL: scoped,
             lightEncURLIfKnown: encRef,
             skipSessionWorkspaceLock: true
         )
@@ -949,9 +1049,10 @@ struct ContentView: View {
             ContiDatabase.clearLocalInstanceSessionState()
             return
         }
-        let access = folder.startAccessingSecurityScopedResource()
+        let scope = securityScopedBookmarkURL ?? folder
+        let access = scope.startAccessingSecurityScopedResource()
         defer {
-            if access { folder.stopAccessingSecurityScopedResource() }
+            if access { scope.stopAccessingSecurityScopedResource() }
         }
         if access {
             ContiDatabase.releaseSessionWorkspaceLockOnClose(in: folder)
@@ -961,6 +1062,8 @@ struct ContentView: View {
     }
 
     private func closeCurrentSessionAndReleaseLock() {
+        postLoginHydrationRefreshTask?.cancel()
+        postLoginHydrationRefreshTask = nil
         releaseSessionLockIfOwned()
         loggedInSessionDb = nil
         loggedInRecords = []
@@ -975,22 +1078,23 @@ struct ContentView: View {
         emailTrim: String,
         passwordTrim: String,
         folderURL: URL,
+        scopedAccessURL: URL,
         lightEncURLIfKnown: URL?,
         skipSessionWorkspaceLock: Bool = false
     ) async -> LoginResultPacket {
         await withCheckedContinuation { (cont: CheckedContinuation<LoginResultPacket, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
-                let folderAccess = folderURL.startAccessingSecurityScopedResource()
+                let folderAccess = scopedAccessURL.startAccessingSecurityScopedResource()
                 defer {
                     if folderAccess {
-                        ContiLightFolderBookmark.renew(from: folderURL)
-                        folderURL.stopAccessingSecurityScopedResource()
+                        ContiLightFolderBookmark.renew(from: scopedAccessURL)
+                        scopedAccessURL.stopAccessingSecurityScopedResource()
                     }
                 }
                 guard folderAccess else {
                     cont.resume(
                         returning: LoginResultPacket(
-                            message: "Impossibile accedere alla cartella (permessi). Scegli di nuovo la cartella con «Scegli cartella…».",
+                            message: "Impossibile accedere alla cartella (permessi). Scegli di nuovo un file con «Scegli file dati…».",
                             records: [],
                             sessionDb: nil,
                             keyURL: nil,
@@ -1041,9 +1145,9 @@ struct ContentView: View {
                     let stem = ContiDatabase.userEncFilenameStem(forEmail: emailTrim)
                     packet = LoginResultPacket(
                         message: """
-                        Nessun file light trovato. Serve solo `*_light.enc` (mai il database grande). \
-                        Dal desktop salva e controlla che esista \(stem)_light.enc nella stessa cartella del file .key.
-                        """,
+                            Nessun file light trovato. Serve solo *_light.enc (mai il database grande).
+                            Dal desktop salva e controlla che esista \(stem)_light.enc nella stessa cartella del file .key.
+                            """,
                         records: [],
                         sessionDb: nil,
                         keyURL: nil,
@@ -1181,14 +1285,40 @@ struct ContentView: View {
                 periodicStartupAlertText = pm
                 periodicStartupAlertPresented = true
             }
-            // Ricarica dopo che Dropbox/Files ha potuto finire la copia locale del `*_light.enc` (stesso effetto del tasto Aggiorna).
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 4_000_000_000)
-                await refreshLightSessionIfLoggedIn()
-            }
+            schedulePostLoginHydrationRefreshes()
         } else {
             closeCurrentSessionAndReleaseLock()
         }
+    }
+
+    /// Alcuni provider (Dropbox/Files) consegnano inizialmente una copia locale non ancora aggiornata.
+    /// Esegue più refresh ritardati dopo login, evitando il requisito pratico di chiudere/riaprire l'app.
+    private func schedulePostLoginHydrationRefreshes() {
+        postLoginHydrationRefreshTask?.cancel()
+        postLoginHydrationRefreshTask = Task { @MainActor in
+            let delaysNs: [UInt64] = [
+                4_000_000_000,   // conferma rapida
+                10_000_000_000,  // coda tipica provider
+                20_000_000_000,  // casi lenti
+            ]
+            for delay in delaysNs {
+                if Task.isCancelled { return }
+                try? await Task.sleep(nanoseconds: delay)
+                if Task.isCancelled { return }
+                await refreshLightSessionIfLoggedIn(forceReResolveEnc: true)
+            }
+        }
+    }
+
+    /// Handler del tasto Aggiorna: doppio refresh per mitigare cache/file-provider non ancora idratato.
+    private func refreshFromToolbarUpdateButton() async {
+        guard !isManualRefreshSequenceRunning else { return }
+        isManualRefreshSequenceRunning = true
+        defer { isManualRefreshSequenceRunning = false }
+        await refreshLightSessionIfLoggedIn(forceReResolveEnc: true)
+        // Seconda passata ravvicinata: spesso Dropbox/Files materializza il blob aggiornato poco dopo.
+        try? await Task.sleep(nanoseconds: 1_300_000_000)
+        await refreshLightSessionIfLoggedIn(forceReResolveEnc: true)
     }
 }
 
@@ -1203,11 +1333,15 @@ private struct LoginResultPacket: @unchecked Sendable {
     let periodicStartupMessage: String?
 }
 
+private struct DataFilePickRequest: Identifiable, Hashable {
+    let id = UUID()
+}
+
 private struct FolderPickRequest: Identifiable, Hashable {
     let id = UUID()
 }
 
-// MARK: - Document picker cartella (senza copia, per bookmark)
+// MARK: - Document picker cartella
 
 private struct DocumentFolderPickerRepresentable: UIViewControllerRepresentable {
     var onPick: (URL) -> Void
@@ -1221,6 +1355,7 @@ private struct DocumentFolderPickerRepresentable: UIViewControllerRepresentable 
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
         picker.delegate = context.coordinator
         picker.allowsMultipleSelection = false
+        picker.modalPresentationStyle = .formSheet
         return picker
     }
 
@@ -1229,6 +1364,7 @@ private struct DocumentFolderPickerRepresentable: UIViewControllerRepresentable 
     final class Coordinator: NSObject, UIDocumentPickerDelegate {
         let onPick: (URL) -> Void
         let onCancel: () -> Void
+        private var callbackAlreadySent = false
 
         init(onPick: @escaping (URL) -> Void, onCancel: @escaping () -> Void) {
             self.onPick = onPick
@@ -1236,6 +1372,8 @@ private struct DocumentFolderPickerRepresentable: UIViewControllerRepresentable 
         }
 
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            guard !callbackAlreadySent else { return }
+            callbackAlreadySent = true
             guard let u = urls.first else {
                 DispatchQueue.main.async { self.onCancel() }
                 return
@@ -1246,6 +1384,60 @@ private struct DocumentFolderPickerRepresentable: UIViewControllerRepresentable 
         }
 
         func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            guard !callbackAlreadySent else { return }
+            callbackAlreadySent = true
+            DispatchQueue.main.async {
+                self.onCancel()
+            }
+        }
+    }
+}
+
+// MARK: - Document picker file dati (fallback: un file; la cartella è preferita)
+
+private struct DocumentDataFilePickerRepresentable: UIViewControllerRepresentable {
+    var onPick: (URL) -> Void
+    var onCancel: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onPick: onPick, onCancel: onCancel)
+    }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.data], asCopy: false)
+        picker.delegate = context.coordinator
+        picker.allowsMultipleSelection = false
+        picker.modalPresentationStyle = .formSheet
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onPick: (URL) -> Void
+        let onCancel: () -> Void
+        private var callbackAlreadySent = false
+
+        init(onPick: @escaping (URL) -> Void, onCancel: @escaping () -> Void) {
+            self.onPick = onPick
+            self.onCancel = onCancel
+        }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            guard !callbackAlreadySent else { return }
+            callbackAlreadySent = true
+            guard let u = urls.first else {
+                DispatchQueue.main.async { self.onCancel() }
+                return
+            }
+            DispatchQueue.main.async {
+                self.onPick(u)
+            }
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            guard !callbackAlreadySent else { return }
+            callbackAlreadySent = true
             DispatchQueue.main.async {
                 self.onCancel()
             }

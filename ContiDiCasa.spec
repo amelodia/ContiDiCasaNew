@@ -3,7 +3,13 @@
 
 import importlib.util
 import os
+import subprocess
 import sys
+
+_AUTO_BUMP = os.environ.get("CDC_AUTO_BUMP_VERSION", "1").strip().lower() not in ("0", "false", "no", "off")
+_BUMP_SCRIPT = os.path.join(SPECPATH, "scripts", "bump_version_build.py")
+if _AUTO_BUMP and os.path.isfile(_BUMP_SCRIPT):
+    subprocess.run([sys.executable, _BUMP_SCRIPT], cwd=SPECPATH, check=True)
 
 _vpath = os.path.join(SPECPATH, "app_version.py")
 _vspec = importlib.util.spec_from_file_location("cdc_app_version", _vpath)

@@ -52,6 +52,7 @@ Se hai già un’app con schermata bianca, di solito manca il contenuto in `Cont
 | `ContiLightApp/ContiLightUIKitStringPick.swift` | Filtri / Nuove registrazioni: scelta da lista con `UITableView` (tap reattivo) |
 | `ContiLightApp/ContiLightApp.swift` | `@main` (solo se non ne hai già uno) |
 | `ContiLightApp/Assets.xcassets/` | **App Icon** (da `euro.jpg` scalato a 1024) + immagine **EuroBrand** in login; aggiungi la cartella al target e in **General → App Icons** scegli `AppIcon`. |
+| `ContiLightApp/euro_brand.jpg` | Copia dell’JPEG euro per il logo login; mettilo nel **Copy Bundle Resources** se l’asset `EuroBrand` non compare nella `Form` |
 
 ## Uso nell’app
 
@@ -60,9 +61,27 @@ Se hai già un’app con schermata bianca, di solito manca il contenuto in `Cont
 3. **Email** e **password** come sul desktop.
 4. **Accedi** — se tutto è corretto, compare un messaggio con esito e numero indicativo di registrazioni.
 
+## Risoluzione logo euro invisibile in login
+
+- In Xcode spunta **`Assets.xcassets`** sul target (Target Membership).
+- Nell’Imageset **`EuroBrand`**, Rendering (Attributes inspector): **Original**, non *Template*.
+- Aggiungi **`euro_brand.jpg`** a **Build Phases → Copy Bundle Resources** se serve.
+
+## Icona sulla Home vede ancora il simbolo generico (il logo login invece sì)
+
+Login e icona app **non** condividono lo stesso file: la Home usa **solo** `Assets.xcassets/AppIcon.appiconset/` (PNG `AppIcon-1024.png` + `Contents.json`), non `EuroBrand` né `euro_brand.jpg`.
+
+1. **Copia l’intera cartella** `AppIcon.appiconset/` dal repo nell’Asset Catalog di Xcode **insieme** al file **`AppIcon-1024.png`** dentro quella cartella (se manca il PNG, Xcode mostra i pozzetti vuoti e SpringBoard resta con l’icona di default).
+2. **Target Membership** sul set **`AppIcon`**: nel navigatore seleziona **`AppIcon`** dentro `Assets.xcassets`, poi **File Inspector** (prima icona a destra) e spunta il **target** dell’app. Se manca, l’icona **non** viene inclusa nel `.app` anche se **General → App Icons** è impostato su `AppIcon`.
+3. **Target** → **General** → **App Icons and Launch Screen** → **App Icons Source** = **`AppIcon`** (il nome del set nell’asset catalog). Questa scelta vale di solito per tutta la build: non serve duplicare niente nei Build Settings.
+4. (**Opzionale**) Se nei **Build Settings** non vedi una riga chiamata *Primary App Icon Set Name*: è normale in alcune versioni/interface di Xcode. Nella casella **filtro** in alto digita **`APPICON`**: dovrebbe comparire **`ASSETCATALOG_COMPILER_APPICON_NAME`** (*Primary App Icon Set Name* nel reference Apple), impostabile a **`AppIcon`**. Oppure scegli **All** anziché *Basic*. Se **General** (punto 3) è già `AppIcon`, puoi ignorare questo punto.
+5. Seleziona **`AppIcon`** nel catalog: nella colonna centrale i tre slot iOS (Any / Dark / Tinted) devono essere riempiti o generati da Xcode; il repo fornisce lo stesso PNG per tutte e tre le voci in `Contents.json`.
+6. **Pulizia cache dispositivo**: elimina l’app dalla Home, in Xcode **Product → Clean Build Folder** (⌘⇧K), poi installa di nuovo. iOS tende a tenere in cache l’icona precedente.
+
 ## Risoluzione “build failed”
 
 - **Tutti** i file sotto `ContiLightApp/` vanno nel target: `ContentView.swift`, **`MovimentiSchedaViews.swift`**, e la cartella **`Assets.xcassets`** (trascina in Xcode e spunta il target). Se manca `MovimentiSchedaViews.swift`, compaiono errori del tipo *Cannot find `MovimentiSchedaRoute` in scope*.
+- Include anche **`euro_brand.jpg`** se usi quel fallback per il logo.
 - **Deployment**: imposta **iOS 17.0** (o superiore); il codice usa API SwiftUI `onChange` in forma iOS 17+.
 - **App Icon**: il set `AppIcon` usa **`AppIcon-1024.png`** (non JPEG); se cambi immagine, mantieni PNG 1024×1024 e aggiorna `Contents.json` in `AppIcon.appiconset`.
 

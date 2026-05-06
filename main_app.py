@@ -9660,6 +9660,8 @@ def build_ui(
     note_tree.configure(yscrollcommand=note_on_yscroll)
 
     _sel_sync = False
+    _mov_edit_modal_count: list[int] = [0]
+    _mov_edit_locked_sel: list[tuple[str, ...]] = [()]
 
     def _clear_selection(tree: ttk.Treeview) -> None:
         for iid in tree.selection():
@@ -9668,8 +9670,50 @@ def build_ui(
     def _selection_tuple(tree: ttk.Treeview) -> tuple[str, ...]:
         return tuple(tree.selection())
 
+    def _mov_edit_modal_selection_locked() -> bool:
+        return _mov_edit_modal_count[0] > 0
+
+    def _mov_edit_force_locked_selection() -> None:
+        sel = _mov_edit_locked_sel[0]
+        if not sel:
+            return
+        for t in (mov_tree, amt_tree, note_tree):
+            if _selection_tuple(t) != sel:
+                t.selection_set(*sel)
+            try:
+                t.focus(sel[0])
+            except Exception:
+                pass
+
+    def _mov_edit_new_dialog(title: str) -> tk.Toplevel:
+        top = tk.Toplevel(root)
+        top.title(title)
+        top.transient(root)
+        if _mov_edit_modal_count[0] <= 0:
+            _mov_edit_locked_sel[0] = _selection_tuple(mov_tree)
+        _mov_edit_modal_count[0] += 1
+
+        def _on_destroy(_e: tk.Event | None = None) -> None:
+            if _e is not None and getattr(_e, "widget", None) is not top:
+                return
+            _mov_edit_modal_count[0] = max(0, _mov_edit_modal_count[0] - 1)
+            if _mov_edit_modal_count[0] == 0:
+                _mov_edit_locked_sel[0] = ()
+
+        top.bind("<Destroy>", _on_destroy, add="+")
+        return top
+
+    def _mov_edit_block_tree_reselect(_e: tk.Event | None = None) -> str | None:
+        if _mov_edit_modal_selection_locked():
+            _mov_edit_force_locked_selection()
+            return "break"
+        return None
+
     def sync_selection_mov(_event: tk.Event | None = None) -> None:
         nonlocal _sel_sync
+        if _mov_edit_modal_selection_locked():
+            _mov_edit_force_locked_selection()
+            return
         if _sel_sync:
             return
         _sel_sync = True
@@ -9690,6 +9734,9 @@ def build_ui(
 
     def sync_selection_amt(_event: tk.Event | None = None) -> None:
         nonlocal _sel_sync
+        if _mov_edit_modal_selection_locked():
+            _mov_edit_force_locked_selection()
+            return
         if _sel_sync:
             return
         _sel_sync = True
@@ -9710,6 +9757,9 @@ def build_ui(
 
     def sync_selection_note(_event: tk.Event | None = None) -> None:
         nonlocal _sel_sync
+        if _mov_edit_modal_selection_locked():
+            _mov_edit_force_locked_selection()
+            return
         if _sel_sync:
             return
         _sel_sync = True
@@ -9756,6 +9806,10 @@ def build_ui(
         _tree.bind("<MouseWheel>", on_mousewheel)
         _tree.bind("<Button-4>", on_button_scroll)
         _tree.bind("<Button-5>", on_button_scroll)
+        _tree.bind("<ButtonPress-1>", _mov_edit_block_tree_reselect, add="+")
+        _tree.bind("<Double-Button-1>", _mov_edit_block_tree_reselect, add="+")
+        for _seq in ("<Up>", "<Down>", "<Prior>", "<Next>", "<Home>", "<End>"):
+            _tree.bind(_seq, _mov_edit_block_tree_reselect, add="+")
 
     # Correzione: solo righe presenti in griglia = già filtrate da «Cerca»; nessuna ricerca fuori dai filtri.
     # Stessa riga del tasto Modifica (col. 0) così l’altezza della barra non cambia al primo clic.
@@ -9995,12 +10049,25 @@ def build_ui(
                 pass
             lbl_saldo_parziale_categoria.grid_remove()
 
-    def persist_db_after_edit(reselect_key: str | None, *, refresh_movements: bool = True) -> None:
+    def persist_db_after_edit(
+        reselect_key: str | None,
+        *,
+        refresh_movements: bool = True,
+        ensure_reselected_visible: bool = False,
+    ) -> None:
+        try:
+            primary_target = Path(data_file_var.get()).expanduser().resolve()
+        except Exception:
+            primary_target = Path(data_file_var.get())
+        try:
+            key_target = Path(key_file_var.get()).expanduser().resolve()
+        except Exception:
+            key_target = Path(key_file_var.get())
         try:
             save_encrypted_db_dual(
                 cur_db(),
-                Path(data_file_var.get()),
-                Path(key_file_var.get()),
+                primary_target,
+                key_target,
             )
             # Correzioni da «Movimenti / Modifica registrazione»:
             # oltre al path operativo in Opzioni, riallinea sempre anche il file canonico
@@ -10008,18 +10075,31 @@ def build_ui(
             em = (session_holder[0].user_email or "").strip().lower()
             if em:
                 canonical_target = per_user_encrypted_db_path(em).resolve()
-                current_target = Path(data_file_var.get()).expanduser().resolve()
+                current_target = primary_target
                 if canonical_target != current_target:
                     save_encrypted_db_dual(
                         cur_db(),
                         canonical_target,
-                        Path(key_file_var.get()),
+                        key_target,
                     )
         except Exception as exc:
             messagebox.showerror("Salvataggio", str(exc))
             return
         if refresh_movements:
-            populate_movements_trees(reselect_stable_key=reselect_key, preserve_scroll=True)
+            fallback_idx: int | None = None
+            if reselect_key:
+                try:
+                    _ch_now = list(mov_tree.get_children())
+                    if reselect_key in _ch_now:
+                        fallback_idx = _ch_now.index(reselect_key)
+                except Exception:
+                    fallback_idx = None
+            populate_movements_trees(
+                reselect_stable_key=reselect_key,
+                preserve_scroll=True,
+                reselect_fallback_index=fallback_idx,
+                ensure_reselected_visible=ensure_reselected_visible,
+            )
             refresh_balance_footer()
         vrf = ver_results_after_persist_cb[0]
         if vrf is not None:
@@ -10049,9 +10129,7 @@ def build_ui(
         if not record_is_within_edit_age(rec):
             return
         year_n = int(rec.get("year", 0))
-        top = tk.Toplevel(root)
-        top.title("Modifica data")
-        top.transient(root)
+        top = _mov_edit_new_dialog("Modifica data")
         frm = ttk.Frame(top, padding=12)
         frm.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frm, text="Data (gg/mm/aaaa):").grid(row=0, column=0, sticky="w")
@@ -10106,7 +10184,7 @@ def build_ui(
                         return
             rec["date_iso"] = iso
             top.destroy()
-            persist_db_after_edit(stable_key)
+            persist_db_after_edit(stable_key, ensure_reselected_visible=True)
 
         bf = ttk.Frame(frm)
         bf.grid(row=1, column=0, columnspan=2, pady=(12, 0))
@@ -10170,9 +10248,7 @@ def build_ui(
         others = [(d, c) for d, c in choices if d not in locked_heads]
         others.sort(key=lambda it: it[0].lower())
         values_list = locked_heads + [d for d, _c in others]
-        top = tk.Toplevel(root)
-        top.title("Modifica categoria")
-        top.transient(root)
+        top = _mov_edit_new_dialog("Modifica categoria")
         frm = ttk.Frame(top, padding=12)
         frm.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frm, text="Categoria:").grid(row=0, column=0, sticky="w")
@@ -10213,7 +10289,7 @@ def build_ui(
             if getattr(e, "widget", None) is top:
                 _combo_cleanup()
 
-        top.bind("<Destroy>", _on_cat_dialog_destroy)
+        top.bind("<Destroy>", _on_cat_dialog_destroy, add="+")
 
         def on_ok() -> None:
             picked = cb.get()
@@ -10230,7 +10306,7 @@ def build_ui(
                 return
             sync_record_category_from_plan(rec, year_categories, code)
             top.destroy()
-            persist_db_after_edit(stable_key)
+            persist_db_after_edit(stable_key, ensure_reselected_visible=True)
 
         bf = ttk.Frame(frm)
         bf.grid(row=1, column=0, columnspan=2, pady=(12, 0))
@@ -10282,9 +10358,7 @@ def build_ui(
         if not names:
             messagebox.showerror("Conto", "Nessun conto per questo anno.")
             return
-        top = tk.Toplevel(root)
-        top.title("Modifica conto (dal conto)")
-        top.transient(root)
+        top = _mov_edit_new_dialog("Modifica conto (dal conto)")
         frm = ttk.Frame(top, padding=12)
         frm.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frm, text="Conto:").grid(row=0, column=0, sticky="w")
@@ -10300,7 +10374,7 @@ def build_ui(
             if getattr(e, "widget", None) is top:
                 _combo_cleanup()
 
-        top.bind("<Destroy>", _on_acc_primary_dialog_destroy)
+        top.bind("<Destroy>", _on_acc_primary_dialog_destroy, add="+")
 
         def on_ok() -> None:
             picked = cb.get()
@@ -10313,7 +10387,7 @@ def build_ui(
                 return
             sync_record_primary_account(rec, accounts, idx0)
             top.destroy()
-            persist_db_after_edit(stable_key)
+            persist_db_after_edit(stable_key, ensure_reselected_visible=True)
 
         bf = ttk.Frame(frm)
         bf.grid(row=1, column=0, columnspan=2, pady=(12, 0))
@@ -10343,9 +10417,7 @@ def build_ui(
         if not names:
             messagebox.showerror("Conto", "Nessun conto per questo anno.")
             return
-        top = tk.Toplevel(root)
-        top.title("Modifica conto (al conto)")
-        top.transient(root)
+        top = _mov_edit_new_dialog("Modifica conto (al conto)")
         frm = ttk.Frame(top, padding=12)
         frm.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frm, text="Conto:").grid(row=0, column=0, sticky="w")
@@ -10361,7 +10433,7 @@ def build_ui(
             if getattr(e, "widget", None) is top:
                 _combo_cleanup()
 
-        top.bind("<Destroy>", _on_acc_secondary_dialog_destroy)
+        top.bind("<Destroy>", _on_acc_secondary_dialog_destroy, add="+")
 
         def on_ok() -> None:
             picked = cb.get()
@@ -10374,7 +10446,7 @@ def build_ui(
                 return
             sync_record_secondary_account(rec, accounts, idx0)
             top.destroy()
-            persist_db_after_edit(stable_key)
+            persist_db_after_edit(stable_key, ensure_reselected_visible=True)
 
         bf = ttk.Frame(frm)
         bf.grid(row=1, column=0, columnspan=2, pady=(12, 0))
@@ -10395,9 +10467,7 @@ def build_ui(
             return
         if not record_is_within_edit_age(rec):
             return
-        top = tk.Toplevel(root)
-        top.title("Modifica assegno")
-        top.transient(root)
+        top = _mov_edit_new_dialog("Modifica assegno")
         frm = ttk.Frame(top, padding=12)
         frm.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frm, text="Assegno:").grid(row=0, column=0, sticky="w")
@@ -10409,7 +10479,7 @@ def build_ui(
         def on_ok() -> None:
             rec["cheque"] = sanitize_single_line_text(v.get() or "", max_len=MAX_CHEQUE_LEN)
             top.destroy()
-            persist_db_after_edit(stable_key)
+            persist_db_after_edit(stable_key, ensure_reselected_visible=True)
 
         bf = ttk.Frame(frm)
         bf.grid(row=1, column=0, columnspan=2, pady=(12, 0))
@@ -10432,9 +10502,7 @@ def build_ui(
         if not record_is_within_edit_age(rec) or record_has_account_verification_flags(rec):
             return
         year = int(rec.get("year", 0))
-        top = tk.Toplevel(root)
-        top.title("Modifica importo")
-        top.transient(root)
+        top = _mov_edit_new_dialog("Modifica importo")
         frm = ttk.Frame(top, padding=12)
         frm.pack(fill=tk.BOTH, expand=True)
         use_lire = year <= 2001 and rec.get("amount_lire_original") is not None
@@ -10481,7 +10549,7 @@ def build_ui(
                 return
             apply_amount_to_record(rec, amt)
             top.destroy()
-            persist_db_after_edit(stable_key)
+            persist_db_after_edit(stable_key, ensure_reselected_visible=True)
 
         bf = ttk.Frame(frm)
         bf.grid(row=1, column=0, columnspan=2, pady=(12, 0))
@@ -10504,9 +10572,7 @@ def build_ui(
             return
         if not record_is_within_edit_age(rec):
             return
-        top = tk.Toplevel(root)
-        top.title("Modifica nota")
-        top.transient(root)
+        top = _mov_edit_new_dialog("Modifica nota")
         frm = ttk.Frame(top, padding=12)
         frm.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frm, text="Nota:").grid(row=0, column=0, sticky="w")
@@ -10521,7 +10587,7 @@ def build_ui(
                 sanitize_single_line_text(v.get() or "", max_len=MAX_RECORD_NOTE_LEN)
             )
             top.destroy()
-            persist_db_after_edit(stable_key)
+            persist_db_after_edit(stable_key, ensure_reselected_visible=True)
 
         bf = ttk.Frame(frm)
         bf.grid(row=1, column=0, columnspan=2, pady=(12, 0))
@@ -11278,6 +11344,8 @@ th {{ background:#efefef; text-align:left; }}
         reselect_stable_key: str | None = None,
         *,
         preserve_scroll: bool = False,
+        reselect_fallback_index: int | None = None,
+        ensure_reselected_visible: bool = False,
     ) -> None:
         nonlocal movements_population_seq
         movements_population_seq += 1
@@ -11411,12 +11479,27 @@ th {{ background:#efefef; text-align:left; }}
                 def _reselect_and_bar() -> None:
                     if token_local != movements_population_seq:
                         return
+                    picked_iid: str | None = None
                     if reselect_key:
                         try:
                             if mov_tree.exists(reselect_key):
                                 mov_tree.selection_set(reselect_key)
-                                if not preserve_scroll:
-                                    mov_tree.see(reselect_key)
+                                picked_iid = reselect_key
+                        except Exception:
+                            pass
+                    if picked_iid is None and reselect_fallback_index is not None:
+                        try:
+                            ch = list(mov_tree.get_children())
+                            if ch:
+                                idx = max(0, min(int(reselect_fallback_index), len(ch) - 1))
+                                picked_iid = str(ch[idx])
+                                mov_tree.selection_set(picked_iid)
+                        except Exception:
+                            picked_iid = None
+                    if picked_iid is not None:
+                        try:
+                            if ensure_reselected_visible or (not preserve_scroll):
+                                mov_tree.see(picked_iid)
                         except Exception:
                             pass
                     try:
@@ -13105,7 +13188,7 @@ th {{ background:#efefef; text-align:left; }}
 
     populate_movements_trees()
 
-    balance_footer = ttk.Frame(movimenti_main_stack, padding=(0, 2, 0, 0), style="MovCdc.TFrame")
+    balance_footer = ttk.Frame(movimenti_main_stack, padding=(0, 0, 0, 0), style="MovCdc.TFrame")
     balance_footer.grid(row=1, column=0, sticky="ew")
     balance_footer_row = tk.Frame(balance_footer, bg=MOVIMENTI_PAGE_BG)
     balance_footer_row.pack(fill=tk.X, anchor=tk.W)
@@ -13118,9 +13201,9 @@ th {{ background:#efefef; text-align:left; }}
     # Larghezza fissa (px) dal testo più lungo, misurata all’avvio con quel font.
     _saldo_lbl_col_px = max(1, int(_saldo_title_col_font.measure(_SALDO_ROW_LONGEST)) + 6)
     # Altezza riga comune (tabella nel canvas + colonna titoli): stesso minsize su entrambe le griglie.
-    _saldo_grid_row_h = int(_saldo_title_col_font.metrics("linespace")) + 1
+    _saldo_grid_row_h = max(1, int(_saldo_title_col_font.metrics("linespace")) - 1)
     # Altezza iniziale; dopo refresh viene impostata su winfo_reqheight della tabella (evita taglio ultima riga).
-    _saldo_canvas_body_h = 6 * (_saldo_grid_row_h + 1) + 6
+    _saldo_canvas_body_h = 6 * _saldo_grid_row_h + 1
     balance_lbl_col = tk.Frame(
         balance_footer_row, width=_saldo_lbl_col_px, highlightthickness=0, bg=MOVIMENTI_PAGE_BG
     )
@@ -13129,7 +13212,7 @@ th {{ background:#efefef; text-align:left; }}
     balance_lbl_col.pack(side=tk.LEFT, anchor="n", padx=(2, 1))
     balance_lbl_col.grid_columnconfigure(0, weight=1)
     for _sr in range(6):
-        balance_lbl_col.grid_rowconfigure(_sr, minsize=_saldo_grid_row_h)
+        balance_lbl_col.grid_rowconfigure(_sr, minsize=(max(1, _saldo_grid_row_h - 4) if _sr == 0 else _saldo_grid_row_h))
     tk.Label(
         balance_lbl_col,
         text="",
@@ -13137,7 +13220,7 @@ th {{ background:#efefef; text-align:left; }}
         anchor="e",
         bg=MOVIMENTI_PAGE_BG,
         fg="#1a1a1a",
-    ).grid(row=0, column=0, sticky="e", pady=(0, 1))
+    ).grid(row=0, column=0, sticky="e", pady=(0, 0))
     tk.Label(
         balance_lbl_col,
         text="Saldi assoluti",
@@ -13145,7 +13228,7 @@ th {{ background:#efefef; text-align:left; }}
         anchor="e",
         bg=MOVIMENTI_PAGE_BG,
         fg="#1a1a1a",
-    ).grid(row=1, column=0, sticky="e", pady=(0, 1))
+    ).grid(row=1, column=0, sticky="e", pady=(0, 0))
     tk.Label(
         balance_lbl_col,
         text="Di cui, impegni futuri",
@@ -13153,7 +13236,7 @@ th {{ background:#efefef; text-align:left; }}
         anchor="e",
         bg=MOVIMENTI_PAGE_BG,
         fg="#1a1a1a",
-    ).grid(row=2, column=0, sticky="e", pady=(0, 1))
+    ).grid(row=2, column=0, sticky="e", pady=(0, 0))
     tk.Label(
         balance_lbl_col,
         text="Disponibilità oggi",
@@ -13161,7 +13244,7 @@ th {{ background:#efefef; text-align:left; }}
         anchor="e",
         bg=MOVIMENTI_PAGE_BG,
         fg="#1a1a1a",
-    ).grid(row=3, column=0, sticky="e", pady=(0, 1))
+    ).grid(row=3, column=0, sticky="e", pady=(0, 0))
     tk.Label(
         balance_lbl_col,
         text="Impegni per carte",
@@ -13169,7 +13252,7 @@ th {{ background:#efefef; text-align:left; }}
         anchor="e",
         bg=MOVIMENTI_PAGE_BG,
         fg="#1a1a1a",
-    ).grid(row=4, column=0, sticky="e", pady=(0, 1))
+    ).grid(row=4, column=0, sticky="e", pady=(0, 0))
     balance_lbl_disponibilita = tk.Label(
         balance_lbl_col,
         text="Disponibilità assoluta",
@@ -13178,7 +13261,7 @@ th {{ background:#efefef; text-align:left; }}
         bg=MOVIMENTI_PAGE_BG,
         fg="#1a1a1a",
     )
-    balance_lbl_disponibilita.grid(row=5, column=0, sticky="e", pady=(0, 1))
+    balance_lbl_disponibilita.grid(row=5, column=0, sticky="e", pady=(0, 0))
     balance_scroll_block = tk.Frame(balance_footer_row, bg=MOVIMENTI_PAGE_BG)
     balance_scroll_block.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, anchor="n")
     balance_center = tk.Frame(balance_scroll_block, bg=MOVIMENTI_PAGE_BG)
@@ -13189,7 +13272,7 @@ th {{ background:#efefef; text-align:left; }}
     balance_center_hscroll = ttk.Scrollbar(balance_center, orient="horizontal", command=balance_center_canvas.xview)
     balance_center_canvas.configure(xscrollcommand=balance_center_hscroll.set)
     balance_center_canvas.pack(fill=tk.X, expand=True)
-    balance_center_hscroll.pack(fill=tk.X, pady=(6, 0))
+    balance_center_hscroll.pack(fill=tk.X, pady=(2, 0))
     # Scroll orizzontale touchpad: su macOS Tk 8.6 deltaX è un MouseWheel con Shift nel modifier state.
     balance_center_canvas.configure(xscrollincrement=36)
 
@@ -13943,13 +14026,9 @@ th {{ background:#efefef; text-align:left; }}
             if lh <= 1:
                 lh = balance_lbl_disponibilita.winfo_reqheight()
             if lh <= 0 or bh <= 0:
-                mid = (5 + 0.5) * _saldo_grid_row_h
-                ptop = max(0, int(mid - bh / 2))
+                ptop = 0
             else:
-                ly = balance_lbl_disponibilita.winfo_rooty() + lh / 2
-                by0 = balance_left.winfo_rooty()
-                ptop = int(round(ly - by0 - bh / 2))
-                ptop = max(0, ptop)
+                ptop = 0
             btn_stampa_saldi.pack_configure(pady=(ptop, 0), anchor="nw")
         except tk.TclError:
             pass
@@ -14013,7 +14092,7 @@ th {{ background:#efefef; text-align:left; }}
                     font=header_font,
                     width=AMT_CELL_WIDTH,
                     anchor="e",
-                ).grid(row=0, column=col, sticky="e", padx=(pl, pr), pady=(0, 1))
+                ).grid(row=0, column=col, sticky="e", padx=(pl, pr), pady=(0, 0))
 
             def amount_cell(row: int, col: int, amt: Decimal) -> None:
                 pl, pr = (0, 2) if col == 0 else (0, 4)
@@ -14024,7 +14103,7 @@ th {{ background:#efefef; text-align:left; }}
                     fg=balance_amount_fg(amt),
                     width=AMT_CELL_WIDTH,
                     anchor=tk.E,
-                ).grid(row=row, column=col, sticky="e", padx=(pl, pr), pady=(0, 1))
+                ).grid(row=row, column=col, sticky="e", padx=(pl, pr), pady=(0, 0))
 
             def dash_cell(row: int, col: int) -> None:
                 pl, pr = (0, 2) if col == 0 else (0, 4)
@@ -14035,7 +14114,7 @@ th {{ background:#efefef; text-align:left; }}
                     fg="#888888",
                     width=AMT_CELL_WIDTH,
                     anchor=tk.E,
-                ).grid(row=row, column=col, sticky="e", padx=(pl, pr), pady=(0, 1))
+                ).grid(row=row, column=col, sticky="e", padx=(pl, pr), pady=(0, 0))
 
             # Solo TOTALE + conti nello scroll orizzontale; etichette righe fisse in balance_lbl_col.
             header_cell(0, "TOTALE")
@@ -14074,12 +14153,12 @@ th {{ background:#efefef; text-align:left; }}
                 else:
                     amount_cell(5, i + 1, amt)
             for _sr in range(6):
-                table.grid_rowconfigure(_sr, minsize=_saldo_grid_row_h)
+                table.grid_rowconfigure(_sr, minsize=(max(1, _saldo_grid_row_h - 4) if _sr == 0 else _saldo_grid_row_h))
             table.update_idletasks()
             # Altezza viewport canvas = tabella reale (pady delle celle + minsize possono superare 6*row_h).
             try:
                 _tbl_h = max(1, table.winfo_reqheight())
-                balance_center_canvas.configure(height=_tbl_h + 4)
+                balance_center_canvas.configure(height=_tbl_h + 1)
             except tk.TclError:
                 pass
             balance_lbl_col.update_idletasks()

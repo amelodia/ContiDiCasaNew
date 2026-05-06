@@ -22,8 +22,6 @@ python3 -c "import PyInstaller" 2>/dev/null || {
 
 python3 -m pip install -r "$ROOT/requirements.txt"
 
-python3 "$ROOT/scripts/bump_version_build.py"
-
 rm -rf "$ROOT/build" "$ROOT/dist/ContiDiCasa" "$ROOT/dist/ContiDiCasa.app"
 
 mkdir -p "$ROOT/build"

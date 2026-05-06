@@ -481,6 +481,8 @@ private struct ContiLightEuroAmountField: UIViewRepresentable {
 struct ContiLightNuovoMovimentoSchedaView: View {
     let sessionDb: [String: Any]?
     let dataFolderURL: URL?
+    /// Stesso bookmark del picker (file `.key`/`.enc`); `startAccessing` va chiamato su questo URL su iPadOS/Dropbox, non sulla cartella genitore.
+    let securityScopedBookmarkURL: URL?
     let keyURL: URL?
     let lightEncURL: URL?
     let email: String
@@ -902,6 +904,37 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         dataFolderURL != nil && keyURL != nil && lightEncURL != nil
     }
 
+    private func errorMessage(from err: Error) -> String {
+        if let ce = err as? ContiLightImmissioneError, case .message(let s) = ce {
+            return s
+        }
+        if let le = err as? LocalizedError, let d = le.errorDescription {
+            return d
+        }
+        return err.localizedDescription
+    }
+
+    private func runWithDataFolderAccess<T>(
+        folder: URL,
+        _ body: () -> Result<T, Error>
+    ) -> Result<T, Error> {
+        let scope = securityScopedBookmarkURL ?? folder
+        let access = scope.startAccessingSecurityScopedResource()
+        defer {
+            if access {
+                scope.stopAccessingSecurityScopedResource()
+            }
+        }
+        guard access else {
+            return .failure(
+                ContiLightImmissioneError.message(
+                    "Impossibile accedere in scrittura alla cartella dati (permessi)."
+                )
+            )
+        }
+        return body()
+    }
+
     private func prepareCommitDialog() {
         guard let db = sessionDb else {
             errorAlertMessage = "Sessione dati assente."
@@ -979,16 +1012,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         let isNewForm = (optEdit == nil)
         isSaving = true
         DispatchQueue.global(qos: .userInitiated).async {
-            let access = folder.startAccessingSecurityScopedResource()
-            defer {
-                if access {
-                    folder.stopAccessingSecurityScopedResource()
-                }
-            }
-            let result: Result<(sessionLight: [String: Any], note: String), Error> = {
-                guard access else {
-                    return .failure(ContiLightImmissioneError.message("Impossibile accedere in scrittura alla cartella dati (permessi)."))
-                }
+            let result = runWithDataFolderAccess(folder: folder) {
                 do {
                     let tpl = try ContiDatabase.buildNewLightRecordTemplate(
                         db: db,
@@ -1019,11 +1043,11 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                         email: emailTrim,
                         password: passwordTrim
                     )
-                    return .success((out.sessionLight, out.note))
+                    return .success((sessionLight: out.sessionLight, note: out.note))
                 } catch {
                     return .failure(error)
                 }
-            }()
+            }
             DispatchQueue.main.async {
                 isSaving = false
                 switch result {
@@ -1036,13 +1060,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                         clearForm()
                     }
                 case .failure(let err):
-                    if let ce = err as? ContiLightImmissioneError, case .message(let s) = ce {
-                        errorAlertMessage = s
-                    } else if let le = err as? LocalizedError, let d = le.errorDescription {
-                        errorAlertMessage = d
-                    } else {
-                        errorAlertMessage = err.localizedDescription
-                    }
+                    errorAlertMessage = errorMessage(from: err)
                     showErrorAlert = true
                 }
             }
@@ -1059,16 +1077,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         let passwordTrim = password.trimmingCharacters(in: .whitespacesAndNewlines)
         isSaving = true
         DispatchQueue.global(qos: .userInitiated).async {
-            let access = folder.startAccessingSecurityScopedResource()
-            defer {
-                if access {
-                    folder.stopAccessingSecurityScopedResource()
-                }
-            }
-            let result: Result<(sessionLight: [String: Any], note: String), Error> = {
-                guard access else {
-                    return .failure(ContiLightImmissioneError.message("Impossibile accedere in scrittura alla cartella dati (permessi)."))
-                }
+            let result = runWithDataFolderAccess(folder: folder) {
                 do {
                     var working = try ContiDatabase.deepCopyDb(db)
                     try ContiDatabase.setSessionRecordCancelled(db: &working, legacyKey: lk, isCancelled: true)
@@ -1081,11 +1090,11 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                         email: emailTrim,
                         password: passwordTrim
                     )
-                    return .success((out.sessionLight, out.note))
+                    return .success((sessionLight: out.sessionLight, note: out.note))
                 } catch {
                     return .failure(error)
                 }
-            }()
+            }
             DispatchQueue.main.async {
                 isSaving = false
                 switch result {
@@ -1094,13 +1103,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                     onPersisted(pair.sessionLight, rows, pair.note)
                     dismiss()
                 case .failure(let err):
-                    if let ce = err as? ContiLightImmissioneError, case .message(let s) = ce {
-                        errorAlertMessage = s
-                    } else if let le = err as? LocalizedError, let d = le.errorDescription {
-                        errorAlertMessage = d
-                    } else {
-                        errorAlertMessage = err.localizedDescription
-                    }
+                    errorAlertMessage = errorMessage(from: err)
                     showErrorAlert = true
                 }
             }
