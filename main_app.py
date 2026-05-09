@@ -4271,6 +4271,99 @@ def apply_macos_dock_icon_from_login_euro_jpeg(*, tk_anchor: tk.Misc | None = No
         return
 
 
+def _apply_main_window_startup_geometry(root: tk.Tk) -> None:
+    """Prepara la root gia' a dimensione massima prima che venga mappata."""
+    try:
+        root.update_idletasks()
+    except Exception:
+        pass
+    try:
+        if platform.system() == "Darwin":
+            try:
+                root.attributes("-fullscreen", False)
+            except Exception:
+                pass
+            sw = root.winfo_screenwidth()
+            sh = root.winfo_screenheight()
+            root.geometry(f"{sw}x{sh}+0+0")
+            return
+        if platform.system() == "Windows":
+            root.geometry("1200x760")
+            try:
+                root.state("zoomed")
+            except Exception:
+                pass
+            return
+
+        # X11/Wayland: chiedi al window manager la finestra zoomed prima del mapping
+        # e usa comunque lo schermo intero come geometria iniziale per evitare il flash 1200x760.
+        sw = max(root.winfo_screenwidth(), 1200)
+        sh = max(root.winfo_screenheight(), 760)
+        root.geometry(f"{sw}x{sh}+0+0")
+        try:
+            root.attributes("-zoomed", True)
+        except Exception:
+            try:
+                root.state("zoomed")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _show_startup_loading_window(root: tk.Tk, message: str) -> None:
+    """Mostra subito una root massimizzata mentre si prepara l'interfaccia principale."""
+    try:
+        root.configure(bg=MOVIMENTI_PAGE_BG)
+    except Exception:
+        pass
+    try:
+        root.title(f"Conti di casa {APP_VERSION}")
+    except Exception:
+        pass
+    try:
+        old = getattr(root, "_cdc_startup_loading_frame", None)
+        if old is not None and old.winfo_exists():
+            old.destroy()
+    except Exception:
+        pass
+    try:
+        frame = tk.Frame(root, bg=MOVIMENTI_PAGE_BG)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        lbl = tk.Label(
+            frame,
+            text=message,
+            bg=MOVIMENTI_PAGE_BG,
+            fg="#1a1a1a",
+            font=("TkDefaultFont", 18, "bold"),
+        )
+        lbl.grid(row=0, column=0, sticky="")
+        root._cdc_startup_loading_frame = frame  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    _apply_main_window_startup_geometry(root)
+    try:
+        root.deiconify()
+        _apply_main_window_startup_geometry(root)
+        root.lift()
+        root.focus_force()
+        root.update()
+    except Exception:
+        pass
+
+
+def _destroy_startup_loading_window(root: tk.Tk) -> None:
+    try:
+        frame = getattr(root, "_cdc_startup_loading_frame", None)
+        if frame is not None and frame.winfo_exists():
+            frame.destroy()
+        root._cdc_startup_loading_frame = None  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def _print_balances_native_macos(build_html: Callable[[float], str]) -> bool:
     """Stampa con dialog nativo macOS (AppKit). Sempre A4 verticale; tabella lunga → pagine successive.
 
@@ -8217,12 +8310,25 @@ def build_ui(
 
     data_file_var.trace_add("write", _sync_path_holders_from_vars)
     key_file_var.trace_add("write", _sync_path_holders_from_vars)
-    # La root resta nascosta durante tutta la costruzione dell'interfaccia: così non si vede
-    # una finestra vuota in fullscreen (su macOS il -fullscreen nativo dà spesso un flash nero in alto).
+    startup_loading_visible = False
     try:
-        root.withdraw()
+        loading_frame = getattr(root, "_cdc_startup_loading_frame", None)
+        startup_loading_visible = bool(loading_frame is not None and loading_frame.winfo_exists())
     except Exception:
-        pass
+        startup_loading_visible = False
+    if startup_loading_visible:
+        _apply_main_window_startup_geometry(root)
+        try:
+            root.update_idletasks()
+        except Exception:
+            pass
+    else:
+        # La root resta nascosta durante tutta la costruzione dell'interfaccia: così non si vede
+        # una finestra vuota in fullscreen (su macOS il -fullscreen nativo dà spesso un flash nero in alto).
+        try:
+            root.withdraw()
+        except Exception:
+            pass
     root.title(window_title_for_session(db_holder[0], session_holder[0], show_clock=True))
 
     main_nb_shell = tk.Frame(root, bg=MOVIMENTI_PAGE_BG)
@@ -30451,21 +30557,10 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     def _present_main_window() -> None:
         """Mostra la finestra principale solo a UI pronta; evita flash nero (fullscreen Cocoa) su macOS."""
         try:
-            if platform.system() == "Darwin":
-                try:
-                    root.attributes("-fullscreen", False)
-                except Exception:
-                    pass
-                sw = root.winfo_screenwidth()
-                sh = root.winfo_screenheight()
-                root.geometry(f"{sw}x{sh}+0+0")
-            else:
-                root.geometry("1200x760")
-                try:
-                    root.state("zoomed")
-                except Exception:
-                    pass
+            _destroy_startup_loading_window(root)
+            _apply_main_window_startup_geometry(root)
             root.deiconify()
+            _apply_main_window_startup_geometry(root)
             root.lift()
             root.focus_force()
             root.update_idletasks()
@@ -30727,6 +30822,7 @@ def main() -> None:
         except Exception:
             pass
 
+    _show_startup_loading_window(root, "Apertura di Conti di casa in corso...")
     path_holder[0] = migrate_data_path_after_login(db_holder[0], session, path_holder[0])
     if session.entered_via_backdoor:
         security_auth.ensure_security(db_holder[0])
