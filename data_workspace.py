@@ -261,6 +261,12 @@ def configure_data_workspace_interactive(parent) -> bool:
         win.geometry(f"+{max(0, px)}+{max(0, py)}")
     except Exception:
         pass
+    try:
+        from window_focus import present_window
+
+        present_window(win, parent)
+    except Exception:
+        pass
     parent.wait_window(win)
 
     ch = choice[0]

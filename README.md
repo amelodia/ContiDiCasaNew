@@ -36,6 +36,15 @@ dist/ContiDiCasa.app
 
 Su macOS, se l'app non e firmata, al primo avvio puo servire aprirla con tasto Ctrl sull'icona e poi **Apri**.
 
+Creazione dell'app Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_windows_app.ps1
+```
+
+L'app generata si trova in `dist\ContiDiCasa\` e lo zip pronto per la distribuzione in `dist\ContiDiCasa-windows.zip`.
+Su Windows va distribuita l'intera cartella (o lo zip), non il solo `ContiDiCasa.exe`: i file runtime Python devono restare accanto all'eseguibile per evitare l'errore "Failed to load Python DLL".
+
 ## File dati
 
 Nella cartella dati scelta dall'utente devono stare insieme:
@@ -143,6 +152,7 @@ I test coprono le parti piu delicate: importi euro, saldi consolidati, regole st
 | `iphone_light/` | Client light iPhone e strumenti di prova. |
 | `tests/` | Test automatici. |
 | `scripts/build_macos_app.sh` | Build macOS `.app`. |
+| `scripts/build_windows_app.ps1` | Build Windows `dist\ContiDiCasa\` + zip. |
 
 ## Note per sviluppo prudente
 

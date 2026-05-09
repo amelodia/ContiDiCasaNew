@@ -1,5 +1,5 @@
-# PyInstaller — bundle macOS (.app). Uso: pyinstaller ContiDiCasa.spec
-# Dipendenze build: pip install pyinstaller (vedi scripts/build_macos_app.sh)
+# PyInstaller — bundle macOS (.app) o cartella Windows. Uso: pyinstaller ContiDiCasa.spec
+# Dipendenze build: pip install pyinstaller (vedi scripts/build_macos_app.sh / build_windows_app.ps1)
 
 import importlib.util
 import os
@@ -14,6 +14,13 @@ _ICNS_PATH = os.path.join(SPECPATH, "build", "ContiDiCasa.icns")
 _BUNDLE_ICON = _ICNS_PATH if os.path.isfile(_ICNS_PATH) else None
 
 block_cipher = None
+
+# Windows: lascia i file runtime (python*.dll, vcruntime*.dll, ...) accanto
+# all'eseguibile. Con il layout "_internal" di PyInstaller 6 e facile copiare
+# solo il .exe e ottenere "Failed to load Python DLL" all'avvio.
+collect_kwargs = {}
+if sys.platform == "win32":
+    collect_kwargs["contents_directory"] = "."
 
 hidden = [
     "app_help_text",
@@ -72,7 +79,9 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # Non comprimere DLL/bootloader: su Windows UPX puo produrre errori
+    # "Failed to load Python DLL" o problemi con runtime VC/Python.
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=(sys.platform == "darwin"),
@@ -87,23 +96,25 @@ coll = COLLECT(
     a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name="ContiDiCasa",
+    **collect_kwargs,
 )
 
-app = BUNDLE(
-    coll,
-    name="ContiDiCasa.app",
-    icon=_BUNDLE_ICON,
-    bundle_identifier="it.contidicasa.desktop",
-    info_plist={
-        "CFBundleName": "Conti di casa",
-        "CFBundleDisplayName": "Conti di casa",
-        "CFBundleShortVersionString": _APP_VERSION,
-        "CFBundleVersion": _APP_VERSION,
-        "LSMinimumSystemVersion": "11.0",
-        "LSApplicationCategoryType": "public.app-category.finance",
-        "NSHighResolutionCapable": True,
-    },
-)
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name="ContiDiCasa.app",
+        icon=_BUNDLE_ICON,
+        bundle_identifier="it.contidicasa.desktop",
+        info_plist={
+            "CFBundleName": "Conti di casa",
+            "CFBundleDisplayName": "Conti di casa",
+            "CFBundleShortVersionString": _APP_VERSION,
+            "CFBundleVersion": _APP_VERSION,
+            "LSMinimumSystemVersion": "11.0",
+            "LSApplicationCategoryType": "public.app-category.finance",
+            "NSHighResolutionCapable": True,
+        },
+    )
