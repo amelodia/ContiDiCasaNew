@@ -2,7 +2,7 @@
 """Incrementa APP_VERSION_BUILD (terzo numero) in app_version.py.
 
 Esegui prima di PyInstaller o manualmente dopo modifiche sostanziali.
-``scripts/build_macos_app.sh`` invoca questo script automaticamente.
+``scripts/build_macos_app.sh`` e ``scripts/build_windows_app.ps1`` invocano questo script automaticamente.
 """
 from __future__ import annotations
 

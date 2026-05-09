@@ -37,12 +37,15 @@ except Exception:  # pragma: no cover - runtime optional dependency check
 
 import app_help_text
 import cloud_sync_wait
+import cdc_ui_palette
+import cdc_ui_theme
 import email_client
 import os_boot_time
 import data_workspace
 import mail_gate
 import periodiche
 import security_auth
+import tk_foreground
 
 try:
     from app_version import APP_VERSION
@@ -56,14 +59,27 @@ VER_PDF_DISABLE_CUTOFF_DATE_FILTER = False
 
 # Sfondo pagina Movimenti (allineato al login).
 MOVIMENTI_PAGE_BG = security_auth.CDC_AZZURRO_CHIARO_BG
-# Toni azzurri per griglie, calendari e campi (coerenza tra tutte le schede).
-CDC_GRID_STRIPE0_BG = "#d0e8f4"
-CDC_GRID_STRIPE1_BG = "#e4f3fa"
-CDC_GRID_HEADING_BG = "#bdddf0"
+# Chip «tipo tab» per la selezione dei filtri in Movimenti.
+MOV_FILTER_TAB_BTN_BG = security_auth.CDC_TIPO_TASTI_BTN_BG
+MOV_FILTER_TAB_BTN_HOVER_BG = getattr(
+    security_auth, "CDC_TIPO_TASTI_BTN_HOVER_BG", security_auth.CDC_TIPO_TASTI_BTN_ACTIVE_BG
+)
+MOV_FILTER_TAB_BTN_ACTIVE_BG = security_auth.CDC_TIPO_TASTI_BTN_ACTIVE_BG
+MOV_FILTER_TAB_BTN_FG = security_auth.CDC_TIPO_TASTI_BTN_FG
+CDC_FILTER_TAB_CHIP_BD = getattr(security_auth, "CDC_TIPO_TASTI_BTN_BD", 1)
+
+# Griglie Treeview: due righe beige molto chiari, tono neutro.
+CDC_GRID_STRIPE0_BG = "#eae9e7"
+CDC_GRID_STRIPE1_BG = "#f7f6f4"
+CDC_GRID_HEADING_BG = "#e2e1de"
+CDC_GRID_TREEVIEW_SEL_BG = "#7eb9e0"
+CDC_GRID_TREEVIEW_SEL_FG = "#1a1a1a"
 CDC_ENTRY_FIELD_BG = "#f2f9fc"
 CDC_CAL_CELL_BG = "#f6fbfe"
 CDC_CAL_SELECTED_BG = "#8ecae6"
 CDC_CAL_DISABLED_BG = "#dfeaf1"
+CDC_CAL_DISABLED_LABEL_FG = "#999999"
+OPZIONI_SCROLL_CANVAS_BG = "#f0f0f0"
 
 from import_legacy import (
     EURO_CONVERSION_RATE,
@@ -115,6 +131,262 @@ _BOOT_DROPBOX_CONFIRM_WITHIN_SECONDS = 5 * 60
 # Stessa regola della colonna Importo nella griglia movimenti.
 COLOR_AMOUNT_POS = "#006400"
 COLOR_AMOUNT_NEG = "#b22222"
+UI_FG_GRID_PRIMARY = "#1a1a1a"
+UI_FG_MOV_SEARCH_CAPTION = "#1a1a1a"
+UI_FG_FILTER_LABEL = "#1a1a1a"
+UI_FG_FILTER_ENTRY = "#111111"
+
+
+def _mirror_palette_runtime_global(name: str, value: object) -> None:
+    import sys
+
+    setattr(sys.modules[__name__], name, value)
+    other = sys.modules.get("main_app")
+    if other is not None and other is not sys.modules[__name__]:
+        setattr(other, name, value)
+
+
+def _apply_ui_palette_runtime(db: dict | None) -> None:
+    """Applica al runtime gli override salvati in DB per i token colore supportati."""
+    cdc_ui_palette.invalidate_base_palette_cache()
+    base = cdc_ui_palette.get_base_palette_map_copy()
+    extras = _ui_palette_extras_defaults()
+    raw = (db or {}).get(cdc_ui_theme._OVERRIDES_KEY) if isinstance(db, dict) else {}
+    overrides: dict[str, str] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if isinstance(k, str) and isinstance(v, str):
+                n = cdc_ui_theme.normalize_hex_color(v)
+                if n is not None:
+                    overrides[k.strip()] = n
+
+    def _r(token: str) -> str:
+        return cdc_ui_theme.resolved_hex(token, base=base, extras=extras, overrides=overrides)
+
+    main_targets = {
+        "bg_page_primary": "MOVIMENTI_PAGE_BG",
+        "bg_opzioni_scroll_canvas": "OPZIONI_SCROLL_CANVAS_BG",
+        "grid_stripe0": "CDC_GRID_STRIPE0_BG",
+        "grid_stripe1": "CDC_GRID_STRIPE1_BG",
+        "grid_heading_bg": "CDC_GRID_HEADING_BG",
+        "fg_grid_primary": "UI_FG_GRID_PRIMARY",
+        "fg_mov_search_caption": "UI_FG_MOV_SEARCH_CAPTION",
+        "grid_tree_selection_bg": "CDC_GRID_TREEVIEW_SEL_BG",
+        "grid_tree_selection_fg": "CDC_GRID_TREEVIEW_SEL_FG",
+        "amount_positive": "COLOR_AMOUNT_POS",
+        "amount_negative": "COLOR_AMOUNT_NEG",
+        "field_bg_moduli": "CDC_ENTRY_FIELD_BG",
+        "fg_filter_label": "UI_FG_FILTER_LABEL",
+        "fg_filter_entry": "UI_FG_FILTER_ENTRY",
+        "mov_filter_tab_btn_bg": "MOV_FILTER_TAB_BTN_BG",
+        "mov_filter_tab_btn_hover_bg": "MOV_FILTER_TAB_BTN_HOVER_BG",
+        "mov_filter_tab_btn_active_bg": "MOV_FILTER_TAB_BTN_ACTIVE_BG",
+        "mov_filter_tab_btn_fg": "MOV_FILTER_TAB_BTN_FG",
+        "cal_cell_bg": "CDC_CAL_CELL_BG",
+        "cal_selected_bg": "CDC_CAL_SELECTED_BG",
+        "cal_disabled_bg": "CDC_CAL_DISABLED_BG",
+        "cal_disabled_label_fg": "CDC_CAL_DISABLED_LABEL_FG",
+    }
+    for token, attr in main_targets.items():
+        _mirror_palette_runtime_global(attr, _r(token))
+
+    for token, attr in {
+        "login_window_bg": "CDC_LOGIN_WIN_BG",
+        "tipo_btn_bg": "CDC_TIPO_TASTI_BTN_BG",
+        "tipo_btn_hover_bg": "CDC_TIPO_TASTI_BTN_HOVER_BG",
+        "tipo_btn_active_bg": "CDC_TIPO_TASTI_BTN_ACTIVE_BG",
+        "tipo_btn_fg": "CDC_TIPO_TASTI_BTN_FG",
+        "tipo_btn_ring": "CDC_TIPO_TASTI_BTN_RING",
+        "tipo_btn_ring_focus": "CDC_TIPO_TASTI_BTN_RING_FOCUS",
+        "tipo_field_bg": "CDC_TIPO_TASTI_FIELD_BG",
+    }.items():
+        setattr(security_auth, attr, _r(token))
+    security_auth._LOGIN_IMG_CANVAS_BG = security_auth.CDC_LOGIN_WIN_BG  # type: ignore[attr-defined]
+    security_auth._LOGIN_BTN_FG = security_auth.CDC_TIPO_TASTI_BTN_FG  # type: ignore[attr-defined]
+    security_auth._LOGIN_BTN_BG = security_auth.CDC_TIPO_TASTI_BTN_BG  # type: ignore[attr-defined]
+    security_auth._LOGIN_BTN_ACTIVE_BG = security_auth.CDC_TIPO_TASTI_BTN_HOVER_BG  # type: ignore[attr-defined]
+
+    cdc_ui_palette.invalidate_base_palette_cache()
+
+
+def _ui_color_overrides_from_db(db: dict | None) -> dict[str, str]:
+    raw = (db or {}).get(cdc_ui_theme._OVERRIDES_KEY) if isinstance(db, dict) else {}
+    out: dict[str, str] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if isinstance(k, str) and isinstance(v, str):
+                n = cdc_ui_theme.normalize_hex_color(v)
+                if n is not None:
+                    out[k.strip()] = n
+    return out
+
+
+def _adopt_ui_color_overrides_from_available_dbs(db: dict, key_path: Path) -> bool:
+    """Se il DB corrente non ha override colori, prova a recuperarli da altri .enc nella cartella dati."""
+    if _ui_color_overrides_from_db(db):
+        return False
+    candidates: list[Path] = []
+    try:
+        candidates.extend(_discover_existing_user_db_candidates())
+    except Exception:
+        pass
+    try:
+        boot = data_workspace.session_bootstrap_enc_path()
+        if boot.is_file():
+            candidates.append(boot)
+    except Exception:
+        pass
+    seen: set[Path] = set()
+    for p in candidates:
+        try:
+            rp = p.resolve()
+        except Exception:
+            rp = p
+        if rp in seen:
+            continue
+        seen.add(rp)
+        try:
+            other = load_encrypted_db(p, key_path)
+        except Exception:
+            continue
+        overrides = _ui_color_overrides_from_db(other)
+        if overrides:
+            db[cdc_ui_theme._OVERRIDES_KEY] = dict(overrides)
+            return True
+    return False
+
+
+def _ui_palette_extras_defaults() -> dict[str, str]:
+    return {
+        "ui_action_blue_bg": "#1565c0",
+        "ui_action_blue_hover_bg": "#0d47a1",
+        "ui_action_red_bg": "#b71c1c",
+        "ui_action_red_hover_bg": "#7f0000",
+        "correction_error_fg": "#b71c1c",
+        "mov_btn_print_search_bg": "#c62828",
+        "mov_btn_print_search_hover_bg": "#8e0000",
+        "mov_btn_espandi_bg": "#00695c",
+        "mov_btn_espandi_hover_bg": "#004d40",
+        "mov_btn_cerca_bg": "#2e7d32",
+        "mov_btn_cerca_hover_bg": "#1b5e20",
+        "mov_pulisci_accedi_bg": "#1565c0",
+        "mov_pulisci_accedi_hover_bg": "#0d47a1",
+        "ver_grid_amount_pos_fg": "#156716",
+        "ver_grid_amount_neg_fg": "#b71c1c",
+        "ver_grid_amount_zero_fg": "#424242",
+        "ver_btn_pending_new_bg": "#2e7d32",
+        "ver_btn_pending_clear_bg": "#616161",
+        "ver_footer_print_bg": "#ff0000",
+        "ver_footer_cycle_bg": "#ef6c00",
+        "ver_footer_close_bg": "#c62828",
+    }
+
+
+def _configure_windows_cdc_color_theme(root: tk.Misc) -> None:
+    """Su Windows i temi ttk nativi ignorano molti colori: usare ``clam`` rende applicabile la palette CdC."""
+    if platform.system() != "Windows":
+        return
+    try:
+        style = ttk.Style(root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure(".", background=MOVIMENTI_PAGE_BG, foreground="#1a1a1a")
+        style.configure("TFrame", background=MOVIMENTI_PAGE_BG)
+        style.configure("TLabel", background=MOVIMENTI_PAGE_BG, foreground="#1a1a1a")
+        style.configure(
+            "TEntry",
+            fieldbackground=CDC_ENTRY_FIELD_BG,
+            background=CDC_ENTRY_FIELD_BG,
+            foreground="#111111",
+            insertcolor="#111111",
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground=CDC_ENTRY_FIELD_BG,
+            background=CDC_ENTRY_FIELD_BG,
+            foreground="#111111",
+            arrowcolor="#1a1a1a",
+            selectbackground=CDC_CAL_SELECTED_BG,
+            selectforeground="#111111",
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", CDC_ENTRY_FIELD_BG), ("!disabled", CDC_ENTRY_FIELD_BG)],
+            foreground=[("readonly", "#111111"), ("!disabled", "#111111")],
+        )
+        style.configure(
+            "TButton",
+            background=security_auth.CDC_TIPO_TASTI_BTN_BG,
+            foreground=security_auth.CDC_TIPO_TASTI_BTN_FG,
+        )
+        style.map(
+            "TButton",
+            background=[
+                ("active", security_auth.CDC_TIPO_TASTI_BTN_ACTIVE_BG),
+                ("pressed", security_auth.CDC_TIPO_TASTI_BTN_ACTIVE_BG),
+            ],
+            foreground=[("active", security_auth.CDC_TIPO_TASTI_BTN_FG)],
+        )
+        style.configure(
+            "Treeview",
+            background=CDC_GRID_STRIPE0_BG,
+            fieldbackground=CDC_GRID_STRIPE0_BG,
+            foreground="#111111",
+            bordercolor=CDC_GRID_HEADING_BG,
+            lightcolor=CDC_GRID_HEADING_BG,
+            darkcolor=CDC_GRID_HEADING_BG,
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=CDC_GRID_HEADING_BG,
+            foreground="#1a1a1a",
+            relief=tk.RAISED,
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", CDC_CAL_SELECTED_BG)],
+            foreground=[("selected", "#000000")],
+        )
+        root.option_add("*TCombobox*Listbox.background", CDC_ENTRY_FIELD_BG)
+        root.option_add("*TCombobox*Listbox.foreground", "#111111")
+        root.option_add("*TCombobox*Listbox.selectBackground", CDC_CAL_SELECTED_BG)
+        root.option_add("*TCombobox*Listbox.selectForeground", "#000000")
+    except Exception as exc:
+        _startup_log(f"Windows color theme setup failed: {exc!r}")
+
+
+def _configure_windows_ui_scale(root: tk.Misc) -> None:
+    """Riduce leggermente l'ingombro generale della UI su Windows."""
+    if platform.system() != "Windows":
+        return
+    try:
+        cur = float(root.tk.call("tk", "scaling"))
+        target = max(0.8, cur * 0.85)
+        root.tk.call("tk", "scaling", target)
+    except Exception:
+        pass
+
+
+def _windows_startup_log_path() -> Path | None:
+    if platform.system() != "Windows":
+        return None
+    base = (os.environ.get("LOCALAPPDATA") or "").strip()
+    if base:
+        return Path(base) / "ContiDiCasa" / "startup.log"
+    return Path.home() / "ContiDiCasa_startup.log"
+
+
+def _startup_log(message: str) -> None:
+    # Diagnostica d'avvio disattivata: mantenere il call-site innocuo evita rumore all'apertura.
+    return
+
+
+def _windows_show_bootstrap_root(root: tk.Tk, text: str) -> None:
+    return
+
+
+def _windows_clear_bootstrap_root(root: tk.Tk) -> None:
+    return
 
 
 def _darwin_prepare_stdin_for_tk_aqua() -> None:
@@ -7447,6 +7719,11 @@ def filter_and_sort_movements_for_grid(
 
 
 def _user_library_conti_support_dir() -> Path:
+    if platform.system() == "Windows":
+        base = (os.environ.get("LOCALAPPDATA") or "").strip()
+        if base:
+            return Path(base) / "ContiDiCasa"
+        return Path.home() / "AppData" / "Local" / "ContiDiCasa"
     return Path.home() / "Library" / "Application Support" / "ContiDiCasa"
 
 
@@ -7768,25 +8045,28 @@ def save_encrypted_db_dual(
     key = get_or_create_key(key_path)
     token = Fernet(key).encrypt(json.dumps(db, ensure_ascii=True, indent=2).encode("utf-8"))
 
-    targets: list[Path] = [primary_output_path]
+    backup_targets: list[Path] = []
     try:
         if resolved_backup.resolve() != primary_output_path.resolve():
-            targets.append(resolved_backup)
+            backup_targets.append(resolved_backup)
     except OSError:
-        targets.append(resolved_backup)
+        backup_targets.append(resolved_backup)
 
-    errors: list[str] = []
-    for t in targets:
+    try:
+        _write_timestamped_presave_backup(primary_output_path)
+        _atomic_write_bytes(primary_output_path, token)
+    except Exception as exc:
+        raise RuntimeError(
+            "Salvataggio cifrato non riuscito sul file operativo:\n"
+            f"{primary_output_path}: {exc}"
+        ) from exc
+
+    for t in backup_targets:
         try:
             _write_timestamped_presave_backup(t)
             _atomic_write_bytes(t, token)
         except Exception as exc:
-            errors.append(f"{t}: {exc}")
-
-    if errors:
-        raise RuntimeError(
-            "Salvataggio cifrato non completato su tutti i target:\n" + "\n".join(errors)
-        )
+            _startup_log(f"local backup save skipped: {t}: {exc!r}")
 
     try:
         import light_enc_sidecar
@@ -8079,9 +8359,19 @@ def migrate_data_path_after_login(
 
     def _replace_db_from_enc(primary: Path) -> bool:
         """Sostituisce il contenuto di ``db`` con il JSON decrittato da ``primary`` (stesso riferimento dict)."""
+        previous_color_overrides = db.get(cdc_ui_theme._OVERRIDES_KEY)
         loaded = load_encrypted_db(primary, key_path)
         if not loaded:
             return False
+        loaded_overrides = loaded.get(cdc_ui_theme._OVERRIDES_KEY)
+        if (
+            (not isinstance(loaded_overrides, dict) or not loaded_overrides)
+            and isinstance(previous_color_overrides, dict)
+            and previous_color_overrides
+        ):
+            # Se il bootstrap caricato contiene la palette aggiornata ma il file
+            # canonico per-utente no, non perdere le attribuzioni colore fatte sul Mac.
+            loaded[cdc_ui_theme._OVERRIDES_KEY] = dict(previous_color_overrides)
         db.clear()
         db.update(loaded)
         periodiche.ensure_periodic_registrations(db)
@@ -8171,6 +8461,7 @@ def build_ui(
     periodiche.ensure_periodic_registrations(db_holder[0])
     email_client.ensure_email_settings(db_holder[0])
     security_auth.ensure_security(db_holder[0])
+    _apply_ui_palette_runtime(db_holder[0])
     try:
         changed = False
         if migrate_dotazione_remove_from_plan_charts(db_holder[0]):
@@ -8187,18 +8478,43 @@ def build_ui(
             changed = True
         if migrate_ensure_budget_ui_prefs(db_holder[0]):
             changed = True
+        if cdc_ui_theme.migrate_ensure_ui_color_overrides(db_holder[0]):
+            changed = True
+        if cdc_ui_theme.migrate_ui_color_token_consolidation(db_holder[0]):
+            changed = True
         if changed:
             save_encrypted_db_dual(db_holder[0], path_holder[0], key_path_holder[0])
     except Exception:
         pass
+    _apply_ui_palette_runtime(db_holder[0])
 
     try:
+        _configure_windows_cdc_color_theme(root)
         root.configure(bg=MOVIMENTI_PAGE_BG)
     except Exception:
         pass
 
     def cur_db() -> dict:
         return db_holder[0]
+
+    def _ui_overrides_for_runtime() -> dict[str, str]:
+        raw = cur_db().get(cdc_ui_theme._OVERRIDES_KEY) or {}
+        out: dict[str, str] = {}
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    n = cdc_ui_theme.normalize_hex_color(v)
+                    if n is not None:
+                        out[k.strip()] = n
+        return out
+
+    def _ui_color(token: str) -> str:
+        return cdc_ui_theme.resolved_hex(
+            token,
+            base=cdc_ui_palette.get_base_palette_map_copy(),
+            extras=_ui_palette_extras_defaults(),
+            overrides=_ui_overrides_for_runtime(),
+        )
 
     def refresh_window_title() -> None:
         root.title(window_title_for_session(cur_db(), session_holder[0], show_clock=True))
@@ -8615,8 +8931,8 @@ def build_ui(
     )
     category_entry.pack(side=tk.LEFT, padx=(0, 6))
 
-    _MOV_AGG_CAT_BTN_BG = "#1565c0"
-    _MOV_AGG_CAT_BTN_ACT = "#0d47a1"
+    _MOV_AGG_CAT_BTN_BG = _ui_color("ui_action_blue_bg")
+    _MOV_AGG_CAT_BTN_ACT = _ui_color("ui_action_blue_hover_bg")
 
     def _mov_refresh_aggregate_category_button_caption() -> None:
         s = (text_aggregate_category_applied_var.get() or "").strip()
@@ -8994,8 +9310,8 @@ def build_ui(
     records_frame.pack(fill=tk.BOTH, expand=True)
 
     search_title_var = tk.StringVar(value="")
-    _PRINT_RICERCA_RED = "#c62828"
-    _PRINT_RICERCA_RED_ACTIVE = "#8e0000"
+    _PRINT_RICERCA_RED = _ui_color("mov_btn_print_search_bg")
+    _PRINT_RICERCA_RED_ACTIVE = _ui_color("mov_btn_print_search_hover_bg")
     search_title_row = tk.Frame(records_frame, bg=MOVIMENTI_PAGE_BG)
     search_title_label = tk.Label(
         search_title_row,
@@ -9480,11 +9796,11 @@ def build_ui(
     # Correzione: solo righe presenti in griglia = già filtrate da «Cerca»; nessuna ricerca fuori dai filtri.
     # Stessa riga del tasto Modifica (col. 0) così l’altezza della barra non cambia al primo clic.
     _movimenti_elenco_expanded: list[bool] = [False]
-    _CORREZIONE_BLUE = "#1565c0"
+    _CORREZIONE_BLUE = _ui_color("ui_action_blue_bg")
     correzione_row = tk.Frame(records_frame, bg=MOVIMENTI_PAGE_BG)
     corr_left_btns = tk.Frame(correzione_row, bg=MOVIMENTI_PAGE_BG)
-    _RIPRISTINA_LAYOUT_BG = "#1565c0"
-    _RIPRISTINA_LAYOUT_BG_ACT = "#0d47a1"
+    _RIPRISTINA_LAYOUT_BG = _ui_color("ui_action_blue_bg")
+    _RIPRISTINA_LAYOUT_BG_ACT = _ui_color("ui_action_blue_hover_bg")
     btn_mov_griglia_ripristina = tk.Label(
         corr_left_btns,
         text="Torna a filtri e saldi",
@@ -9522,8 +9838,8 @@ def build_ui(
         relief=tk.RAISED,
         bd=1,
     )
-    _ESPANDI_ELENCO_BG = "#00695c"
-    _ESPANDI_ELENCO_BG_ACT = "#004d40"
+    _ESPANDI_ELENCO_BG = _ui_color("mov_btn_espandi_bg")
+    _ESPANDI_ELENCO_BG_ACT = _ui_color("mov_btn_espandi_hover_bg")
     btn_espandi_elenco_mov = tk.Label(
         corr_left_btns,
         text="Espandi ricerca",
@@ -11598,11 +11914,13 @@ th {{ background:#efefef; text-align:left; }}
         except Exception:
             pass
 
-    _CERCA_GREEN = "#2e7d32"
-    _CERCA_GREEN_ACTIVE = "#1b5e20"
-    _PULISCI_BLUE = "#1565c0"
-    _PULISCI_BLUE_ACTIVE = "#0d47a1"
-    cerca_wrap = tk.Frame(filters_row, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
+    _CERCA_GREEN = _ui_color("mov_btn_cerca_bg")
+    _CERCA_GREEN_ACTIVE = _ui_color("mov_btn_cerca_hover_bg")
+    _PULISCI_BLUE = _ui_color("mov_pulisci_accedi_bg")
+    _PULISCI_BLUE_ACTIVE = _ui_color("mov_pulisci_accedi_hover_bg")
+    filters_action_wrap = tk.Frame(movimenti_body, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
+    filters_action_inner = tk.Frame(filters_action_wrap, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
+    cerca_wrap = tk.Frame(filters_action_inner, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
     lbl_cerca = tk.Label(
         cerca_wrap,
         text="Cerca",
@@ -11629,7 +11947,7 @@ th {{ background:#efefef; text-align:left; }}
     lbl_cerca.bind("<Leave>", _cerca_leave)
 
     lbl_pulisci_filtri = tk.Label(
-        filters_row,
+        filters_action_inner,
         text="Pulisci filtri",
         cursor="hand2",
         highlightthickness=0,
@@ -11642,9 +11960,11 @@ th {{ background:#efefef; text-align:left; }}
         relief=tk.RAISED,
         bd=1,
     )
-    cerca_wrap.pack(side=tk.LEFT, padx=(_FILTER_ROW_BUTTON_GAP, 0))
+    filters_action_wrap.pack(fill=tk.X, pady=(0, 4), before=records_frame)
+    filters_action_inner.pack(anchor=tk.CENTER)
+    cerca_wrap.pack(side=tk.LEFT, padx=(0, _FILTER_ROW_BUTTON_GAP))
     lbl_cerca.pack(side=tk.TOP, fill=tk.X)
-    lbl_pulisci_filtri.pack(side=tk.LEFT, padx=(_FILTER_ROW_BUTTON_GAP, 0))
+    lbl_pulisci_filtri.pack(side=tk.LEFT)
 
     def _pulisci_enter(_e: tk.Event) -> None:
         lbl_pulisci_filtri.configure(bg=_PULISCI_BLUE_ACTIVE)
@@ -13627,8 +13947,8 @@ th {{ background:#efefef; text-align:left; }}
         _debug_log(run_id, "H3", "main_app.py:_print_saldi_direct", "fallback_browser_used", {})
         # #endregion
 
-    _PRINT_RED = "#c62828"
-    _PRINT_RED_ACTIVE = "#8e0000"
+    _PRINT_RED = _ui_color("mov_btn_print_search_bg")
+    _PRINT_RED_ACTIVE = _ui_color("mov_btn_print_search_hover_bg")
     btn_stampa_saldi = tk.Label(
         balance_left,
         text="Stampa\nsaldi",
@@ -17553,17 +17873,17 @@ th {{ background:#efefef; text-align:left; }}
     _ver_ui_font = ("TkDefaultFont", 11)
     _ver_ui_font_b = ("TkDefaultFont", 11, "bold")
     _ver_cand_promo_font = ("TkDefaultFont", 14, "bold")
-    _VER_GRID_AMT_POS_FG = "#156716"
-    _VER_GRID_AMT_NEG_FG = "#b71c1c"
-    _VER_GRID_AMT_ZERO_FG = "#424242"
+    _VER_GRID_AMT_POS_FG = _ui_color("ver_grid_amount_pos_fg")
+    _VER_GRID_AMT_NEG_FG = _ui_color("ver_grid_amount_neg_fg")
+    _VER_GRID_AMT_ZERO_FG = _ui_color("ver_grid_amount_zero_fg")
     # Tasti azioni sospesi: stessi colori/dimensioni della barra «registrazioni non verificate».
-    _VER_PENDING_BTN_EDIT_BG = "#1565c0"
-    _VER_PENDING_BTN_DEL_BG = "#b71c1c"
-    _VER_PENDING_BTN_NEW_BG = "#2e7d32"
-    _VER_PENDING_BTN_CLEARSEL_BG = "#616161"
-    _VER_FOOT_PRINT_BG = "#546e7a"
-    _VER_FOOT_CYCLE_BG = "#ef6c00"
-    _VER_FOOT_CLOSE_BG = "#c62828"
+    _VER_PENDING_BTN_EDIT_BG = _ui_color("ui_action_blue_bg")
+    _VER_PENDING_BTN_DEL_BG = _ui_color("ui_action_red_bg")
+    _VER_PENDING_BTN_NEW_BG = _ui_color("ver_btn_pending_new_bg")
+    _VER_PENDING_BTN_CLEARSEL_BG = _ui_color("ver_btn_pending_clear_bg")
+    _VER_FOOT_PRINT_BG = _ui_color("ver_footer_print_bg")
+    _VER_FOOT_CYCLE_BG = _ui_color("ver_footer_cycle_bg")
+    _VER_FOOT_CLOSE_BG = _ui_color("ver_footer_close_bg")
     _VER_ACTION_BTN_FONT = ("TkDefaultFont", 15, "bold")
 
     _ver_res_style = ttk.Style()
@@ -19427,7 +19747,7 @@ th {{ background:#efefef; text-align:left; }}
         ver_unver_amt_tree.column("amount_eur", width=min(amt_w, 200), minwidth=92)
 
     # Barra correzione registrazioni non verificate (stesse regole della pagina Movimenti).
-    _VER_CORR_BLUE = "#1565c0"
+    _VER_CORR_BLUE = _ui_color("ui_action_blue_bg")
     ver_unver_correzione_row = tk.Frame(ver_results_frame, bg=_VER_BG, highlightthickness=0)
     ver_unver_btn_modifica_reg = tk.Label(
         ver_unver_correzione_row,
@@ -29194,7 +29514,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         pass
 
     # Opzioni page (scroll verticale: posta, percorsi, legacy possono superare l’altezza finestra)
-    _OPZ_PAGE_BG = "#f0f0f0"
+    _OPZ_PAGE_BG = OPZIONI_SCROLL_CANVAS_BG
     opz_scroll_outer = ttk.Frame(opzioni_frame)
     opz_scroll_outer.pack(fill=tk.BOTH, expand=True)
     opz_canvas = tk.Canvas(opz_scroll_outer, highlightthickness=0, bg=_OPZ_PAGE_BG)
@@ -29214,10 +29534,10 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     opz_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     opz_vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
-    _OPZ_BLUE = "#1565c0"
-    _OPZ_BLUE_ACTIVE = "#0d47a1"
-    _OPZ_RED = "#b71c1c"
-    _OPZ_RED_ACTIVE = "#7f0000"
+    _OPZ_BLUE = _ui_color("ui_action_blue_bg")
+    _OPZ_BLUE_ACTIVE = _ui_color("ui_action_blue_hover_bg")
+    _OPZ_RED = _ui_color("ui_action_red_bg")
+    _OPZ_RED_ACTIVE = _ui_color("ui_action_red_hover_bg")
     _OPZ_TITLE_FONT = ("TkDefaultFont", 14, "bold")
     _OPZ_PATH_ENTRY_WIDTH = 64
     _OPZ_PATH_BTN_WIDTH = 14
@@ -29265,6 +29585,60 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         "Apri scheda Conti…",
         lambda: (_ensure_plan_conti_tab(), notebook.select(plan_conti_frame), _reload_plan_conti_form()),
     ).pack(side=tk.LEFT, padx=(0, 0))
+
+    _opz_palette_extras = _ui_palette_extras_defaults()
+    cdc_ui_palette.assert_extras_defined_for_dynamic_tokens(_opz_palette_extras)
+
+    def _opz_color_overrides() -> dict[str, str]:
+        raw = cur_db().get(cdc_ui_theme._OVERRIDES_KEY) or {}
+        out: dict[str, str] = {}
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    n = cdc_ui_theme.normalize_hex_color(v)
+                    if n is not None:
+                        out[k.strip()] = n
+        return out
+
+    def _opz_color_resolver(token: str) -> str:
+        return cdc_ui_theme.resolved_hex(
+            token,
+            base=cdc_ui_palette.get_base_palette_map_copy(),
+            extras=_opz_palette_extras,
+            overrides=_opz_color_overrides(),
+        )
+
+    def _opz_color_commit(token: str, value: str | None) -> None:
+        d = cur_db()
+        cdc_ui_theme.migrate_ensure_ui_color_overrides(d)
+        prev_overrides = dict(_opz_color_overrides())
+        d[cdc_ui_theme._OVERRIDES_KEY] = cdc_ui_theme.merge_overrides(
+            prev_overrides, token, value
+        )
+        _apply_ui_palette_runtime(d)
+        _configure_windows_cdc_color_theme(root)
+        try:
+            save_encrypted_db_dual(d, path_holder[0], key_path_holder[0])
+        except Exception as exc:
+            d[cdc_ui_theme._OVERRIDES_KEY] = prev_overrides
+            _apply_ui_palette_runtime(d)
+            _configure_windows_cdc_color_theme(root)
+            messagebox.showerror("Palette colori", str(exc), parent=root)
+            return
+        messagebox.showinfo(
+            "Palette colori",
+            "Colore salvato. Alcune parti gia' visibili potrebbero aggiornarsi completamente al prossimo avvio.",
+            parent=root,
+        )
+
+    cdc_ui_palette.pack_opzioni_color_palette_section(
+        opz_scrollable,
+        extras=_opz_palette_extras,
+        title_font=_OPZ_TITLE_FONT,
+        section_bg=_OPZ_PAGE_BG,
+        get_resolved_hex=_opz_color_resolver,
+        on_color_commit=_opz_color_commit,
+    )
 
     mail_outer = ttk.LabelFrame(opz_scrollable, padding=10)
     mail_outer.configure(
@@ -30430,6 +30804,20 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         _startup_periodic_due_check()
         _startup_check_virtuale_pending()
 
+    def _stabilize_initial_movimenti_layout() -> None:
+        if _cdc_current[0] is not movimenti_frame:
+            return
+        try:
+            refresh_movement_filter_button_styles()
+            refresh_date_controls_visibility()
+            _sync_filters_search_spacer_width()
+            populate_movements_trees(preserve_scroll=True)
+            refresh_balance_footer()
+            root.update_idletasks()
+        except Exception:
+            pass
+
+    root.after(60, _stabilize_initial_movimenti_layout)
     root.after(200, _open_opzioni_if_mail_incomplete)
     root.after(350, _startup_periodic_then_virtuale)
     root.after(900, _try_open_plan_conti_pending)
@@ -30449,7 +30837,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     root.after(900, _poll_registration_once)
 
     def _present_main_window() -> None:
-        """Mostra la finestra principale solo a UI pronta; evita flash nero (fullscreen Cocoa) su macOS."""
+        """Mostra la finestra principale solo a UI pronta e portala davanti all'avvio."""
         try:
             if platform.system() == "Darwin":
                 try:
@@ -30459,15 +30847,30 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 sw = root.winfo_screenwidth()
                 sh = root.winfo_screenheight()
                 root.geometry(f"{sw}x{sh}+0+0")
+                root.deiconify()
             else:
-                root.geometry("1200x760")
                 try:
-                    root.state("zoomed")
+                    sw = int(root.winfo_screenwidth())
+                    sh = int(root.winfo_screenheight())
+                    ww = min(1100, max(900, int(sw * 0.86)))
+                    wh = min(700, max(620, int(sh * 0.84)))
+                    root.geometry(f"{ww}x{wh}+{max(0, (sw - ww) // 2)}+{max(0, (sh - wh) // 3)}")
+                except Exception:
+                    root.geometry("1100x700")
+                root.deiconify()
+                tk_foreground.present_window(root)
+                def _zoom_and_present_windows() -> None:
+                    try:
+                        root.state("zoomed")
+                    except Exception:
+                        pass
+                    tk_foreground.present_window(root)
+
+                try:
+                    root.after(450, _zoom_and_present_windows)
                 except Exception:
                     pass
-            root.deiconify()
-            root.lift()
-            root.focus_force()
+            tk_foreground.present_window(root)
             root.update_idletasks()
 
             def _dock_icon_when_safe() -> None:
@@ -30548,22 +30951,138 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     root.mainloop()
 
 
+def _ask_boot_dropbox_updated(root: tk.Tk) -> bool:
+    if platform.system() != "Windows":
+        return messagebox.askokcancel(
+            "Conti di casa",
+            "Hai controllato che Dropbox sia aggiornato?\n\n"
+            "Se la cartella dati è in Dropbox e non ha ancora finito di sincronizzare, attendere "
+            "prima di continuare.\n\n"
+            "OK = continua e carica il database\n"
+            "Annulla = esci dall'applicazione",
+            parent=None,
+        )
+
+    result: list[bool] = [False]
+    win = tk.Toplevel(root)
+    win.title("Conti di casa")
+    win.resizable(False, False)
+    try:
+        win.withdraw()
+    except Exception:
+        pass
+    frm = ttk.Frame(win, padding=16)
+    frm.pack(fill=tk.BOTH, expand=True)
+    ttk.Label(
+        frm,
+        text=(
+            "Hai controllato che Dropbox sia aggiornato?\n\n"
+            "Se la cartella dati è in Dropbox e non ha ancora finito di sincronizzare, "
+            "attendere prima di continuare.\n\n"
+            "OK = continua e carica il database\n"
+            "Annulla = esci dall'applicazione"
+        ),
+        justify=tk.LEFT,
+        wraplength=440,
+    ).pack(anchor=tk.W)
+    row = ttk.Frame(frm)
+    row.pack(pady=(14, 0))
+
+    def _ok() -> None:
+        result[0] = True
+        win.destroy()
+
+    def _cancel() -> None:
+        result[0] = False
+        win.destroy()
+
+    ttk.Button(row, text="OK", command=_ok, width=12).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Button(row, text="Annulla", command=_cancel, width=12).pack(side=tk.LEFT)
+    win.protocol("WM_DELETE_WINDOW", _cancel)
+    try:
+        win.update_idletasks()
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        w = max(460, win.winfo_reqwidth())
+        h = win.winfo_reqheight()
+        win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 3}")
+    except Exception:
+        pass
+    try:
+        win.deiconify()
+        win.grab_set()
+    except Exception:
+        pass
+    tk_foreground.present_window(win, parent=root)
+    root.wait_window(win)
+    return result[0]
+
+
+def _show_post_login_wait(root: tk.Tk) -> tk.Toplevel | None:
+    try:
+        win = tk.Toplevel(root)
+        win.title("Conti di casa")
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=18)
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            frm,
+            text="Accesso riuscito",
+            font=("TkDefaultFont", 12, "bold"),
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            frm,
+            text="Attendere: sto aprendo il database e preparando la finestra principale…",
+            wraplength=420,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(8, 0))
+        win.update_idletasks()
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        w = max(460, win.winfo_reqwidth())
+        h = max(120, win.winfo_reqheight())
+        win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 3}")
+        win.deiconify()
+        tk_foreground.present_window(win, parent=root)
+        root.update_idletasks()
+        root.update()
+        return win
+    except Exception:
+        return None
+
+
+def _close_post_login_wait(win: tk.Toplevel | None) -> None:
+    if win is None:
+        return
+    try:
+        win.destroy()
+    except Exception:
+        pass
+
+
 def main() -> None:
+    _startup_log("main() start")
     if Fernet is None:
+        _startup_log("cryptography missing")
         print("Installa cryptography: pip install cryptography", file=sys.stderr)
         sys.exit(1)
 
     _darwin_prepare_stdin_for_tk_aqua()
 
     root = tk.Tk()
+    _configure_windows_ui_scale(root)
+    _configure_windows_cdc_color_theme(root)
     root.title("Conti di casa")
+    _windows_show_bootstrap_root(root, "Avvio dell'applicazione…")
     # La root resta nascosta fino al bisogno (evita la grande finestra vuota dietro i dialoghi).
     try:
         root.withdraw()
     except Exception:
         pass
 
+    _windows_show_bootstrap_root(root, "Verifica componenti grafici…")
     if not security_auth.verify_pillow_for_login_ui(parent=None):
+        _startup_log("Pillow check failed")
         print("Avvio interrotto: Pillow non disponibile per UI login.", file=sys.stderr)
         try:
             root.destroy()
@@ -30574,7 +31093,9 @@ def main() -> None:
     # Non mostrare la root qui: evita il flash di una cornice vuota prima del dialogo cartella dati / login
     # (i Toplevel usano ``parent`` anche con root ``withdraw()``).
 
+    _windows_show_bootstrap_root(root, "Configurazione cartella dati…")
     if not data_workspace.configure_data_workspace_interactive(root):
+        _startup_log("workspace configuration cancelled")
         print("Avvio annullato: cartella dati non configurata.", file=sys.stderr)
         try:
             root.destroy()
@@ -30582,9 +31103,12 @@ def main() -> None:
             pass
         return
     data_dir = data_workspace.data_dir()
+    _startup_log(f"workspace configured: {data_dir}")
     try:
+        _windows_show_bootstrap_root(root, "Controllo cartella dati in uso…")
         acquire_data_workspace_lock(data_dir, app_kind="desktop")
     except Exception as exc:
+        _startup_log(f"workspace lock failed: {exc!r}")
         # Non abbiamo creato il segnaposto: non va cancellato un file altrui ancora valido.
         try:
             messagebox.showerror("Cartella dati in uso", str(exc), parent=None)
@@ -30598,8 +31122,10 @@ def main() -> None:
 
     atexit.register(release_data_workspace_lock, data_dir)
     try:
+        _windows_show_bootstrap_root(root, "Controllo file Dropbox in conflitto…")
         _assert_no_dropbox_conflicted_enc_files(data_dir / "conti_utente_placeholder.enc")
     except Exception as exc:
+        _startup_log(f"conflicted enc check failed: {exc!r}")
         release_data_workspace_lock(data_dir)
         try:
             messagebox.showerror("Conti di casa", str(exc), parent=None)
@@ -30618,15 +31144,9 @@ def main() -> None:
 
     up = os_boot_time.seconds_since_os_boot()
     if up is not None and up < _BOOT_DROPBOX_CONFIRM_WITHIN_SECONDS:
-        if not messagebox.askokcancel(
-            "Conti di casa",
-            "Hai controllato che Dropbox sia aggiornato?\n\n"
-            "Se la cartella dati è in Dropbox e non ha ancora finito di sincronizzare, attendere "
-            "prima di continuare.\n\n"
-            "OK = continua e carica il database\n"
-            "Annulla = esci dall'applicazione",
-            parent=None,
-        ):
+        _windows_show_bootstrap_root(root, "Conferma sincronizzazione Dropbox…")
+        if not _ask_boot_dropbox_updated(root):
+            _startup_log("Dropbox confirmation cancelled")
             print("Avvio annullato: conferma Dropbox dopo boot non accettata.", file=sys.stderr)
             try:
                 root.destroy()
@@ -30636,11 +31156,16 @@ def main() -> None:
 
     # Root resta nascosta: lo splash Dropbox è un Toplevel; ``deiconify`` qui causava un flash visivo.
 
+    _windows_show_bootstrap_root(root, "Caricamento database cifrato…")
     db, resolved_path = load_database_at_startup(sync_ui_parent=root)
+    _startup_log(f"database loaded: {resolved_path}")
 
     db_holder: list[dict] = [db]
     path_holder: list[Path] = [resolved_path]
     key_path_holder: list[Path] = [data_workspace.default_key_file().resolve()]
+    _adopt_ui_color_overrides_from_available_dbs(db_holder[0], key_path_holder[0])
+    _apply_ui_palette_runtime(db_holder[0])
+    _configure_windows_cdc_color_theme(root)
 
     def save_db() -> None:
         periodiche.ensure_periodic_registrations(db_holder[0])
@@ -30653,7 +31178,9 @@ def main() -> None:
         )
 
     security_auth.ensure_security(db_holder[0])
+    _windows_show_bootstrap_root(root, "Verifica configurazione posta…")
     if not mail_gate.run_startup_mail_gate(root, db_holder[0], save_db):
+        _startup_log("startup mail gate cancelled")
         try:
             messagebox.showwarning(
                 "Conti di casa",
@@ -30668,7 +31195,9 @@ def main() -> None:
         except Exception:
             pass
         return
+    _windows_show_bootstrap_root(root, "Verifica primo accesso…")
     if not security_auth.run_first_access_wizard_if_needed(root, db_holder[0], save_db):
+        _startup_log("first access wizard cancelled")
         try:
             messagebox.showwarning(
                 "Conti di casa",
@@ -30705,6 +31234,7 @@ def main() -> None:
         after_prepare_nuova_utenza=reset_contabili_for_nuova_utenza,
     )
     if not ok or session is None:
+        _startup_log("login cancelled")
         try:
             messagebox.showinfo(
                 "Conti di casa",
@@ -30727,13 +31257,24 @@ def main() -> None:
         except Exception:
             pass
 
+    _windows_show_bootstrap_root(root, "Apertura dati utente…")
     path_holder[0] = migrate_data_path_after_login(db_holder[0], session, path_holder[0])
+    if _adopt_ui_color_overrides_from_available_dbs(db_holder[0], key_path_holder[0]):
+        try:
+            save_encrypted_db_dual(db_holder[0], path_holder[0], key_path_holder[0])
+        except Exception:
+            pass
+    _apply_ui_palette_runtime(db_holder[0])
+    _startup_log(f"user data path ready: {path_holder[0]}")
     if session.entered_via_backdoor:
         security_auth.ensure_security(db_holder[0])
         session.is_registered = bool(
             (db_holder[0].get("user_profile") or {}).get("registration_verified")
         )
+    _startup_log("building main UI")
+    _windows_clear_bootstrap_root(root)
     build_ui(db_holder[0], root, session, path_holder, key_path_holder)
+    _startup_log("main UI exited")
 
 
 if __name__ == "__main__":

@@ -36,6 +36,23 @@ dist/ContiDiCasa.app
 
 Su macOS, se l'app non e firmata, al primo avvio puo servire aprirla con tasto Ctrl sull'icona e poi **Apri**.
 
+Creazione del pacchetto Windows (PowerShell su Windows):
+
+```powershell
+.\scripts\build_windows_app.ps1
+```
+
+L'app generata si trova in:
+
+```text
+dist\ContiDiCasa\ContiDiCasa.exe
+dist\ContiDiCasa-Windows.zip
+dist\ContiDiCasa-Windows-Setup.exe
+```
+
+Su GitHub Actions, la workflow **Windows build** pubblica sia lo zip sia l'installer `.exe`
+come artifact del run. L'eseguibile e l'installer usano l'icona euro incorporata.
+
 ## File dati
 
 Nella cartella dati scelta dall'utente devono stare insieme:
@@ -143,6 +160,7 @@ I test coprono le parti piu delicate: importi euro, saldi consolidati, regole st
 | `iphone_light/` | Client light iPhone e strumenti di prova. |
 | `tests/` | Test automatici. |
 | `scripts/build_macos_app.sh` | Build macOS `.app`. |
+| `scripts/build_windows_app.ps1` | Build Windows e pacchetto `.zip`. |
 
 ## Note per sviluppo prudente
 

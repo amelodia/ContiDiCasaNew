@@ -194,6 +194,8 @@ def configure_data_workspace_interactive(parent) -> bool:
     import tkinter as tk
     from tkinter import filedialog, messagebox
 
+    import tk_foreground
+
     saved = load_saved_workspace_path()
     if saved is not None:
         set_data_workspace_root(saved)
@@ -261,6 +263,7 @@ def configure_data_workspace_interactive(parent) -> bool:
         win.geometry(f"+{max(0, px)}+{max(0, py)}")
     except Exception:
         pass
+    tk_foreground.present_window(win, parent=parent)
     parent.wait_window(win)
 
     ch = choice[0]
