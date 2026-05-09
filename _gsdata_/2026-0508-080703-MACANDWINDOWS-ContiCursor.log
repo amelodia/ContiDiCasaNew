@@ -1,0 +1,227 @@
+2026-05-08 08:15:55: == Sincronizzazione avviata da User Command
+2026-05-08 08:15:57: GsConnectAndSetRoot1 connected to dropbox://api.dropboxapi.com/CursorAppMacCdc
+2026-05-08 08:15:57: ConnectCloned connected to file:///C:/Users/macand/ContiNew
+2026-05-08 08:15:57: GsConnectAndSetRoot1 connected to dropbox://api.dropboxapi.com/CursorAppMacCdc
+2026-05-08 08:15:57: GsConnectAndSetRoot1 connected to dropbox://api.dropboxapi.com/CursorAppMacCdc
+2026-05-08 08:15:57: ConnectCloned connected to file:///C:/Users/macand/ContiNew
+2026-05-08 08:15:57: ConnectCloned connected to file:///C:/Users/macand/ContiNew
+2026-05-08 08:15:57: Crea cartella C:/Users/macand/ContiNew/.cursor
+2026-05-08 08:15:57: Crea cartella C:/Users/macand/ContiNew/.git
+2026-05-08 08:15:58: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.gitignore' -> 'C:/Users/macand/ContiNew/.gitignore' (566)
+2026-05-08 08:15:58: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.gitattributes' -> 'C:/Users/macand/ContiNew/.gitattributes' (66)
+2026-05-08 08:15:58: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.cursor/debug-8c5304.log' -> 'C:/Users/macand/ContiNew/.cursor/debug-8c5304.log' (82,248)
+2026-05-08 08:15:58: Crea cartella C:/Users/macand/ContiNew/.git/cursor
+2026-05-08 08:15:59: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/COMMIT_EDITMSG' -> 'C:/Users/macand/ContiNew/.git/COMMIT_EDITMSG' (18)
+2026-05-08 08:15:59: Crea cartella C:/Users/macand/ContiNew/.git/cursor/crepe
+2026-05-08 08:15:59: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/config' -> 'C:/Users/macand/ContiNew/.git/config' (410)
+2026-05-08 08:15:59: Crea cartella C:/Users/macand/ContiNew/.git/cursor/crepe/163dbf953fa019653cecc7ca40f2246a170c0ad1
+2026-05-08 08:15:59: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/description' -> 'C:/Users/macand/ContiNew/.git/description' (22)
+2026-05-08 08:16:00: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/HEAD' -> 'C:/Users/macand/ContiNew/.git/HEAD' (21)
+2026-05-08 08:16:00: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/FETCH_HEAD' -> 'C:/Users/macand/ContiNew/.git/FETCH_HEAD' (235)
+2026-05-08 08:16:00: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/cursor/crepe/163dbf953fa019653cecc7ca40f2246a170c0ad1/index.bin' -> 'C:/Users/macand/ContiNew/.git/cursor/crepe/163dbf953fa019653cecc7ca40f2246a170c0ad1/index.bin' (1,428)
+2026-05-08 08:16:00: Crea cartella C:/Users/macand/ContiNew/.git/hooks
+2026-05-08 08:16:01: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/index' -> 'C:/Users/macand/ContiNew/.git/index' (7,474)
+2026-05-08 08:16:01: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/cursor/crepe/163dbf953fa019653cecc7ca40f2246a170c0ad1/postings.bin' -> 'C:/Users/macand/ContiNew/.git/cursor/crepe/163dbf953fa019653cecc7ca40f2246a170c0ad1/postings.bin' (463)
+2026-05-08 08:16:01: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/cursor/crepe/163dbf953fa019653cecc7ca40f2246a170c0ad1/metadata.json' -> 'C:/Users/macand/ContiNew/.git/cursor/crepe/163dbf953fa019653cecc7ca40f2246a170c0ad1/metadata.json' (30)
+2026-05-08 08:16:01: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/hooks/fsmonitor-watchman.sample' -> 'C:/Users/macand/ContiNew/.git/hooks/fsmonitor-watchman.sample' (4,726)
+2026-05-08 08:16:01: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/hooks/commit-msg.sample' -> 'C:/Users/macand/ContiNew/.git/hooks/commit-msg.sample' (896)
+2026-05-08 08:16:01: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/hooks/applypatch-msg.sample' -> 'C:/Users/macand/ContiNew/.git/hooks/applypatch-msg.sample' (478)
+2026-05-08 08:16:02: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/hooks/post-update.sample' -> 'C:/Users/macand/ContiNew/.git/hooks/post-update.sample' (189)
+2026-05-08 08:16:02: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/hooks/pre-commit.sample' -> 'C:/Users/macand/ContiNew/.git/hooks/pre-commit.sample' (1,649)
+2026-05-08 08:16:02: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/hooks/pre-applypatch.sample' -> 'C:/Users/macand/ContiNew/.git/hooks/pre-applypatch.sample' (424)
+2026-05-08 08:16:03: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/hooks/pre-merge-commit.sample' -> 'C:/Users/macand/ContiNew/.git/hooks/pre-merge-commit.sample' (416)
+2026-05-08 08:16:03: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/hooks/pre-rebase.sample' -> 'C:/Users/macand/ContiNew/.git/hooks/pre-rebase.sample' (4,898)
+2026-05-08 08:16:03: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/hooks/pre-push.sample' -> 'C:/Users/macand/ContiNew/.git/hooks/pre-push.sample' (1,374)
+2026-05-08 08:16:03: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/hooks/pre-receive.sample' -> 'C:/Users/macand/ContiNew/.git/hooks/pre-receive.sample' (544)
+2026-05-08 08:16:04: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/hooks/prepare-commit-msg.sample' -> 'C:/Users/macand/ContiNew/.git/hooks/prepare-commit-msg.sample' (1,492)
+2026-05-08 08:16:04: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/hooks/push-to-checkout.sample' -> 'C:/Users/macand/ContiNew/.git/hooks/push-to-checkout.sample' (2,783)
+2026-05-08 08:16:04: Crea cartella C:/Users/macand/ContiNew/.git/info
+2026-05-08 08:16:04: Crea cartella C:/Users/macand/ContiNew/.git/logs
+2026-05-08 08:16:04: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/hooks/sendemail-validate.sample' -> 'C:/Users/macand/ContiNew/.git/hooks/sendemail-validate.sample' (2,308)
+2026-05-08 08:16:04: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/info/exclude' -> 'C:/Users/macand/ContiNew/.git/info/exclude' (240)
+2026-05-08 08:16:04: Crea cartella C:/Users/macand/ContiNew/.git/logs/refs
+2026-05-08 08:16:04: Crea cartella C:/Users/macand/ContiNew/.git/objects
+2026-05-08 08:16:04: Crea cartella C:/Users/macand/ContiNew/.git/logs/refs/heads
+2026-05-08 08:16:04: Crea cartella C:/Users/macand/ContiNew/.git/objects/00
+2026-05-08 08:16:04: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/hooks/update.sample' -> 'C:/Users/macand/ContiNew/.git/hooks/update.sample' (3,650)
+2026-05-08 08:16:05: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/logs/HEAD' -> 'C:/Users/macand/ContiNew/.git/logs/HEAD' (4,948)
+2026-05-08 08:16:05: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/logs/refs/heads/main' -> 'C:/Users/macand/ContiNew/.git/logs/refs/heads/main' (4,948)
+2026-05-08 08:16:05: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/00/5f16f51d5d4113942e86fd41ec5a93e6ed552a' -> 'C:/Users/macand/ContiNew/.git/objects/00/5f16f51d5d4113942e86fd41ec5a93e6ed552a' (128)
+2026-05-08 08:16:05: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/00/c317af453a288232155f8e9cb32ccadf8b8e0c' -> 'C:/Users/macand/ContiNew/.git/objects/00/c317af453a288232155f8e9cb32ccadf8b8e0c' (1,771)
+2026-05-08 08:16:05: Crea cartella C:/Users/macand/ContiNew/.git/objects/03
+2026-05-08 08:16:05: Crea cartella C:/Users/macand/ContiNew/.git/objects/05
+2026-05-08 08:16:06: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/00/f13bfe7d34f44718eff78efcd3bf54aa33c20a' -> 'C:/Users/macand/ContiNew/.git/objects/00/f13bfe7d34f44718eff78efcd3bf54aa33c20a' (260)
+2026-05-08 08:16:06: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/00/f08168bd8e2d5a470b08e309fb60b3bdc3c478' -> 'C:/Users/macand/ContiNew/.git/objects/00/f08168bd8e2d5a470b08e309fb60b3bdc3c478' (179)
+2026-05-08 08:16:06: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/03/3edbcd8236c86a6af6a4e8f002325e1e6d82af' -> 'C:/Users/macand/ContiNew/.git/objects/03/3edbcd8236c86a6af6a4e8f002325e1e6d82af' (178)
+2026-05-08 08:16:06: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/05/2ec48434ca0d2b1b294af35c0188229c9682b7' -> 'C:/Users/macand/ContiNew/.git/objects/05/2ec48434ca0d2b1b294af35c0188229c9682b7' (42,412)
+2026-05-08 08:16:06: Crea cartella C:/Users/macand/ContiNew/.git/objects/06
+2026-05-08 08:16:06: Crea cartella C:/Users/macand/ContiNew/.git/objects/07
+2026-05-08 08:16:07: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/05/a74fea3a7cb6eba00a764af245efbf7d2ba66c' -> 'C:/Users/macand/ContiNew/.git/objects/05/a74fea3a7cb6eba00a764af245efbf7d2ba66c' (181)
+2026-05-08 08:16:07: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/03/630a1fd1d3129df62edca670dea79f297c13b8' -> 'C:/Users/macand/ContiNew/.git/objects/03/630a1fd1d3129df62edca670dea79f297c13b8' (1,067)
+2026-05-08 08:16:07: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/06/7d0a989d24285e96557010aacd14f4626348b0' -> 'C:/Users/macand/ContiNew/.git/objects/06/7d0a989d24285e96557010aacd14f4626348b0' (12,097)
+2026-05-08 08:16:08: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/07/740c98c9cc96a364cdcf9afda19508e0da4c3b' -> 'C:/Users/macand/ContiNew/.git/objects/07/740c98c9cc96a364cdcf9afda19508e0da4c3b' (195)
+2026-05-08 08:16:08: Crea cartella C:/Users/macand/ContiNew/.git/objects/0a
+2026-05-08 08:16:08: Crea cartella C:/Users/macand/ContiNew/.git/objects/0b
+2026-05-08 08:16:08: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/06/e02fefdf8fcc3cce36cf7417b302c2007c05a1' -> 'C:/Users/macand/ContiNew/.git/objects/06/e02fefdf8fcc3cce36cf7417b302c2007c05a1' (2,029)
+2026-05-08 08:16:08: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/06/ab39d3fb13d386719a9019c66f1143fe926638' -> 'C:/Users/macand/ContiNew/.git/objects/06/ab39d3fb13d386719a9019c66f1143fe926638' (138)
+2026-05-08 08:16:08: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/0a/7aeffcf1bc6b363bf2e68ff528524b7c60b8b8' -> 'C:/Users/macand/ContiNew/.git/objects/0a/7aeffcf1bc6b363bf2e68ff528524b7c60b8b8' (22,370)
+2026-05-08 08:16:09: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/0b/2199dd5b486fee6b09f885209fa5bffdb159ee' -> 'C:/Users/macand/ContiNew/.git/objects/0b/2199dd5b486fee6b09f885209fa5bffdb159ee' (11,097)
+2026-05-08 08:16:09: Crea cartella C:/Users/macand/ContiNew/.git/objects/0d
+2026-05-08 08:16:09: Crea cartella C:/Users/macand/ContiNew/.git/objects/0f
+2026-05-08 08:16:09: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/0b/e13ffb2e15cc4876a0dd292c78cc9546a9183c' -> 'C:/Users/macand/ContiNew/.git/objects/0b/e13ffb2e15cc4876a0dd292c78cc9546a9183c' (113)
+2026-05-08 08:16:09: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/0a/a93b4e3d48a7a5b7e2af836cfafd1f72f12795' -> 'C:/Users/macand/ContiNew/.git/objects/0a/a93b4e3d48a7a5b7e2af836cfafd1f72f12795' (2,981)
+2026-05-08 08:16:10: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/0f/515810e1e90e1f77ca6c9788da4d7ac06c248e' -> 'C:/Users/macand/ContiNew/.git/objects/0f/515810e1e90e1f77ca6c9788da4d7ac06c248e' (787)
+2026-05-08 08:16:10: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/0d/5c8e73b5868020ec5d79d590da80bb27e3e2c6' -> 'C:/Users/macand/ContiNew/.git/objects/0d/5c8e73b5868020ec5d79d590da80bb27e3e2c6' (1,225)
+2026-05-08 08:16:10: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/0d/6a4ed8bd2ad43a7cbdf29bc9c7893e01217d8d' -> 'C:/Users/macand/ContiNew/.git/objects/0d/6a4ed8bd2ad43a7cbdf29bc9c7893e01217d8d' (1,040)
+2026-05-08 08:16:10: Crea cartella C:/Users/macand/ContiNew/.git/objects/10
+2026-05-08 08:16:10: Crea cartella C:/Users/macand/ContiNew/.git/objects/11
+2026-05-08 08:16:10: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/0d/731ea20d884eef05589c012c09a9f7d109438e' -> 'C:/Users/macand/ContiNew/.git/objects/0d/731ea20d884eef05589c012c09a9f7d109438e' (657)
+2026-05-08 08:16:11: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/0d/d9cf90b02b9f8ce58b610b0c57d758cbb09e7d' -> 'C:/Users/macand/ContiNew/.git/objects/0d/d9cf90b02b9f8ce58b610b0c57d758cbb09e7d' (85,634)
+2026-05-08 08:16:11: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/10/1275988951a1d00b32bd5059689b78962ae6ca' -> 'C:/Users/macand/ContiNew/.git/objects/10/1275988951a1d00b32bd5059689b78962ae6ca' (129)
+2026-05-08 08:16:11: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/11/7589e166d0e01a6dcefade5ab33c5ccf91cce3' -> 'C:/Users/macand/ContiNew/.git/objects/11/7589e166d0e01a6dcefade5ab33c5ccf91cce3' (1,189)
+2026-05-08 08:16:11: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/11/865aaa502c3f93d055e2043959ce5cb2cae883' -> 'C:/Users/macand/ContiNew/.git/objects/11/865aaa502c3f93d055e2043959ce5cb2cae883' (3,901)
+2026-05-08 08:16:11: Crea cartella C:/Users/macand/ContiNew/.git/objects/12
+2026-05-08 08:16:11: Crea cartella C:/Users/macand/ContiNew/.git/objects/14
+2026-05-08 08:16:12: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/10/6d1cdb75e45fb111ca4e787b062df0a8a0d50e' -> 'C:/Users/macand/ContiNew/.git/objects/10/6d1cdb75e45fb111ca4e787b062df0a8a0d50e' (1,483)
+2026-05-08 08:16:12: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/10/e40233c205268fa2fbb3f06a226daef904dc01' -> 'C:/Users/macand/ContiNew/.git/objects/10/e40233c205268fa2fbb3f06a226daef904dc01' (788)
+2026-05-08 08:16:13: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/12/1a62dc302d55ed3be7a73f0b571dc70499ad14' -> 'C:/Users/macand/ContiNew/.git/objects/12/1a62dc302d55ed3be7a73f0b571dc70499ad14' (38,709)
+2026-05-08 08:16:13: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/12/20c962d780ccda2ddd98632f104b415ddf8a67' -> 'C:/Users/macand/ContiNew/.git/objects/12/20c962d780ccda2ddd98632f104b415ddf8a67' (7,694)
+2026-05-08 08:16:13: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/14/497b7c410c4f4b5aae385ce2b0e688df6bba69' -> 'C:/Users/macand/ContiNew/.git/objects/14/497b7c410c4f4b5aae385ce2b0e688df6bba69' (327,992)
+2026-05-08 08:16:13: Crea cartella C:/Users/macand/ContiNew/.git/objects/15
+2026-05-08 08:16:13: Crea cartella C:/Users/macand/ContiNew/.git/objects/16
+2026-05-08 08:16:13: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/12/24d4ce833f4bba171c5fead03c5c09738be348' -> 'C:/Users/macand/ContiNew/.git/objects/12/24d4ce833f4bba171c5fead03c5c09738be348' (5,710)
+2026-05-08 08:16:13: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/12/673a2e677f66463b3f0582da519cf0df10b048' -> 'C:/Users/macand/ContiNew/.git/objects/12/673a2e677f66463b3f0582da519cf0df10b048' (90)
+2026-05-08 08:16:13: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/15/09c4ce8bb07091db5cf4f669db97acca4791a6' -> 'C:/Users/macand/ContiNew/.git/objects/15/09c4ce8bb07091db5cf4f669db97acca4791a6' (1,847)
+2026-05-08 08:16:14: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/16/3dbf953fa019653cecc7ca40f2246a170c0ad1' -> 'C:/Users/macand/ContiNew/.git/objects/16/3dbf953fa019653cecc7ca40f2246a170c0ad1' (144)
+2026-05-08 08:16:14: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/16/3e03769edd3cba54fa9032f43cbb131383c75e' -> 'C:/Users/macand/ContiNew/.git/objects/16/3e03769edd3cba54fa9032f43cbb131383c75e' (27,007)
+2026-05-08 08:16:14: Crea cartella C:/Users/macand/ContiNew/.git/objects/17
+2026-05-08 08:16:14: Crea cartella C:/Users/macand/ContiNew/.git/objects/18
+2026-05-08 08:16:14: Crea cartella C:/Users/macand/ContiNew/.git/objects/19
+2026-05-08 08:16:14: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/16/971b58fe5da3d115d97b63506cb9fb4cdadb36' -> 'C:/Users/macand/ContiNew/.git/objects/16/971b58fe5da3d115d97b63506cb9fb4cdadb36' (245)
+2026-05-08 08:16:15: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/17/240ae2e7be0866025f36b554cc1c16abeab850' -> 'C:/Users/macand/ContiNew/.git/objects/17/240ae2e7be0866025f36b554cc1c16abeab850' (13,514)
+2026-05-08 08:16:15: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/18/1b0b47152dc8e638bb76b6bab404b73457fd23' -> 'C:/Users/macand/ContiNew/.git/objects/18/1b0b47152dc8e638bb76b6bab404b73457fd23' (307)
+2026-05-08 08:16:15: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/19/955fe3f0716ba83bb0fc01c659d0542af76844' -> 'C:/Users/macand/ContiNew/.git/objects/19/955fe3f0716ba83bb0fc01c659d0542af76844' (4,085)
+2026-05-08 08:16:16: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/19/d7c0f9b65ccb18f084e97d198f8955b0a93c50' -> 'C:/Users/macand/ContiNew/.git/objects/19/d7c0f9b65ccb18f084e97d198f8955b0a93c50' (795)
+2026-05-08 08:16:16: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/17/8544b87da9f1a4c699df6849584cbb6bc0d620' -> 'C:/Users/macand/ContiNew/.git/objects/17/8544b87da9f1a4c699df6849584cbb6bc0d620' (42,227)
+2026-05-08 08:16:16: Crea cartella C:/Users/macand/ContiNew/.git/objects/1a
+2026-05-08 08:16:16: Crea cartella C:/Users/macand/ContiNew/.git/objects/1b
+2026-05-08 08:16:16: Crea cartella C:/Users/macand/ContiNew/.git/objects/1c
+2026-05-08 08:16:16: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/17/fc469bab967093ae3e482f223f673f3b5988d1' -> 'C:/Users/macand/ContiNew/.git/objects/17/fc469bab967093ae3e482f223f673f3b5988d1' (256)
+2026-05-08 08:16:16: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/1a/6c6c7a698e40a611445cda1797d5d618f3d078' -> 'C:/Users/macand/ContiNew/.git/objects/1a/6c6c7a698e40a611445cda1797d5d618f3d078' (174)
+2026-05-08 08:16:16: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/1b/87d54fdb83abdfb6d2ff8321a76a8e4493352a' -> 'C:/Users/macand/ContiNew/.git/objects/1b/87d54fdb83abdfb6d2ff8321a76a8e4493352a' (179)
+2026-05-08 08:16:16: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/1c/9d00f990baaefd032f73c03bb79cd746b8741f' -> 'C:/Users/macand/ContiNew/.git/objects/1c/9d00f990baaefd032f73c03bb79cd746b8741f' (1,512)
+2026-05-08 08:16:16: Crea cartella C:/Users/macand/ContiNew/.git/objects/1d
+2026-05-08 08:16:16: Crea cartella C:/Users/macand/ContiNew/.git/objects/1e
+2026-05-08 08:16:17: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/1c/f7efb82fdeca8d58b2fba9a50fd037403709e7' -> 'C:/Users/macand/ContiNew/.git/objects/1c/f7efb82fdeca8d58b2fba9a50fd037403709e7' (457)
+2026-05-08 08:16:17: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/1c/c9bffb9fca01b4bbfb71eef17f7668a72b3603' -> 'C:/Users/macand/ContiNew/.git/objects/1c/c9bffb9fca01b4bbfb71eef17f7668a72b3603' (7,353)
+2026-05-08 08:16:17: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/1d/040906b5eb0d394bd37e7ff161c1a58f828609' -> 'C:/Users/macand/ContiNew/.git/objects/1d/040906b5eb0d394bd37e7ff161c1a58f828609' (1,039)
+2026-05-08 08:16:17: Crea cartella C:/Users/macand/ContiNew/.git/objects/1f
+2026-05-08 08:16:17: Crea cartella C:/Users/macand/ContiNew/.git/objects/21
+2026-05-08 08:16:18: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/1e/3d246fa09619da197383ceb12c1618c398f8d7' -> 'C:/Users/macand/ContiNew/.git/objects/1e/3d246fa09619da197383ceb12c1618c398f8d7' (2,407)
+2026-05-08 08:16:18: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/1d/18a80c920ffaf031e67cb97cd8895b7005e84d' -> 'C:/Users/macand/ContiNew/.git/objects/1d/18a80c920ffaf031e67cb97cd8895b7005e84d' (92)
+2026-05-08 08:16:18: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/1f/ca16d8b2cf20e28adc7aaa9a4f6df81ee9eeb2' -> 'C:/Users/macand/ContiNew/.git/objects/1f/ca16d8b2cf20e28adc7aaa9a4f6df81ee9eeb2' (1,499)
+2026-05-08 08:16:18: Crea cartella C:/Users/macand/ContiNew/.git/objects/22
+2026-05-08 08:16:19: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/21/2d77b9aa3c826326de9c6962a9bf8faf028bf0' -> 'C:/Users/macand/ContiNew/.git/objects/21/2d77b9aa3c826326de9c6962a9bf8faf028bf0' (14,294)
+2026-05-08 08:16:19: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/21/7e3e8681ff97e00adc6907b7367e2b8eb1b7cd' -> 'C:/Users/macand/ContiNew/.git/objects/21/7e3e8681ff97e00adc6907b7367e2b8eb1b7cd' (91)
+2026-05-08 08:16:19: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/22/c04aa7fb1ca118273eee004f8bd663cd6a9b80' -> 'C:/Users/macand/ContiNew/.git/objects/22/c04aa7fb1ca118273eee004f8bd663cd6a9b80' (231)
+2026-05-08 08:16:19: Crea cartella C:/Users/macand/ContiNew/.git/objects/23
+2026-05-08 08:16:20: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/22/d577a1e3ccd2272a606cc60bad8515216daba3' -> 'C:/Users/macand/ContiNew/.git/objects/22/d577a1e3ccd2272a606cc60bad8515216daba3' (182)
+2026-05-08 08:16:20: Crea cartella C:/Users/macand/ContiNew/.git/objects/26
+2026-05-08 08:16:20: Crea cartella C:/Users/macand/ContiNew/.git/objects/27
+2026-05-08 08:16:20: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/23/b8ce1f5959f065b8df6da6a7adb2bb135d1575' -> 'C:/Users/macand/ContiNew/.git/objects/23/b8ce1f5959f065b8df6da6a7adb2bb135d1575' (22,508)
+2026-05-08 08:16:20: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/22/de3e6a7de6f3605a6e7dbe13b2dd3c99969e2c' -> 'C:/Users/macand/ContiNew/.git/objects/22/de3e6a7de6f3605a6e7dbe13b2dd3c99969e2c' (5,793)
+2026-05-08 08:16:20: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/26/2c2bc72d83518a37a91ebd20578526205bb27a' -> 'C:/Users/macand/ContiNew/.git/objects/26/2c2bc72d83518a37a91ebd20578526205bb27a' (58)
+2026-05-08 08:16:20: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/27/0f379e7e226f45a4da42f3284f0f2ad33741ad' -> 'C:/Users/macand/ContiNew/.git/objects/27/0f379e7e226f45a4da42f3284f0f2ad33741ad' (1,235)
+2026-05-08 08:16:20: Crea cartella C:/Users/macand/ContiNew/.git/objects/28
+2026-05-08 08:16:20: Crea cartella C:/Users/macand/ContiNew/.git/objects/29
+2026-05-08 08:16:21: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/27/23f4864189616ef49f3baa70ac54ba0246d93e' -> 'C:/Users/macand/ContiNew/.git/objects/27/23f4864189616ef49f3baa70ac54ba0246d93e' (12,260)
+2026-05-08 08:16:21: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/28/6a3873d3739935b820ecbd075845067a5aeb7e' -> 'C:/Users/macand/ContiNew/.git/objects/28/6a3873d3739935b820ecbd075845067a5aeb7e' (195)
+2026-05-08 08:16:21: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/26/3bf7da1769b8521c7975cfa5c37be968e1466f' -> 'C:/Users/macand/ContiNew/.git/objects/26/3bf7da1769b8521c7975cfa5c37be968e1466f' (6,765)
+2026-05-08 08:16:21: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/29/f82ec5d76852469486d72c59eaae021a61d4b7' -> 'C:/Users/macand/ContiNew/.git/objects/29/f82ec5d76852469486d72c59eaae021a61d4b7' (1,509)
+2026-05-08 08:16:21: Crea cartella C:/Users/macand/ContiNew/.git/objects/2a
+2026-05-08 08:16:21: Crea cartella C:/Users/macand/ContiNew/.git/objects/2b
+2026-05-08 08:16:22: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/28/d468da912ffbde2199175af354a118ea6cb9fe' -> 'C:/Users/macand/ContiNew/.git/objects/28/d468da912ffbde2199175af354a118ea6cb9fe' (1,161)
+2026-05-08 08:16:22: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/28/d032da41e69c07b293494d55c0006822e3bd50' -> 'C:/Users/macand/ContiNew/.git/objects/28/d032da41e69c07b293494d55c0006822e3bd50' (918,014)
+2026-05-08 08:16:22: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/2a/a21fd7384a83df09fabab828c5fb2149e92814' -> 'C:/Users/macand/ContiNew/.git/objects/2a/a21fd7384a83df09fabab828c5fb2149e92814' (1,069)
+2026-05-08 08:16:23: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/2b/4020584aba9377edbde8308b65c274e702cc24' -> 'C:/Users/macand/ContiNew/.git/objects/2b/4020584aba9377edbde8308b65c274e702cc24' (11,916)
+2026-05-08 08:16:23: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/2b/98cd7423543db55fef6c585b1703369450be93' -> 'C:/Users/macand/ContiNew/.git/objects/2b/98cd7423543db55fef6c585b1703369450be93' (92)
+2026-05-08 08:16:23: Crea cartella C:/Users/macand/ContiNew/.git/objects/2c
+2026-05-08 08:16:23: Crea cartella C:/Users/macand/ContiNew/.git/objects/2d
+2026-05-08 08:16:23: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/2b/970618909c88f6207f092b55d111fff2742c0e' -> 'C:/Users/macand/ContiNew/.git/objects/2b/970618909c88f6207f092b55d111fff2742c0e' (2,572)
+2026-05-08 08:16:24: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/2d/36874d3ac972b917aeb3ce1a6fc35ec3751f83' -> 'C:/Users/macand/ContiNew/.git/objects/2d/36874d3ac972b917aeb3ce1a6fc35ec3751f83' (3,469)
+2026-05-08 08:16:24: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/2b/e3a8b64efb35ef1ea336d9b794d891ba449222' -> 'C:/Users/macand/ContiNew/.git/objects/2b/e3a8b64efb35ef1ea336d9b794d891ba449222' (29,858)
+2026-05-08 08:16:24: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/2c/043faacb3ddf36d8214e383b4d0736c2029fe1' -> 'C:/Users/macand/ContiNew/.git/objects/2c/043faacb3ddf36d8214e383b4d0736c2029fe1' (1,266)
+2026-05-08 08:16:24: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/2d/bd2dbbd575760d41a906fd45fd403dd44ad80d' -> 'C:/Users/macand/ContiNew/.git/objects/2d/bd2dbbd575760d41a906fd45fd403dd44ad80d' (21,365)
+2026-05-08 08:16:24: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/2d/f8025917375beb808d80f6014c6cbbf37c7157' -> 'C:/Users/macand/ContiNew/.git/objects/2d/f8025917375beb808d80f6014c6cbbf37c7157' (656)
+2026-05-08 08:16:24: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/2d/aeb2ad2c6e137f23a07deb711cb0436f08526b' -> 'C:/Users/macand/ContiNew/.git/objects/2d/aeb2ad2c6e137f23a07deb711cb0436f08526b' (350)
+2026-05-08 08:16:24: Crea cartella C:/Users/macand/ContiNew/.git/objects/31
+2026-05-08 08:16:24: Crea cartella C:/Users/macand/ContiNew/.git/objects/32
+2026-05-08 08:16:25: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/2c/49685cc4d6071eef346fe20f3876a711185495' -> 'C:/Users/macand/ContiNew/.git/objects/2c/49685cc4d6071eef346fe20f3876a711185495' (694)
+2026-05-08 08:16:25: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/2c/6789c59c3d49cac752def95698fd3fafb524b9' -> 'C:/Users/macand/ContiNew/.git/objects/2c/6789c59c3d49cac752def95698fd3fafb524b9' (344)
+2026-05-08 08:16:25: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/31/e5d49adc491328250d97f4798aebc079cbba5e' -> 'C:/Users/macand/ContiNew/.git/objects/31/e5d49adc491328250d97f4798aebc079cbba5e' (928,913)
+2026-05-08 08:16:25: Crea cartella C:/Users/macand/ContiNew/.git/objects/33
+2026-05-08 08:16:25: Crea cartella C:/Users/macand/ContiNew/.git/objects/34
+2026-05-08 08:16:26: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/32/faaea3a9f434338935e78b686ac8e251d3410c' -> 'C:/Users/macand/ContiNew/.git/objects/32/faaea3a9f434338935e78b686ac8e251d3410c' (197)
+2026-05-08 08:16:26: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/32/9a87bb231e9b2c164e0123e840d0fe369ea6c3' -> 'C:/Users/macand/ContiNew/.git/objects/32/9a87bb231e9b2c164e0123e840d0fe369ea6c3' (170)
+2026-05-08 08:16:26: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/33/24406262ea6fa73ebb78674a6d36ea908a0185' -> 'C:/Users/macand/ContiNew/.git/objects/33/24406262ea6fa73ebb78674a6d36ea908a0185' (2,251)
+2026-05-08 08:16:26: Crea cartella C:/Users/macand/ContiNew/.git/objects/35
+2026-05-08 08:16:26: Crea cartella C:/Users/macand/ContiNew/.git/objects/36
+2026-05-08 08:16:27: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/34/0f6fa60b63fe610ab8f87a580dd727c32dffdc' -> 'C:/Users/macand/ContiNew/.git/objects/34/0f6fa60b63fe610ab8f87a580dd727c32dffdc' (1,879)
+2026-05-08 08:16:27: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/34/1c442bfea23f4b70bce604a426d1234b9c5dbe' -> 'C:/Users/macand/ContiNew/.git/objects/34/1c442bfea23f4b70bce604a426d1234b9c5dbe' (262)
+2026-05-08 08:16:27: Crea cartella C:/Users/macand/ContiNew/.git/objects/37
+2026-05-08 08:16:27: Crea cartella C:/Users/macand/ContiNew/.git/objects/38
+2026-05-08 08:16:27: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/35/ac59ff730bd65ddcbf58e867ae358f0fa67a3f' -> 'C:/Users/macand/ContiNew/.git/objects/35/ac59ff730bd65ddcbf58e867ae358f0fa67a3f' (306)
+2026-05-08 08:16:27: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/36/0809d55b6a9beb5f6130b82b5c5002a442fad1' -> 'C:/Users/macand/ContiNew/.git/objects/36/0809d55b6a9beb5f6130b82b5c5002a442fad1' (946)
+2026-05-08 08:16:27: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/38/e2d97b6ffaded98e45fe9001c503edd360f931' -> 'C:/Users/macand/ContiNew/.git/objects/38/e2d97b6ffaded98e45fe9001c503edd360f931' (257)
+2026-05-08 08:16:28: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/37/51d90d7a7f903c3fa3325ab3825c80cc9d6e30' -> 'C:/Users/macand/ContiNew/.git/objects/37/51d90d7a7f903c3fa3325ab3825c80cc9d6e30' (129)
+2026-05-08 08:16:28: Crea cartella C:/Users/macand/ContiNew/.git/objects/3a
+2026-05-08 08:16:28: Crea cartella C:/Users/macand/ContiNew/.git/objects/3b
+2026-05-08 08:16:28: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/37/a4c8bba82a46a0964c32f829b3ecc235a43ab2' -> 'C:/Users/macand/ContiNew/.git/objects/37/a4c8bba82a46a0964c32f829b3ecc235a43ab2' (21,346)
+2026-05-08 08:16:28: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/37/dcbfe90414ed6b5bb90201df812ce6e42a0869' -> 'C:/Users/macand/ContiNew/.git/objects/37/dcbfe90414ed6b5bb90201df812ce6e42a0869' (63)
+2026-05-08 08:16:28: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/3a/8f93615e143cb5b4fe1acb323e7af59637a81a' -> 'C:/Users/macand/ContiNew/.git/objects/3a/8f93615e143cb5b4fe1acb323e7af59637a81a' (129)
+2026-05-08 08:16:29: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/3b/1062ff85cf1bb1bad13a9643397687f2952de5' -> 'C:/Users/macand/ContiNew/.git/objects/3b/1062ff85cf1bb1bad13a9643397687f2952de5' (3,855)
+2026-05-08 08:16:29: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/3b/57e327722d101240af2bac9288225c5ce64dbf' -> 'C:/Users/macand/ContiNew/.git/objects/3b/57e327722d101240af2bac9288225c5ce64dbf' (10,739)
+2026-05-08 08:16:29: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/3b/8a30404ebf882087b01573f9cb489b9597f169' -> 'C:/Users/macand/ContiNew/.git/objects/3b/8a30404ebf882087b01573f9cb489b9597f169' (184,590)
+2026-05-08 08:16:30: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/3b/8c222f2d0c1da1e76e2d0c5b25c7718ce90820' -> 'C:/Users/macand/ContiNew/.git/objects/3b/8c222f2d0c1da1e76e2d0c5b25c7718ce90820' (770)
+2026-05-08 08:16:30: Crea cartella C:/Users/macand/ContiNew/.git/objects/3c
+2026-05-08 08:16:30: Crea cartella C:/Users/macand/ContiNew/.git/objects/3e
+2026-05-08 08:16:30: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/3b/fc0bb8489f20f2ae7881539529a81b787f355b' -> 'C:/Users/macand/ContiNew/.git/objects/3b/fc0bb8489f20f2ae7881539529a81b787f355b' (305)
+2026-05-08 08:16:30: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/3a/a5987b77ebaba9ff6eed3e2f7e6380831d2e6d' -> 'C:/Users/macand/ContiNew/.git/objects/3a/a5987b77ebaba9ff6eed3e2f7e6380831d2e6d' (257)
+2026-05-08 08:16:30: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/3c/9294a71925d8d722ed8166c5e6202b9d0a116f' -> 'C:/Users/macand/ContiNew/.git/objects/3c/9294a71925d8d722ed8166c5e6202b9d0a116f' (326,946)
+2026-05-08 08:16:30: Crea cartella C:/Users/macand/ContiNew/.git/objects/3f
+2026-05-08 08:16:30: Crea cartella C:/Users/macand/ContiNew/.git/objects/40
+2026-05-08 08:16:31: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/3e/c4262b3c94760119665791a8e0b5e52ab33344' -> 'C:/Users/macand/ContiNew/.git/objects/3e/c4262b3c94760119665791a8e0b5e52ab33344' (789)
+2026-05-08 08:16:31: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/3e/14e17e34d2b6b5efdc482e5e9728bda5602992' -> 'C:/Users/macand/ContiNew/.git/objects/3e/14e17e34d2b6b5efdc482e5e9728bda5602992' (184)
+2026-05-08 08:16:31: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/3f/df3da5bf1cf7b921bdda380908a36aaccf70a4' -> 'C:/Users/macand/ContiNew/.git/objects/3f/df3da5bf1cf7b921bdda380908a36aaccf70a4' (3,777)
+2026-05-08 08:16:31: Crea cartella C:/Users/macand/ContiNew/.git/objects/41
+2026-05-08 08:16:31: Crea cartella C:/Users/macand/ContiNew/.git/objects/42
+2026-05-08 08:16:31: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/40/1b38d62e0e2b7b8fd42170a4d3581088a44b80' -> 'C:/Users/macand/ContiNew/.git/objects/40/1b38d62e0e2b7b8fd42170a4d3581088a44b80' (3,826)
+2026-05-08 08:16:31: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/40/819bbb5395e4d565cf4960b55dd3c49bd12153' -> 'C:/Users/macand/ContiNew/.git/objects/40/819bbb5395e4d565cf4960b55dd3c49bd12153' (298)
+2026-05-08 08:16:32: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/42/ca887eb4dd78cd21a9f0ec564c5e27f205a93b' -> 'C:/Users/macand/ContiNew/.git/objects/42/ca887eb4dd78cd21a9f0ec564c5e27f205a93b' (77,647)
+2026-05-08 08:16:32: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/41/a8a7cfc2cf9ff540e02974fb4122c08014fcd8' -> 'C:/Users/macand/ContiNew/.git/objects/41/a8a7cfc2cf9ff540e02974fb4122c08014fcd8' (308)
+2026-05-08 08:16:32: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/42/8b3ecc8b5e4558f84e82d05910cc4d7cfb7af9' -> 'C:/Users/macand/ContiNew/.git/objects/42/8b3ecc8b5e4558f84e82d05910cc4d7cfb7af9' (453)
+2026-05-08 08:16:32: Crea cartella C:/Users/macand/ContiNew/.git/objects/43
+2026-05-08 08:16:32: Crea cartella C:/Users/macand/ContiNew/.git/objects/45
+2026-05-08 08:16:32: Crea cartella C:/Users/macand/ContiNew/.git/objects/46
+2026-05-08 08:16:33: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/45/9242d0f29f41d23a70db1c5842dd5b8e14f5ee' -> 'C:/Users/macand/ContiNew/.git/objects/45/9242d0f29f41d23a70db1c5842dd5b8e14f5ee' (1,039)
+2026-05-08 08:16:33: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/45/99ebb9cb1067eafaa6fb72fb3da76d899d8f98' -> 'C:/Users/macand/ContiNew/.git/objects/45/99ebb9cb1067eafaa6fb72fb3da76d899d8f98' (16,617)
+2026-05-08 08:16:33: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/41/cb7bc5202eb31cffc1aebaad7c423cb39bad29' -> 'C:/Users/macand/ContiNew/.git/objects/41/cb7bc5202eb31cffc1aebaad7c423cb39bad29' (3,585)
+2026-05-08 08:16:34: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/46/59240c5824176c8e6e83591dea58b1397e65b0' -> 'C:/Users/macand/ContiNew/.git/objects/46/59240c5824176c8e6e83591dea58b1397e65b0' (17,557)
+2026-05-08 08:16:34: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/46/8ed235923a26482063009f9a77b8f2847c50e3' -> 'C:/Users/macand/ContiNew/.git/objects/46/8ed235923a26482063009f9a77b8f2847c50e3' (129)
+2026-05-08 08:16:34: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/46/e188d7e5903f9897f77c304004c96dd194c1d4' -> 'C:/Users/macand/ContiNew/.git/objects/46/e188d7e5903f9897f77c304004c96dd194c1d4' (204,822)
+2026-05-08 08:16:34: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/45/e49363bc23f8d395d2e17b96b5653c11552fd5' -> 'C:/Users/macand/ContiNew/.git/objects/45/e49363bc23f8d395d2e17b96b5653c11552fd5' (689)
+2026-05-08 08:16:35: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/43/2f24ceb26d91f16c53abac7608d5e3cb3b3cab' -> 'C:/Users/macand/ContiNew/.git/objects/43/2f24ceb26d91f16c53abac7608d5e3cb3b3cab' (173)
+2026-05-08 08:16:35: Crea cartella C:/Users/macand/ContiNew/.git/objects/47
+2026-05-08 08:16:35: Crea cartella C:/Users/macand/ContiNew/.git/objects/48
+2026-05-08 08:16:35: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/43/3e54ffcc80aedb82a29f2ba235367e9fa9404d' -> 'C:/Users/macand/ContiNew/.git/objects/43/3e54ffcc80aedb82a29f2ba235367e9fa9404d' (4,352)
+2026-05-08 08:16:35: Stop requested by Stop By User: #1
+2026-05-08 08:16:35: copying Mod time: Stop By User
+2026-05-08 08:16:35: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/48/c22b3e6fe2be6ecbb788634b5f7a7550b197c5' -> 'C:/Users/macand/ContiNew/.git/objects/48/c22b3e6fe2be6ecbb788634b5f7a7550b197c5' (86)
+2026-05-08 08:16:35: worker: Stop By User
+2026-05-08 08:16:35: copying Mod time: Stop By User
+2026-05-08 08:16:35: copying Mod time: Stop By User
+2026-05-08 08:16:35: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/47/141b76e6cc2b2c91b7a931125479ea40c944ca' -> 'C:/Users/macand/ContiNew/.git/objects/47/141b76e6cc2b2c91b7a931125479ea40c944ca' (129)
+2026-05-08 08:16:35: Copia (creazione) 'dropbox://api.dropboxapi.com/CursorAppMacCdc/.git/objects/43/b00139a25d4405bda987e0418995df01640690' -> 'C:/Users/macand/ContiNew/.git/objects/43/b00139a25d4405bda987e0418995df01640690' (2,707)
+2026-05-08 08:16:36: Salva Rapporto di stato dropbox://api.dropboxapi.com/CursorAppMacCdc/_gsdata_/_file_state_v4._gs
+2026-05-08 08:16:37: Salva Rapporto di stato C:/Users/macand/ContiNew/_gsdata_/_file_state_v4._gs
+2026-05-08 08:16:37: worker: Stop By User
