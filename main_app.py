@@ -43,6 +43,7 @@ import data_workspace
 import mail_gate
 import periodiche
 import security_auth
+import tk_foreground
 
 try:
     from app_version import APP_VERSION
@@ -30449,7 +30450,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     root.after(900, _poll_registration_once)
 
     def _present_main_window() -> None:
-        """Mostra la finestra principale solo a UI pronta; evita flash nero (fullscreen Cocoa) su macOS."""
+        """Mostra la finestra principale solo a UI pronta e portala davanti all'avvio."""
         try:
             if platform.system() == "Darwin":
                 try:
@@ -30466,8 +30467,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 except Exception:
                     pass
             root.deiconify()
-            root.lift()
-            root.focus_force()
+            tk_foreground.present_window(root)
             root.update_idletasks()
 
             def _dock_icon_when_safe() -> None:
