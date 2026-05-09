@@ -44,6 +44,13 @@ import mail_gate
 import periodiche
 import security_auth
 
+import cdc_ui_palette
+import cdc_ui_theme
+try:
+    import sv_ttk
+except ImportError:
+    sv_ttk = None  # pragma: no cover - fallback se ``pip install sv-ttk`` non fatto
+
 try:
     from app_version import APP_VERSION
 except ImportError:  # pragma: no cover - esecuzione da sorgente senza modulo
@@ -56,14 +63,30 @@ VER_PDF_DISABLE_CUTOFF_DATE_FILTER = False
 
 # Sfondo pagina Movimenti (allineato al login).
 MOVIMENTI_PAGE_BG = security_auth.CDC_AZZURRO_CHIARO_BG
-# Toni azzurri per griglie, calendari e campi (coerenza tra tutte le schede).
-CDC_GRID_STRIPE0_BG = "#d0e8f4"
-CDC_GRID_STRIPE1_BG = "#e4f3fa"
-CDC_GRID_HEADING_BG = "#bdddf0"
+
+# Chip «tipo tab» per la selezione dei filtri in Movimenti (modalità, preset data/registrazione, ecc.);
+# separati dai tab delle pagine in alto, che usano i token «tipo» / gruppo palette «Finestra login e barra schede pagine».
+MOV_FILTER_TAB_BTN_BG = security_auth.CDC_TIPO_TASTI_BTN_BG
+MOV_FILTER_TAB_BTN_HOVER_BG = security_auth.CDC_TIPO_TASTI_BTN_HOVER_BG
+MOV_FILTER_TAB_BTN_ACTIVE_BG = security_auth.CDC_TIPO_TASTI_BTN_ACTIVE_BG
+MOV_FILTER_TAB_BTN_FG = security_auth.CDC_TIPO_TASTI_BTN_FG
+# Cornice chip filtri Movimenti, Statistiche, Budget (stesso spessore barra schede e login tipo-tasti).
+CDC_FILTER_TAB_CHIP_BD = security_auth.CDC_TIPO_TASTI_BTN_BD
+
+# Griglie Treeview: due righe beige molto chiari, tono neutro (poco caldo).
+CDC_GRID_STRIPE0_BG = "#eae9e7"
+CDC_GRID_STRIPE1_BG = "#f7f6f4"
+CDC_GRID_HEADING_BG = "#e2e1de"
+# Riga selezionata nei Treeview principali (Movimenti, periodiche, importi; Verifica risultati).
+CDC_GRID_TREEVIEW_SEL_BG = "#7eb9e0"
+CDC_GRID_TREEVIEW_SEL_FG = "#1a1a1a"
 CDC_ENTRY_FIELD_BG = "#f2f9fc"
 CDC_CAL_CELL_BG = "#f6fbfe"
 CDC_CAL_SELECTED_BG = "#8ecae6"
 CDC_CAL_DISABLED_BG = "#dfeaf1"
+CDC_CAL_DISABLED_LABEL_FG = "#999999"
+# Canvas scrollabile della scheda Opzioni (`cdc_ui_palette` e finestra Impostazioni).
+OPZIONI_SCROLL_CANVAS_BG = "#f0f0f0"
 
 from import_legacy import (
     EURO_CONVERSION_RATE,
@@ -115,6 +138,31 @@ _BOOT_DROPBOX_CONFIRM_WITHIN_SECONDS = 5 * 60
 # Stessa regola della colonna Importo nella griglia movimenti.
 COLOR_AMOUNT_POS = "#006400"
 COLOR_AMOUNT_NEG = "#b22222"
+
+# Testo/style Movimenti (modificabili da Opzioni → tema; `_base_palette_map`` li legge per i default)
+UI_FG_GRID_PRIMARY = "#1a1a1a"
+# Riepilogo testuale della ricerca sopra la griglia (separato dall’aspetto intestazioni colonne).
+UI_FG_MOV_SEARCH_CAPTION = "#1a1a1a"
+UI_FG_FILTER_LABEL = "#1a1a1a"
+UI_FG_FILTER_ENTRY = "#111111"
+
+
+def _palette_runtime_attr(name: str) -> object:
+    """Attributo sul modulo in esecuzione (`main_app` o `__main__` quando si usa `python main_app.py`)."""
+    import sys
+
+    return getattr(sys.modules[__name__], name)
+
+
+def _mirror_palette_runtime_global(name: str, value: object) -> None:
+    """Allinea costanti tema fra `sys.modules[__name__]` e `main_app` se il file è caricato due volte."""
+    import sys
+
+    primary = sys.modules[__name__]
+    setattr(primary, name, value)
+    dup = sys.modules.get("main_app")
+    if dup is not None and dup is not primary:
+        setattr(dup, name, value)
 
 
 def _darwin_prepare_stdin_for_tk_aqua() -> None:
@@ -1502,7 +1550,7 @@ def build_immissione_calendar_toplevel(
                 cell.configure(cursor="hand2")
                 cell.bind("<Button-1>", lambda _e, dd=dsel: _cell_pick(dd))
             else:
-                cell.configure(fg="#999999", bg=CDC_CAL_DISABLED_BG)
+                cell.configure(fg=CDC_CAL_DISABLED_LABEL_FG, bg=CDC_CAL_DISABLED_BG)
 
             if dsel == selected_date:
                 cell.configure(
@@ -1750,10 +1798,19 @@ def format_category_note_stored(note: str) -> str:
 
 
 def format_record_note_stored(note: str) -> str:
-    t = clip_text((note or "").strip(), MAX_RECORD_NOTE_LEN)
-    if not t:
+    """Nota da salvare: preserva spazi iniziali/finali; primo carattere alfabetico minuscolo → maiuscolo."""
+    t = clip_text(note or "", MAX_RECORD_NOTE_LEN)
+    if not t.strip():
+        return ""
+    i = 0
+    while i < len(t) and t[i].isspace():
+        i += 1
+    if i >= len(t):
         return t
-    return t[0].upper() + t[1:]
+    c = t[i]
+    if c.islower():
+        t = t[:i] + c.upper() + t[i + 1 :]
+    return t
 
 
 def sync_record_category_names_if_identical_old(
@@ -2387,14 +2444,26 @@ def parse_lire_amount_input(s: str) -> Decimal:
     return Decimal(int(t))
 
 
-def sanitize_single_line_text(value: str, *, max_len: int | None = None) -> str:
-    """Normalizza testo utente su una riga (rimuove caratteri di controllo) e applica trim/lunghezza."""
+def sanitize_single_line_text(value: str, *, max_len: int | None = None, strip_edges: bool = True) -> str:
+    """Normalizza testo utente su una riga (rimuove caratteri di controllo) e lunghezza massima.
+
+    ``strip_edges``: se True rimuove spazi (e tab) iniziali/finali — per Assegno e Nota delle
+    registrazioni usare ``False`` così gli spazi ai bordi restano come immessi dall'utente.
+    """
     raw = value or ""
-    out = "".join((" " if (ord(ch) < 32 or ord(ch) == 127) else ch) for ch in raw).strip()
+    out = "".join((" " if (ord(ch) < 32 or ord(ch) == 127) else ch) for ch in raw)
+    if strip_edges:
+        out = out.strip()
     return out[:max_len] if max_len is not None else out
 
 
-def bind_limited_single_line_text_entry(entry: tk.Misc, var: tk.StringVar, *, max_len: int) -> None:
+def bind_limited_single_line_text_entry(
+    entry: tk.Misc,
+    var: tk.StringVar,
+    *,
+    max_len: int,
+    strip_edges: bool = True,
+) -> None:
     """Impedisce a un campo testuale breve di superare il limite anche durante digitazione/incolla."""
     busy = [False]
 
@@ -2402,7 +2471,7 @@ def bind_limited_single_line_text_entry(entry: tk.Misc, var: tk.StringVar, *, ma
         if busy[0]:
             return
         current = var.get() or ""
-        cleaned = sanitize_single_line_text(current, max_len=max_len)
+        cleaned = sanitize_single_line_text(current, max_len=max_len, strip_edges=strip_edges)
         if cleaned == current:
             return
         busy[0] = True
@@ -8465,6 +8534,10 @@ def build_ui(
             changed = True
         if migrate_ensure_budget_ui_prefs(db_holder[0]):
             changed = True
+        if cdc_ui_theme.migrate_ensure_ui_color_overrides(db_holder[0]):
+            changed = True
+        if cdc_ui_theme.migrate_ui_color_token_consolidation(db_holder[0]):
+            changed = True
         if changed:
             save_encrypted_db_dual(db_holder[0], path_holder[0], key_path_holder[0])
     except Exception:
@@ -8516,9 +8589,6 @@ def build_ui(
     cdc_content.rowconfigure(0, weight=1)
     cdc_content.columnconfigure(0, weight=1)
 
-    _tipo_bg = security_auth.CDC_TIPO_TASTI_BTN_BG
-    _tipo_act = security_auth.CDC_TIPO_TASTI_BTN_ACTIVE_BG
-    _tipo_fg = security_auth.CDC_TIPO_TASTI_BTN_FG
     _TAB_BAR_FONT = ("TkDefaultFont", 13, "bold")
     _nb_style = ttk.Style(root)
     _nb_style.configure("MovCdc.TFrame", background=MOVIMENTI_PAGE_BG, fieldbackground=MOVIMENTI_PAGE_BG)
@@ -8609,11 +8679,24 @@ def build_ui(
 
     def _cdc_sync_tab_style() -> None:
         cur = _cdc_current[0]
+        _bd = CDC_FILTER_TAB_CHIP_BD
         for fr, lbl in _frame_to_tab_label.items():
             if fr is cur:
-                lbl.configure(bg=_tipo_act, relief=tk.SUNKEN, bd=2, highlightthickness=0)
+                lbl.configure(
+                    bg=security_auth.CDC_TIPO_TASTI_BTN_ACTIVE_BG,
+                    fg=security_auth.CDC_TIPO_TASTI_BTN_FG,
+                    relief=tk.SUNKEN,
+                    bd=_bd,
+                    highlightthickness=0,
+                )
             else:
-                lbl.configure(bg=_tipo_bg, relief=tk.RAISED, bd=1, highlightthickness=0)
+                lbl.configure(
+                    bg=security_auth.CDC_TIPO_TASTI_BTN_BG,
+                    fg=security_auth.CDC_TIPO_TASTI_BTN_FG,
+                    relief=tk.RAISED,
+                    bd=_bd,
+                    highlightthickness=0,
+                )
 
     def _cdc_forget_plan_conti_bar() -> None:
         if not _plan_conti_visible[0]:
@@ -8643,6 +8726,20 @@ def build_ui(
                     refresh_balance_footer()
                 except NameError:
                     pass
+            else:
+
+                def _mov_saldi_layout_kick() -> None:
+                    try:
+                        refresh_balance_footer()
+                    except NameError:
+                        pass
+                    try:
+                        movimenti_main_stack.update_idletasks()
+                        balance_footer.update_idletasks()
+                    except tk.TclError:
+                        pass
+
+                root.after_idle(_mov_saldi_layout_kick)
         elif _new is verifica_frame:
             fn = _ver_on_tab_enter_fn[0]
             if fn is not None:
@@ -8702,19 +8799,39 @@ def build_ui(
             _notebook_virtuale_tab_guard()
         except NameError:
             pass
+        # Su alcuni ambienti (es. Tk su macOS) il contenuto non viene ridisegnato finché non arriva
+        # un evento successivo (es. Leave sulla barra tab): forziamo il layout dopo il passaggio di tab.
+        try:
+            f.update_idletasks()
+            cdc_content.update_idletasks()
+            root.update_idletasks()
+        except tk.TclError:
+            pass
+
+        def _cdc_kick_tab_redraw() -> None:
+            try:
+                f.update_idletasks()
+                cdc_content.update_idletasks()
+            except tk.TclError:
+                pass
+
+        try:
+            root.after_idle(_cdc_kick_tab_redraw)
+        except tk.TclError:
+            pass
 
     def _mk_cdc_tab(title: str, frame: tk.Widget) -> tk.Label:
         lbl = tk.Label(
             cdc_tab_btn_row,
             text=title,
             font=_TAB_BAR_FONT,
-            bg=_tipo_bg,
-            fg=_tipo_fg,
-            padx=10,
-            pady=5,
+            bg=security_auth.CDC_TIPO_TASTI_BTN_BG,
+            fg=security_auth.CDC_TIPO_TASTI_BTN_FG,
+            padx=14,
+            pady=8,
             cursor="hand2",
             relief=tk.RAISED,
-            bd=1,
+            bd=CDC_FILTER_TAB_CHIP_BD,
             highlightthickness=0,
         )
 
@@ -8723,7 +8840,7 @@ def build_ui(
 
         def _ent(_e: tk.Event) -> None:
             if _cdc_current[0] is not frame:
-                lbl.configure(bg=_tipo_act)
+                lbl.configure(bg=security_auth.CDC_TIPO_TASTI_BTN_HOVER_BG)
 
         def _lev(_e: tk.Event) -> None:
             _cdc_sync_tab_style()
@@ -8860,7 +8977,7 @@ def build_ui(
     reg_controls_row.pack_forget()
 
     filters_text_row = ttk.Frame(movimenti_body, style="MovCdc.TFrame")
-    filters_text_row.pack(fill=tk.X, pady=(0, 6))
+    filters_text_row.pack(fill=tk.X, pady=(0, 2))
 
     # Riga filtri testuali (visibile solo in Ricerca per data)
     filters_text_inner = ttk.Frame(filters_text_row, style="MovCdc.TFrame")
@@ -8873,9 +8990,9 @@ def build_ui(
     ttk.Style(root).configure("Filters.TCombobox", font=filter_ui_font)
     ttk.Style(root).configure("Filters.TButton", font=filter_ui_font)
     _mov_style = ttk.Style(root)
-    _mov_style.configure("MovCdc.TLabel", font=filter_ui_font, background=MOVIMENTI_PAGE_BG, foreground="#1a1a1a")
+    _mov_style.configure("MovCdc.TLabel", font=filter_ui_font, background=MOVIMENTI_PAGE_BG, foreground=UI_FG_FILTER_LABEL)
     _mov_style.configure(
-        "MovCdc.TEntry", font=filter_ui_font, fieldbackground=CDC_ENTRY_FIELD_BG, foreground="#111111"
+        "MovCdc.TEntry", font=filter_ui_font, fieldbackground=CDC_ENTRY_FIELD_BG, foreground=UI_FG_FILTER_ENTRY
     )
     _mov_style.configure("MovCdc.TCombobox", font=filter_ui_font, fieldbackground=CDC_ENTRY_FIELD_BG)
 
@@ -8936,8 +9053,8 @@ def build_ui(
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=6,
-        pady=2,
+        padx=14,
+        pady=7,
         bg=_MOV_AGG_CAT_BTN_BG,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -9067,7 +9184,9 @@ def build_ui(
         style="MovCdc.TEntry",
     )
     cheque_entry.pack(side=tk.LEFT, padx=(0, 8))
-    bind_limited_single_line_text_entry(cheque_entry, text_cheque_preview_var, max_len=MAX_CHEQUE_LEN)
+    bind_limited_single_line_text_entry(
+        cheque_entry, text_cheque_preview_var, max_len=MAX_CHEQUE_LEN, strip_edges=False
+    )
 
     ttk.Label(filters_text_inner, text="Nota", style="MovCdc.TLabel").pack(side=tk.LEFT, padx=(0, 6))
     note_entry = ttk.Entry(
@@ -9076,10 +9195,12 @@ def build_ui(
         width=28,
         style="MovCdc.TEntry",
     )
-    bind_limited_single_line_text_entry(note_entry, text_note_preview_var, max_len=MAX_RECORD_NOTE_LEN)
+    bind_limited_single_line_text_entry(
+        note_entry, text_note_preview_var, max_len=MAX_RECORD_NOTE_LEN, strip_edges=False
+    )
     bind_entry_first_char_uppercase(text_note_preview_var, note_entry)
 
-    # Nota, Cerca e Pulisci filtri: pack differito dopo definizione di apply_movement_search / clear.
+    # Nota, Cerca e Pulisci filtri: pack differito dopo definizione di apply_movement_search / clear_movement_filters_to_defaults.
 
     # ---- UI Ricerca per registrazione (preset + range reg + conto) ----
     reg_controls_inner = ttk.Frame(reg_controls_row, style="MovCdc.TFrame")
@@ -9091,8 +9212,8 @@ def build_ui(
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=8,
-        pady=6,
+        padx=12,
+        pady=7,
     )
     reg_btn_all = tk.Label(
         reg_controls_inner,
@@ -9100,8 +9221,8 @@ def build_ui(
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=8,
-        pady=6,
+        padx=12,
+        pady=7,
     )
     reg_btn_last12.pack(side=tk.LEFT, padx=(0, 8))
     reg_btn_all.pack(side=tk.LEFT, padx=(0, 16))
@@ -9270,7 +9391,7 @@ def build_ui(
         ):
             text_account_preview_var.set(_ALL_ACCOUNTS_LABEL)
 
-    records_frame = ttk.Frame(movimenti_body, padding=8, style="MovCdc.TFrame")
+    records_frame = ttk.Frame(movimenti_body, padding=(8, 2, 8, 4), style="MovCdc.TFrame")
     records_frame.pack(fill=tk.BOTH, expand=True)
 
     search_title_var = tk.StringVar(value="")
@@ -9281,15 +9402,14 @@ def build_ui(
         search_title_row,
         textvariable=search_title_var,
         font=("TkDefaultFont", 12, "bold"),
-        fg="#1a1a1a",
+        fg=UI_FG_MOV_SEARCH_CAPTION,
         bg=MOVIMENTI_PAGE_BG,
         anchor="w",
-        justify="left",
     )
-    search_title_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    search_title_label.pack(fill=tk.X, anchor="w")
 
     # ``no_results_block`` / ``no_results_label`` creati dopo i separatori colonna (vedi sotto)
-    # così l’avviso «nessun risultato» non finisce sotto le barre azzurre tra le griglie.
+    # così l’avviso «nessun risultato» non finisce sotto le barre colore intestazione tra le griglie.
 
     mov_style = ttk.Style(root)
     mov_style.configure(
@@ -9315,9 +9435,25 @@ def build_ui(
         borderwidth=1,
         relief="flat",
         background=CDC_GRID_HEADING_BG,
-        foreground="#1a1a1a",
+        foreground=UI_FG_GRID_PRIMARY,
         font=("TkDefaultFont", 10, "bold"),
     )
+
+    # Larghezze colonne dati e celle header custom. Le colonne Treeview restano base:
+    # il piccolo extra serve solo all'intestazione, che su macOS risulta leggermente più stretta.
+    _MOV_CHEQUE_COL_BASE = 76
+    _MOV_AMOUNT_COL_BASE = 116
+    _MOV_CHEQUE_HDR_EXTRA = 10
+    _MOV_AMOUNT_HDR_EXTRA = 8
+    _MOV_CHEQUE_COL_W = _MOV_CHEQUE_COL_BASE
+    _MOV_AMOUNT_COL_W = _MOV_AMOUNT_COL_BASE
+    _MOV_CHEQUE_HDR_W = _MOV_CHEQUE_COL_BASE + _MOV_CHEQUE_HDR_EXTRA
+    _MOV_AMOUNT_HDR_W = _MOV_AMOUNT_COL_BASE + _MOV_AMOUNT_HDR_EXTRA
+    _MOV_CHEQUE_COL_MIN = 68
+    _MOV_AMOUNT_COL_MIN = 96
+    _mov_f_grid_cell = tkfont.Font(root, font=("TkDefaultFont", 11, "bold"))
+    _mov_f_amt_cell = tkfont.Font(root, font=("TkDefaultFont", 12, "bold"))
+    _mov_note_hdr_lpad = 2
 
     # Prima colonna `mov_pad` vuota (1px): su macOS la prima colonna dati ha bug/troncamenti; Reg è la seconda.
     # Solo `show=headings` (no colonna albero #0): così `anchor=e` su Reg allinea a destra correttamente.
@@ -9356,7 +9492,13 @@ def build_ui(
     mov_tree.column("account_primary_flags", width=24, anchor=tk.CENTER, stretch=False, minwidth=22)
     mov_tree.column("account_secondary_name", width=110, anchor="w", stretch=False, minwidth=100)
     mov_tree.column("account_secondary_flags", width=24, anchor=tk.CENTER, stretch=False, minwidth=22)
-    mov_tree.column("cheque", width=76, anchor="w", stretch=False, minwidth=68)
+    mov_tree.column(
+        "cheque",
+        width=_MOV_CHEQUE_COL_W,
+        anchor="w",
+        stretch=False,
+        minwidth=_MOV_CHEQUE_COL_MIN,
+    )
 
     mov_tree.tag_configure("stripe0", background=CDC_GRID_STRIPE0_BG)
     mov_tree.tag_configure("stripe1", background=CDC_GRID_STRIPE1_BG)
@@ -9389,8 +9531,8 @@ def build_ui(
 
         cat = (text_category_applied_var.get() or "").strip()
         acc = (text_account_applied_var.get() or "").strip()
-        chq = (text_cheque_applied_var.get() or "").strip()
-        note = (text_note_applied_var.get() or "").strip()
+        chq = text_cheque_applied_var.get() or ""
+        note = text_note_applied_var.get() or ""
         agg_f = (text_aggregate_category_applied_var.get() or "").strip()
         if agg_f:
             parts.append(f"per categorie il cui nome contiene «{agg_f}»")
@@ -9484,7 +9626,13 @@ def build_ui(
         style="MovGridAmount.Treeview",
     )
     amt_tree.heading("amount_eur", text="Importo", anchor="e")
-    amt_tree.column("amount_eur", width=116, anchor="e", stretch=False, minwidth=96)
+    amt_tree.column(
+        "amount_eur",
+        width=_MOV_AMOUNT_COL_W,
+        anchor="e",
+        stretch=False,
+        minwidth=_MOV_AMOUNT_COL_MIN,
+    )
     amt_tree.tag_configure("neg", foreground=COLOR_AMOUNT_NEG)
     amt_tree.tag_configure("pos", foreground=COLOR_AMOUNT_POS)
     amt_tree.tag_configure("stripe0", background=CDC_GRID_STRIPE0_BG)
@@ -9508,25 +9656,36 @@ def build_ui(
 
     # Intestazioni custom (su macOS ttk può ignorare l'allineamento delle headings).
     header_bg = CDC_GRID_HEADING_BG
-    header_fg = "#1a1a1a"
+    header_fg = UI_FG_GRID_PRIMARY
     header_font = ("TkDefaultFont", 10, "bold")
-    header_row = tk.Frame(records_frame, bg=header_bg)
-    mov_hdr = tk.Frame(header_row, bg=header_bg)
-    amt_hdr = tk.Frame(header_row, bg=header_bg)
-    note_hdr = tk.Frame(header_row, bg=header_bg)
+    try:
+        root.update_idletasks()
+    except tk.TclError:
+        pass
+    mov_records_header_row = tk.Frame(records_frame, bg=header_bg)
+    mov_hdr = tk.Frame(mov_records_header_row, bg=header_bg)
+    amt_hdr = tk.Frame(mov_records_header_row, bg=header_bg)
+    note_hdr = tk.Frame(mov_records_header_row, bg=header_bg)
     # Canale separatore: permette di posizionare la linea leggermente più a sinistra/destra.
     _SEP_CH_W = 6
-    hdr_sep_1 = tk.Frame(header_row, bg=header_bg, width=_SEP_CH_W)
-    hdr_sep_2 = tk.Frame(header_row, bg=header_bg, width=_SEP_CH_W)
+    hdr_sep_1 = tk.Frame(mov_records_header_row, bg=header_bg, width=_SEP_CH_W)
+    hdr_sep_2 = tk.Frame(mov_records_header_row, bg=header_bg, width=_SEP_CH_W)
     hdr_sep_1_line = tk.Frame(hdr_sep_1, bg="#c0c0c0", width=1)
     hdr_sep_2_line = tk.Frame(hdr_sep_2, bg="#c0c0c0", width=1)
 
     # La riga header deve seguire la griglia principale (mov / amt / note).
-    header_row.grid_columnconfigure(0, weight=0, minsize=120)  # mov_hdr
-    header_row.grid_columnconfigure(1, weight=0, minsize=_SEP_CH_W)    # sep
-    header_row.grid_columnconfigure(2, weight=0, minsize=116)  # amt_hdr
-    header_row.grid_columnconfigure(3, weight=0, minsize=_SEP_CH_W)    # sep
-    header_row.grid_columnconfigure(4, weight=1, minsize=180)  # note_hdr
+    # Stesso spessore delle righe Treeview Movimenti (vedi ``rowheight=22`` negli stili sopra).
+    _MOV_HDR_ROW_H = 22
+    mov_records_header_row.grid_rowconfigure(0, minsize=_MOV_HDR_ROW_H)
+    mov_hdr.grid_rowconfigure(0, minsize=_MOV_HDR_ROW_H)
+    amt_hdr.grid_rowconfigure(0, minsize=_MOV_HDR_ROW_H)
+    note_hdr.grid_rowconfigure(0, minsize=_MOV_HDR_ROW_H)
+
+    mov_records_header_row.grid_columnconfigure(0, weight=0, minsize=120)  # mov_hdr
+    mov_records_header_row.grid_columnconfigure(1, weight=0, minsize=_SEP_CH_W)  # sep
+    mov_records_header_row.grid_columnconfigure(2, weight=0, minsize=_MOV_AMOUNT_HDR_W)  # amt_hdr
+    mov_records_header_row.grid_columnconfigure(3, weight=0, minsize=_SEP_CH_W)  # sep
+    mov_records_header_row.grid_columnconfigure(4, weight=1, minsize=180)  # note_hdr
 
     # Mov header columns (pixel widths = come Treeview)
     mov_hdr.grid_columnconfigure(0, minsize=1)    # mov_pad
@@ -9537,7 +9696,7 @@ def build_ui(
     mov_hdr.grid_columnconfigure(5, minsize=24)   # flags
     mov_hdr.grid_columnconfigure(6, minsize=110)  # al conto
     mov_hdr.grid_columnconfigure(7, minsize=24)   # flags2
-    mov_hdr.grid_columnconfigure(8, minsize=76)   # Assegno
+    mov_hdr.grid_columnconfigure(8, minsize=_MOV_CHEQUE_HDR_W)   # Assegno
 
     tk.Label(mov_hdr, text="", bg=header_bg, fg=header_fg, font=header_font).grid(row=0, column=0, sticky="ew")
     tk.Label(mov_hdr, text="Reg #", bg=header_bg, fg=header_fg, font=header_font, anchor="center").grid(row=0, column=1, sticky="ew")
@@ -9547,7 +9706,14 @@ def build_ui(
     tk.Label(mov_hdr, text="", bg=header_bg, fg=header_fg, font=header_font).grid(row=0, column=5, sticky="ew")
     tk.Label(mov_hdr, text="al conto", bg=header_bg, fg=header_fg, font=header_font, anchor="w").grid(row=0, column=6, sticky="ew")
     tk.Label(mov_hdr, text="", bg=header_bg, fg=header_fg, font=header_font).grid(row=0, column=7, sticky="ew")
-    tk.Label(mov_hdr, text="Assegno", bg=header_bg, fg=header_fg, font=header_font, anchor="w").grid(row=0, column=8, sticky="ew")
+    tk.Label(
+        mov_hdr,
+        text="Assegno",
+        bg=header_bg,
+        fg=header_fg,
+        font=header_font,
+        anchor="w",
+    ).grid(row=0, column=8, sticky="nsew")
 
     # Linee verticali in intestazione (mov_hdr): overlay, coerenti con le larghezze del Treeview.
     mov_hdr_vlines: list[tk.Frame] = []
@@ -9606,11 +9772,26 @@ def build_ui(
     mov_hdr.bind("<Configure>", _schedule_mov_hdr_vlines_on_configure, add=True)
     root.after(0, _position_mov_hdr_vlines)
 
-    amt_hdr.grid_columnconfigure(0, weight=1, minsize=116)
-    tk.Label(amt_hdr, text="Importo", bg=header_bg, fg=header_fg, font=header_font, anchor="e").grid(row=0, column=0, sticky="ew")
+    amt_hdr.grid_columnconfigure(0, weight=1, minsize=_MOV_AMOUNT_HDR_W)
+    tk.Label(
+        amt_hdr,
+        text="Importo  ",
+        bg=header_bg,
+        fg=header_fg,
+        font=header_font,
+        anchor="e",
+    ).grid(row=0, column=0, sticky="nsew")
 
-    note_hdr.grid_columnconfigure(0, weight=1, minsize=420)
-    tk.Label(note_hdr, text="Nota", bg=header_bg, fg=header_fg, font=header_font, anchor="w").grid(row=0, column=0, sticky="ew")
+    note_hdr.grid_columnconfigure(0, weight=0, minsize=_mov_note_hdr_lpad)
+    note_hdr.grid_columnconfigure(1, weight=1, minsize=420 - _mov_note_hdr_lpad)
+    tk.Label(
+        note_hdr,
+        text="Nota",
+        bg=header_bg,
+        fg=header_fg,
+        font=header_font,
+        anchor="w",
+    ).grid(row=0, column=1, sticky="nsew")
 
     yscroll = ttk.Scrollbar(records_frame, orient=tk.VERTICAL, command=mov_tree.yview)
 
@@ -9825,8 +10006,8 @@ def build_ui(
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=12,
-        pady=4,
+        padx=14,
+        pady=7,
         bg=_RIPRISTINA_LAYOUT_BG,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -9849,8 +10030,8 @@ def build_ui(
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=12,
-        pady=4,
+        padx=14,
+        pady=7,
         bg=_PRINT_RICERCA_RED,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -9864,8 +10045,8 @@ def build_ui(
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=12,
-        pady=4,
+        padx=14,
+        pady=7,
         bg=_ESPANDI_ELENCO_BG,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -9891,8 +10072,8 @@ def build_ui(
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=12,
-        pady=4,
+        padx=14,
+        pady=7,
         bg=_CORREZIONE_BLUE,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -9911,9 +10092,9 @@ def build_ui(
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=10,
-        pady=4,
-        bg="#ef6c00",
+        padx=14,
+        pady=7,
+        bg=_PRINT_RICERCA_RED,
         fg="#ffffff",
         relief=tk.RAISED,
         bd=1,
@@ -9924,9 +10105,9 @@ def build_ui(
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=10,
-        pady=4,
-        bg="#b71c1c",
+        padx=14,
+        pady=7,
+        bg=_PRINT_RICERCA_RED,
         fg="#ffffff",
         relief=tk.RAISED,
         bd=1,
@@ -10474,10 +10655,10 @@ def build_ui(
         v = tk.StringVar(value=str(rec.get("cheque") or ""))
         ent_edit_cheque = ttk.Entry(frm, textvariable=v, width=MAX_CHEQUE_LEN)
         ent_edit_cheque.grid(row=0, column=1, sticky="w", padx=(8, 0))
-        bind_limited_single_line_text_entry(ent_edit_cheque, v, max_len=MAX_CHEQUE_LEN)
+        bind_limited_single_line_text_entry(ent_edit_cheque, v, max_len=MAX_CHEQUE_LEN, strip_edges=False)
 
         def on_ok() -> None:
-            rec["cheque"] = sanitize_single_line_text(v.get() or "", max_len=MAX_CHEQUE_LEN)
+            rec["cheque"] = sanitize_single_line_text(v.get() or "", max_len=MAX_CHEQUE_LEN, strip_edges=False)
             top.destroy()
             persist_db_after_edit(stable_key, ensure_reselected_visible=True)
 
@@ -10579,12 +10760,12 @@ def build_ui(
         v = tk.StringVar(value=str(rec.get("note") or ""))
         ent_edit_note = ttk.Entry(frm, textvariable=v, width=MAX_RECORD_NOTE_LEN, style="NewReg.TEntry")
         ent_edit_note.grid(row=0, column=1, sticky="w", padx=(8, 0))
-        bind_limited_single_line_text_entry(ent_edit_note, v, max_len=MAX_RECORD_NOTE_LEN)
+        bind_limited_single_line_text_entry(ent_edit_note, v, max_len=MAX_RECORD_NOTE_LEN, strip_edges=False)
         bind_entry_first_char_uppercase(v, ent_edit_note)
 
         def on_ok() -> None:
             rec["note"] = format_record_note_stored(
-                sanitize_single_line_text(v.get() or "", max_len=MAX_RECORD_NOTE_LEN)
+                sanitize_single_line_text(v.get() or "", max_len=MAX_RECORD_NOTE_LEN, strip_edges=False)
             )
             top.destroy()
             persist_db_after_edit(stable_key, ensure_reselected_visible=True)
@@ -11009,7 +11190,15 @@ th {{ background:#efefef; text-align:left; }}
 
     btn_modifica_reg.bind("<Button-1>", on_modifica_reg_click)
     btn_forza_verifica.bind("<Button-1>", on_forza_verifica_click)
+    btn_forza_verifica.bind(
+        "<Enter>", lambda _e: btn_forza_verifica.configure(bg=_PRINT_RICERCA_RED_ACTIVE)
+    )
+    btn_forza_verifica.bind("<Leave>", lambda _e: btn_forza_verifica.configure(bg=_PRINT_RICERCA_RED))
     btn_elimina_reg.bind("<Button-1>", on_elimina_reg_click)
+    btn_elimina_reg.bind(
+        "<Enter>", lambda _e: btn_elimina_reg.configure(bg=_PRINT_RICERCA_RED_ACTIVE)
+    )
+    btn_elimina_reg.bind("<Leave>", lambda _e: btn_elimina_reg.configure(bg=_PRINT_RICERCA_RED))
     for _t in (mov_tree, amt_tree, note_tree):
         _t.bind("<Button-3>", on_movimenti_grid_context_menu, add="+")
         _t.bind("<Button-2>", on_movimenti_grid_context_menu, add="+")
@@ -11024,7 +11213,7 @@ th {{ background:#efefef; text-align:left; }}
     # Colonne griglia: mov | sep | amt | sep | note | scrollbar
     records_frame.grid_columnconfigure(0, weight=0, minsize=120)
     records_frame.grid_columnconfigure(1, weight=0, minsize=_SEP_CH_W)
-    records_frame.grid_columnconfigure(2, weight=0, minsize=116)
+    records_frame.grid_columnconfigure(2, weight=0, minsize=_MOV_AMOUNT_COL_W)
     records_frame.grid_columnconfigure(3, weight=0, minsize=_SEP_CH_W)
     records_frame.grid_columnconfigure(4, weight=1, minsize=180)
     records_frame.grid_columnconfigure(5, weight=0, minsize=20)
@@ -11035,7 +11224,7 @@ th {{ background:#efefef; text-align:left; }}
     search_title_row.grid(row=0, column=0, columnspan=6, sticky="ew", pady=(0, 6))
     correzione_row.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(0, 4))
     corr_left_btns.grid(row=0, column=0, sticky="w", padx=(0, 10))
-    header_row.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(0, 2))
+    mov_records_header_row.grid(row=2, column=0, columnspan=6, sticky="ew", pady=(0, 2))
     mov_hdr.grid(row=0, column=0, sticky="ew")
     hdr_sep_1.grid(row=0, column=1, sticky="nsw")
     amt_hdr.grid(row=0, column=2, sticky="ew")
@@ -11164,8 +11353,8 @@ th {{ background:#efefef; text-align:left; }}
         q_acc_raw = text_account_applied_var.get().strip()
         q_cat = "" if q_cat_raw in ("", _ALL_CATEGORIES_LABEL) else q_cat_raw.lower()
         q_acc = "" if q_acc_raw in ("", _ALL_ACCOUNTS_LABEL) else q_acc_raw.lower()
-        q_chq = text_cheque_applied_var.get().strip().lower()
-        q_note = text_note_applied_var.get().strip().casefold()
+        q_chq = (text_cheque_applied_var.get() or "").lower()
+        q_note = (text_note_applied_var.get() or "").casefold()
         q_amt_raw = (text_amount_applied_var.get() or "").strip()
         q_amt: Decimal | None = None
         if q_amt_raw:
@@ -11453,7 +11642,7 @@ th {{ background:#efefef; text-align:left; }}
                 except Exception:
                     pass
                 try:
-                    header_row.grid()
+                    mov_records_header_row.grid()
                     mov_tree.grid()
                     sep_1.grid()
                     amt_tree.grid()
@@ -11516,7 +11705,7 @@ th {{ background:#efefef; text-align:left; }}
             except Exception:
                 pass
             try:
-                header_row.grid()
+                mov_records_header_row.grid()
                 mov_tree.grid()
                 sep_1.grid()
                 amt_tree.grid()
@@ -11527,9 +11716,9 @@ th {{ background:#efefef; text-align:left; }}
                 pass
             root.after(0, lambda: flush_movement_batch(0))
         else:
-            # Nessun risultato: pannello a tutta la riga elenco (sopra i canali azzurri / separatori).
+            # Nessun risultato: pannello a tutta la riga elenco (sopra i separatori colore intestazione).
             try:
-                header_row.grid_remove()
+                mov_records_header_row.grid_remove()
                 mov_tree.grid_remove()
                 sep_1.grid_remove()
                 amt_tree.grid_remove()
@@ -11544,28 +11733,36 @@ th {{ background:#efefef; text-align:left; }}
             except Exception:
                 pass
 
-    # Toggle filtri: stessa palette «tipo tasti» dei tab (esclusi Pulisci filtri / Cerca).
-    _FILTER_BG_OFF = security_auth.CDC_TIPO_TASTI_BTN_BG
-    _FILTER_BG_ON = security_auth.CDC_TIPO_TASTI_BTN_ACTIVE_BG
-    _FILTER_FG = security_auth.CDC_TIPO_TASTI_BTN_FG
+    # Toggle filtri Movimenti: palette dedicata (`MOV_FILTER_TAB_*` in Opzioni), separata dai tab pagina alto.
 
-    def _set_filter_toggle_style(w: tk.Label, selected: bool) -> None:
+    def _set_filter_toggle_style(w: tk.Label, selected: bool, *, bd_width: int = 1) -> None:
         if selected:
             w.configure(
-                bg=_FILTER_BG_ON,
-                fg=_FILTER_FG,
+                bg=MOV_FILTER_TAB_BTN_ACTIVE_BG,
+                fg=MOV_FILTER_TAB_BTN_FG,
                 relief=tk.SUNKEN,
-                bd=2,
+                bd=bd_width,
                 highlightthickness=0,
             )
         else:
             w.configure(
-                bg=_FILTER_BG_OFF,
-                fg=_FILTER_FG,
+                bg=MOV_FILTER_TAB_BTN_BG,
+                fg=MOV_FILTER_TAB_BTN_FG,
                 relief=tk.RAISED,
-                bd=1,
+                bd=bd_width,
                 highlightthickness=0,
             )
+
+    def _filter_chip_hover(lbl: tk.Label, refresh: Callable[[], None], selected: Callable[[], bool]) -> None:
+        def _ent(_ev: tk.Event) -> None:
+            if not selected():
+                lbl.configure(bg=MOV_FILTER_TAB_BTN_HOVER_BG)
+
+        def _lev(_ev: tk.Event) -> None:
+            refresh()
+
+        lbl.bind("<Enter>", _ent)
+        lbl.bind("<Leave>", _lev)
 
     _FILTER_ROW_BUTTON_GAP = 8
 
@@ -11577,8 +11774,8 @@ th {{ background:#efefef; text-align:left; }}
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=6,
-        pady=4,
+        padx=10,
+        pady=6,
     )
     btn_order_reg = tk.Label(
         g1,
@@ -11586,8 +11783,8 @@ th {{ background:#efefef; text-align:left; }}
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=6,
-        pady=4,
+        padx=10,
+        pady=6,
     )
     btn_order_date.bind("<Button-1>", lambda _e: pick_order("date"))
     btn_order_reg.bind("<Button-1>", lambda _e: pick_order("registration"))
@@ -11602,8 +11799,8 @@ th {{ background:#efefef; text-align:left; }}
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=6,
-        pady=4,
+        padx=10,
+        pady=6,
     )
     btn_future_exclude = tk.Label(
         g2,
@@ -11611,8 +11808,8 @@ th {{ background:#efefef; text-align:left; }}
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=6,
-        pady=4,
+        padx=10,
+        pady=6,
     )
     btn_future_include.bind("<Button-1>", lambda _e: pick_future("include"))
     btn_future_exclude.bind("<Button-1>", lambda _e: pick_future("exclude"))
@@ -11627,8 +11824,8 @@ th {{ background:#efefef; text-align:left; }}
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=6,
-        pady=4,
+        padx=10,
+        pady=6,
     )
     btn_dir_forward = tk.Label(
         g3,
@@ -11636,8 +11833,8 @@ th {{ background:#efefef; text-align:left; }}
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=6,
-        pady=4,
+        padx=10,
+        pady=6,
     )
     btn_dir_backward.bind("<Button-1>", lambda _e: pick_direction("backward"))
     btn_dir_forward.bind("<Button-1>", lambda _e: pick_direction("forward"))
@@ -11645,12 +11842,13 @@ th {{ background:#efefef; text-align:left; }}
     btn_dir_forward.pack(side=tk.LEFT)
 
     def refresh_movement_filter_button_styles() -> None:
-        _set_filter_toggle_style(btn_order_date, filter_order_preview_var.get() == "date")
-        _set_filter_toggle_style(btn_order_reg, filter_order_preview_var.get() == "registration")
-        _set_filter_toggle_style(btn_future_include, filter_future_preview_var.get() == "include")
-        _set_filter_toggle_style(btn_future_exclude, filter_future_preview_var.get() == "exclude")
-        _set_filter_toggle_style(btn_dir_backward, filter_direction_preview_var.get() == "backward")
-        _set_filter_toggle_style(btn_dir_forward, filter_direction_preview_var.get() == "forward")
+        _bd = CDC_FILTER_TAB_CHIP_BD
+        _set_filter_toggle_style(btn_order_date, filter_order_preview_var.get() == "date", bd_width=_bd)
+        _set_filter_toggle_style(btn_order_reg, filter_order_preview_var.get() == "registration", bd_width=_bd)
+        _set_filter_toggle_style(btn_future_include, filter_future_preview_var.get() == "include", bd_width=_bd)
+        _set_filter_toggle_style(btn_future_exclude, filter_future_preview_var.get() == "exclude", bd_width=_bd)
+        _set_filter_toggle_style(btn_dir_backward, filter_direction_preview_var.get() == "backward", bd_width=_bd)
+        _set_filter_toggle_style(btn_dir_forward, filter_direction_preview_var.get() == "forward", bd_width=_bd)
 
     def pick_order(which: str) -> None:
         if filter_order_preview_var.get() == which:
@@ -11689,6 +11887,19 @@ th {{ background:#efefef; text-align:left; }}
             refresh_registration_scope_and_controls()
         except Exception:
             pass
+
+    _filter_chip_hover(btn_order_date, refresh_movement_filter_button_styles, lambda: filter_order_preview_var.get() == "date")
+    _filter_chip_hover(
+        btn_order_reg, refresh_movement_filter_button_styles, lambda: filter_order_preview_var.get() == "registration"
+    )
+    _filter_chip_hover(btn_future_include, refresh_movement_filter_button_styles, lambda: filter_future_preview_var.get() == "include")
+    _filter_chip_hover(btn_future_exclude, refresh_movement_filter_button_styles, lambda: filter_future_preview_var.get() == "exclude")
+    _filter_chip_hover(
+        btn_dir_backward, refresh_movement_filter_button_styles, lambda: filter_direction_preview_var.get() == "backward"
+    )
+    _filter_chip_hover(
+        btn_dir_forward, refresh_movement_filter_button_styles, lambda: filter_direction_preview_var.get() == "forward"
+    )
 
     def _movement_preview_matches_applied_snapshot(
         o: str,
@@ -11937,9 +12148,26 @@ th {{ background:#efefef; text-align:left; }}
     bind_return_tab_and_kp_enter(cheque_entry, apply_movement_search, add=True)
     bind_return_tab_and_kp_enter(note_entry, apply_movement_search, add=True)
 
-    def clear_movement_text_filters() -> None:
-        # Solo filtri testuali (categoria, conti, importo, …). Ordine, date future, preset intervallo
-        # data/registrazione e «Ultimi 12 mesi» / «Tutto il periodo» restano come selezionati (no reset visivo).
+    def clear_movement_filters_to_defaults() -> None:
+        """Ripristina tutti i filtri di ricerca ai default iniziali (come all'avvio) e applica «Cerca»."""
+        nonlocal date_custom_manual_override
+
+        date_custom_manual_override = False
+
+        filter_order_preview_var.set("date")
+        filter_future_preview_var.set("include")
+        filter_direction_preview_var.set("backward")
+
+        reg_preset_preview_var.set("last_12")
+        reg_from_preview_var.set("")
+        reg_to_preview_var.set("")
+
+        date_preset_preview_var.set("last_12")
+        try:
+            date_year_var.set("Anno")
+        except Exception:
+            pass
+
         text_category_preview_var.set(_ALL_CATEGORIES_LABEL)
         text_account_preview_var.set(_ALL_ACCOUNTS_LABEL)
         text_aggregate_category_preview_var.set("")
@@ -11947,17 +12175,45 @@ th {{ background:#efefef; text-align:left; }}
         text_amount_preview_var.set("-")
         text_cheque_preview_var.set("")
         text_note_preview_var.set("")
+
         try:
-            if filter_order_preview_var.get() == "date":
-                refresh_category_account_dropdowns()
-            else:
-                refresh_registration_scope_and_controls()
+            refresh_date_preview_from_modes(normalize_custom_range=True)
+        except Exception:
+            try:
+                refresh_date_fields_from_current_preset()
+            except Exception:
+                pass
+
+        try:
+            refresh_movement_filter_button_styles()
         except Exception:
             pass
+        try:
+            refresh_reg_preset_button_styles()
+        except Exception:
+            pass
+        try:
+            refresh_date_preset_button_styles()
+        except Exception:
+            pass
+
         try:
             refresh_date_controls_visibility()
         except Exception:
             pass
+        try:
+            refresh_date_year_menu()
+        except Exception:
+            pass
+        try:
+            refresh_category_account_dropdowns()
+        except Exception:
+            pass
+        try:
+            _sync_filters_search_spacer_width()
+        except Exception:
+            pass
+
         apply_movement_search()
         try:
             category_entry.focus_set()
@@ -11966,8 +12222,8 @@ th {{ background:#efefef; text-align:left; }}
 
     _CERCA_GREEN = "#2e7d32"
     _CERCA_GREEN_ACTIVE = "#1b5e20"
-    _PULISCI_BLUE = "#1565c0"
-    _PULISCI_BLUE_ACTIVE = "#0d47a1"
+    _MOV_PULISCI_ACCEDI_BG = "#1565c0"
+    _MOV_PULISCI_ACCEDI_HOVER_BG = "#0d47a1"
     cerca_wrap = tk.Frame(filters_row, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
     lbl_cerca = tk.Label(
         cerca_wrap,
@@ -11975,9 +12231,9 @@ th {{ background:#efefef; text-align:left; }}
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        width=14,
-        padx=10,
-        pady=5,
+        width=8,
+        padx=8,
+        pady=6,
         bg=_CERCA_GREEN,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -12000,10 +12256,10 @@ th {{ background:#efefef; text-align:left; }}
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        width=10,
-        padx=10,
-        pady=5,
-        bg=_PULISCI_BLUE,
+        width=19,
+        padx=12,
+        pady=6,
+        bg=_MOV_PULISCI_ACCEDI_BG,
         fg="#ffffff",
         relief=tk.RAISED,
         bd=1,
@@ -12013,14 +12269,14 @@ th {{ background:#efefef; text-align:left; }}
     lbl_pulisci_filtri.pack(side=tk.LEFT, padx=(_FILTER_ROW_BUTTON_GAP, 0))
 
     def _pulisci_enter(_e: tk.Event) -> None:
-        lbl_pulisci_filtri.configure(bg=_PULISCI_BLUE_ACTIVE)
+        lbl_pulisci_filtri.configure(bg=_MOV_PULISCI_ACCEDI_HOVER_BG)
 
     def _pulisci_leave(_e: tk.Event) -> None:
-        lbl_pulisci_filtri.configure(bg=_PULISCI_BLUE)
+        lbl_pulisci_filtri.configure(bg=_MOV_PULISCI_ACCEDI_BG)
 
     lbl_pulisci_filtri.bind("<Enter>", _pulisci_enter)
     lbl_pulisci_filtri.bind("<Leave>", _pulisci_leave)
-    lbl_pulisci_filtri.bind("<Button-1>", lambda _e: clear_movement_text_filters())
+    lbl_pulisci_filtri.bind("<Button-1>", lambda _e: clear_movement_filters_to_defaults())
 
     filters_search_spacer = tk.Frame(
         filters_search_row, highlightthickness=0, borderwidth=0, bg=MOVIMENTI_PAGE_BG
@@ -12579,8 +12835,9 @@ th {{ background:#efefef; text-align:left; }}
         refresh_date_controls_visibility()
 
     def refresh_reg_preset_button_styles() -> None:
-        _set_filter_toggle_style(reg_btn_last12, reg_preset_preview_var.get() == "last_12")
-        _set_filter_toggle_style(reg_btn_all, reg_preset_preview_var.get() == "all_time")
+        _bd = CDC_FILTER_TAB_CHIP_BD
+        _set_filter_toggle_style(reg_btn_last12, reg_preset_preview_var.get() == "last_12", bd_width=_bd)
+        _set_filter_toggle_style(reg_btn_all, reg_preset_preview_var.get() == "all_time", bd_width=_bd)
 
     def pick_reg_preset(preset_id: str) -> None:
         if reg_preset_preview_var.get() == preset_id:
@@ -12594,6 +12851,8 @@ th {{ background:#efefef; text-align:left; }}
 
     reg_btn_last12.bind("<Button-1>", lambda _e: pick_reg_preset("last_12"))
     reg_btn_all.bind("<Button-1>", lambda _e: pick_reg_preset("all_time"))
+    _filter_chip_hover(reg_btn_last12, refresh_reg_preset_button_styles, lambda: reg_preset_preview_var.get() == "last_12")
+    _filter_chip_hover(reg_btn_all, refresh_reg_preset_button_styles, lambda: reg_preset_preview_var.get() == "all_time")
 
     # Enter nei campi reg = esegui Cerca (con validazione in apply_movement_search)
     bind_return_and_kp_enter(reg_from_entry, apply_movement_search)
@@ -12616,7 +12875,7 @@ th {{ background:#efefef; text-align:left; }}
                 return
             main_end = main.winfo_x() + main.winfo_width()
             w = max(0, int(target_x - main_end))
-            h = 28
+            h = 34
             filters_search_spacer.configure(width=w, height=h)
             filters_search_spacer.pack_propagate(False)
         except Exception:
@@ -12640,8 +12899,9 @@ th {{ background:#efefef; text-align:left; }}
     presets_row.pack(side=tk.LEFT)
 
     def refresh_date_preset_button_styles() -> None:
+        _bd = CDC_FILTER_TAB_CHIP_BD
         for pid, btn in date_preset_buttons.items():
-            _set_filter_toggle_style(btn, date_preset_preview_var.get() == pid)
+            _set_filter_toggle_style(btn, date_preset_preview_var.get() == pid, bd_width=_bd)
 
     def pick_date_preset(preset_id: str) -> None:
         if date_preset_preview_var.get() == preset_id and preset_id != "custom":
@@ -12683,12 +12943,19 @@ th {{ background:#efefef; text-align:left; }}
             cursor="hand2",
             highlightthickness=0,
             font=filter_ui_font,
-            padx=8,
-            pady=6,
+            padx=12,
+            pady=7,
         )
         b.bind("<Button-1>", lambda _e, _pid=pid: pick_date_preset(_pid))
         b.pack(side=tk.LEFT, padx=(0, 8))
         date_preset_buttons[pid] = b
+
+    for _p_h, _b_h in date_preset_buttons.items():
+        _filter_chip_hover(
+            _b_h,
+            refresh_date_preset_button_styles,
+            (lambda _pp=_p_h: date_preset_preview_var.get() == _pp),
+        )
 
     fields_row = ttk.Frame(date_controls_left, style="MovCdc.TFrame")
     fields_row.pack(side=tk.LEFT, padx=(16, 0))
@@ -13995,25 +14262,23 @@ th {{ background:#efefef; text-align:left; }}
         _debug_log(run_id, "H3", "main_app.py:_print_saldi_direct", "fallback_browser_used", {})
         # #endregion
 
-    _PRINT_RED = "#c62828"
-    _PRINT_RED_ACTIVE = "#8e0000"
     btn_stampa_saldi = tk.Label(
         balance_left,
         text="Stampa\nsaldi",
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=8,
-        pady=2,
-        bg=_PRINT_RED,
+        padx=14,
+        pady=7,
+        bg=_PRINT_RICERCA_RED,
         fg="#ffffff",
         relief=tk.RAISED,
         bd=1,
     )
     btn_stampa_saldi.pack(anchor="nw")
     btn_stampa_saldi.bind("<Button-1>", lambda _e: _print_saldi_direct())
-    btn_stampa_saldi.bind("<Enter>", lambda _e: btn_stampa_saldi.configure(bg=_PRINT_RED_ACTIVE))
-    btn_stampa_saldi.bind("<Leave>", lambda _e: btn_stampa_saldi.configure(bg=_PRINT_RED))
+    btn_stampa_saldi.bind("<Enter>", lambda _e: btn_stampa_saldi.configure(bg=_PRINT_RICERCA_RED_ACTIVE))
+    btn_stampa_saldi.bind("<Leave>", lambda _e: btn_stampa_saldi.configure(bg=_PRINT_RICERCA_RED))
 
     def _align_stampa_saldi_to_middle_row() -> None:
         """Centro verticale del tasto = centro dell’etichetta «Disponibilità assoluta» (non solo minsize teorico)."""
@@ -14083,6 +14348,12 @@ th {{ background:#efefef; text-align:left; }}
             header_font = ("TkDefaultFont", 11, "bold")
             amount_font = ("TkDefaultFont", 11, "bold")
             AMT_CELL_WIDTH = 16
+            _hdr_bg = CDC_GRID_HEADING_BG
+            _hdr_fg = UI_FG_GRID_PRIMARY
+
+            def _saldi_footer_data_row_bg(row: int) -> str:
+                """Stesse strisce dei Treeview Movimenti: prima riga importi → stripe0."""
+                return CDC_GRID_STRIPE0_BG if (row - 1) % 2 == 0 else CDC_GRID_STRIPE1_BG
 
             def header_cell(col: int, text: str) -> None:
                 pl, pr = (0, 2) if col == 0 else (0, 4)
@@ -14090,28 +14361,37 @@ th {{ background:#efefef; text-align:left; }}
                     table,
                     text=text,
                     font=header_font,
+                    fg=_hdr_fg,
+                    bg=_hdr_bg,
+                    highlightthickness=0,
                     width=AMT_CELL_WIDTH,
                     anchor="e",
                 ).grid(row=0, column=col, sticky="e", padx=(pl, pr), pady=(0, 0))
 
             def amount_cell(row: int, col: int, amt: Decimal) -> None:
                 pl, pr = (0, 2) if col == 0 else (0, 4)
+                cell_bg = _saldi_footer_data_row_bg(row)
                 tk.Label(
                     table,
                     text=format_saldo_cell("E", amt),
                     font=amount_font,
                     fg=balance_amount_fg(amt),
+                    bg=cell_bg,
+                    highlightthickness=0,
                     width=AMT_CELL_WIDTH,
                     anchor=tk.E,
                 ).grid(row=row, column=col, sticky="e", padx=(pl, pr), pady=(0, 0))
 
             def dash_cell(row: int, col: int) -> None:
                 pl, pr = (0, 2) if col == 0 else (0, 4)
+                cell_bg = _saldi_footer_data_row_bg(row)
                 tk.Label(
                     table,
                     text="—",
                     font=amount_font,
                     fg="#888888",
+                    bg=cell_bg,
+                    highlightthickness=0,
                     width=AMT_CELL_WIDTH,
                     anchor=tk.E,
                 ).grid(row=row, column=col, sticky="e", padx=(pl, pr), pady=(0, 0))
@@ -14152,6 +14432,13 @@ th {{ background:#efefef; text-align:left; }}
                     dash_cell(5, i + 1)
                 else:
                     amount_cell(5, i + 1, amt)
+            for _sr in range(6):
+                row_bg = _hdr_bg if _sr == 0 else _saldi_footer_data_row_bg(_sr)
+                for w in balance_lbl_col.grid_slaves(row=_sr, column=0):
+                    try:
+                        w.configure(bg=row_bg, fg="#000000")
+                    except tk.TclError:
+                        pass
             for _sr in range(6):
                 table.grid_rowconfigure(_sr, minsize=(max(1, _saldo_grid_row_h - 4) if _sr == 0 else _saldo_grid_row_h))
             table.update_idletasks()
@@ -14208,8 +14495,8 @@ th {{ background:#efefef; text-align:left; }}
         font=_TAB_BAR_FONT,
         padx=10,
         pady=5,
-        bg=_tipo_bg,
-        fg=_tipo_fg,
+        bg=MOV_FILTER_TAB_BTN_BG,
+        fg=MOV_FILTER_TAB_BTN_FG,
         relief=tk.RAISED,
         bd=1,
     )
@@ -14221,8 +14508,8 @@ th {{ background:#efefef; text-align:left; }}
         font=_TAB_BAR_FONT,
         padx=10,
         pady=5,
-        bg=_tipo_bg,
-        fg=_tipo_fg,
+        bg=MOV_FILTER_TAB_BTN_BG,
+        fg=MOV_FILTER_TAB_BTN_FG,
         relief=tk.RAISED,
         bd=1,
     )
@@ -14233,16 +14520,40 @@ th {{ background:#efefef; text-align:left; }}
 
     def _nuovi_sync_subtab_style() -> None:
         if nuovi_submode[0] == "new":
-            btn_nuova_reg.configure(bg=_tipo_act, fg=_tipo_fg, relief=tk.SUNKEN, bd=2, highlightthickness=0)
-            btn_reg_periodiche.configure(bg=_tipo_bg, fg=_tipo_fg, relief=tk.RAISED, bd=1, highlightthickness=0)
+            btn_nuova_reg.configure(
+                bg=MOV_FILTER_TAB_BTN_ACTIVE_BG,
+                fg=MOV_FILTER_TAB_BTN_FG,
+                relief=tk.SUNKEN,
+                bd=3,
+                highlightthickness=0,
+            )
+            btn_reg_periodiche.configure(
+                bg=MOV_FILTER_TAB_BTN_BG,
+                fg=MOV_FILTER_TAB_BTN_FG,
+                relief=tk.RAISED,
+                bd=1,
+            )
         else:
-            btn_nuova_reg.configure(bg=_tipo_bg, fg=_tipo_fg, relief=tk.RAISED, bd=1, highlightthickness=0)
-            btn_reg_periodiche.configure(bg=_tipo_act, fg=_tipo_fg, relief=tk.SUNKEN, bd=2, highlightthickness=0)
+            btn_nuova_reg.configure(
+                bg=MOV_FILTER_TAB_BTN_BG,
+                fg=MOV_FILTER_TAB_BTN_FG,
+                relief=tk.RAISED,
+                bd=1,
+            )
+            btn_reg_periodiche.configure(
+                bg=MOV_FILTER_TAB_BTN_ACTIVE_BG,
+                fg=MOV_FILTER_TAB_BTN_FG,
+                relief=tk.SUNKEN,
+                bd=3,
+                highlightthickness=0,
+            )
 
     def _nuovi_subtab_enter(which: str):
         def _on_ent(_e: tk.Event) -> None:
             if nuovi_submode[0] != which:
-                (btn_nuova_reg if which == "new" else btn_reg_periodiche).configure(bg=_tipo_act)
+                (btn_nuova_reg if which == "new" else btn_reg_periodiche).configure(
+                    bg=MOV_FILTER_TAB_BTN_HOVER_BG
+                )
 
         return _on_ent
 
@@ -14450,6 +14761,26 @@ th {{ background:#efefef; text-align:left; }}
     ttk.Style(root).configure("NewReg.TCombobox", font=newreg_ui_font, fieldbackground=MOVIMENTI_PAGE_BG)
     ttk.Style(root).configure("NewReg.TButton", font=newreg_ui_font)
 
+    _newreg_plain_lbl_kw: dict[str, object] = {
+        "bg": MOVIMENTI_PAGE_BG,
+        "highlightthickness": 0,
+        "font": newreg_ui_font,
+        "fg": "#1a1a1a",
+        "anchor": "w",
+        "justify": "left",
+    }
+    _newreg_cat_note_lbl_kw: dict[str, object] = {
+        "bg": MOVIMENTI_PAGE_BG,
+        "highlightthickness": 0,
+        "font": newreg_cat_note_font,
+        "fg": "#000000",
+        "anchor": "w",
+        "justify": "left",
+    }
+
+    _NR_OGGI_BTN_BG = "#1565c0"
+    _NR_OGGI_BTN_ACTIVE_BG = "#0d47a1"
+
     _NUOVI_TITLE_LBL_CH = 40  # usato ancora nel modulo periodiche (titolo compatto)
     nuovi_title_center = tk.Frame(nuova_form_host, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     nuovi_title_center.pack(fill=tk.X, anchor=tk.CENTER, pady=(0, 2))
@@ -14475,16 +14806,49 @@ th {{ background:#efefef; text-align:left; }}
 
     _newreg_py = 2
     _newreg_px = 6
-    ttk.Label(nuova_form_head, text="Data (gg/mm/aaaa)", style="NewReg.TLabel").grid(
+    tk.Label(nuova_form_head, text="Data (gg/mm/aaaa)", **_newreg_plain_lbl_kw).grid(
         row=0, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px)
     )
     row_date = tk.Frame(nuova_form_head, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     ent_date = ttk.Entry(row_date, textvariable=newreg_date_var, width=_NR_W_DATE, style="NewReg.TEntry")
     ent_date.pack(side=tk.LEFT)
-    btn_oggi = ttk.Button(row_date, text="Oggi", style="NewReg.TButton")
+    btn_oggi = tk.Label(
+        row_date,
+        text="Oggi",
+        font=newreg_ui_font,
+        fg="#ffffff",
+        bg=_NR_OGGI_BTN_BG,
+        padx=10,
+        pady=4,
+        cursor="hand2",
+        relief=tk.RAISED,
+        bd=1,
+        highlightthickness=0,
+    )
+
+    def _nr_oggi_btn_enter(_w: tk.Label) -> Callable[[tk.Event], None]:
+        def _f(_e: tk.Event) -> None:
+            try:
+                _w.configure(bg=_NR_OGGI_BTN_ACTIVE_BG)
+            except tk.TclError:
+                pass
+
+        return _f
+
+    def _nr_oggi_btn_leave(_w: tk.Label) -> Callable[[tk.Event], None]:
+        def _f(_e: tk.Event) -> None:
+            try:
+                _w.configure(bg=_NR_OGGI_BTN_BG)
+            except tk.TclError:
+                pass
+
+        return _f
+
+    btn_oggi.bind("<Enter>", _nr_oggi_btn_enter(btn_oggi))
+    btn_oggi.bind("<Leave>", _nr_oggi_btn_leave(btn_oggi))
     btn_oggi.pack(side=tk.LEFT, padx=(6, 0))
     row_date.grid(row=0, column=1, sticky="w", pady=_newreg_py)
-    ttk.Label(nuova_form_head, text="Categoria", style="NewReg.TLabel").grid(
+    tk.Label(nuova_form_head, text="Categoria", **_newreg_plain_lbl_kw).grid(
         row=1, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px)
     )
     cb_cat = ttk.Combobox(
@@ -14502,26 +14866,35 @@ th {{ background:#efefef; text-align:left; }}
     lbl_cat_note = tk.Label(
         nuova_cat_note_row,
         textvariable=newreg_cat_note_var,
-        font=newreg_cat_note_font,
-        bg=MOVIMENTI_PAGE_BG,
-        fg="#000000",
-        anchor="w",
-        justify="left",
-        highlightthickness=0,
+        **_newreg_cat_note_lbl_kw,
     )
     lbl_cat_note.pack(anchor=tk.W, pady=(0, 4))
 
-    ttk.Label(nuova_form, text="Conto", style="NewReg.TLabel").grid(row=0, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
+    tk.Label(nuova_form, text="Conto", **_newreg_plain_lbl_kw).grid(row=0, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
     row_conto_outer = tk.Frame(nuova_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     cb_acc1 = ttk.Combobox(row_conto_outer, textvariable=newreg_acc1_var, state="readonly", width=_NR_W_ACC, style="NewReg.TCombobox")
     cb_acc1.pack(side=tk.LEFT)
-    btn_aggiorna_saldo = ttk.Button(row_conto_outer, text="Aggiorna saldo di cassa", style="NewReg.TButton")
+    btn_aggiorna_saldo = tk.Label(
+        row_conto_outer,
+        text="Aggiorna saldo di cassa",
+        cursor="hand2",
+        highlightthickness=0,
+        font=newreg_ui_font,
+        fg="#ffffff",
+        bg=_NR_OGGI_BTN_BG,
+        padx=10,
+        pady=4,
+        relief=tk.RAISED,
+        bd=1,
+    )
+    btn_aggiorna_saldo.bind("<Enter>", _nr_oggi_btn_enter(btn_aggiorna_saldo))
+    btn_aggiorna_saldo.bind("<Leave>", _nr_oggi_btn_leave(btn_aggiorna_saldo))
     row_conto_outer.grid(row=0, column=1, columnspan=2, sticky="w", pady=_newreg_py)
     nuova_form.columnconfigure(1, weight=0)
     nuova_form.grid_columnconfigure(2, weight=1)
 
     frm_saldo_below_btn = tk.Frame(nuova_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    lbl_acc2 = ttk.Label(nuova_form, text="Secondo conto", style="NewReg.TLabel")
+    lbl_acc2 = tk.Label(nuova_form, text="Secondo conto", **_newreg_plain_lbl_kw)
     row_acc2_outer = tk.Frame(nuova_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     cb_acc2 = ttk.Combobox(row_acc2_outer, textvariable=newreg_acc2_var, state="readonly", width=_NR_W_ACC, style="NewReg.TCombobox")
     cb_acc2.pack(side=tk.LEFT)
@@ -14536,7 +14909,7 @@ th {{ background:#efefef; text-align:left; }}
                                  font=("TkDefaultFont", 11), anchor="w", justify="left")
     lbl_virtuale_nota.pack(anchor=tk.W)
     frm_virtuale_detail = tk.Frame(frm_virtuale_info, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    ttk.Label(frm_virtuale_detail, text="Saldo virtuale (€)", style="NewReg.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+    tk.Label(frm_virtuale_detail, text="Saldo virtuale (€)", **_newreg_plain_lbl_kw).pack(side=tk.LEFT, padx=(0, 6))
     ent_virtuale_saldo = ttk.Entry(frm_virtuale_detail, textvariable=virtuale_display_var, width=_NR_W_AMT, style="NewReg.TEntry")
     ent_virtuale_saldo.pack(side=tk.LEFT, padx=(0, 8))
     btn_scarica_virtuale = ttk.Button(frm_virtuale_detail, text="Scarica saldo virtuale", style="NewReg.TButton")
@@ -14548,37 +14921,60 @@ th {{ background:#efefef; text-align:left; }}
         pass
 
     # Importo (€) + Nuovo saldo di cassa inline (stesso grid row).
-    lbl_importo = ttk.Label(nuova_form, text="Importo (€)", style="NewReg.TLabel")
+    lbl_importo = tk.Label(nuova_form, text="Importo (€)", **_newreg_plain_lbl_kw)
     lbl_importo.grid(row=3, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
     row_amt = tk.Frame(nuova_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     ent_amt = ttk.Entry(row_amt, textvariable=newreg_amount_var, width=_NR_W_AMT, style="NewReg.TEntry")
     ent_amt.pack(side=tk.LEFT)
     newreg_saldo_cassa_var = tk.StringVar(value="")
     ent_saldo = ttk.Entry(row_amt, textvariable=newreg_saldo_cassa_var, width=_NR_W_AMT, style="NewReg.TEntry")
-    lbl_saldo_inline = ttk.Label(row_amt, text="Nuovo saldo di cassa (€)", style="NewReg.TLabel")
+    lbl_saldo_inline = tk.Label(row_amt, text="Nuovo saldo di cassa (€)", **_newreg_plain_lbl_kw)
     row_amt.grid(row=3, column=1, sticky="w", pady=_newreg_py)
 
-    lbl_assegno = ttk.Label(nuova_form, text="Assegno", style="NewReg.TLabel")
+    lbl_assegno = tk.Label(nuova_form, text="Assegno", **_newreg_plain_lbl_kw)
     lbl_assegno.grid(row=4, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
     ent_chq = ttk.Entry(nuova_form, textvariable=newreg_cheque_var, width=_NR_W_CHQ, style="NewReg.TEntry")
     ent_chq.grid(row=4, column=1, sticky="w", pady=_newreg_py)
-    bind_limited_single_line_text_entry(ent_chq, newreg_cheque_var, max_len=MAX_CHEQUE_LEN)
-    ttk.Label(nuova_form, text="Nota", style="NewReg.TLabel").grid(row=5, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
+    bind_limited_single_line_text_entry(ent_chq, newreg_cheque_var, max_len=MAX_CHEQUE_LEN, strip_edges=False)
+    tk.Label(nuova_form, text="Nota", **_newreg_plain_lbl_kw).grid(row=5, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
     ent_note = ttk.Entry(nuova_form, textvariable=newreg_note_var, width=_NR_W_NOTE, style="NewReg.TEntry")
     ent_note.grid(row=5, column=1, sticky="w", pady=_newreg_py)
-    bind_limited_single_line_text_entry(ent_note, newreg_note_var, max_len=MAX_RECORD_NOTE_LEN)
+    bind_limited_single_line_text_entry(ent_note, newreg_note_var, max_len=MAX_RECORD_NOTE_LEN, strip_edges=False)
     bind_entry_first_char_uppercase(newreg_note_var, ent_note)
 
     row_btns_outer = tk.Frame(nuova_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     row_btns_outer.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 0))
     row_btns = tk.Frame(row_btns_outer, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     row_btns.pack(anchor=tk.CENTER)
-    btn_confirm = ttk.Button(row_btns, text="Conferma immissione", style="NewReg.TButton")
-    btn_clear = ttk.Button(row_btns, text="Cancella valori", style="NewReg.TButton")
-    btn_finish = ttk.Button(row_btns, text="Concludi immissione", style="NewReg.TButton")
+    btn_confirm = tk.Label(
+        row_btns,
+        text="Conferma immissione",
+        cursor="hand2",
+        highlightthickness=0,
+        font=newreg_ui_font,
+        padx=14,
+        pady=7,
+        bg=_PRINT_RICERCA_RED,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+        takefocus=1,
+    )
+    btn_clear = tk.Label(
+        row_btns,
+        text="Cancella valori",
+        cursor="hand2",
+        highlightthickness=0,
+        font=newreg_ui_font,
+        padx=14,
+        pady=7,
+        bg=_MOV_PULISCI_ACCEDI_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
     btn_confirm.pack(side=tk.LEFT, padx=(0, 8))
     btn_clear.pack(side=tk.LEFT, padx=(0, 8))
-    btn_finish.pack(side=tk.LEFT)
 
     cat_opts_cache: list[tuple[str, str]] = []
     acc_opts_cache: list[tuple[str, str]] = []
@@ -15359,8 +15755,8 @@ th {{ background:#efefef; text-align:left; }}
             (newreg_acc2_var.get() or "").strip(),
             (newreg_amount_var.get() or "").strip(),
             newreg_sign_var.get(),
-            (newreg_cheque_var.get() or "").strip(),
-            (newreg_note_var.get() or "").strip(),
+            newreg_cheque_var.get() or "",
+            newreg_note_var.get() or "",
             (newreg_saldo_cassa_var.get() or "").strip(),
         )
 
@@ -15371,7 +15767,7 @@ th {{ background:#efefef; text-align:left; }}
         return b == _newreg_form_snapshot()
 
     def _newreg_importo_implica_conferma() -> bool:
-        """True se il campo importo è compilato (serve conferma come per «Concludi immissione»)."""
+        """True se il campo importo è compilato (serve conferma prima di uscire dalla scheda)."""
         raw_amt = (newreg_amount_var.get() or "").strip()
         if not raw_amt or raw_amt in ("+", "-"):
             return False
@@ -15516,11 +15912,11 @@ th {{ background:#efefef; text-align:left; }}
         elif _is_primary_account_credit_card():
             chq = sanitize_single_line_text(CREDIT_CARD_CHEQUE_LABEL, max_len=MAX_CHEQUE_LEN)
         else:
-            chq = sanitize_single_line_text(newreg_cheque_var.get() or "", max_len=MAX_CHEQUE_LEN)
+            chq = sanitize_single_line_text(newreg_cheque_var.get() or "", max_len=MAX_CHEQUE_LEN, strip_edges=False)
             if not chq:
                 chq = "-"
         note = format_record_note_stored(
-            sanitize_single_line_text(newreg_note_var.get() or "", max_len=MAX_RECORD_NOTE_LEN)
+            sanitize_single_line_text(newreg_note_var.get() or "", max_len=MAX_RECORD_NOTE_LEN, strip_edges=False)
         )
         if not note:
             note = "-"
@@ -15624,41 +16020,19 @@ th {{ background:#efefef; text-align:left; }}
         nuovi_status_var.set("")
         return True
 
-    def _commit_new_record(*, finish: bool) -> None:
-        if finish and virtuale_discharge_active[0]:
-            messagebox.showwarning(
-                "Saldo virtuale",
-                f"Il saldo virtuale è di {format_euro_it(virtuale_saldo[0])} €.\n"
-                "Occorre azzerarlo prima di uscire dall'immissione dati.",
-            )
-            return
-        if finish and not _newreg_importo_implica_conferma():
-            _populate_form_defaults(keep_last=False)
-            notebook.select(movimenti_frame)
-            return
+    def _commit_new_record() -> None:
         payload = _collect_new_record_payload()
         if payload is None:
-            if finish and messagebox.askyesno(
-                "Concludi immissione",
-                "Dati incompleti/non validi. Chiudere comunque e tornare a Movimenti?",
-            ):
-                _populate_form_defaults(keep_last=False)
-                notebook.select(movimenti_frame)
             return
         rec, preview = payload
-        title = "Concludi immissione" if finish else "Conferma immissione"
-        if not _run_new_record_save_confirmed(rec, preview, dialog_title=title):
+        if not _run_new_record_save_confirmed(rec, preview, dialog_title="Conferma immissione"):
             return
-        # Dopo ogni inserimento andato a buon fine: ripulire il modulo; se resti sulla pagina,
-        # mantieni data/categoria/conto dell'ultima registrazione; se passi ai Movimenti, default alla prossima visita.
-        _populate_form_defaults(keep_last=not finish)
-        if finish:
-            notebook.select(movimenti_frame)
-        else:
-            try:
-                ent_date.focus_set()
-            except Exception:
-                pass
+        # Dopo ogni inserimento andato a buon fine: ripulire il modulo mantenendo data/categoria/conto dell'ultima registrazione.
+        _populate_form_defaults(keep_last=True)
+        try:
+            ent_date.focus_set()
+        except Exception:
+            pass
 
     def _nuovi_leave_guard(_dest: tk.Widget) -> bool:
         """Prima di lasciare «Nuove registrazioni»: conferma salvataggio se importo compilato; reset default."""
@@ -15679,7 +16053,7 @@ th {{ background:#efefef; text-align:left; }}
                 return True
             return False
         rec, preview = payload
-        if not _run_new_record_save_confirmed(rec, preview, dialog_title="Concludi immissione"):
+        if not _run_new_record_save_confirmed(rec, preview, dialog_title="Conferma immissione"):
             return False
         _populate_form_defaults(keep_last=False)
         return True
@@ -15710,7 +16084,7 @@ th {{ background:#efefef; text-align:left; }}
     per_main = tk.Frame(periodiche_panel, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     per_main.pack(fill=tk.BOTH, expand=True)
     per_form_center_strip = tk.Frame(per_main, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    per_form_center_strip.pack(fill=tk.X)
+    per_form_center_strip.pack(fill=tk.X, pady=(0, 0))
     per_form_center_strip.grid_columnconfigure(0, weight=1, uniform="per_strip_pad")
     per_form_center_strip.grid_columnconfigure(1, weight=0)
     per_form_center_strip.grid_columnconfigure(2, weight=1, uniform="per_strip_pad")
@@ -15722,7 +16096,7 @@ th {{ background:#efefef; text-align:left; }}
     per_list_block.pack(fill=tk.BOTH, expand=True)
 
     per_title_row = tk.Frame(per_list_block, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    ttk.Label(per_title_row, text="Elenco registrazioni periodiche", style="NewReg.TLabel").pack(
+    tk.Label(per_title_row, text="Elenco registrazioni periodiche", **_newreg_plain_lbl_kw).pack(
         side=tk.LEFT, anchor=tk.W
     )
     btn_per_edit_future = tk.Label(
@@ -15762,7 +16136,7 @@ th {{ background:#efefef; text-align:left; }}
     tree_per_scroll_x = ttk.Scrollbar(per_tree_frame, orient="horizontal")
     _SEP_CH_W = 6
     header_bg = CDC_GRID_HEADING_BG
-    header_fg = "#1a1a1a"
+    header_fg = UI_FG_GRID_PRIMARY
     header_font = ("TkDefaultFont", 10, "bold")
     header_row = tk.Frame(per_tree_frame, bg=header_bg)
     per_mov_hdr = tk.Frame(header_row, bg=header_bg)
@@ -16053,8 +16427,8 @@ th {{ background:#efefef; text-align:left; }}
     per_tree_frame.bind("<Configure>", _per_schedule_tree_visible_rows, add=True)
     root.after_idle(_per_schedule_tree_visible_rows)
 
-    per_title_row.pack(fill=tk.X, anchor=tk.W, pady=(4, 0))
-    per_tree_frame.pack(fill=tk.BOTH, expand=True, pady=(2, 2))
+    per_title_row.pack(fill=tk.X, anchor=tk.W, pady=(0, 0))
+    per_tree_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 2))
 
     per_title_center = tk.Frame(per_top_block, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     per_title_center.pack(fill=tk.X, anchor=tk.CENTER, pady=(0, 0))
@@ -16070,16 +16444,30 @@ th {{ background:#efefef; text-align:left; }}
     ).pack(fill=tk.X)
 
     per_form = tk.Frame(per_top_block, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    per_form.pack(fill=tk.X, anchor=tk.CENTER, pady=(0, 2))
+    per_form.pack(fill=tk.X, anchor=tk.CENTER, pady=(0, 0))
 
-    _per_py, _per_px = 2, 6
-    ttk.Label(per_form, textvariable=per_date_field_lbl_var, style="NewReg.TLabel").grid(
+    _per_py, _per_px = 1, 6
+    tk.Label(per_form, textvariable=per_date_field_lbl_var, **_newreg_plain_lbl_kw).grid(
         row=0, column=0, sticky="w", pady=_per_py, padx=(0, _per_px)
     )
     row_per_start = tk.Frame(per_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     ent_per_start = ttk.Entry(row_per_start, textvariable=per_start_date_var, width=_NR_W_DATE, style="NewReg.TEntry")
     ent_per_start.pack(side=tk.LEFT)
-    btn_per_oggi = ttk.Button(row_per_start, text="Oggi", style="NewReg.TButton")
+    btn_per_oggi = tk.Label(
+        row_per_start,
+        text="Oggi",
+        font=newreg_ui_font,
+        fg="#ffffff",
+        bg=_NR_OGGI_BTN_BG,
+        padx=10,
+        pady=4,
+        cursor="hand2",
+        relief=tk.RAISED,
+        bd=1,
+        highlightthickness=0,
+    )
+    btn_per_oggi.bind("<Enter>", _nr_oggi_btn_enter(btn_per_oggi))
+    btn_per_oggi.bind("<Leave>", _nr_oggi_btn_leave(btn_per_oggi))
     btn_per_oggi.pack(side=tk.LEFT, padx=(6, 0))
     row_per_start.grid(row=0, column=1, sticky="w", pady=_per_py)
 
@@ -16173,7 +16561,9 @@ th {{ background:#efefef; text-align:left; }}
     ent_per_start.bind("<FocusOut>", lambda _e: _normalize_per_start_date_display())
     ent_per_start.bind("<Button-1>", _per_start_date_button1)
 
-    ttk.Label(per_form, text="Cadenza", style="NewReg.TLabel").grid(row=1, column=0, sticky="nw", pady=_per_py, padx=(0, _per_px))
+    tk.Label(per_form, text="Cadenza", **{**_newreg_plain_lbl_kw, "anchor": "nw"}).grid(
+        row=1, column=0, sticky="nw", pady=_per_py, padx=(0, _per_px)
+    )
     _per_cadence_labels: dict[str, tk.Label] = {}
 
     def _per_refresh_cadence_button_styles() -> None:
@@ -16181,12 +16571,27 @@ th {{ background:#efefef; text-align:left; }}
         if cid not in periodiche.CADENCE_IDS:
             cid = "monthly"
             per_cadence_var.set(cid)
-        on_bg = security_auth.CDC_TIPO_TASTI_BTN_ACTIVE_BG
-        off_bg = security_auth.CDC_TIPO_TASTI_BTN_BG
+        on_bg = MOV_FILTER_TAB_BTN_ACTIVE_BG
+        off_bg = MOV_FILTER_TAB_BTN_BG
+        fg = MOV_FILTER_TAB_BTN_FG
         for k, lbl in _per_cadence_labels.items():
             is_on = k == cid
-            lbl.configure(bg=on_bg if is_on else off_bg, fg=security_auth.CDC_TIPO_TASTI_BTN_FG,
-                          relief=tk.SUNKEN if is_on else tk.RAISED, bd=2 if is_on else 1)
+            if is_on:
+                lbl.configure(
+                    bg=on_bg,
+                    fg=fg,
+                    relief=tk.SUNKEN,
+                    bd=2,
+                    highlightthickness=0,
+                )
+            else:
+                lbl.configure(
+                    bg=off_bg,
+                    fg=fg,
+                    relief=tk.RAISED,
+                    bd=1,
+                    highlightthickness=0,
+                )
 
     def _per_set_cadence_pick(cadence_id: str) -> None:
         per_cadence_var.set(cadence_id)
@@ -16194,8 +16599,8 @@ th {{ background:#efefef; text-align:left; }}
 
     col_cad = tk.Frame(per_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     # Larghezza fissa (caratteri) per «Quadrimestrale», la più lunga tra le etichette.
-    _per_cad_toggle_w = 12
-    _cad_font = ("TkDefaultFont", 10)
+    _per_cad_toggle_w = 13
+    _cad_font = ("TkDefaultFont", 11)
     _ncad = len(periodiche.CADENCE_CHOICES)
     _row1_n = (_ncad + 1) // 2
     for i, (cid, lab) in enumerate(periodiche.CADENCE_CHOICES):
@@ -16207,50 +16612,84 @@ th {{ background:#efefef; text-align:left; }}
             font=_cad_font,
             width=_per_cad_toggle_w,
             anchor=tk.CENTER,
-            padx=2,
-            pady=4,
+            padx=3,
+            pady=6,
             cursor="hand2",
             highlightthickness=0,
             relief=tk.RAISED,
             bd=1,
-            bg=security_auth.CDC_TIPO_TASTI_BTN_BG,
-            fg=security_auth.CDC_TIPO_TASTI_BTN_FG,
+            bg=MOV_FILTER_TAB_BTN_BG,
+            fg=MOV_FILTER_TAB_BTN_FG,
         )
-        lb.grid(row=r, column=c, padx=2, pady=2, sticky="nw")
+        lb.grid(row=r, column=c, padx=3, pady=3, sticky="nw")
         lb.bind("<Button-1>", lambda e, c_id=cid: _per_set_cadence_pick(c_id))
+
+        def _cad_ent(_ev: tk.Event, _cid=cid) -> None:
+            if per_cadence_var.get() != _cid:
+                lb.configure(bg=MOV_FILTER_TAB_BTN_HOVER_BG)
+
+        def _cad_lev(_ev: tk.Event) -> None:
+            _per_refresh_cadence_button_styles()
+
+        lb.bind("<Enter>", _cad_ent)
+        lb.bind("<Leave>", _cad_lev)
         _per_cadence_labels[cid] = lb
     _per_refresh_cadence_button_styles()
     col_cad.grid(row=1, column=1, columnspan=3, sticky="nw", pady=_per_py)
-    ttk.Label(per_form, text="Categoria", style="NewReg.TLabel").grid(row=2, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
+    tk.Label(per_form, text="Categoria", **_newreg_plain_lbl_kw).grid(row=2, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
     cb_per_cat = ttk.Combobox(per_form, textvariable=per_cat_var, state="readonly", width=_NR_W_CAT, style="NewReg.TCombobox")
     cb_per_cat.grid(row=2, column=1, columnspan=2, sticky="w", pady=_per_py)
-    ttk.Label(per_form, textvariable=per_cat_note_var, style="NewRegNote.TLabel").grid(
+    tk.Label(per_form, textvariable=per_cat_note_var, **_newreg_cat_note_lbl_kw).grid(
         row=3, column=0, columnspan=3, sticky="w", pady=(0, 2)
     )
-    ttk.Label(per_form, text="Conto", style="NewReg.TLabel").grid(row=4, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
+    tk.Label(per_form, text="Conto", **_newreg_plain_lbl_kw).grid(row=4, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
     cb_per_acc1 = ttk.Combobox(per_form, textvariable=per_acc1_var, state="readonly", width=_NR_W_ACC, style="NewReg.TCombobox")
     cb_per_acc1.grid(row=4, column=1, columnspan=2, sticky="w", pady=_per_py)
-    lbl_per_acc2 = ttk.Label(per_form, text="Secondo conto", style="NewReg.TLabel")
+    lbl_per_acc2 = tk.Label(per_form, text="Secondo conto", **_newreg_plain_lbl_kw)
     row_per_acc2 = tk.Frame(per_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     cb_per_acc2 = ttk.Combobox(row_per_acc2, textvariable=per_acc2_var, state="readonly", width=_NR_W_ACC, style="NewReg.TCombobox")
     cb_per_acc2.pack(side=tk.LEFT)
     lbl_per_acc2.grid(row=5, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
     row_per_acc2.grid(row=5, column=1, columnspan=2, sticky="w", pady=_per_py)
-    ttk.Label(per_form, text="Importo (€)", style="NewReg.TLabel").grid(row=6, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
+    tk.Label(per_form, text="Importo (€)", **_newreg_plain_lbl_kw).grid(row=6, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
     row_per_amt = tk.Frame(per_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     ent_per_amt = ttk.Entry(row_per_amt, textvariable=per_amount_var, width=_NR_W_AMT, style="NewReg.TEntry")
     ent_per_amt.pack(side=tk.LEFT)
     row_per_amt.grid(row=6, column=1, sticky="w", pady=_per_py)
-    ttk.Label(per_form, text="Nota", style="NewReg.TLabel").grid(row=7, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
+    tk.Label(per_form, text="Nota", **_newreg_plain_lbl_kw).grid(row=7, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
     ent_per_note = ttk.Entry(per_form, textvariable=per_note_var, width=_NR_W_NOTE, style="NewReg.TEntry")
     ent_per_note.grid(row=7, column=1, columnspan=3, sticky="w", pady=_per_py)
-    bind_limited_single_line_text_entry(ent_per_note, per_note_var, max_len=MAX_RECORD_NOTE_LEN)
+    bind_limited_single_line_text_entry(ent_per_note, per_note_var, max_len=MAX_RECORD_NOTE_LEN, strip_edges=False)
     bind_entry_first_char_uppercase(per_note_var, ent_per_note)
 
     row_per_btns = tk.Frame(per_top_block, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    row_per_btns.pack(fill=tk.X, pady=(2, 0), anchor=tk.W)
-    btn_per_confirm = ttk.Button(row_per_btns, text="Conferma creazione", style="NewReg.TButton")
-    btn_per_clear = ttk.Button(row_per_btns, text="Cancella valori", style="NewReg.TButton")
+    row_per_btns.pack(fill=tk.X, pady=(0, 0), anchor=tk.W)
+    btn_per_confirm = tk.Label(
+        row_per_btns,
+        text="Conferma creazione",
+        cursor="hand2",
+        highlightthickness=0,
+        font=newreg_ui_font,
+        padx=14,
+        pady=7,
+        bg=_PRINT_RICERCA_RED,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    btn_per_clear = tk.Label(
+        row_per_btns,
+        text="Cancella valori",
+        cursor="hand2",
+        highlightthickness=0,
+        font=newreg_ui_font,
+        padx=14,
+        pady=7,
+        bg=_MOV_PULISCI_ACCEDI_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
     btn_per_confirm.grid(row=0, column=0, padx=(0, 8), sticky="w")
     btn_per_clear.grid(row=0, column=1, padx=(0, 8), sticky="w")
     tk.Label(
@@ -16260,7 +16699,7 @@ th {{ background:#efefef; text-align:left; }}
         fg="#555555",
         font=("TkDefaultFont", 10),
         highlightthickness=0,
-    ).pack(fill=tk.X, anchor=tk.W, pady=(2, 0))
+    ).pack(fill=tk.X, anchor=tk.W, pady=(0, 0))
 
     def _per_refresh_form_title() -> None:
         if nuovi_submode[0] == "periodiche":
@@ -16659,7 +17098,7 @@ th {{ background:#efefef; text-align:left; }}
             return None
         chq = sanitize_single_line_text("Periodica", max_len=MAX_CHEQUE_LEN)
         note = format_record_note_stored(
-            sanitize_single_line_text(per_note_var.get() or "", max_len=MAX_RECORD_NOTE_LEN)
+            sanitize_single_line_text(per_note_var.get() or "", max_len=MAX_RECORD_NOTE_LEN, strip_edges=False)
         )
         if not note:
             note = "-"
@@ -17196,13 +17635,13 @@ th {{ background:#efefef; text-align:left; }}
             ent = ttk.Entry(frm, textvariable=v, width=_NR_W_NOTE)
             ttk.Label(frm, text="Nota").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
             ent.grid(row=1, column=1, sticky="w", pady=4)
-            bind_limited_single_line_text_entry(ent, v, max_len=MAX_RECORD_NOTE_LEN)
+            bind_limited_single_line_text_entry(ent, v, max_len=MAX_RECORD_NOTE_LEN, strip_edges=False)
 
             def on_ok() -> None:
                 if not messagebox.askyesno("Registrazioni periodiche", "Confermi la modifica della nota?", parent=top):
                     return
                 note = format_record_note_stored(
-                    sanitize_single_line_text(v.get() or "", max_len=MAX_RECORD_NOTE_LEN)
+                    sanitize_single_line_text(v.get() or "", max_len=MAX_RECORD_NOTE_LEN, strip_edges=False)
                 )
                 old_regs = copy.deepcopy(cur_db().get("periodic_registrations", []))
                 tpl["note"] = note if note else "-"
@@ -17333,9 +17772,15 @@ th {{ background:#efefef; text-align:left; }}
         per_start_date_var.set(to_italian_date(tdy.isoformat()))
         per_start_date_manual_mode[0] = False
 
-    btn_per_oggi.configure(command=_per_oggi_click)
-    btn_per_confirm.configure(command=_per_conferma_immissione)
-    btn_per_clear.configure(command=_per_clear_form)
+    btn_per_oggi.bind("<Button-1>", lambda _e: _per_oggi_click())
+    btn_per_confirm.bind("<Button-1>", lambda _e: _per_conferma_immissione())
+    btn_per_confirm.bind(
+        "<Enter>", lambda _e: btn_per_confirm.configure(bg=_PRINT_RICERCA_RED_ACTIVE)
+    )
+    btn_per_confirm.bind("<Leave>", lambda _e: btn_per_confirm.configure(bg=_PRINT_RICERCA_RED))
+    btn_per_clear.bind("<Button-1>", lambda _e: _per_clear_form())
+    btn_per_clear.bind("<Enter>", lambda _e: btn_per_clear.configure(bg=_MOV_PULISCI_ACCEDI_HOVER_BG))
+    btn_per_clear.bind("<Leave>", lambda _e: btn_per_clear.configure(bg=_MOV_PULISCI_ACCEDI_BG))
     btn_per_edit_future.bind("<Button-1>", lambda _e: _per_prepare_edit_selected())
     btn_per_delete.bind("<Button-1>", lambda _e: _per_delete_selected())
 
@@ -17672,7 +18117,7 @@ th {{ background:#efefef; text-align:left; }}
             ent_date.icursor(len(newreg_date_var.get() or ""))
         except Exception:
             pass
-    btn_oggi.configure(command=_on_oggi_click)
+    btn_oggi.bind("<Button-1>", lambda _e: _on_oggi_click())
     def _on_date_enter(_e: tk.Event) -> str:
         _normalize_newreg_date_display()
         try:
@@ -17844,14 +18289,22 @@ th {{ background:#efefef; text-align:left; }}
     ent_amt.bind("<FocusOut>", _on_amt_focusout, add="+")
     bind_return_tab_and_kp_enter(ent_chq, _on_chq_enter)
     bind_return_tab_and_kp_enter(ent_note, _on_note_enter)
-    btn_confirm.configure(command=lambda: _commit_new_record(finish=False))
-    bind_return_and_kp_enter(btn_confirm, lambda _e: (_commit_new_record(finish=False), "break")[1])
-    btn_finish.configure(command=lambda: _commit_new_record(finish=True))
-    btn_clear.configure(command=_clear_values)
+    def _on_btn_confirm_click(_e: tk.Event | None = None) -> None:
+        _commit_new_record()
+
+    btn_confirm.bind("<Button-1>", lambda _e: _on_btn_confirm_click())
+    bind_return_and_kp_enter(btn_confirm, lambda _e: (_on_btn_confirm_click(), "break")[1])
+    btn_confirm.bind(
+        "<Enter>", lambda _e: btn_confirm.configure(bg=_PRINT_RICERCA_RED_ACTIVE)
+    )
+    btn_confirm.bind("<Leave>", lambda _e: btn_confirm.configure(bg=_PRINT_RICERCA_RED))
+    btn_clear.bind("<Button-1>", lambda _e: _clear_values())
+    btn_clear.bind("<Enter>", lambda _e: btn_clear.configure(bg=_MOV_PULISCI_ACCEDI_HOVER_BG))
+    btn_clear.bind("<Leave>", lambda _e: btn_clear.configure(bg=_MOV_PULISCI_ACCEDI_BG))
     nuovi_leave_guard_ref[0] = _nuovi_leave_guard
     btn_nuova_reg.bind("<Button-1>", lambda _e: _show_mode("new"))
     btn_reg_periodiche.bind("<Button-1>", lambda _e: _show_mode("periodiche"))
-    btn_aggiorna_saldo.configure(command=_on_aggiorna_saldo_cassa_click)
+    btn_aggiorna_saldo.bind("<Button-1>", lambda _e: _on_aggiorna_saldo_cassa_click())
     btn_scarica_virtuale.configure(command=_on_scarica_virtuale_click)
 
     _last_nb_tab: list[int] = [0]
@@ -17911,6 +18364,8 @@ th {{ background:#efefef; text-align:left; }}
     _VER_BG = MOVIMENTI_PAGE_BG
     _ver_ui_font = ("TkDefaultFont", 11)
     _ver_ui_font_b = ("TkDefaultFont", 11, "bold")
+    # Schermata iniziale (conto, date, memoria, cartella PDF): un punto in più rispetto a _ver_ui_font.
+    _ver_setup_intro_font = ("TkDefaultFont", 12)
     _ver_cand_promo_font = ("TkDefaultFont", 14, "bold")
     _VER_GRID_AMT_POS_FG = "#156716"
     _VER_GRID_AMT_NEG_FG = "#b71c1c"
@@ -17920,7 +18375,10 @@ th {{ background:#efefef; text-align:left; }}
     _VER_PENDING_BTN_DEL_BG = "#b71c1c"
     _VER_PENDING_BTN_NEW_BG = "#2e7d32"
     _VER_PENDING_BTN_CLEARSEL_BG = "#616161"
-    _VER_FOOT_PRINT_BG = "#546e7a"
+    # Piede risultati: «Stampa» = rosso tema richiesto; setup PDF automatico / sfoglia restano neutri.
+    _VER_SETUP_PDF_BTN_BG = "#546e7a"
+    _VER_FOOT_PRINT_BG = "#ff0000"
+    _VER_FOOT_PRINT_BG_ACT = "#cc0000"
     _VER_FOOT_CYCLE_BG = "#ef6c00"
     _VER_FOOT_CLOSE_BG = "#c62828"
     _VER_ACTION_BTN_FONT = ("TkDefaultFont", 15, "bold")
@@ -17943,6 +18401,30 @@ th {{ background:#efefef; text-align:left; }}
         foreground="#1a1a1a",
         font=("TkDefaultFont", 11, "bold"),
     )
+
+    def _configure_grid_treeview_selection_styles() -> None:
+        b = CDC_GRID_TREEVIEW_SEL_BG
+        fg = CDC_GRID_TREEVIEW_SEL_FG
+        try:
+            mov_style.map(
+                "MovGrid.Treeview",
+                background=[("selected", b)],
+                foreground=[("selected", fg)],
+            )
+            mov_style.map(
+                "MovGridAmount.Treeview",
+                background=[("selected", b)],
+                foreground=[("selected", fg)],
+            )
+            _ver_res_style.map(
+                "VerRes.Treeview",
+                background=[("selected", b)],
+                foreground=[("selected", fg)],
+            )
+        except tk.TclError:
+            pass
+
+    _configure_grid_treeview_selection_styles()
 
     def _ver_grid_amount_from_decimal(d: Decimal) -> tuple[str, str]:
         """Testo importo griglia verifica (+/− sempre) e tag Treeview per colore riga."""
@@ -17975,6 +18457,17 @@ th {{ background:#efefef; text-align:left; }}
             tv.tag_configure("ver_amt_zero", foreground=_VER_GRID_AMT_ZERO_FG)
         except tk.TclError:
             pass
+
+    def _ver_configure_results_grids_neutral_amount_fg(*tvs: ttk.Treeview) -> None:
+        # Testo fisso scuro: non usare UI_FG_GRID_PRIMARY (in Opzioni può essere chiaro per altri elementi).
+        fg = "#1a1a1a"
+        for tv in tvs:
+            try:
+                tv.tag_configure("ver_amt_pos", foreground=fg)
+                tv.tag_configure("ver_amt_neg", foreground=fg)
+                tv.tag_configure("ver_amt_zero", foreground=fg)
+            except tk.TclError:
+                pass
 
     ver_body = tk.Frame(verifica_frame, bg=_VER_BG, highlightthickness=0)
     ver_body.pack(fill=tk.BOTH, expand=True)
@@ -18283,7 +18776,7 @@ th {{ background:#efefef; text-align:left; }}
     ver_setup_inner.pack(anchor=tk.CENTER)
     ver_auto_folder_box_visible: list[bool] = [False]
 
-    tk.Label(ver_setup_inner, text="Conto da verificare", font=_ver_ui_font, bg=_VER_BG).grid(
+    tk.Label(ver_setup_inner, text="Conto da verificare", font=_ver_setup_intro_font, bg=_VER_BG).grid(
         row=0, column=0, sticky="w", padx=(0, 8), pady=2
     )
     ver_acc_combo = ttk.Combobox(ver_setup_inner, textvariable=ver_account_name_var, state="readonly", width=20,
@@ -18298,7 +18791,7 @@ th {{ background:#efefef; text-align:left; }}
         ),
     )
 
-    tk.Label(ver_setup_inner, text="Data chiusura estratto conto", font=_ver_ui_font, bg=_VER_BG).grid(
+    tk.Label(ver_setup_inner, text="Data chiusura estratto conto", font=_ver_setup_intro_font, bg=_VER_BG).grid(
         row=0, column=2, sticky="w", padx=(0, 8), pady=2
     )
     ver_cutoff_entry = ttk.Entry(ver_setup_inner, textvariable=ver_cutoff_date_var, width=12, style="NewReg.TEntry")
@@ -18418,7 +18911,7 @@ th {{ background:#efefef; text-align:left; }}
         font=_VER_ACTION_BTN_FONT,
         padx=16,
         pady=6,
-        bg=_VER_FOOT_PRINT_BG,
+        bg=_VER_SETUP_PDF_BTN_BG,
         fg="#ffffff",
         relief=tk.RAISED,
         bd=1,
@@ -18464,7 +18957,7 @@ th {{ background:#efefef; text-align:left; }}
     )
 
     ver_bancoposta_lbl = tk.Label(
-        ver_setup_inner, text="Estratto conto / carta (PDF, opz.)", font=_ver_ui_font, bg=_VER_BG
+        ver_setup_inner, text="Estratto conto / carta (PDF, opz.)", font=_ver_setup_intro_font, bg=_VER_BG
     )
     ver_bancoposta_lbl.grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(2, 4))
     ver_bancoposta_entry = ttk.Entry(
@@ -18480,7 +18973,7 @@ th {{ background:#efefef; text-align:left; }}
         font=_VER_ACTION_BTN_FONT,
         padx=12,
         pady=6,
-        bg=_VER_FOOT_PRINT_BG,
+        bg=_VER_SETUP_PDF_BTN_BG,
         fg="#ffffff",
         relief=tk.RAISED,
         bd=1,
@@ -18492,7 +18985,7 @@ th {{ background:#efefef; text-align:left; }}
     ver_auto_folder_label = tk.Label(
         ver_auto_folder_box,
         text="Cartella dove collocare gli estratti conto pdf per verifica",
-        font=_ver_ui_font,
+        font=_ver_setup_intro_font,
         bg=_VER_BG,
         fg="#1a1a1a",
         anchor="w",
@@ -18518,7 +19011,7 @@ th {{ background:#efefef; text-align:left; }}
         font=_VER_ACTION_BTN_FONT,
         padx=12,
         pady=6,
-        bg=_VER_FOOT_PRINT_BG,
+        bg=_VER_SETUP_PDF_BTN_BG,
         fg="#ffffff",
         relief=tk.RAISED,
         bd=1,
@@ -18545,7 +19038,7 @@ th {{ background:#efefef; text-align:left; }}
             "Conti, seguite dalla numerazione mensile 01, 02, ..., 12."
         ),
         wraplength=780,
-        font=("TkDefaultFont", 9),
+        font=("TkDefaultFont", 10),
         bg=_VER_BG,
         fg="#444444",
         justify="left",
@@ -18558,7 +19051,7 @@ th {{ background:#efefef; text-align:left; }}
     tk.Label(
         ver_setup_inner,
         textvariable=ver_pdf_auto_diag_var,
-        font=("TkDefaultFont", 9),
+        font=("TkDefaultFont", 10),
         bg=_VER_BG,
         fg="#333333",
         justify=tk.LEFT,
@@ -18568,7 +19061,7 @@ th {{ background:#efefef; text-align:left; }}
 
     ver_setup_saved_var = tk.StringVar(value="")
     ver_setup_saved_label = tk.Label(
-        ver_setup_frame, textvariable=ver_setup_saved_var, font=_ver_ui_font,
+        ver_setup_frame, textvariable=ver_setup_saved_var, font=_ver_setup_intro_font,
         bg=_VER_BG, fg="#8B0000", anchor="w",
     )
     ver_setup_saved_label.pack(anchor=tk.CENTER, pady=(2, 0))
@@ -18873,11 +19366,11 @@ th {{ background:#efefef; text-align:left; }}
             _ver_cancel_memory_resume_prompt_after()
             acc_name = ver_account_name_var.get().strip()
             if not acc_name:
-                ver_setup_saved_var.set("")
+                _ver_refresh_setup_saved_banner_global()
                 return
             acc_code = _ver_account_code_for_name(acc_name)
             if not acc_code:
-                ver_setup_saved_var.set("")
+                _ver_refresh_setup_saved_banner_global()
                 return
             saved = _ver_load_pending_from_db(acc_code)
             # Il campo PDF non deve restare popolato con il file del conto precedente: senza memoria PDF
@@ -18947,12 +19440,12 @@ th {{ background:#efefef; text-align:left; }}
     ver_sospesi_right = tk.Frame(ver_sospesi_split, bg=_VER_BG, highlightthickness=0)
     ver_sospesi_split.columnconfigure(0, weight=3, uniform="ver_sosp")
     ver_sospesi_split.columnconfigure(1, weight=2, uniform="ver_sosp")
-    ver_sospesi_split.rowconfigure(0, weight=0)
+    ver_sospesi_split.rowconfigure(0, weight=1)
     ver_sospesi_left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
     ver_sospesi_right.grid(row=0, column=1, sticky="nsew")
     ver_sospesi_right.rowconfigure(0, weight=1)
     ver_sospesi_right.columnconfigure(0, weight=1)
-    ver_summary_outer = tk.Frame(ver_sospesi_right, bg=_VER_BG, highlightthickness=0)
+    ver_summary_outer = tk.Frame(ver_sospesi_right, bg=CDC_GRID_STRIPE1_BG, highlightthickness=0)
     ver_summary_outer.grid(row=0, column=0, sticky="nsew")
     ver_summary_outer.rowconfigure(0, weight=1)
     ver_summary_outer.rowconfigure(2, weight=1)
@@ -19142,6 +19635,8 @@ th {{ background:#efefef; text-align:left; }}
                 fg, ver_input_frame
             ):
                 return
+            if _ver_widget_or_ancestor_is(fg, ver_pending_btns):
+                return
             if _ver_widget_or_ancestor_is(fg, ver_results_btns):
                 return
             if _ver_widget_or_ancestor_is(fg, ver_unver_correzione_row):
@@ -19170,14 +19665,14 @@ th {{ background:#efefef; text-align:left; }}
     )
     ver_ent_chq = ttk.Entry(ver_input_frame, textvariable=ver_inp_chq_var, width=12, style="NewReg.TEntry")
     ver_ent_chq.grid(row=0, column=5, sticky="w", padx=(0, 16), pady=2)
-    bind_limited_single_line_text_entry(ver_ent_chq, ver_inp_chq_var, max_len=MAX_CHEQUE_LEN)
+    bind_limited_single_line_text_entry(ver_ent_chq, ver_inp_chq_var, max_len=MAX_CHEQUE_LEN, strip_edges=False)
 
     tk.Label(ver_input_frame, text="Nota", font=_ver_ui_font, bg=_VER_BG).grid(
         row=0, column=6, sticky="w", padx=(0, 6), pady=2
     )
     ver_ent_note = ttk.Entry(ver_input_frame, textvariable=ver_inp_note_var, width=28, style="NewReg.TEntry")
     ver_ent_note.grid(row=0, column=7, sticky="w", padx=(0, 8), pady=2)
-    bind_limited_single_line_text_entry(ver_ent_note, ver_inp_note_var, max_len=MAX_RECORD_NOTE_LEN)
+    bind_limited_single_line_text_entry(ver_ent_note, ver_inp_note_var, max_len=MAX_RECORD_NOTE_LEN, strip_edges=False)
     bind_entry_first_char_uppercase(ver_inp_note_var, ver_ent_note)
 
     def _ver_on_chq_enter(_e: object = None) -> str | None:
@@ -19369,7 +19864,7 @@ th {{ background:#efefef; text-align:left; }}
                 pass
 
     # --- griglia candidati per verifica manuale ---
-    ver_cand_frame = tk.Frame(ver_work_frame, bg=_VER_BG, highlightthickness=0)
+    ver_cand_frame = tk.Frame(ver_work_frame, bg=_VER_BG, highlightthickness=0, takefocus=0)
     ver_cand_title_var = tk.StringVar(value="")
     tk.Label(
         ver_cand_frame,
@@ -19427,6 +19922,10 @@ th {{ background:#efefef; text-align:left; }}
     ver_btn_cand_confirm.pack(side=tk.LEFT, padx=(0, 8))
     ver_btn_cand_none = ttk.Button(ver_cand_btns, text="Nessuna corrispondenza", style="NewReg.TButton")
     ver_btn_cand_none.pack(side=tk.LEFT)
+    _ver_cand_btn_confirm_full = "Conferma verifica della registrazione selezionata"
+    _ver_cand_btn_none_full = "Nessuna corrispondenza"
+    _ver_cand_btn_confirm_short = "Conferma"
+    _ver_cand_btn_none_short = "Non conferma"
 
     ver_cand_candidates: list[list[tuple[int, dict]]] = [[]]
     ver_cand_pending_item: list[dict | None] = [None]
@@ -19455,6 +19954,8 @@ th {{ background:#efefef; text-align:left; }}
         pdf_booking_date: str = "",
         pdf_note_full: str = "",
     ) -> None:
+        if not candidates:
+            return
         ver_cand_candidates[0] = candidates
         pend: dict = {"amount": _ver_amount_storage_str(amt), "cheque": chq, "note": note}
         bd0 = (pdf_booking_date or "").strip()
@@ -19480,7 +19981,14 @@ th {{ background:#efefef; text-align:left; }}
         nd_one = " ".join(nd_raw.split()) if nd_raw else ""
         if nd_one:
             parts2.append(f"Nota: {nd_one}")
-        ver_cand_dato_var.set(" — ".join(parts2) if parts2 else "")
+        base_dato = " — ".join(parts2) if parts2 else ""
+        if n_c == 1:
+            reg_only = candidates[0][0]
+            ver_cand_dato_var.set(
+                f"Registrazione candidata n. {reg_only}" + (f" — {base_dato}" if base_dato else "")
+            )
+        else:
+            ver_cand_dato_var.set(base_dato)
         d = cur_db()
         acc_by_year = year_accounts_map(d)
         cat_by_year = year_categories_map(d)
@@ -19510,6 +20018,47 @@ th {{ background:#efefef; text-align:left; }}
                 ),
                 tags=(amt_tag,),
             )
+        if n_c <= 1:
+            try:
+                ver_btn_cand_confirm.configure(text=_ver_cand_btn_confirm_short)
+                ver_btn_cand_none.configure(text=_ver_cand_btn_none_short)
+            except tk.TclError:
+                pass
+            try:
+                ver_cand_tree_frame.pack_forget()
+            except tk.TclError:
+                pass
+            if n_c == 1:
+                try:
+                    ver_cand_tree.selection_set("0")
+                except tk.TclError:
+                    pass
+
+                def _ver_cand_focus_ok() -> None:
+                    try:
+                        ver_btn_cand_confirm.focus_set()
+                    except tk.TclError:
+                        pass
+
+                root.after(10, _ver_cand_focus_ok)
+        else:
+            try:
+                ver_btn_cand_confirm.configure(text=_ver_cand_btn_confirm_full)
+                ver_btn_cand_none.configure(text=_ver_cand_btn_none_full)
+            except tk.TclError:
+                pass
+            try:
+                ver_cand_tree.configure(height=6)
+            except tk.TclError:
+                pass
+            try:
+                if not str(ver_cand_tree_frame.winfo_manager() or "").strip():
+                    ver_cand_tree_frame.pack(fill=tk.X, pady=(0, 4), before=ver_cand_btns)
+            except tk.TclError:
+                try:
+                    ver_cand_tree_frame.pack(fill=tk.X, pady=(0, 4), before=ver_cand_btns)
+                except tk.TclError:
+                    pass
         try:
             ver_btn_verifica.pack_forget()
         except tk.TclError:
@@ -19546,12 +20095,36 @@ th {{ background:#efefef; text-align:left; }}
         ver_cand_title_var.set("")
         ver_cand_dato_var.set("")
         ver_pending_resolve_idx[0] = None
+        try:
+            ver_btn_cand_confirm.configure(text=_ver_cand_btn_confirm_full)
+            ver_btn_cand_none.configure(text=_ver_cand_btn_none_full)
+        except tk.TclError:
+            pass
+        try:
+            if not str(ver_cand_tree_frame.winfo_manager() or "").strip():
+                ver_cand_tree_frame.pack(fill=tk.X, pady=(0, 4), before=ver_cand_btns)
+        except tk.TclError:
+            try:
+                ver_cand_tree_frame.pack(fill=tk.X, pady=(0, 4), before=ver_cand_btns)
+            except tk.TclError:
+                pass
+        try:
+            ver_cand_tree.configure(height=6)
+        except tk.TclError:
+            pass
         _ver_update_submit_visibility()
         _ver_update_pending_action_buttons_visibility()
         _ver_place_pending_host()
 
     def _ver_on_cand_confirm() -> None:
-        sel = ver_cand_tree.selection()
+        cands = ver_cand_candidates[0]
+        sel = list(ver_cand_tree.selection())
+        if not sel and len(cands) == 1:
+            sel = ["0"]
+            try:
+                ver_cand_tree.selection_set("0")
+            except tk.TclError:
+                pass
         if not sel:
             ver_status_var.set("Seleziona una registrazione nella griglia candidati.")
             return
@@ -19559,7 +20132,6 @@ th {{ background:#efefef; text-align:left; }}
             idx = int(sel[0])
         except (ValueError, IndexError):
             return
-        cands = ver_cand_candidates[0]
         if idx < 0 or idx >= len(cands):
             return
         chosen_rec = cands[idx][1]
@@ -19647,6 +20219,16 @@ th {{ background:#efefef; text-align:left; }}
     ver_btn_cand_confirm.configure(command=_ver_on_cand_confirm)
     ver_btn_cand_none.configure(command=_ver_on_cand_none)
 
+    def _ver_cand_on_return_key(_e: object | None = None) -> str | None:
+        if not _ver_candidate_pick_ui_active():
+            return None
+        if len(ver_cand_candidates[0]) != 1:
+            return None
+        _ver_on_cand_confirm()
+        return "break"
+
+    bind_return_and_kp_enter(ver_cand_frame, _ver_cand_on_return_key)
+
     # --- elenco dati di verifica di sessione (stesso blocco in lavorazione o in pagina risultati) ---
     ver_pending_lbl = tk.Label(
         ver_pending_host,
@@ -19659,7 +20241,7 @@ th {{ background:#efefef; text-align:left; }}
     ver_pending_lbl.pack(fill=tk.X, pady=(4, 0))
 
     ver_pending_tree_frame = tk.Frame(ver_pending_host, bg=_VER_BG, highlightthickness=0)
-    ver_pending_tree_frame.configure(height=242)
+    ver_pending_tree_frame.configure(height=320)
     ver_pending_tree_frame.pack_propagate(False)
     ver_pending_tree_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
     ver_pending_tree = ttk.Treeview(
@@ -19677,15 +20259,15 @@ th {{ background:#efefef; text-align:left; }}
     ver_pending_tree.column("date", width=62, anchor="w", stretch=False, minwidth=52)
     ver_pending_tree.column("amount", width=78, anchor="e", stretch=False, minwidth=64)
     ver_pending_tree.column("cheque", width=56, anchor="w", stretch=False, minwidth=44)
-    ver_pending_tree.column("note", width=120, anchor="w", stretch=True, minwidth=72)
+    ver_pending_tree.column("note", width=168, anchor="w", stretch=False, minwidth=72)
     ver_pending_tree.column("stato", width=72, anchor="w", stretch=False, minwidth=56)
     _ver_configure_ver_tree_amount_tags(ver_pending_tree)
     try:
-        ver_pending_tree.tag_configure("ver_sess_ok", background="#e8f5e9")
-        ver_pending_tree.tag_configure("ver_sess_sosp", background=_VER_BG)
-        ver_pending_tree.tag_configure("ver_sess_pdf", background="#fff8e1")
+        ver_pending_tree.tag_configure("stripe0", background=CDC_GRID_STRIPE0_BG)
+        ver_pending_tree.tag_configure("stripe1", background=CDC_GRID_STRIPE1_BG)
     except tk.TclError:
         pass
+    _ver_configure_results_grids_neutral_amount_fg(ver_pending_tree)
     ver_pend_scroll = ttk.Scrollbar(ver_pending_tree_frame, orient="vertical", command=ver_pending_tree.yview)
     ver_pending_tree.configure(yscrollcommand=ver_pend_scroll.set)
     ver_pending_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -19701,7 +20283,7 @@ th {{ background:#efefef; text-align:left; }}
         font=filter_ui_font,
         padx=12,
         pady=4,
-        bg=_VER_PENDING_BTN_NEW_BG,
+        bg=_VER_PENDING_BTN_EDIT_BG,
         fg="#ffffff",
         relief=tk.RAISED,
         bd=1,
@@ -19809,7 +20391,7 @@ th {{ background:#efefef; text-align:left; }}
     ver_unver_tree.column("category", width=88, anchor="w", stretch=False, minwidth=64)
     ver_unver_tree.column("account", width=78, anchor="w", stretch=False, minwidth=56)
     ver_unver_tree.column("cheque", width=48, anchor="w", stretch=False, minwidth=40)
-    ver_unver_tree.column("note", width=220, anchor="w", stretch=True, minwidth=100)
+    ver_unver_tree.column("note", width=220, anchor="w", stretch=False, minwidth=100)
     ver_unver_tree.column("period", width=120, anchor="center", stretch=False, minwidth=96)
 
     ver_unver_amt_tree = ttk.Treeview(
@@ -19859,13 +20441,13 @@ th {{ background:#efefef; text-align:left; }}
 
     _ver_configure_ver_tree_amount_tags(ver_unver_amt_tree)
     try:
-        ver_unver_amt_tree.tag_configure("ver_amt_zero", foreground="#1a1a1a")
+        ver_unver_tree.tag_configure("stripe0", background=CDC_GRID_STRIPE0_BG)
+        ver_unver_tree.tag_configure("stripe1", background=CDC_GRID_STRIPE1_BG)
+        ver_unver_amt_tree.tag_configure("stripe0", background=CDC_GRID_STRIPE0_BG)
+        ver_unver_amt_tree.tag_configure("stripe1", background=CDC_GRID_STRIPE1_BG)
     except tk.TclError:
         pass
-    try:
-        ver_unver_tree.tag_configure("ver_uv_in_period", background="#fff8e1", foreground="#b71c1c")
-    except tk.TclError:
-        pass
+    _ver_configure_results_grids_neutral_amount_fg(ver_unver_amt_tree)
 
     _ver_unv_sel_lock: list[bool] = [False]
 
@@ -20145,7 +20727,7 @@ th {{ background:#efefef; text-align:left; }}
         lambda e: on_elimina_reg_click_generic(e, _ver_unver_correzione_current_key_and_rec),
     )
 
-    ver_summary_frame = tk.Frame(ver_summary_outer, bg=_VER_BG, highlightthickness=0)
+    ver_summary_frame = tk.Frame(ver_summary_outer, bg=CDC_GRID_STRIPE1_BG, highlightthickness=0)
     _ver_sum_title_font = ("TkDefaultFont", 15, "bold")
     _ver_sum_row_font = ("TkDefaultFont", 14)
     _ver_sum_row_font_b = ("TkDefaultFont", 14, "bold")
@@ -20157,8 +20739,8 @@ th {{ background:#efefef; text-align:left; }}
         ver_summary_frame,
         text="",
         font=_ver_sum_sess_ok_font,
-        bg=_VER_BG,
-        fg="#2e7d32",
+        bg=CDC_GRID_STRIPE1_BG,
+        fg="#1a1a1a",
         anchor="w",
         justify=tk.LEFT,
     )
@@ -20166,18 +20748,19 @@ th {{ background:#efefef; text-align:left; }}
         ver_summary_frame,
         text="Riepilogo",
         font=_ver_sum_title_font,
-        bg=_VER_BG,
+        bg=CDC_GRID_STRIPE1_BG,
         fg="#1a1a1a",
         anchor="w",
     )
     ver_summary_title_lbl.pack(fill=tk.X, anchor="w", pady=(0, 1))
-    ver_summary_inner = tk.Frame(ver_summary_frame, bg=_VER_BG, highlightthickness=0)
+    ver_summary_inner = tk.Frame(ver_summary_frame, bg=CDC_GRID_STRIPE1_BG, highlightthickness=0)
     ver_summary_inner.pack(fill=tk.X, anchor="w")
     ver_verdict_lbl = tk.Label(
         ver_summary_frame,
         text="",
         font=_ver_sum_verdict_font,
-        bg=_VER_BG,
+        bg=CDC_GRID_STRIPE1_BG,
+        fg="#1a1a1a",
         anchor="w",
         justify=tk.LEFT,
     )
@@ -20220,15 +20803,37 @@ th {{ background:#efefef; text-align:left; }}
             stmt_balance=stmt_balance,
             diff=diff,
         )
+        sum_bg = str(_palette_runtime_attr("CDC_GRID_STRIPE1_BG") or CDC_GRID_STRIPE1_BG)
+        sum_fg = "#1a1a1a"
+        acc_cc_sum = ver_account_code_var.get().strip()
+        cc_debit_disp = bool(acc_cc_sum) and account_is_credit_card_by_code(cur_db(), acc_cc_sum)
+
+        def _ccd(v: object) -> Decimal:
+            try:
+                d0 = v if isinstance(v, Decimal) else Decimal(str(v))
+            except Exception:
+                d0 = Decimal("0")
+            return (-d0) if cc_debit_disp else d0
+
         for i, (desc, val) in enumerate(rows):
+            if cc_debit_disp and (
+                desc == "Saldo assoluto di Conti di casa"
+                or desc == "Proiezione del saldo assoluto di Conti di casa"
+                or desc == "Saldo dell'estratto conto"
+                or desc == "Differenza"
+            ):
+                disp_val = _ccd(val)
+            else:
+                try:
+                    disp_val = val if isinstance(val, Decimal) else Decimal(str(val))
+                except Exception:
+                    disp_val = Decimal("0")
             is_diff = desc == "Differenza"
             if is_diff:
-                amt_fg = _ver_summary_diff_line_color(match_ok)
                 df = _ver_sum_row_font_b
                 af = _ver_sum_amt_font_b
                 py = (1, 0)
             else:
-                amt_fg = _ver_summary_amount_line_color(val)
                 df = _ver_sum_row_font
                 af = _ver_sum_amt_font
                 py = (0, 0)
@@ -20236,16 +20841,16 @@ th {{ background:#efefef; text-align:left; }}
                 ver_summary_inner,
                 text=desc,
                 font=df,
-                bg=_VER_BG,
-                fg="#1a1a1a",
+                bg=sum_bg,
+                fg=sum_fg,
                 anchor="w",
             ).grid(row=i, column=0, sticky="w", padx=(0, 6), pady=py)
             tk.Label(
                 ver_summary_inner,
-                text=_ver_summary_signed_eur(val),
+                text=_ver_summary_signed_eur(disp_val),
                 font=af,
-                bg=_VER_BG,
-                fg=amt_fg,
+                bg=sum_bg,
+                fg=sum_fg,
                 anchor="e",
             ).grid(row=i, column=1, sticky="e", padx=(0, 0), pady=py)
         ver_summary_inner.grid_columnconfigure(0, weight=0)
@@ -20282,7 +20887,7 @@ th {{ background:#efefef; text-align:left; }}
             parent=verifica_frame,
         )
         if new_chq is not None:
-            item["cheque"] = new_chq.strip()
+            item["cheque"] = sanitize_single_line_text(new_chq or "", max_len=MAX_CHEQUE_LEN, strip_edges=False)
             changed_here = True
         new_note = simpledialog.askstring(
             "Modifica nota",
@@ -20291,7 +20896,7 @@ th {{ background:#efefef; text-align:left; }}
             parent=verifica_frame,
         )
         if new_note is not None:
-            item["note"] = new_note.strip()
+            item["note"] = sanitize_single_line_text(new_note or "", max_len=MAX_RECORD_NOTE_LEN, strip_edges=False)
             changed_here = True
         if changed_here:
             item["verified"] = False
@@ -20385,6 +20990,8 @@ th {{ background:#efefef; text-align:left; }}
             except Exception:
                 bal = Decimal("0")
         amt = (-bal).quantize(Decimal("0.01"))
+        if amt < 0:
+            amt = abs(amt)
         stmt_for_msg = pd.get("stmt_balance")
         try:
             if stmt_for_msg is not None:
@@ -20441,10 +21048,10 @@ th {{ background:#efefef; text-align:left; }}
                 f"• Saldo estratto conto (importo dovuto come in estratto, in positivo): {estratto_positive_eur}\n"
                 f"• Dal conto: {nm_cc}\n"
                 f"• Al conto: {nm_ref}\n"
-                f"• Importo registrazione (scarico carta / addebito sul conto di riferimento): "
+                f"• Importo registrazione (Girata conto/conto, importo positivo — scarico carta / addebito sul conto di riferimento): "
                 f"{('+' if amt >= 0 else '')}{format_euro_it(amt)} €\n\n"
-                "L'importo della registrazione è l'opposto del saldo contabile carta (addebiti negativi in app); "
-                "con verifica coincidente coincide in genere con l'importo dovuto sull'estratto in valore assoluto. "
+                "L'importo è calcolato in modo che risulti positivo (valore assoluto rispetto al saldo contabile carta "
+                "quando serve). "
                 "La girata riduce il saldo carta e il conto di riferimento della stessa cifra "
                 "(senza inversione di segno sul secondo conto nelle schermate di verifica)."
                 f"{uv_tail}\n\n"
@@ -20605,6 +21212,11 @@ th {{ background:#efefef; text-align:left; }}
         ver_inp_chq_var.set("")
         ver_inp_note_var.set("")
         _ver_pack_ver_input_on_results_page()
+        _ver_update_pending_action_buttons_visibility()
+        try:
+            root.after_idle(_ver_update_pending_action_buttons_visibility)
+        except Exception:
+            pass
         try:
             ver_btn_new_ver_data.focus_set()
         except tk.TclError:
@@ -20665,7 +21277,7 @@ th {{ background:#efefef; text-align:left; }}
             if en:
                 ver_btn_bancoposta_browse.configure(
                     cursor="hand2",
-                    bg=_VER_FOOT_PRINT_BG,
+                    bg=_VER_SETUP_PDF_BTN_BG,
                     fg="#ffffff",
                 )
             else:
@@ -21455,6 +22067,36 @@ th {{ background:#efefef; text-align:left; }}
 
         ver_memory_resume_prompt_after[0] = root.after(1, _go)
 
+    def _ver_hide_pending_area_for_stmt_dialog() -> None:
+        """Nasconde la griglia sessione/dati verifica (vuota o non rilevante) dietro ai dialoghi sul saldo."""
+        try:
+            ver_pending_host.pack_forget()
+        except tk.TclError:
+            pass
+
+    def _ver_stmt_balance_initial_hint_for_dialog(val: Decimal | None) -> Decimal | None:
+        """Conto carta: proposta saldo estratto in negativo (debito); conti banca: segno dall'estratto."""
+        if val is None:
+            return None
+        ac = (ver_account_code_var.get().strip() or (ver_session_account_code[0] or "")).strip()
+        if not ac:
+            try:
+                return val.quantize(Decimal("0.01"))
+            except Exception:
+                return None
+        if not account_is_credit_card_by_code(cur_db(), ac):
+            try:
+                return val.quantize(Decimal("0.01"))
+            except Exception:
+                return None
+        try:
+            iq = val.quantize(Decimal("0.01"))
+        except Exception:
+            return None
+        if iq > 0:
+            return -iq
+        return iq
+
     # ---- Avvio sessione ----
     def _ver_on_start() -> None:
         try:
@@ -21693,6 +22335,7 @@ th {{ background:#efefef; text-align:left; }}
         _pdf_coda_has_row = bool(_q0) and 0 <= _i0 < len(_q0)
         if not resuming_manual_batch and not ver_pending_items[0] and not _pdf_coda_has_row:
             if _ver_all_verified(acc_code):
+                _ver_hide_pending_area_for_stmt_dialog()
                 ver_manual_any_amount_submitted[0] = True
                 messagebox.showinfo(
                     "Verifica",
@@ -21856,13 +22499,15 @@ th {{ background:#efefef; text-align:left; }}
             ver_ent_amt.focus_set()
             return
         ver_manual_any_amount_submitted[0] = True
-        chq = ver_inp_chq_var.get().strip()
-        note = ver_inp_note_var.get().strip()
-        if not chq and not note:
+        raw_chq = ver_inp_chq_var.get() or ""
+        raw_note = ver_inp_note_var.get() or ""
+        if not raw_chq.strip() and not raw_note.strip():
             messagebox.showerror("Verifica", "Immetti il testo dell'Assegno oppure della Nota.")
             ver_ent_chq.focus_set()
             return
-        if chq and note:
+        chq = sanitize_single_line_text(raw_chq, max_len=MAX_CHEQUE_LEN, strip_edges=False)
+        note = sanitize_single_line_text(raw_note, max_len=MAX_RECORD_NOTE_LEN, strip_edges=False)
+        if chq.strip() and note.strip():
             if pdf_assisted:
                 ver_inp_chq_var.set("")
                 chq = ""
@@ -22185,22 +22830,25 @@ th {{ background:#efefef; text-align:left; }}
                 pass
         on_results = _ver_ui_on_results_page()
         ver_pending_tree.delete(*ver_pending_tree.get_children())
+        display_idx = 0
         for i, item in enumerate(ver_pending_items[0]):
             if on_results and _ver_item_is_verified(item):
                 continue
+            stripe = f"stripe{display_idx % 2}"
+            display_idx += 1
             date_disp = _ver_format_pending_item_date(item)
             if on_results:
                 amt_str, pend_tag = _ver_grid_amount_from_amount_str(item.get("amount", "0"))
                 stato = "In sospeso"
-                row_tags = ("ver_sess_sosp", pend_tag)
+                row_tags = (stripe, pend_tag)
             elif _ver_item_is_verified(item):
-                amt_str, _pend = _ver_grid_amount_from_amount_str(item.get("amount", "0"))
+                amt_str, pend_tag = _ver_grid_amount_from_amount_str(item.get("amount", "0"))
                 stato = "Verificato"
-                row_tags = ("ver_sess_ok",)
+                row_tags = (stripe, pend_tag)
             else:
                 amt_str, pend_tag = _ver_grid_amount_from_amount_str(item.get("amount", "0"))
                 stato = "In sospeso"
-                row_tags = ("ver_sess_sosp", pend_tag)
+                row_tags = (stripe, pend_tag)
             chq_d = _ver_trunc_ver_result_cell(item.get("cheque", ""), 20)
             note_d = _ver_trunc_ver_result_cell(item.get("note", ""), 120)
             ver_pending_tree.insert(
@@ -22225,12 +22873,13 @@ th {{ background:#efefef; text-align:left; }}
                 note_pdf = str(row.get("note") or "")
                 if len(note_pdf) > 240:
                     note_pdf = note_pdf[:237] + "..."
+                stripe_pdf = f"stripe{display_idx % 2}"
                 ver_pending_tree.insert(
                     "",
                     "end",
                     iid="__pdf_current__",
                     values=(date_pdf, amt_str_p, "", note_pdf, "Voce corrente (PDF)"),
-                    tags=(pdf_tag, "ver_sess_pdf"),
+                    tags=(stripe_pdf, pdf_tag),
                 )
         ch = ver_pending_tree.get_children()
         if ch:
@@ -22270,6 +22919,13 @@ th {{ background:#efefef; text-align:left; }}
             ver_pending_lbl.configure(text="Tutti i dati di verifica di sessione risultano verificati")
         else:
             ver_pending_lbl.configure(text="Dati di verifica in sospeso")
+        def _ver_pending_redraw_pulse() -> None:
+            try:
+                ver_pending_tree.update_idletasks()
+                ver_pending_tree_frame.update_idletasks()
+            except tk.TclError:
+                pass
+
         _ver_update_pending_action_buttons_visibility()
         _ver_place_pending_host()
         _ver_update_results_session_ui_visibility()
@@ -22278,7 +22934,13 @@ th {{ background:#efefef; text-align:left; }}
             try:
                 ver_results_frame.update_idletasks()
                 ver_pending_host.update_idletasks()
+                ver_pending_tree_frame.update_idletasks()
+                ver_pending_tree.update_idletasks()
             except tk.TclError:
+                pass
+            try:
+                root.after_idle(_ver_pending_redraw_pulse)
+            except Exception:
                 pass
             _ver_pack_ver_input_on_results_page()
 
@@ -22483,9 +23145,12 @@ th {{ background:#efefef; text-align:left; }}
     # ---- Terminazione immissione e posizionamento ** ----
     def _ver_ask_stmt_balance(*, initial_balance: Decimal | None = None) -> Decimal | None:
         """Finestra dedicata per immissione saldo estratto conto con validazione euro."""
+        _ver_hide_pending_area_for_stmt_dialog()
         eff_initial = initial_balance
         if eff_initial is None:
             eff_initial = ver_pdf_closing_balance_hint[0]
+        if eff_initial is not None:
+            eff_initial = _ver_stmt_balance_initial_hint_for_dialog(eff_initial)
 
         dlg = tk.Toplevel(verifica_frame)
         dlg.title("Saldo estratto conto")
@@ -22497,7 +23162,6 @@ th {{ background:#efefef; text-align:left; }}
             except Exception:
                 pass
         dlg.resizable(False, False)
-        dlg.configure(bg=_VER_BG)
 
         intro = (
             f"Immetti il saldo del conto {ver_account_name_var.get()}\n"
@@ -22509,7 +23173,6 @@ th {{ background:#efefef; text-align:left; }}
             dlg,
             text=intro,
             font=_ver_ui_font,
-            bg=_VER_BG,
             justify=tk.LEFT,
         ).pack(padx=16, pady=(16, 8))
         bal_var = tk.StringVar(value="+")
@@ -22544,8 +23207,9 @@ th {{ background:#efefef; text-align:left; }}
                 pass
 
         bal_err_var = tk.StringVar(value="")
-        tk.Label(dlg, textvariable=bal_err_var, font=("TkDefaultFont", 10), bg=_VER_BG,
-                 fg="#c62828").pack(padx=16, pady=(0, 4))
+        tk.Label(dlg, textvariable=bal_err_var, font=("TkDefaultFont", 10), fg="#c62828").pack(
+            padx=16, pady=(0, 4)
+        )
 
         result: list[Decimal | None] = [None]
 
@@ -22565,7 +23229,7 @@ th {{ background:#efefef; text-align:left; }}
         def _on_cancel() -> None:
             dlg.destroy()
 
-        btn_frame = tk.Frame(dlg, bg=_VER_BG)
+        btn_frame = tk.Frame(dlg)
         btn_frame.pack(padx=16, pady=(4, 16))
         ttk.Button(btn_frame, text="Conferma", command=_on_ok, style="NewReg.TButton").pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(btn_frame, text="Annulla", command=_on_cancel, style="NewReg.TButton").pack(side=tk.LEFT)
@@ -22656,6 +23320,14 @@ th {{ background:#efefef; text-align:left; }}
         _ver_show_results(acc_code, stmt_balance)
         ver_bancoposta_closing[0] = None
         ver_pdf_closing_balance_hint[0] = None
+
+    def _ver_session_has_no_entered_verification_data() -> bool:
+        """True se non risultano righe in sospeso né immissioni contate (stesso criterio del Termina «a vuoto»)."""
+        if _ver_count_pending_rows() > 0:
+            return False
+        if ver_manual_any_amount_submitted[0]:
+            return False
+        return True
 
     def _ver_on_end_input() -> None:
         _ver_suppress_next_amt_focusout_check()
@@ -22792,7 +23464,8 @@ th {{ background:#efefef; text-align:left; }}
                 if pre_bal is not None:
                     ver_pdf_closing_balance_hint[0] = pre_bal
             if pre_bal is not None:
-                ver_stmt_balance_var.set(str(pre_bal))
+                adj_bal = _ver_stmt_balance_initial_hint_for_dialog(pre_bal)
+                ver_stmt_balance_var.set(str(adj_bal if adj_bal is not None else pre_bal))
                 existing = ver_stmt_balance_var.get().strip()
         if existing:
             try:
@@ -22812,6 +23485,22 @@ th {{ background:#efefef; text-align:left; }}
                     ver_pdf_closing_balance_hint[0] = ask_hint
             stmt_balance = _ver_ask_stmt_balance(initial_balance=ask_hint)
             if stmt_balance is None:
+                if _ver_session_has_no_entered_verification_data():
+                    acc_abandon = str(ver_account_code_var.get() or "").strip() or str(
+                        ver_session_account_code[0] or ""
+                    ).strip()
+                    if acc_abandon:
+                        try:
+                            _ver_clear_pending_from_db(acc_abandon)
+                            persist_db_after_edit(None)
+                        except Exception:
+                            pass
+                    _ver_apply_full_verification_teardown()
+                    try:
+                        _ver_update_pending_action_buttons_visibility()
+                    except Exception:
+                        pass
+                    return
                 _ver_restore_immissione_after_stmt_cancelled()
                 ver_status_var.set(
                     "Saldo estratto conto non indicato: continuare l'immissione dei dati di verifica, "
@@ -23117,7 +23806,9 @@ th {{ background:#efefef; text-align:left; }}
         ver_unver_tree.delete(*ver_unver_tree.get_children())
         ver_unver_amt_tree.delete(*ver_unver_amt_tree.get_children())
 
+        uvi = 0
         for reg_n, rec, side in unverified_before:
+            stripe = f"stripe{uvi % 2}"
             y_acc = acc_by_year.get(rec.get("year"), [])
             y_cat = cat_by_year.get(rec.get("year"), [])
             cat_name = category_name_for_record(rec, y_cat)
@@ -23138,11 +23829,13 @@ th {{ background:#efefef; text-align:left; }}
                     _ver_trunc_ver_result_cell(str(rec.get("note") or ""), 140),
                     "✖",
                 ),
-                tags=("ver_uv_in_period",),
+                tags=(stripe,),
             )
-            ver_unver_amt_tree.insert("", "end", iid=iid, values=(amount_text,), tags=(uv_tag,))
+            ver_unver_amt_tree.insert("", "end", iid=iid, values=(amount_text,), tags=(uv_tag, stripe))
+            uvi += 1
 
         for reg_n, rec, side in unverified_after:
+            stripe = f"stripe{uvi % 2}"
             y_acc = acc_by_year.get(rec.get("year"), [])
             y_cat = cat_by_year.get(rec.get("year"), [])
             cat_name = category_name_for_record(rec, y_cat)
@@ -23163,9 +23856,10 @@ th {{ background:#efefef; text-align:left; }}
                     _ver_trunc_ver_result_cell(str(rec.get("note") or ""), 140),
                     "",
                 ),
-                tags=(),
+                tags=(stripe,),
             )
-            ver_unver_amt_tree.insert("", "end", iid=iid, values=(amount_text,), tags=(uv_tag2,))
+            ver_unver_amt_tree.insert("", "end", iid=iid, values=(amount_text,), tags=(uv_tag2, stripe))
+            uvi += 1
 
         try:
             _ver_unver_autofit_key_columns()
@@ -23215,7 +23909,7 @@ th {{ background:#efefef; text-align:left; }}
             ver_results_btns.pack(anchor=tk.CENTER, pady=2)
         except tk.TclError:
             pass
-        ver_sospesi_split.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(2, 4), in_=ver_results_frame)
+        ver_sospesi_split.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=4, pady=(2, 4), in_=ver_results_frame)
         ver_results_title.pack(side=tk.TOP, fill=tk.X, pady=(6, 4), in_=ver_results_frame, after=ver_sospesi_split)
         if count_unverified == 0:
             try:
@@ -23349,6 +24043,8 @@ th {{ background:#efefef; text-align:left; }}
         # Resta sulla pagina risultati: uscita dalla verifica solo con «Chiudi verifica».
 
     ver_btn_print.bind("<Button-1>", lambda _e: _ver_on_print())
+    ver_btn_print.bind("<Enter>", lambda _e: ver_btn_print.configure(bg=_VER_FOOT_PRINT_BG_ACT))
+    ver_btn_print.bind("<Leave>", lambda _e: ver_btn_print.configure(bg=_VER_FOOT_PRINT_BG))
 
     # ---- Nuovo ciclo: ritenta verifica automatica sui sospesi ----
     def _ver_retry_pending() -> int:
@@ -23540,6 +24236,7 @@ th {{ background:#efefef; text-align:left; }}
         ver_setup_saved_var.set("")
         ver_setup_frame.pack(fill=tk.X, anchor=tk.W, pady=(0, 4), in_=ver_body)
         _ver_populate_account_combo()
+        _ver_refresh_setup_saved_banner_global()
 
     def _ver_on_close() -> None:
         ver_amt_focusout_suppress_once[0] = True
@@ -23595,6 +24292,8 @@ th {{ background:#efefef; text-align:left; }}
                 except Exception:
                     bal_x = Decimal("0")
             amt_x = (-bal_x).quantize(Decimal("0.01"))
+            if amt_x < 0:
+                amt_x = abs(amt_x)
             stmt_pdf = pd_cc.get("stmt_balance")
             try:
                 stmt_pdf_d = Decimal(str(stmt_pdf)) if stmt_pdf is not None else bal_x
@@ -23614,11 +24313,10 @@ th {{ background:#efefef; text-align:left; }}
                 f"• Saldo estratto conto (come in estratto, in positivo): {estratto_pos_txt}\n"
                 f"• Dal conto: {nm_cc}\n"
                 f"• Al conto: {nm_ref}\n"
-                f"• Importo registrazione (scarico carta / addebito sul conto di riferimento): "
+                f"• Importo registrazione (Girata positiva — scarico carta / addebito sul conto di riferimento): "
                 f"{('+' if amt_x >= 0 else '')}{format_euro_it(amt_x)} €\n\n"
-                "L'importo della registrazione è l'opposto del saldo contabile carta in Conti di casa "
-                "(gli acquisti figurano negativamente); coincide in genere con l'importo dovuto dell'estratto "
-                "in valore assoluto. "
+                "L'importo è registrato in positivo (valore assoluto se necessario); coincide di solito con "
+                "l'importo dovuto sull'estratto in valore assoluto. "
                 "(Senza inversione di segno sul secondo conto nelle schermate di verifica.)"
                 f"{uv_tail}\n\n"
                 "«Annulla» resta in questa pagina. «OK» salva la girata e chiude la sessione di verifica."
@@ -23739,21 +24437,16 @@ th {{ background:#efefef; text-align:left; }}
     stat_report_row.columnconfigure(0, weight=1)
     stat_report_btns = ttk.Frame(stat_report_row, style="MovCdc.TFrame")
     stat_report_btns.grid(row=0, column=0)
-    _STAT_REPORT_SEL_BG = "#0d47a1"
-    _STAT_REPORT_SEL_ACT_BG = "#08306b"
-    _STAT_REPORT_OFF_BG = "#e3f2fd"
-    _STAT_REPORT_OFF_ACT_BG = "#bbdefb"
-    _STAT_REPORT_OFF_FG = "#0d47a1"
     stat_report_conti_btn = tk.Label(
         stat_report_btns,
         text="Statistiche per conti",
         cursor="hand2",
         highlightthickness=0,
-        font=filter_ui_font,
-        padx=14,
-        pady=3,
+        font=_TAB_BAR_FONT,
+        padx=10,
+        pady=5,
         relief=tk.RAISED,
-        bd=1,
+        bd=CDC_FILTER_TAB_CHIP_BD,
     )
     stat_report_conti_btn.pack(side=tk.LEFT, padx=(0, 10))
     stat_report_categorie_btn = tk.Label(
@@ -23761,13 +24454,15 @@ th {{ background:#efefef; text-align:left; }}
         text="Statistiche per categoria",
         cursor="hand2",
         highlightthickness=0,
-        font=filter_ui_font,
-        padx=14,
-        pady=3,
+        font=_TAB_BAR_FONT,
+        padx=10,
+        pady=5,
         relief=tk.RAISED,
-        bd=1,
+        bd=CDC_FILTER_TAB_CHIP_BD,
     )
     stat_report_categorie_btn.pack(side=tk.LEFT)
+    _set_filter_toggle_style(stat_report_conti_btn, True, bd_width=CDC_FILTER_TAB_CHIP_BD)
+    _set_filter_toggle_style(stat_report_categorie_btn, False, bd_width=CDC_FILTER_TAB_CHIP_BD)
     def _stat_select_report_mode(mode: str) -> None:
         stat_category_history_mode.set(False)
         if str(stat_report_mode.get() or "") == mode:
@@ -23856,20 +24551,31 @@ th {{ background:#efefef; text-align:left; }}
         rowheight=_stat_rowh,
         borderwidth=0,
         relief="flat",
+        background=CDC_GRID_STRIPE1_BG,
+        fieldbackground=CDC_GRID_STRIPE1_BG,
     )
-    _stat_sty.configure("StatCdc.Treeview.Heading", font=(_stat_ffam, _stat_fsz, "bold"))
+    _stat_sty.configure(
+        "StatCdc.Treeview.Heading",
+        font=(_stat_ffam, _stat_fsz, "bold"),
+        background=CDC_GRID_HEADING_BG,
+        foreground="#1a1a1a",
+    )
     _stat_sty.configure(
         "BudSumm.Treeview",
         font=(_stat_ffam, _stat_fsz),
         rowheight=max(_stat_rowh, int(_stat_fsz * 2.65)),
         borderwidth=0,
         relief="flat",
+        background=CDC_GRID_STRIPE1_BG,
+        fieldbackground=CDC_GRID_STRIPE1_BG,
     )
     # Aqua taglia le heading multilinea del Treeview: intestazioni vere su Label (vedi _bud_pack_section_tree).
     _stat_sty.configure(
         "BudSumm.Treeview.Heading",
         font=(_stat_ffam, 1),
         padding=(0, 0),
+        background=CDC_GRID_HEADING_BG,
+        foreground="#1a1a1a",
     )
     _stat_sty.configure(
         "StatHistoryCdc.Treeview",
@@ -23877,8 +24583,15 @@ th {{ background:#efefef; text-align:left; }}
         rowheight=max(20, int(_stat_fsz * 1.55)),
         borderwidth=0,
         relief="flat",
+        background=CDC_GRID_STRIPE1_BG,
+        fieldbackground=CDC_GRID_STRIPE1_BG,
     )
-    _stat_sty.configure("StatHistoryCdc.Treeview.Heading", font=(_stat_ffam, _stat_fsz, "bold"))
+    _stat_sty.configure(
+        "StatHistoryCdc.Treeview.Heading",
+        font=(_stat_ffam, _stat_fsz, "bold"),
+        background=CDC_GRID_HEADING_BG,
+        foreground="#1a1a1a",
+    )
 
     # Sette colonne dati (niente «Raffronto» in tabella; il valore resta calcolabile dove serve).
     _stat_month_right_cols = ("ini", "fin", "dsaldo", "pct", "entr", "usc", "net")
@@ -24881,6 +25594,14 @@ th {{ background:#efefef; text-align:left; }}
 
     _stat_on_tab_enter_fn[0] = _stat_refresh_trees
     _stat_refresh_trees()
+
+    def _stat_on_frame_map(_e: tk.Event | None = None) -> None:
+        try:
+            statistiche_frame.update_idletasks()
+        except tk.TclError:
+            pass
+
+    statistiche_frame.bind("<Map>", lambda _e: root.after_idle(_stat_on_frame_map), add="+")
 
     def _stat_table_heads_from_def(head_it: tuple[tuple[str, str, int], ...]) -> list[str]:
         return [pair[1] for pair in head_it]
@@ -26215,11 +26936,27 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 return
             _stat_print_aggregate_category_history_via_browser(intro_plain, needle_ok)
 
-        ttk.Button(bf, text="Stampa…", command=_print_aggregate_category_history_sheet).pack(side=tk.RIGHT, padx=(0, 8))
+        agg_hist_stamp = tk.Label(
+            bf,
+            text="Stampa…",
+            cursor="hand2",
+            highlightthickness=0,
+            font=filter_ui_font,
+            padx=8,
+            pady=2,
+            bg=_STAT_TK_PRINT_RED,
+            fg="#ffffff",
+            relief=tk.RAISED,
+            bd=1,
+        )
+        agg_hist_stamp.pack(side=tk.RIGHT, padx=(0, 8))
+        agg_hist_stamp.bind("<Button-1>", lambda _e: _print_aggregate_category_history_sheet())
+        agg_hist_stamp.bind("<Enter>", lambda _e: agg_hist_stamp.configure(bg=_STAT_TK_PRINT_RED_ACT))
+        agg_hist_stamp.bind("<Leave>", lambda _e: agg_hist_stamp.configure(bg=_STAT_TK_PRINT_RED))
         ttk.Button(bf, text="Chiudi", command=top.destroy).pack(side=tk.RIGHT)
 
-    _STAT_TK_PRINT_RED = "#c62828"
-    _STAT_TK_PRINT_RED_ACT = "#8e0000"
+    _STAT_TK_PRINT_RED = "#ff0000"
+    _STAT_TK_PRINT_RED_ACT = "#cc0000"
     _STAT_TK_BARS_BLUE = "#1565c0"
     _STAT_TK_BARS_BLUE_ACT = "#0d47a1"
 
@@ -26368,24 +27105,10 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     )
     stat_history_category_cb.bind("<<ComboboxSelected>>", lambda _e: _stat_refresh_category_history_table())
 
-    def _stat_config_report_button(btn: tk.Label, *, selected: bool, active: bool = False) -> None:
-        if selected:
-            btn.configure(
-                bg=_STAT_REPORT_SEL_ACT_BG if active else _STAT_REPORT_SEL_BG,
-                fg="#ffffff",
-                relief=tk.SUNKEN,
-            )
-        else:
-            btn.configure(
-                bg=_STAT_REPORT_OFF_ACT_BG if active else _STAT_REPORT_OFF_BG,
-                fg=_STAT_REPORT_OFF_FG,
-                relief=tk.RAISED,
-            )
-
     def _stat_refresh_report_buttons() -> None:
         mode = str(stat_report_mode.get() or "conti")
-        _stat_config_report_button(stat_report_conti_btn, selected=(mode == "conti"))
-        _stat_config_report_button(stat_report_categorie_btn, selected=(mode == "categorie"))
+        _set_filter_toggle_style(stat_report_conti_btn, mode == "conti", bd_width=CDC_FILTER_TAB_CHIP_BD)
+        _set_filter_toggle_style(stat_report_categorie_btn, mode == "categorie", bd_width=CDC_FILTER_TAB_CHIP_BD)
 
     def _stat_show_standard_period_controls(show: bool) -> None:
         widgets: tuple[tk.Misc, ...] = (
@@ -26483,31 +27206,22 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         except tk.TclError:
             pass
 
-    stat_report_conti_btn.bind(
-        "<Enter>",
-        lambda _e: _stat_config_report_button(
-            stat_report_conti_btn,
-            selected=(str(stat_report_mode.get() or "conti") == "conti"),
-            active=True,
-        ),
+    _filter_chip_hover(
+        stat_report_conti_btn,
+        _stat_refresh_report_buttons,
+        lambda: str(stat_report_mode.get() or "conti") == "conti",
     )
-    stat_report_conti_btn.bind("<Leave>", lambda _e: _stat_refresh_report_buttons())
-    stat_report_categorie_btn.bind(
-        "<Enter>",
-        lambda _e: _stat_config_report_button(
-            stat_report_categorie_btn,
-            selected=(str(stat_report_mode.get() or "conti") == "categorie"),
-            active=True,
-        ),
+    _filter_chip_hover(
+        stat_report_categorie_btn,
+        _stat_refresh_report_buttons,
+        lambda: str(stat_report_mode.get() or "conti") == "categorie",
     )
-    stat_report_categorie_btn.bind("<Leave>", lambda _e: _stat_refresh_report_buttons())
     stat_report_mode.trace_add("write", _stat_apply_report_mode)
     _stat_apply_report_mode()
 
     # ----- Budget: tabellone annuale (movimenti reali vs budget modificabile) -----
     _bud_top_fr = ttk.Frame(budget_frame, style="MovCdc.TFrame")
     _bud_top_fr.pack(anchor=tk.W, fill=tk.X, pady=(0, 6))
-    ttk.Label(_bud_top_fr, text="Anno di riferimento:", style="MovCdc.TLabel").pack(side=tk.LEFT)
     _bud_year_candidates = sorted(
         {int(yb["year"]) for yb in (db_holder[0].get("years") or []) if yb.get("year") is not None},
         key=int,
@@ -26523,23 +27237,50 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             budget_snapshot_load(db_holder[0], _ply, _pnm)
             _bud_default_year = _ply
     budget_year_var = tk.StringVar(value=str(_bud_default_year))
+
+    _bud_view_mode: list[str] = ["tabellone"]
+
+    _bud_top_fr.columnconfigure(1, weight=1)
+
+    _bud_hdr_left = tk.Frame(_bud_top_fr, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
+    ttk.Label(_bud_hdr_left, text="Anno di riferimento:", style="MovCdc.TLabel").pack(side=tk.LEFT)
     budget_year_cb = ttk.Combobox(
-        _bud_top_fr,
+        _bud_hdr_left,
         textvariable=budget_year_var,
         width=7,
         state="readonly",
         values=[str(y) for y in _bud_year_candidates],
     )
     budget_year_cb.pack(side=tk.LEFT, padx=(8, 0))
-    ttk.Label(
-        _bud_top_fr,
-        text="Doppio clic su «BUD» per modificare un mese. Tasto destro sulla riga: uguale budget mensile (media su 12) o grafico.",
-        style="MovCdc.TLabel",
-        font=("TkDefaultFont", 10),
-    ).pack(side=tk.LEFT, padx=(16, 0))
+    _bud_hdr_left.grid(row=0, column=0, sticky="w")
 
-    _bud_bar_actions = tk.Frame(_bud_top_fr, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    _bud_bar_actions.pack(side=tk.RIGHT, padx=(8, 0))
+    _bud_hdr_right = tk.Frame(_bud_top_fr, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
+    _bud_bar_extra = tk.Frame(_bud_hdr_right, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
+    _bud_bar_extra.pack(side=tk.LEFT)
+    _bud_hdr_right.grid(row=0, column=2, sticky="e", padx=(8, 0))
+
+    _bud_hdr_center = tk.Frame(_bud_top_fr, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
+    _bud_hdr_center.columnconfigure(0, weight=1)
+    _bud_hdr_center.columnconfigure(2, weight=1)
+    _bud_bar_tabs = tk.Frame(_bud_hdr_center, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
+    _bud_bar_tabs.grid(row=0, column=1)
+    _bud_hdr_center.grid(row=0, column=1, sticky="ew")
+
+    _bud_extra_slot_w: list[int] = [0]
+    _bud_hdr_right_slot_w: list[int] = [0]
+
+    def _bud_capture_extra_w() -> None:
+        try:
+            _bud_bar_extra.update_idletasks()
+            w = int(_bud_bar_extra.winfo_reqwidth())
+            if w > _bud_extra_slot_w[0]:
+                _bud_extra_slot_w[0] = w
+            _bud_hdr_right.update_idletasks()
+            wr = int(_bud_hdr_right.winfo_reqwidth())
+            if wr > _bud_hdr_right_slot_w[0]:
+                _bud_hdr_right_slot_w[0] = wr
+        except (tk.TclError, ValueError, TypeError):
+            pass
 
     def _bud_current_year_int() -> int:
         try:
@@ -26822,10 +27563,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             m.grab_release()
 
     _BUD_BTN_SCEN_BG, _BUD_BTN_SCEN_BG_ACT = "#1565c0", "#0d47a1"
-    _BUD_BTN_TABC_BG, _BUD_BTN_TABC_BG_ACT = "#00695c", "#004d40"
-    _BUD_BTN_SINT_BG, _BUD_BTN_SINT_BG_ACT = "#6a1b9a", "#4a148c"
-    _BUD_BTN_PDFT_BG, _BUD_BTN_PDFT_BG_ACT = "#c62828", "#8e0000"
-    _BUD_BTN_PDFS_BG, _BUD_BTN_PDFS_BG_ACT = "#e65100", "#bf360c"
+    _BUD_BTN_PDFT_BG, _BUD_BTN_PDFT_BG_ACT = "#ff0000", "#cc0000"
 
     def _bud_wire_lbl_btn(w: tk.Label, bg: str, bg_act: str) -> None:
         def _en(_e: tk.Event | None = None) -> None:
@@ -26837,8 +27575,14 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         w.bind("<Enter>", _en)
         w.bind("<Leave>", _lv)
 
-    _bud_pdf_tab_btn = tk.Label(
-        _bud_bar_actions,
+    def _bud_on_print_click() -> None:
+        if _bud_view_mode[0] == "sintesi":
+            _bud_print_summary_dlg()
+        else:
+            _bud_print_dlg()
+
+    _bud_print_btn = tk.Label(
+        _bud_bar_extra,
         text="Stampa tabellone",
         bg=_BUD_BTN_PDFT_BG,
         fg="#ffffff",
@@ -26850,8 +27594,8 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         bd=1,
         highlightthickness=0,
     )
-    _bud_wire_lbl_btn(_bud_pdf_tab_btn, _BUD_BTN_PDFT_BG, _BUD_BTN_PDFT_BG_ACT)
-    _bud_pdf_tab_btn.bind("<Button-1>", lambda _e: _bud_print_dlg())
+    _bud_wire_lbl_btn(_bud_print_btn, _BUD_BTN_PDFT_BG, _BUD_BTN_PDFT_BG_ACT)
+    _bud_print_btn.bind("<Button-1>", lambda _e: _bud_on_print_click())
 
     lbl_budget_heading = tk.Label(
         budget_frame,
@@ -26925,8 +27669,6 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
 
     _bud_summary_wrap.bind("<Enter>", lambda _e: _bud_summ_canvas.focus_set())
 
-    _bud_view_mode: list[str] = ["tabellone"]
-
     def _bud_pack_section_tree(
         parent: tk.Misc,
         section_title: str,
@@ -26944,8 +27686,8 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         htree = max(4, min(18, len(rows)))
         table_box = ttk.Frame(parent, style="MovCdc.TFrame")
         table_box.pack(fill=tk.X, expand=False)
-        _hdr_bg = (_stat_sty.lookup("Treeview.Heading", "background") or "").strip() or "#e8e8e8"
-        _hdr_fg = (_stat_sty.lookup("Treeview.Heading", "foreground") or "").strip() or "#000000"
+        _hdr_bg = CDC_GRID_HEADING_BG
+        _hdr_fg = "#1a1a1a"
         _hdr_sep = "#c4c4c4"
         _hdr_font = (_stat_ffam, max(8, _stat_fsz - 1), "bold")
         hdr_bar = tk.Frame(table_box, bg=_hdr_sep, highlightthickness=0)
@@ -27026,22 +27768,6 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 _bud_summ_resize()
                 _bud_summ_bind_wheel_recursive(_bud_summ_inner)
                 return
-            btn_pdf_s = tk.Label(
-                _bud_summ_inner,
-                text="Stampa sintesi PDF…",
-                bg=_BUD_BTN_PDFS_BG,
-                fg="#ffffff",
-                font=("TkDefaultFont", 10),
-                padx=12,
-                pady=5,
-                cursor="hand2",
-                relief=tk.RAISED,
-                bd=1,
-                highlightthickness=0,
-            )
-            _bud_wire_lbl_btn(btn_pdf_s, _BUD_BTN_PDFS_BG, _BUD_BTN_PDFS_BG_ACT)
-            btn_pdf_s.bind("<Button-1>", lambda _e: _bud_print_summary_dlg())
-            btn_pdf_s.pack(anchor=tk.W, pady=(0, 8))
             _bud_pack_section_tree(
                 _bud_summ_inner,
                 "1) MOVIMENTI — mensile e cumulo",
@@ -27125,16 +27851,88 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         except Exception as exc:
             messagebox.showerror("Sintesi budget", str(exc), parent=root)
 
+    def _set_budget_tab_chip_style(w: tk.Label, selected: bool) -> None:
+        """Chip Tabellone/Sintesi: stessa palette e rilievo dei filtri Movimenti (bd=CDC_FILTER_TAB_CHIP_BD)."""
+        if selected:
+            w.configure(
+                bg=MOV_FILTER_TAB_BTN_ACTIVE_BG,
+                fg=MOV_FILTER_TAB_BTN_FG,
+                relief=tk.SUNKEN,
+                bd=CDC_FILTER_TAB_CHIP_BD,
+                highlightthickness=0,
+            )
+        else:
+            w.configure(
+                bg=MOV_FILTER_TAB_BTN_BG,
+                fg=MOV_FILTER_TAB_BTN_FG,
+                relief=tk.RAISED,
+                bd=CDC_FILTER_TAB_CHIP_BD,
+                highlightthickness=0,
+            )
+
+    _bud_tab_btn = tk.Label(
+        _bud_bar_tabs,
+        text="Tabellone",
+        cursor="hand2",
+        highlightthickness=0,
+        font=_TAB_BAR_FONT,
+        padx=10,
+        pady=5,
+        width=12,
+        relief=tk.SUNKEN,
+        bd=CDC_FILTER_TAB_CHIP_BD,
+        bg=MOV_FILTER_TAB_BTN_ACTIVE_BG,
+        fg=MOV_FILTER_TAB_BTN_FG,
+    )
+    _bud_tab_btn.pack(side=tk.LEFT, padx=(0, 10))
+    _bud_sin_btn = tk.Label(
+        _bud_bar_tabs,
+        text="Sintesi",
+        cursor="hand2",
+        highlightthickness=0,
+        font=_TAB_BAR_FONT,
+        padx=10,
+        pady=5,
+        width=12,
+        relief=tk.RAISED,
+        bd=CDC_FILTER_TAB_CHIP_BD,
+        bg=MOV_FILTER_TAB_BTN_BG,
+        fg=MOV_FILTER_TAB_BTN_FG,
+    )
+    _bud_sin_btn.pack(side=tk.LEFT)
+    _set_budget_tab_chip_style(_bud_tab_btn, True)
+    _set_budget_tab_chip_style(_bud_sin_btn, False)
+
+    def _bud_refresh_tab_chips() -> None:
+        vm = _bud_view_mode[0]
+        _set_budget_tab_chip_style(_bud_tab_btn, vm == "tabellone")
+        _set_budget_tab_chip_style(_bud_sin_btn, vm == "sintesi")
+
     def _bud_show_tabellone() -> None:
         _bud_view_mode[0] = "tabellone"
         _bud_summary_wrap.pack_forget()
         _bud_grid_outer.pack(fill=tk.BOTH, expand=True)
-        _bud_tab_btn.configure(relief=tk.SUNKEN, bd=2)
-        _bud_sin_btn.configure(relief=tk.RAISED, bd=1)
+        _bud_refresh_tab_chips()
+        try:
+            _bud_print_btn.configure(text="Stampa tabellone")
+        except tk.TclError:
+            pass
         try:
             _bud_summ_canvas.yview_moveto(0)
         except tk.TclError:
             pass
+        try:
+            _bud_bar_extra.pack_propagate(True)
+            _bud_bar_extra.configure(width=0, height=0)
+            _bud_hdr_right.pack_propagate(True)
+            _bud_hdr_right.configure(width=0, height=0)
+        except tk.TclError:
+            pass
+        if not _bud_print_btn.winfo_ismapped():
+            _bud_print_btn.pack(side=tk.LEFT, padx=(0, 6))
+        if not _bud_scen_btn.winfo_ismapped():
+            _bud_scen_btn.pack(side=tk.LEFT, padx=(0, 6))
+        _bud_capture_extra_w()
 
     def _bud_show_sintesi() -> None:
         _bud_view_mode[0] = "sintesi"
@@ -27142,46 +27940,48 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         _bud_summary_wrap.pack(fill=tk.BOTH, expand=True)
         _bud_summ_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         _bud_summ_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        _bud_sin_btn.configure(relief=tk.SUNKEN, bd=2)
-        _bud_tab_btn.configure(relief=tk.RAISED, bd=1)
+        _bud_refresh_tab_chips()
+        try:
+            _bud_print_btn.configure(text="Stampa sintesi")
+        except tk.TclError:
+            pass
+        _bud_capture_extra_w()
+        try:
+            _bud_bar_extra.update_idletasks()
+            w_hold = max(int(_bud_bar_extra.winfo_reqwidth()), int(_bud_extra_slot_w[0]), 220)
+            h_hold = max(int(_bud_bar_extra.winfo_reqheight()), 28)
+            _bud_bar_extra.configure(width=w_hold, height=h_hold)
+            _bud_bar_extra.pack_propagate(False)
+        except tk.TclError:
+            pass
+        _bud_scen_btn.pack_forget()
+        if not _bud_print_btn.winfo_ismapped():
+            _bud_print_btn.pack(side=tk.LEFT, padx=(0, 6))
+        try:
+            _bud_hdr_right.update_idletasks()
+            wrh = max(int(_bud_hdr_right.winfo_reqwidth()), int(_bud_hdr_right_slot_w[0]), 1)
+            hrh = max(int(_bud_hdr_right.winfo_reqheight()), 28)
+            _bud_hdr_right.configure(width=wrh, height=hrh)
+            _bud_hdr_right.pack_propagate(False)
+        except tk.TclError:
+            pass
         _bud_refresh_summary_view()
 
-    _bud_tab_btn = tk.Label(
-        _bud_bar_actions,
-        text="Tabellone",
-        bg=_BUD_BTN_TABC_BG,
-        fg="#ffffff",
-        font=("TkDefaultFont", 10, "bold"),
-        padx=12,
-        pady=5,
-        cursor="hand2",
-        relief=tk.SUNKEN,
-        bd=2,
-        highlightthickness=0,
+    _filter_chip_hover(
+        _bud_tab_btn,
+        _bud_refresh_tab_chips,
+        lambda: _bud_view_mode[0] == "tabellone",
     )
-    _bud_wire_lbl_btn(_bud_tab_btn, _BUD_BTN_TABC_BG, _BUD_BTN_TABC_BG_ACT)
+    _filter_chip_hover(
+        _bud_sin_btn,
+        _bud_refresh_tab_chips,
+        lambda: _bud_view_mode[0] == "sintesi",
+    )
     _bud_tab_btn.bind("<Button-1>", lambda _e: _bud_show_tabellone())
-    _bud_tab_btn.pack(side=tk.LEFT, padx=(0, 6))
-
-    _bud_sin_btn = tk.Label(
-        _bud_bar_actions,
-        text="Sintesi",
-        bg=_BUD_BTN_SINT_BG,
-        fg="#ffffff",
-        font=("TkDefaultFont", 10, "bold"),
-        padx=12,
-        pady=5,
-        cursor="hand2",
-        relief=tk.RAISED,
-        bd=1,
-        highlightthickness=0,
-    )
-    _bud_wire_lbl_btn(_bud_sin_btn, _BUD_BTN_SINT_BG, _BUD_BTN_SINT_BG_ACT)
     _bud_sin_btn.bind("<Button-1>", lambda _e: _bud_show_sintesi())
-    _bud_sin_btn.pack(side=tk.LEFT, padx=(0, 6))
 
     _bud_scen_btn = tk.Label(
-        _bud_bar_actions,
+        _bud_bar_extra,
         text="Scenari / ripristino",
         bg=_BUD_BTN_SCEN_BG,
         fg="#ffffff",
@@ -27195,9 +27995,14 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     )
     _bud_wire_lbl_btn(_bud_scen_btn, _BUD_BTN_SCEN_BG, _BUD_BTN_SCEN_BG_ACT)
     _bud_scen_btn.bind("<Button-1>", lambda e: _bud_open_scenario_menu(e))
+    _bud_print_btn.pack(side=tk.LEFT, padx=(0, 6))
     _bud_scen_btn.pack(side=tk.LEFT, padx=(0, 6))
 
-    _bud_pdf_tab_btn.pack(side=tk.LEFT, padx=(0, 6))
+    def _bud_after_build_idle() -> None:
+        _bud_capture_extra_w()
+        _bud_refresh_tab_chips()
+
+    root.after_idle(_bud_after_build_idle)
 
     _bud_grid_outer.pack(fill=tk.BOTH, expand=True)
 
@@ -27265,7 +28070,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     _BUD_TOP_HEIGHT = 3  # Sotto-intestazione MOV/BUD + TOTALI + DIFFERENZE (oltre alla riga heading)
     _BUD_BODY_HEIGHT = 20
 
-    _BUD_TOP_FIXED_BG = "#7eb3db"
+    _BUD_TOP_FIXED_BG = "#d0c0ae"
 
     _bud_tl_view_style = "BudTlCdc.Treeview"
     _stat_sty.configure(
@@ -27274,11 +28079,14 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         rowheight=_stat_rowh,
         borderwidth=0,
         relief="flat",
+        background=CDC_GRID_STRIPE1_BG,
+        fieldbackground=CDC_GRID_STRIPE1_BG,
     )
     _stat_sty.configure(
         _bud_tl_view_style + ".Heading",
         font=(_stat_ffam, _stat_fsz, "bold"),
         background=_BUD_TOP_FIXED_BG,
+        foreground="#1a1a1a",
         relief="flat",
     )
 
@@ -27289,11 +28097,14 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         rowheight=_stat_rowh,
         borderwidth=0,
         relief="flat",
+        background=CDC_GRID_STRIPE1_BG,
+        fieldbackground=CDC_GRID_STRIPE1_BG,
     )
     _stat_sty.configure(
         _bud_tr_view_style + ".Heading",
         font=(_stat_ffam, _stat_fsz, "bold"),
         background=_BUD_TOP_FIXED_BG,
+        foreground="#1a1a1a",
         relief="flat",
     )
     try:
@@ -27564,7 +28375,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         _tv.tag_configure("budget_tot", background=CDC_GRID_HEADING_BG)
         _tv.tag_configure(
             "budget_diff",
-            background="#e1f5fe",
+            background="#f0e6d8",
             font=(_stat_ffam, _stat_fsz),
         )
         _tv.tag_configure("budget_cat0", background=CDC_GRID_STRIPE0_BG)
@@ -27659,6 +28470,10 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 tv.delete(iid)
 
     def _budget_refresh_grid() -> None:
+        try:
+            _bud_refresh_tab_chips()
+        except tk.TclError:
+            pass
         try:
             y_head = int(str(budget_year_var.get()).strip())
         except (TypeError, ValueError):
@@ -27897,6 +28712,10 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
 
     _budget_on_tab_enter_fn[0] = _budget_refresh_grid
     _budget_refresh_grid()
+    try:
+        budget_frame.bind("<Map>", lambda _e: _bud_refresh_tab_chips(), add="+")
+    except tk.TclError:
+        pass
 
     ttk.Label(
         aiuto_frame,
@@ -29054,6 +29873,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             ttk.Label(fc, text="Nota registrazione").grid(row=3, column=0, sticky="nw", pady=2)
             ent_nt = ttk.Entry(fc, textvariable=nt_var, width=40)
             ent_nt.grid(row=3, column=1, sticky="we", padx=(8, 0), pady=2)
+            bind_limited_single_line_text_entry(ent_nt, nt_var, max_len=MAX_RECORD_NOTE_LEN, strip_edges=False)
             bind_entry_first_char_uppercase(nt_var, ent_nt)
             fc.columnconfigure(1, weight=1)
             er2 = ttk.Label(fc, text="", foreground="#b00020", wraplength=440)
@@ -29079,7 +29899,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                     er2.configure(text="Selezionare una categoria.")
                     return
                 note = format_record_note_stored(
-                    sanitize_single_line_text(nt_var.get() or "", max_len=MAX_RECORD_NOTE_LEN)
+                    sanitize_single_line_text(nt_var.get() or "", max_len=MAX_RECORD_NOTE_LEN, strip_edges=False)
                 )
                 if not note.strip():
                     er2.configure(text="La nota è obbligatoria.")
@@ -29722,10 +30542,9 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         pass
 
     # Opzioni page (scroll verticale: posta, percorsi, legacy possono superare l’altezza finestra)
-    _OPZ_PAGE_BG = "#f0f0f0"
     opz_scroll_outer = ttk.Frame(opzioni_frame)
     opz_scroll_outer.pack(fill=tk.BOTH, expand=True)
-    opz_canvas = tk.Canvas(opz_scroll_outer, highlightthickness=0, bg=_OPZ_PAGE_BG)
+    opz_canvas = tk.Canvas(opz_scroll_outer, highlightthickness=0, bg=OPZIONI_SCROLL_CANVAS_BG)
     opz_vsb = ttk.Scrollbar(opz_scroll_outer, orient="vertical", command=opz_canvas.yview)
     opz_scrollable = ttk.Frame(opz_canvas)
     opz_scrollable_win = opz_canvas.create_window((0, 0), window=opz_scrollable, anchor="nw")
@@ -29742,6 +30561,21 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     opz_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     opz_vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
+    def _opz_on_frame_map(_e: tk.Event | None = None) -> None:
+        try:
+            opz_canvas.update_idletasks()
+            cw = int(opz_canvas.winfo_width())
+            if cw > 1:
+                opz_canvas.itemconfigure(opz_scrollable_win, width=cw)
+            bb = opz_canvas.bbox("all")
+            if bb:
+                opz_canvas.configure(scrollregion=bb)
+        except tk.TclError:
+            pass
+
+    opzioni_frame.bind("<Map>", lambda _e: root.after_idle(_opz_on_frame_map), add="+")
+    opz_canvas.bind("<Map>", lambda _e: root.after_idle(_opz_on_frame_map), add="+")
+
     _OPZ_BLUE = "#1565c0"
     _OPZ_BLUE_ACTIVE = "#0d47a1"
     _OPZ_RED = "#b71c1c"
@@ -29749,6 +30583,9 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     _OPZ_TITLE_FONT = ("TkDefaultFont", 14, "bold")
     _OPZ_PATH_ENTRY_WIDTH = 64
     _OPZ_PATH_BTN_WIDTH = 14
+
+    _opz_link_blue_meta: list[tuple[tk.Label, str, str]] = []
+    _opz_link_red_meta: list[tuple[tk.Label, str, str]] = []
 
     def _opz_action_label(
         parent: tk.Misc,
@@ -29774,8 +30611,12 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             width=width if width is not None else 0,
         )
         lbl.bind("<Button-1>", lambda _e: command())
-        lbl.bind("<Enter>", lambda _e: lbl.configure(bg=active_color))
-        lbl.bind("<Leave>", lambda _e: lbl.configure(bg=color))
+        lbl.bind("<Enter>", lambda _e, l=lbl, ac=active_color: l.configure(bg=ac))
+        lbl.bind("<Leave>", lambda _e, l=lbl, c=color: l.configure(bg=c))
+        if (color, active_color) == (_OPZ_BLUE, _OPZ_BLUE_ACTIVE):
+            _opz_link_blue_meta.append((lbl, color, active_color))
+        elif (color, active_color) == (_OPZ_RED, _OPZ_RED_ACTIVE):
+            _opz_link_red_meta.append((lbl, color, active_color))
         return lbl
 
     opz_plan_row = ttk.Frame(opz_scrollable)
@@ -29793,6 +30634,562 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         "Apri scheda Conti…",
         lambda: (_ensure_plan_conti_tab(), notebook.select(plan_conti_frame), _reload_plan_conti_form()),
     ).pack(side=tk.LEFT, padx=(0, 0))
+
+    # Snapshot codice (costanti modulo + esempi pulsanti Movimenti) prima di Applicare tema da DB overrides.
+    _palette_defaults = dict(cdc_ui_palette.get_base_palette_map_copy())
+    _opz_palette_extras = {
+        "ui_action_blue_bg": _OPZ_BLUE,
+        "ui_action_blue_hover_bg": _OPZ_BLUE_ACTIVE,
+        "ui_action_red_bg": _OPZ_RED,
+        "ui_action_red_hover_bg": _OPZ_RED_ACTIVE,
+        "correction_error_fg": "#b71c1c",
+        "mov_btn_print_search_bg": _PRINT_RICERCA_RED,
+        "mov_btn_print_search_hover_bg": _PRINT_RICERCA_RED_ACTIVE,
+        "mov_btn_espandi_bg": _ESPANDI_ELENCO_BG,
+        "mov_btn_espandi_hover_bg": _ESPANDI_ELENCO_BG_ACT,
+        "mov_btn_cerca_bg": _CERCA_GREEN,
+        "mov_btn_cerca_hover_bg": _CERCA_GREEN_ACTIVE,
+        "mov_pulisci_accedi_bg": _MOV_PULISCI_ACCEDI_BG,
+        "mov_pulisci_accedi_hover_bg": _MOV_PULISCI_ACCEDI_HOVER_BG,
+        "ver_grid_amount_pos_fg": _VER_GRID_AMT_POS_FG,
+        "ver_grid_amount_neg_fg": _VER_GRID_AMT_NEG_FG,
+        "ver_grid_amount_zero_fg": _VER_GRID_AMT_ZERO_FG,
+        "ver_btn_pending_new_bg": _VER_PENDING_BTN_NEW_BG,
+        "ver_btn_pending_clear_bg": _VER_PENDING_BTN_CLEARSEL_BG,
+        "ver_footer_print_bg": _VER_FOOT_PRINT_BG,
+        "ver_footer_cycle_bg": _VER_FOOT_CYCLE_BG,
+        "ver_footer_close_bg": _VER_FOOT_CLOSE_BG,
+    }
+    _palette_extras_default = dict(_opz_palette_extras)
+
+    def _get_ui_color_overrides() -> dict[str, str]:
+        raw = cur_db().get(cdc_ui_theme._OVERRIDES_KEY) or {}
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, str] = {}
+        for k, v in raw.items():
+            if isinstance(k, str) and isinstance(v, str):
+                out[k] = v
+        return out
+
+    def _resolved_ui_palette_hex(token: str) -> str:
+        return cdc_ui_theme.resolved_hex(
+            token,
+            base=_palette_defaults,
+            extras=_palette_extras_default,
+            overrides=_get_ui_color_overrides(),
+        )
+
+    _PATCH_TK_SUBTREE_MAX_NODES = 14_000
+
+    def _patch_tk_bg_subtree(widget: tk.Misc, old_hex: str, new_hex: str, _left: list[int] | None = None) -> None:
+        ol = (old_hex or "").lower()
+        if not ol:
+            return
+        if _left is None:
+            _left = [_PATCH_TK_SUBTREE_MAX_NODES]
+        if _left[0] <= 0:
+            return
+        _left[0] -= 1
+        try:
+            cls = widget.winfo_class()
+            if cls in ("Frame", "Label", "Canvas", "Tk", "Toplevel"):
+                bg = widget.cget("bg")
+                if isinstance(bg, str) and bg.lower() == ol:
+                    widget.configure(bg=new_hex)
+        except tk.TclError:
+            pass
+        try:
+            for ch in widget.winfo_children():
+                _patch_tk_bg_subtree(ch, old_hex, new_hex, _left)
+        except tk.TclError:
+            pass
+
+    def _patch_tk_fg_subtree(widget: tk.Misc, old_hex: str, new_hex: str, _left: list[int] | None = None) -> None:
+        ol = (old_hex or "").lower()
+        if not ol:
+            return
+        if _left is None:
+            _left = [_PATCH_TK_SUBTREE_MAX_NODES]
+        if _left[0] <= 0:
+            return
+        _left[0] -= 1
+        try:
+            if widget.winfo_class() == "Label":
+                fg = widget.cget("fg")
+                if isinstance(fg, str) and fg.lower() == ol:
+                    widget.configure(fg=new_hex)
+        except tk.TclError:
+            pass
+        try:
+            for ch in widget.winfo_children():
+                _patch_tk_fg_subtree(ch, old_hex, new_hex, _left)
+        except tk.TclError:
+            pass
+
+    def _opz_refresh_link_hover_binds() -> None:
+        for lbl, _c, _ac in _opz_link_blue_meta:
+            try:
+                lbl.configure(bg=_OPZ_BLUE)
+                lbl.bind("<Enter>", lambda _e, l=lbl, ac=_OPZ_BLUE_ACTIVE: l.configure(bg=ac))
+                lbl.bind("<Leave>", lambda _e, l=lbl, c=_OPZ_BLUE: l.configure(bg=c))
+            except tk.TclError:
+                pass
+        for lbl, _c, _ac in _opz_link_red_meta:
+            try:
+                lbl.configure(bg=_OPZ_RED)
+                lbl.bind("<Enter>", lambda _e, l=lbl, ac=_OPZ_RED_ACTIVE: l.configure(bg=ac))
+                lbl.bind("<Leave>", lambda _e, l=lbl, c=_OPZ_RED: l.configure(bg=c))
+            except tk.TclError:
+                pass
+
+    def _refresh_red_action_hover_binds() -> None:
+        for lbl in (ver_btn_del_pending, btn_per_delete):
+            try:
+                lbl.configure(bg=_OPZ_RED)
+                lbl.bind("<Enter>", lambda _e, l=lbl, ac=_OPZ_RED_ACTIVE: l.configure(bg=ac))
+                lbl.bind("<Leave>", lambda _e, l=lbl, c=_OPZ_RED: l.configure(bg=c))
+            except tk.TclError:
+                pass
+
+    def _on_ui_palette_color_commit(token: str, value: str | None) -> None:
+        cur = _get_ui_color_overrides()
+        prev_h = cdc_ui_theme.resolved_hex(
+            token, base=_palette_defaults, extras=_palette_extras_default, overrides=cur
+        )
+        merged = cdc_ui_theme.merge_overrides(cur, token, value)
+        new_h = cdc_ui_theme.resolved_hex(
+            token, base=_palette_defaults, extras=_palette_extras_default, overrides=merged
+        )
+        cur_db()[cdc_ui_theme._OVERRIDES_KEY] = merged
+        try:
+            save_encrypted_db_dual(cur_db(), path_holder[0], key_path_holder[0])
+        except Exception:
+            pass
+        if (prev_h or "").strip().lower() == (new_h or "").strip().lower():
+            return
+        _apply_ui_theme_token(token, new_h)
+
+    def _apply_ui_theme_token(token: str, h: str) -> None:
+        import security_auth as sa
+
+        nonlocal _MOV_AGG_CAT_BTN_BG, _MOV_AGG_CAT_BTN_ACT
+        nonlocal _PRINT_RICERCA_RED, _PRINT_RICERCA_RED_ACTIVE
+        nonlocal _CORREZIONE_BLUE
+        nonlocal _RIPRISTINA_LAYOUT_BG, _RIPRISTINA_LAYOUT_BG_ACT
+        nonlocal _ESPANDI_ELENCO_BG, _ESPANDI_ELENCO_BG_ACT
+        nonlocal _CERCA_GREEN, _CERCA_GREEN_ACTIVE
+        nonlocal _MOV_PULISCI_ACCEDI_BG, _MOV_PULISCI_ACCEDI_HOVER_BG
+        nonlocal _VER_GRID_AMT_POS_FG, _VER_GRID_AMT_NEG_FG, _VER_GRID_AMT_ZERO_FG
+        nonlocal _VER_PENDING_BTN_EDIT_BG, _VER_PENDING_BTN_DEL_BG, _VER_PENDING_BTN_NEW_BG, _VER_PENDING_BTN_CLEARSEL_BG
+        nonlocal _VER_FOOT_PRINT_BG, _VER_FOOT_CYCLE_BG, _VER_FOOT_CLOSE_BG
+        nonlocal _VER_CORR_BLUE
+        nonlocal _OPZ_BLUE, _OPZ_BLUE_ACTIVE, _OPZ_RED, _OPZ_RED_ACTIVE
+
+        def _mov_filter_rf() -> None:
+            try:
+                refresh_movement_filter_button_styles()
+                refresh_reg_preset_button_styles()
+                refresh_date_preset_button_styles()
+                _stat_refresh_report_buttons()
+                _nuovi_sync_subtab_style()
+                _per_refresh_cadence_button_styles()
+            except Exception:
+                pass
+
+        def _cdc_tab_rf() -> None:
+            try:
+                _cdc_sync_tab_style()
+            except Exception:
+                pass
+
+        try:
+            if token == "bg_page_primary":
+                old = _palette_runtime_attr("MOVIMENTI_PAGE_BG")
+                _mirror_palette_runtime_global("MOVIMENTI_PAGE_BG", h)
+                try:
+                    root.configure(bg=h)
+                except tk.TclError:
+                    pass
+                for w in (main_nb_shell, cdc_tab_bar, cdc_tab_btn_row, cdc_content, movimenti_main_stack, nuovi_dati_frame):
+                    try:
+                        w.configure(bg=h)
+                    except tk.TclError:
+                        pass
+                try:
+                    _nb_style.configure("MovCdc.TFrame", background=h, fieldbackground=h)
+                    _nb_style.configure("MovCdc.TLabel", background=h)
+                    _mov_style.configure(
+                        "MovCdc.TLabel",
+                        font=filter_ui_font,
+                        background=h,
+                        foreground=_palette_runtime_attr("UI_FG_FILTER_LABEL"),
+                    )
+                except tk.TclError:
+                    pass
+                _patch_tk_bg_subtree(main_nb_shell, old, h)
+                _cdc_tab_rf()
+                try:
+                    lbl_correzione_msg.configure(bg=h)
+                except Exception:
+                    pass
+            elif token == "bg_opzioni_scroll_canvas":
+                old = _palette_runtime_attr("OPZIONI_SCROLL_CANVAS_BG")
+                _mirror_palette_runtime_global("OPZIONI_SCROLL_CANVAS_BG", h)
+                try:
+                    opz_canvas.configure(bg=h)
+                except tk.TclError:
+                    pass
+                _patch_tk_bg_subtree(opz_scrollable, old, h)
+            elif token == "grid_stripe0":
+                old = _palette_runtime_attr("CDC_GRID_STRIPE0_BG")
+                _mirror_palette_runtime_global("CDC_GRID_STRIPE0_BG", h)
+                for tv in (mov_tree, amt_tree, note_tree, tree_per_amt, tree_per, tree_per_note,
+                          ver_pending_tree, ver_unver_tree, ver_unver_amt_tree):
+                    try:
+                        tv.tag_configure("stripe0", background=h)
+                    except tk.TclError:
+                        pass
+                try:
+                    refresh_balance_footer()
+                except Exception:
+                    pass
+            elif token == "grid_stripe1":
+                old = _palette_runtime_attr("CDC_GRID_STRIPE1_BG")
+                _mirror_palette_runtime_global("CDC_GRID_STRIPE1_BG", h)
+                for tv in (mov_tree, amt_tree, note_tree, tree_per_amt, tree_per, tree_per_note,
+                          ver_pending_tree, ver_unver_tree, ver_unver_amt_tree):
+                    try:
+                        tv.tag_configure("stripe1", background=h)
+                    except tk.TclError:
+                        pass
+                try:
+                    mov_style.configure(
+                        "MovGrid.Treeview",
+                        background=h,
+                        fieldbackground=h,
+                    )
+                    mov_style.configure(
+                        "MovGridAmount.Treeview",
+                        background=h,
+                        fieldbackground=h,
+                    )
+                    _ver_res_style.configure("VerRes.Treeview", background=h, fieldbackground=h)
+                    for _vw in (
+                        ver_summary_outer,
+                        ver_summary_frame,
+                        ver_summary_inner,
+                        ver_sess_all_matched_lbl,
+                        ver_summary_title_lbl,
+                        ver_verdict_lbl,
+                    ):
+                        _vw.configure(bg=h)
+                except tk.TclError:
+                    pass
+                try:
+                    refresh_balance_footer()
+                except Exception:
+                    pass
+            elif token == "grid_heading_bg":
+                old = _palette_runtime_attr("CDC_GRID_HEADING_BG")
+                _mirror_palette_runtime_global("CDC_GRID_HEADING_BG", h)
+                try:
+                    mov_style.configure("MovGrid.Treeview.Heading", background=h)
+                    _ver_res_style.configure("VerRes.Treeview.Heading", background=h)
+                except tk.TclError:
+                    pass
+                _patch_tk_bg_subtree(records_frame, old, h)
+                try:
+                    _patch_tk_bg_subtree(per_tree_frame, old, h)
+                except Exception:
+                    pass
+                try:
+                    refresh_balance_footer()
+                except Exception:
+                    pass
+            elif token == "fg_grid_primary":
+                old = _palette_runtime_attr("UI_FG_GRID_PRIMARY")
+                _mirror_palette_runtime_global("UI_FG_GRID_PRIMARY", h)
+                try:
+                    mov_style.configure("MovGrid.Treeview.Heading", foreground=h)
+                    # Verifica: intestazioni sempre scure (UI_FG_GRID_PRIMARY da Opzioni può essere chiaro).
+                    _ver_res_style.configure("VerRes.Treeview.Heading", foreground="#1a1a1a")
+                except tk.TclError:
+                    pass
+                try:
+                    _ver_configure_results_grids_neutral_amount_fg(ver_pending_tree, ver_unver_amt_tree)
+                except Exception:
+                    pass
+                _patch_tk_fg_subtree(mov_records_header_row, old, h)
+                try:
+                    _patch_tk_fg_subtree(header_row, old, h)
+                except Exception:
+                    pass
+                try:
+                    refresh_balance_footer()
+                except Exception:
+                    pass
+            elif token == "fg_mov_search_caption":
+                _mirror_palette_runtime_global("UI_FG_MOV_SEARCH_CAPTION", h)
+                try:
+                    search_title_label.configure(fg=h)
+                except tk.TclError:
+                    pass
+            elif token == "grid_tree_selection_bg":
+                _mirror_palette_runtime_global("CDC_GRID_TREEVIEW_SEL_BG", h)
+                _configure_grid_treeview_selection_styles()
+            elif token == "grid_tree_selection_fg":
+                _mirror_palette_runtime_global("CDC_GRID_TREEVIEW_SEL_FG", h)
+                _configure_grid_treeview_selection_styles()
+            elif token == "amount_positive":
+                _mirror_palette_runtime_global("COLOR_AMOUNT_POS", h)
+                for tv in (amt_tree, tree_per_amt):
+                    try:
+                        tv.tag_configure("pos", foreground=h)
+                    except tk.TclError:
+                        pass
+            elif token == "amount_negative":
+                _mirror_palette_runtime_global("COLOR_AMOUNT_NEG", h)
+                for tv in (amt_tree, tree_per_amt):
+                    try:
+                        tv.tag_configure("neg", foreground=h)
+                    except tk.TclError:
+                        pass
+            elif token == "field_bg_moduli":
+                old = _palette_runtime_attr("CDC_ENTRY_FIELD_BG")
+                _mirror_palette_runtime_global("CDC_ENTRY_FIELD_BG", h)
+                try:
+                    _mov_style.configure(
+                        "MovCdc.TEntry",
+                        font=filter_ui_font,
+                        fieldbackground=h,
+                        foreground=_palette_runtime_attr("UI_FG_FILTER_ENTRY"),
+                    )
+                    _mov_style.configure("MovCdc.TCombobox", font=filter_ui_font, fieldbackground=h)
+                    _nb_style.configure("MovCdc.TEntry", fieldbackground=h)
+                    _nb_style.configure("MovCdc.TCombobox", fieldbackground=h)
+                except tk.TclError:
+                    pass
+            elif token == "fg_filter_label":
+                _mirror_palette_runtime_global("UI_FG_FILTER_LABEL", h)
+                try:
+                    _mov_style.configure(
+                        "MovCdc.TLabel",
+                        font=filter_ui_font,
+                        background=_palette_runtime_attr("MOVIMENTI_PAGE_BG"),
+                        foreground=h,
+                    )
+                except tk.TclError:
+                    pass
+            elif token == "fg_filter_entry":
+                _mirror_palette_runtime_global("UI_FG_FILTER_ENTRY", h)
+                try:
+                    _mov_style.configure(
+                        "MovCdc.TEntry",
+                        font=filter_ui_font,
+                        fieldbackground=_palette_runtime_attr("CDC_ENTRY_FIELD_BG"),
+                        foreground=h,
+                    )
+                except tk.TclError:
+                    pass
+            elif token == "mov_filter_tab_btn_bg":
+                _mirror_palette_runtime_global("MOV_FILTER_TAB_BTN_BG", h)
+                _mov_filter_rf()
+            elif token == "mov_filter_tab_btn_hover_bg":
+                _mirror_palette_runtime_global("MOV_FILTER_TAB_BTN_HOVER_BG", h)
+                _mov_filter_rf()
+            elif token == "mov_filter_tab_btn_active_bg":
+                _mirror_palette_runtime_global("MOV_FILTER_TAB_BTN_ACTIVE_BG", h)
+                _mov_filter_rf()
+            elif token == "mov_filter_tab_btn_fg":
+                _mirror_palette_runtime_global("MOV_FILTER_TAB_BTN_FG", h)
+                _mov_filter_rf()
+            elif token == "cal_cell_bg":
+                _mirror_palette_runtime_global("CDC_CAL_CELL_BG", h)
+            elif token == "cal_selected_bg":
+                _mirror_palette_runtime_global("CDC_CAL_SELECTED_BG", h)
+            elif token == "cal_disabled_bg":
+                _mirror_palette_runtime_global("CDC_CAL_DISABLED_BG", h)
+            elif token == "cal_disabled_label_fg":
+                _mirror_palette_runtime_global("CDC_CAL_DISABLED_LABEL_FG", h)
+            elif token == "login_window_bg":
+                sa.CDC_LOGIN_WIN_BG = h
+            elif token == "tipo_btn_bg":
+                sa.CDC_TIPO_TASTI_BTN_BG = h
+                _cdc_tab_rf()
+            elif token == "tipo_btn_hover_bg":
+                sa.CDC_TIPO_TASTI_BTN_HOVER_BG = h
+                _cdc_tab_rf()
+            elif token == "tipo_btn_active_bg":
+                sa.CDC_TIPO_TASTI_BTN_ACTIVE_BG = h
+                _cdc_tab_rf()
+            elif token == "tipo_btn_fg":
+                sa.CDC_TIPO_TASTI_BTN_FG = h
+                _cdc_tab_rf()
+            elif token == "tipo_btn_ring":
+                sa.CDC_TIPO_TASTI_BTN_RING = h
+            elif token == "tipo_btn_ring_focus":
+                sa.CDC_TIPO_TASTI_BTN_RING_FOCUS = h
+            elif token == "tipo_field_bg":
+                sa.CDC_TIPO_TASTI_FIELD_BG = h
+            elif token == "ui_action_blue_bg":
+                _MOV_AGG_CAT_BTN_BG = h
+                _CORREZIONE_BLUE = h
+                _RIPRISTINA_LAYOUT_BG = h
+                _VER_PENDING_BTN_EDIT_BG = h
+                _VER_CORR_BLUE = h
+                _OPZ_BLUE = h
+                try:
+                    mov_aggregate_cat_btn.configure(bg=h)
+                    btn_modifica_reg.configure(bg=h)
+                    btn_mov_griglia_ripristina.configure(bg=h)
+                    ver_btn_edit_pending.configure(bg=h)
+                    ver_btn_new_ver_data.configure(bg=h)
+                    ver_btn_cancel_immissione.configure(bg=h)
+                    ver_unver_btn_modifica_reg.configure(bg=h)
+                    btn_per_edit_future.configure(bg=h)
+                except tk.TclError:
+                    pass
+                _opz_refresh_link_hover_binds()
+            elif token == "ui_action_blue_hover_bg":
+                _MOV_AGG_CAT_BTN_ACT = h
+                _RIPRISTINA_LAYOUT_BG_ACT = h
+                _OPZ_BLUE_ACTIVE = h
+                _opz_refresh_link_hover_binds()
+            elif token == "mov_btn_print_search_bg":
+                _PRINT_RICERCA_RED = h
+                try:
+                    btn_stampa_ricerca.configure(bg=h)
+                    btn_stampa_saldi.configure(bg=h)
+                    btn_forza_verifica.configure(bg=h)
+                    btn_elimina_reg.configure(bg=h)
+                    btn_confirm.configure(bg=h)
+                    btn_per_confirm.configure(bg=h)
+                except tk.TclError:
+                    pass
+            elif token == "mov_btn_print_search_hover_bg":
+                _PRINT_RICERCA_RED_ACTIVE = h
+            elif token == "mov_btn_espandi_bg":
+                _ESPANDI_ELENCO_BG = h
+                try:
+                    btn_espandi_elenco_mov.configure(bg=h)
+                except tk.TclError:
+                    pass
+            elif token == "mov_btn_espandi_hover_bg":
+                _ESPANDI_ELENCO_BG_ACT = h
+            elif token == "mov_btn_cerca_bg":
+                _CERCA_GREEN = h
+                try:
+                    lbl_cerca.configure(bg=h)
+                except tk.TclError:
+                    pass
+            elif token == "mov_btn_cerca_hover_bg":
+                _CERCA_GREEN_ACTIVE = h
+            elif token == "mov_pulisci_accedi_bg":
+                _MOV_PULISCI_ACCEDI_BG = h
+                try:
+                    lbl_pulisci_filtri.configure(bg=h)
+                    btn_clear.configure(bg=h)
+                    btn_per_clear.configure(bg=h)
+                except tk.TclError:
+                    pass
+            elif token == "mov_pulisci_accedi_hover_bg":
+                _MOV_PULISCI_ACCEDI_HOVER_BG = h
+            elif token == "correction_error_fg":
+                try:
+                    lbl_correzione_msg.configure(fg=h)
+                    ver_unver_lbl_correzione_msg.configure(fg=h)
+                except tk.TclError:
+                    pass
+            elif token == "ver_grid_amount_pos_fg":
+                _VER_GRID_AMT_POS_FG = h
+                try:
+                    _ver_configure_ver_tree_amount_tags(ver_cand_tree)
+                except tk.TclError:
+                    pass
+                try:
+                    _ver_configure_results_grids_neutral_amount_fg(ver_pending_tree, ver_unver_amt_tree)
+                except Exception:
+                    pass
+            elif token == "ver_grid_amount_neg_fg":
+                _VER_GRID_AMT_NEG_FG = h
+                try:
+                    _ver_configure_ver_tree_amount_tags(ver_cand_tree)
+                except tk.TclError:
+                    pass
+                try:
+                    _ver_configure_results_grids_neutral_amount_fg(ver_pending_tree, ver_unver_amt_tree)
+                except Exception:
+                    pass
+            elif token == "ver_grid_amount_zero_fg":
+                _VER_GRID_AMT_ZERO_FG = h
+                try:
+                    _ver_configure_ver_tree_amount_tags(ver_cand_tree)
+                except tk.TclError:
+                    pass
+                try:
+                    _ver_configure_results_grids_neutral_amount_fg(ver_pending_tree, ver_unver_amt_tree)
+                except Exception:
+                    pass
+            elif token == "ver_btn_pending_new_bg":
+                _VER_PENDING_BTN_NEW_BG = h
+                try:
+                    ver_btn_abbina_pending.configure(bg=h)
+                except tk.TclError:
+                    pass
+            elif token == "ver_btn_pending_clear_bg":
+                _VER_PENDING_BTN_CLEARSEL_BG = h
+                try:
+                    ver_btn_annulla_sel_pending.configure(bg=h)
+                except tk.TclError:
+                    pass
+            elif token == "ver_footer_print_bg":
+                _VER_FOOT_PRINT_BG = h
+                try:
+                    ver_btn_print.configure(bg=h)
+                except tk.TclError:
+                    pass
+            elif token == "ver_footer_cycle_bg":
+                _VER_FOOT_CYCLE_BG = h
+                try:
+                    ver_btn_new_cycle.configure(bg=h)
+                except tk.TclError:
+                    pass
+            elif token == "ver_footer_close_bg":
+                _VER_FOOT_CLOSE_BG = h
+                try:
+                    ver_btn_close.configure(bg=h)
+                except tk.TclError:
+                    pass
+            elif token == "ui_action_red_bg":
+                _OPZ_RED = h
+                _VER_PENDING_BTN_DEL_BG = h
+                try:
+                    ver_btn_del_pending.configure(bg=h)
+                    btn_per_delete.configure(bg=h)
+                except tk.TclError:
+                    pass
+                _opz_refresh_link_hover_binds()
+                _refresh_red_action_hover_binds()
+            elif token == "ui_action_red_hover_bg":
+                _OPZ_RED_ACTIVE = h
+                _opz_refresh_link_hover_binds()
+                _refresh_red_action_hover_binds()
+        except Exception:
+            pass
+
+    def _apply_all_ui_theme_tokens() -> None:
+        for tid in cdc_ui_palette.ALL_UI_COLOR_TOKEN_IDS:
+            _apply_ui_theme_token(tid, _resolved_ui_palette_hex(tid))
+
+    cdc_ui_palette.pack_opzioni_color_palette_section(
+        opz_scrollable,
+        extras=_opz_palette_extras,
+        title_font=_OPZ_TITLE_FONT,
+        section_bg=OPZIONI_SCROLL_CANVAS_BG,
+        get_resolved_hex=_resolved_ui_palette_hex,
+        on_color_commit=_on_ui_palette_color_commit,
+    )
 
     mail_outer = ttk.LabelFrame(opz_scrollable, padding=10)
     mail_outer.configure(
@@ -30963,8 +32360,30 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
 
     root.after(250, _banner_clock_tick)
 
+    try:
+        _apply_all_ui_theme_tokens()
+    except Exception:
+        pass
     _present_main_window()
     root.mainloop()
+
+
+def _apply_sun_valley_ttk_theme(root: tk.Tk) -> None:
+    """Applica il tema Sun Valley ai widget ``ttk`` (login, dialoghi, notebook, ecc.)."""
+    if sv_ttk is None:
+        return
+    try:
+        # Coerenza con gli sfondi azzurri chiari delle pagine (``MOVIMENTI_PAGE_BG`` ecc.).
+        sv_ttk.set_theme("light", root=root)
+    except Exception:
+        return
+    try:
+        sty = ttk.Style(root)
+        if sty.theme_use() == "sun-valley-light":
+            sty.configure("TButton", padding=(14, 9))
+            sty.configure("Accent.TButton", padding=(14, 9))
+    except tk.TclError:
+        pass
 
 
 def main() -> None:
@@ -30975,6 +32394,7 @@ def main() -> None:
     _darwin_prepare_stdin_for_tk_aqua()
 
     root = tk.Tk()
+    _apply_sun_valley_ttk_theme(root)
     root.title("Conti di casa")
     # La root resta nascosta fino al bisogno (evita la grande finestra vuota dietro i dialoghi).
     try:
@@ -31072,6 +32492,16 @@ def main() -> None:
         )
 
     security_auth.ensure_security(db_holder[0])
+    try:
+        _pal_mig = False
+        if cdc_ui_theme.migrate_ensure_ui_color_overrides(db_holder[0]):
+            _pal_mig = True
+        if cdc_ui_theme.migrate_ui_color_token_consolidation(db_holder[0]):
+            _pal_mig = True
+        if _pal_mig:
+            save_encrypted_db_dual(db_holder[0], path_holder[0], key_path_holder[0])
+    except Exception:
+        pass
     if not mail_gate.run_startup_mail_gate(root, db_holder[0], save_db):
         try:
             messagebox.showwarning(
@@ -31152,7 +32582,33 @@ def main() -> None:
         session.is_registered = bool(
             (db_holder[0].get("user_profile") or {}).get("registration_verified")
         )
-    build_ui(db_holder[0], root, session, path_holder, key_path_holder)
+    try:
+        build_ui(db_holder[0], root, session, path_holder, key_path_holder)
+    except Exception:
+        import traceback
+
+        tb = traceback.format_exc()
+        try:
+            print(tb, file=sys.stderr)
+        except Exception:
+            pass
+        tail = tb.strip()
+        if len(tail) > 2400:
+            tail = "…\n" + tail[-2400:]
+        try:
+            messagebox.showerror(
+                "Conti di casa",
+                "Errore durante l'avvio dell'interfaccia dopo l'accesso.\n"
+                "Se esegui da terminale, controlla il traceback completo lì.\n\n"
+                + tail,
+                parent=root,
+            )
+        except Exception:
+            pass
+        try:
+            root.destroy()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

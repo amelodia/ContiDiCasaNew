@@ -24,20 +24,29 @@ from app_version import APP_VERSION
 
 SaveFn = Callable[[], None]
 
-# Sfondo azzurro chiaro (login, pagina Movimenti e altre UI allineate).
+# Sfondo azzurro chiaro (pagine principali dopo l’accesso, stesso tono in ``main_app.MOVIMENTI_PAGE_BG``).
 CDC_AZZURRO_CHIARO_BG = "#d8ecf5"
-# Finestra di accesso: stesso azzurro.
-_LOGIN_IMG_CANVAS_BG = CDC_AZZURRO_CHIARO_BG
+# Finestra di accesso: pesca molto chiaro, coerente con ``CDC_TIPO_TASTI_BTN_*``.
+CDC_LOGIN_WIN_BG = "#fff5f0"
+# Compositing immagine euro + riempimenti ``tk`` nella finestra login.
+_LOGIN_IMG_CANVAS_BG = CDC_LOGIN_WIN_BG
 
-# Palette «tipo tasti» (ocra chiaro, testo nero): unica fonte per riuso in altre schermate.
-CDC_TIPO_TASTI_BTN_BG = "#efe4b8"
-CDC_TIPO_TASTI_BTN_ACTIVE_BG = "#e2d696"
-CDC_TIPO_TASTI_BTN_FG = "#1a1a1a"
+# Palette «tipo tasti»: non selezionato = giallo-arancio chiaro (tocco di rosso); selezionato = arancio più scuro; hover = intermedio.
+CDC_TIPO_TASTI_BTN_BG = "#ffe4c4"
+CDC_TIPO_TASTI_BTN_HOVER_BG = "#ffb078"
+CDC_TIPO_TASTI_BTN_ACTIVE_BG = "#c45a18"
+CDC_TIPO_TASTI_BTN_FG = "#3d1a0a"
+CDC_TIPO_TASTI_BTN_RING = "#e88840"
+CDC_TIPO_TASTI_BTN_RING_FOCUS = "#9a4810"
+# Campi testo login: più chiaro dei tasti «spenti», stessa famiglia cromatica.
+CDC_TIPO_TASTI_FIELD_BG = "#fff4ea"
+# Cornice (``tk.Label`` / ``tk.Button`` in rilievo): login, barra schede pagine; chip filtro in ``main_app``.
+CDC_TIPO_TASTI_BTN_BD = 3
 
-# Login: stessi colori del tipo tasti (`tk.Label`, colori fedeli su macOS).
+# Fallback per altri ``_login_action_label`` senza colori dedicati.
 _LOGIN_BTN_FG = CDC_TIPO_TASTI_BTN_FG
 _LOGIN_BTN_BG = CDC_TIPO_TASTI_BTN_BG
-_LOGIN_BTN_ACTIVE_BG = CDC_TIPO_TASTI_BTN_ACTIVE_BG
+_LOGIN_BTN_ACTIVE_BG = CDC_TIPO_TASTI_BTN_HOVER_BG
 # Larghezza in caratteri allineata ad «Accedi» per tasti corti (es. «Esci»).
 _LOGIN_BTN_WIDTH_ACCEDI_CHARS = len("Accedi")
 
@@ -68,7 +77,7 @@ def _security_auth_package_dir() -> Path:
 def _login_bg_rgb() -> tuple[int, int, int]:
     s = _LOGIN_IMG_CANVAS_BG.strip().lstrip("#")
     if len(s) != 6:
-        return 216, 236, 245
+        return 255, 245, 240
     return int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
 
 
@@ -428,6 +437,66 @@ def run_first_access_wizard_if_needed(
     return result[0] is True
 
 
+def _login_movimenti_action_button_colors(db: dict) -> dict[str, tuple[str, str]]:
+    """Colori effettivi come in Movimenti: token palette + default ``extras`` + ``_ui_color_overrides`` nel DB.
+    Chiavi: ``accedi`` (Pulisci filtri, «Accedi», «Cancella valori»), ``pulisci`` (blu «Nuova utenza» /azione), ``stampa`` (rosso).
+
+    Se ``ui_action_blue_*`` (Nuova utenza) risulta verde e ``mov_pulisci_accedi_*`` no, si scambiano
+    le coppie così «Nuova utenza» resta nel blocco blu d’azione.
+    """
+    import cdc_ui_palette as cup
+    import cdc_ui_theme as cut
+
+    base = cup.get_base_palette_map_copy()
+    extras = {
+        "mov_btn_cerca_bg": "#2e7d32",
+        "mov_btn_cerca_hover_bg": "#1b5e20",
+        "mov_pulisci_accedi_bg": "#1565c0",
+        "mov_pulisci_accedi_hover_bg": "#0d47a1",
+        "ui_action_blue_bg": "#1565c0",
+        "ui_action_blue_hover_bg": "#0d47a1",
+        "mov_btn_print_search_bg": "#c62828",
+        "mov_btn_print_search_hover_bg": "#8e0000",
+    }
+    raw = db.get(cut._OVERRIDES_KEY) or {}
+    overrides: dict[str, str] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if isinstance(k, str) and isinstance(v, str):
+                overrides[k] = v
+
+    def _r(token: str) -> str:
+        return cut.resolved_hex(token, base=base, extras=extras, overrides=overrides)
+
+    def _norm_bg(h: str) -> str:
+        return (cut.normalize_hex_color(h) or (h or "").strip().lower()).lower()
+
+    def _rgb24(h: str) -> tuple[int, int, int]:
+        n = _norm_bg(h).lstrip("#")
+        if len(n) != 6:
+            return 0, 0, 0
+        return int(n[0:2], 16), int(n[2:4], 16), int(n[4:6], 16)
+
+    def _looks_green_primary(bg: str) -> bool:
+        """Verde dominante rispetto a R e B."""
+        r, g, b = _rgb24(bg)
+        return g >= max(r, b) + 15 and g >= 60
+
+    accedi_pair = (_r("mov_pulisci_accedi_bg"), _r("mov_pulisci_accedi_hover_bg"))
+    pulisci_pair = (_r("ui_action_blue_bg"), _r("ui_action_blue_hover_bg"))
+
+    a_bg, p_bg = accedi_pair[0], pulisci_pair[0]
+    green_on_nuova_token = _looks_green_primary(p_bg) and not _looks_green_primary(a_bg)
+    if green_on_nuova_token:
+        accedi_pair, pulisci_pair = pulisci_pair, accedi_pair
+
+    return {
+        "accedi": accedi_pair,
+        "pulisci": pulisci_pair,
+        "stampa": (_r("mov_btn_print_search_bg"), _r("mov_btn_print_search_hover_bg")),
+    }
+
+
 def run_login_dialog(
     parent: tk.Tk,
     db: dict,
@@ -443,7 +512,7 @@ def run_login_dialog(
     win = tk.Toplevel(parent)
     win.title(f"Accesso — Conti di casa {APP_VERSION}")
     try:
-        win.configure(bg=_LOGIN_IMG_CANVAS_BG)
+        win.configure(bg=CDC_LOGIN_WIN_BG)
     except Exception:
         pass
     win.resizable(False, False)
@@ -453,23 +522,34 @@ def run_login_dialog(
     except Exception:
         pass
 
-    _login_style = ttk.Style()
+    _login_style = ttk.Style(win)
     try:
-        _login_style.configure("CdcLogin.TLabel", background=_LOGIN_IMG_CANVAS_BG, foreground="#1a1a1a")
+        _login_style.configure(
+            "CdcLogin.TLabel",
+            background=CDC_LOGIN_WIN_BG,
+            foreground=CDC_TIPO_TASTI_BTN_FG,
+        )
+        _login_style.configure(
+            "CdcLogin.TEntry",
+            fieldbackground=CDC_TIPO_TASTI_FIELD_BG,
+            foreground=CDC_TIPO_TASTI_BTN_FG,
+            insertcolor=CDC_TIPO_TASTI_BTN_FG,
+            font=("TkDefaultFont", 12),
+        )
     except Exception:
         pass
 
-    outer = tk.Frame(win, bg=_LOGIN_IMG_CANVAS_BG)
+    outer = tk.Frame(win, bg=CDC_LOGIN_WIN_BG)
     outer.pack(padx=14, pady=(8, _LOGIN_OUTER_PAD_BOTTOM_PX))
     outer.columnconfigure(0, weight=1)
 
-    banner_wrap = tk.Frame(outer, bg=_LOGIN_IMG_CANVAS_BG)
+    banner_wrap = tk.Frame(outer, bg=CDC_LOGIN_WIN_BG)
     banner_wrap.grid(row=0, column=0, sticky="ew", pady=(0, 8))
     banner_wrap.columnconfigure(0, weight=1)
 
     banner_inner = tk.Frame(
         banner_wrap,
-        bg=_LOGIN_IMG_CANVAS_BG,
+        bg=CDC_LOGIN_WIN_BG,
         width=_LOGIN_BANNER_AREA_WIDTH,
         height=_LOGIN_BANNER_AREA_HEIGHT,
         highlightthickness=0,
@@ -481,7 +561,7 @@ def run_login_dialog(
 
     euro_lbl = tk.Label(
         banner_inner,
-        bg=_LOGIN_IMG_CANVAS_BG,
+        bg=CDC_LOGIN_WIN_BG,
         bd=0,
         highlightthickness=0,
     )
@@ -490,7 +570,7 @@ def run_login_dialog(
         euro_lbl.image = win._login_banner_photo
     euro_lbl.place(relx=0.5, rely=0.5, anchor="center")
 
-    frm = tk.Frame(outer, bg=_LOGIN_IMG_CANVAS_BG)
+    frm = tk.Frame(outer, bg=CDC_LOGIN_WIN_BG)
     frm.grid(row=1, column=0, sticky="ew")
     frm.columnconfigure(0, weight=1)
 
@@ -508,14 +588,14 @@ def run_login_dialog(
         row=email_row, column=0, sticky="w"
     )
     email_var = tk.StringVar(value=_login_prefill_email(up))
-    ent_email = ttk.Entry(frm, textvariable=email_var, width=38)
+    ent_email = ttk.Entry(frm, textvariable=email_var, width=38, style="CdcLogin.TEntry")
     ent_email.grid(row=email_row + 1, column=0, columnspan=2, sticky="we", pady=(2, 8))
 
     ttk.Label(frm, text="Password", font=("TkDefaultFont", 12), style="CdcLogin.TLabel").grid(
         row=email_row + 2, column=0, sticky="w"
     )
     pw_var = tk.StringVar()
-    ent_pw = ttk.Entry(frm, textvariable=pw_var, width=38, show="•")
+    ent_pw = ttk.Entry(frm, textvariable=pw_var, width=38, show="•", style="CdcLogin.TEntry")
     ent_pw.grid(row=email_row + 3, column=0, columnspan=2, sticky="we", pady=(2, 6))
 
     out: list[tuple[bool, AppSession | None]] = [(False, None)]
@@ -640,12 +720,17 @@ def run_login_dialog(
             do_backdoor()
         return "break"
 
-    rowb = tk.Frame(frm, bg=_LOGIN_IMG_CANVAS_BG)
+    rowb = tk.Frame(frm, bg=CDC_LOGIN_WIN_BG)
     rowb.grid(row=email_row + 4, column=0, columnspan=2, sticky="we", pady=(2, 0))
     rowb.columnconfigure(0, weight=1)
     rowb.columnconfigure(2, weight=1)
-    btn_bar = tk.Frame(rowb, bg=_LOGIN_IMG_CANVAS_BG)
+    btn_bar = tk.Frame(rowb, bg=CDC_LOGIN_WIN_BG)
     btn_bar.grid(row=0, column=1, sticky="")
+
+    _lm = _login_movimenti_action_button_colors(db)
+    acc_bg, acc_act = _lm["accedi"]
+    nuo_bg, nuo_act = _lm["pulisci"]
+    esc_bg, esc_act = _lm["stampa"]
 
     def _login_action_label(
         parent: tk.Misc,
@@ -653,18 +738,24 @@ def run_login_dialog(
         command: Callable[[], None],
         *,
         width_chars: int | None = None,
+        btn_bg: str | None = None,
+        btn_active_bg: str | None = None,
+        btn_fg: str | None = None,
     ) -> tk.Label:
+        bg = btn_bg if btn_bg is not None else _LOGIN_BTN_BG
+        bg_act = btn_active_bg if btn_active_bg is not None else _LOGIN_BTN_ACTIVE_BG
+        fg = btn_fg if btn_fg is not None else _LOGIN_BTN_FG
         kw: dict[str, Any] = {
             "master": parent,
             "text": text,
             "font": ("TkDefaultFont", 11, "bold"),
-            "bg": _LOGIN_BTN_BG,
-            "fg": _LOGIN_BTN_FG,
-            "padx": 8,
-            "pady": 4,
+            "bg": bg,
+            "fg": fg,
+            "padx": 14,
+            "pady": 7,
             "cursor": "hand2",
             "relief": tk.RAISED,
-            "bd": 1,
+            "bd": CDC_TIPO_TASTI_BTN_BD,
             "highlightthickness": 0,
         }
         if width_chars is not None:
@@ -672,10 +763,10 @@ def run_login_dialog(
         lb = tk.Label(**kw)
 
         def _enter(_e: tk.Event | None = None) -> None:
-            lb.configure(bg=_LOGIN_BTN_ACTIVE_BG)
+            lb.configure(bg=bg_act)
 
         def _leave(_e: tk.Event | None = None) -> None:
-            lb.configure(bg=_LOGIN_BTN_BG)
+            lb.configure(bg=bg)
 
         def _click(_e: tk.Event) -> None:
             command()
@@ -686,13 +777,32 @@ def run_login_dialog(
         return lb
 
     _btn_pad_between = (0, 8)
-    _login_action_label(btn_bar, "Accedi", do_login, width_chars=_LOGIN_BTN_WIDTH_ACCEDI_CHARS).pack(
-        side=tk.LEFT, padx=_btn_pad_between
-    )
-    _login_action_label(btn_bar, "Nuova utenza", do_nuova_utenza).pack(side=tk.LEFT, padx=_btn_pad_between)
-    _login_action_label(btn_bar, "Esci", lambda: win.destroy(), width_chars=_LOGIN_BTN_WIDTH_ACCEDI_CHARS).pack(
-        side=tk.LEFT
-    )
+    _login_action_label(
+        btn_bar,
+        "Accedi",
+        do_login,
+        width_chars=_LOGIN_BTN_WIDTH_ACCEDI_CHARS,
+        btn_bg=acc_bg,
+        btn_active_bg=acc_act,
+        btn_fg="#ffffff",
+    ).pack(side=tk.LEFT, padx=_btn_pad_between)
+    _login_action_label(
+        btn_bar,
+        "Nuova utenza",
+        do_nuova_utenza,
+        btn_bg=nuo_bg,
+        btn_active_bg=nuo_act,
+        btn_fg="#ffffff",
+    ).pack(side=tk.LEFT, padx=_btn_pad_between)
+    _login_action_label(
+        btn_bar,
+        "Esci",
+        lambda: win.destroy(),
+        width_chars=_LOGIN_BTN_WIDTH_ACCEDI_CHARS,
+        btn_bg=esc_bg,
+        btn_active_bg=esc_act,
+        btn_fg="#ffffff",
+    ).pack(side=tk.LEFT)
 
     win.bind("<Control-z>", on_ctrl_z)
     win.bind("<Control-Z>", on_ctrl_z)

@@ -6,6 +6,8 @@
 
 # Dipendenze comuni
 cryptography>=42.0.0
+# Tema ttk moderno (Sun Valley) per controlli ttk su desktop
+sv-ttk>=2.4.0
 # Obbligatorio: finestra di accesso (JPEG incorporato in euro_login_asset via ImageTk).
 # Build eseguibile: assicurarsi che Pillow sia nel bundle (PyInstaller: --collect-all PIL o hiddenimports PIL._imaging).
 Pillow>=10.0.0

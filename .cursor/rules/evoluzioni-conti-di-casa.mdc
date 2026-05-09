@@ -27,7 +27,7 @@ Punti collegati: `ent_amt`, filtri Movimenti, `ent_per_amt`, dialog **Modifica i
 
 - Preimpostazione: **`Aut ` + `gg/mm` + uno spazio finale** (es. `Aut 15/03 `) per continuare a digitare dopo la data, **salvo** se il **primo conto** è **Cassa** o **conto carta** (in tal caso niente «Aut», modello **Giroconto** come negli altri casi).
 - Al **focus** sul campo Nota, se il contenuto è quello modello, cursore **dopo lo spazio** finale.
-- Dopo ogni inserimento riuscito: `_populate_form_defaults(keep_last=True)` per **data, categoria e conti** della registrazione appena inserita mentre si resta sulla pagina; uscita dalla scheda **Nuove registrazioni** → `keep_last=False` (default iniziale). **Concludi immissione** senza importo significativo: nessun dialogo, passaggio a Movimenti; con importo: stessa conferma d’inserimento di **Conferma immissione**. **Barra schede**: con importo compilato, stessa conferma prima di lasciare la pagina.
+- Dopo ogni inserimento riuscito: `_populate_form_defaults(keep_last=True)` per **data, categoria e conti** della registrazione appena inserita mentre si resta sulla pagina; uscita dalla scheda **Nuove registrazioni** → `keep_last=False` (default iniziale). **Barra schede**: con importo compilato, conferma d’inserimento (come **Conferma immissione**) prima di lasciare la pagina.
 
 ## Girata conto/conto — secondo conto
 
@@ -55,6 +55,10 @@ Punti collegati: `ent_amt`, filtri Movimenti, `ent_per_amt`, dialog **Modifica i
 
 - Immagine login: **solo** JPEG incorporato (`euro_login_asset.py`); **Pillow obbligatorio** all'avvio (`verify_pillow_for_login_ui`).
 - Rigenerare asset: `python3 regen_euro_login_asset.py` (neutro) o `--from-assets` da `assets/euro.jpg`.
+
+## Palette — chip filtri Movimenti vs tab pagina
+
+- I pulsanti tipo «tab» per **modalità/preset ricerca** in Movimenti usano **`MOV_FILTER_TAB_*`** in `main_app.py` e i token Opzioni **`mov_filter_tab_btn_*`**; la **barra tab delle pagine** (Movimenti, Nuove registrazioni, …), il footer saldi su periodiche ecc. restano sulle **`CDC_TIPO_TASTI_*`** (gruppo palette **Finestra login e barra schede pagine** / tipo tasti). Nella **finestra di login**, **Accedi** usa **`mov_pulisci_accedi_*`** (come «Pulisci filtri» in Movimenti e «Cancella valori» in Nuova registrazione/Periodiche); **Nuova utenza** usa **`ui_action_blue_*`**; **Esci** usa **`mov_btn_print_search_*`**, risolti con **`cdc_ui_theme.resolved_hex`** (`security_auth._login_movimenti_action_button_colors`).
 
 ## Ricerca Movimenti — preset «Ultimi N mesi» con date future comprese
 

@@ -6,6 +6,8 @@ import os
 import subprocess
 import sys
 
+from PyInstaller.utils.hooks import collect_all
+
 _AUTO_BUMP = os.environ.get("CDC_AUTO_BUMP_VERSION", "1").strip().lower() not in ("0", "false", "no", "off")
 _BUMP_SCRIPT = os.path.join(SPECPATH, "scripts", "bump_version_build.py")
 if _AUTO_BUMP and os.path.isfile(_BUMP_SCRIPT):
@@ -37,12 +39,20 @@ hidden = [
     "mail_gate",
     "periodiche",
     "security_auth",
+    "cdc_ui_palette",
+    "cdc_ui_theme",
+    "cdc_round_color_wheel",
     "import_legacy",
     "estratto_conto_pdf",
     "light_enc_sidecar",
     # Matplotlib PDF backend è importato dinamicamente da fig.savefig(..., format="pdf").
     "matplotlib.backends.backend_pdf",
 ]
+
+_sv_ttk_collect = collect_all("sv_ttk")
+_sv_ttk_datas = list(_sv_ttk_collect[0])
+_sv_ttk_binaries = list(_sv_ttk_collect[1])
+_sv_ttk_hidden = list(_sv_ttk_collect[2])
 
 if sys.platform == "darwin":
     hidden += [
@@ -54,9 +64,9 @@ if sys.platform == "darwin":
 a = Analysis(
     ["main_app.py"],
     pathex=[],
-    binaries=[],
-    datas=[],
-    hiddenimports=hidden,
+    binaries=_sv_ttk_binaries,
+    datas=_sv_ttk_datas,
+    hiddenimports=hidden + _sv_ttk_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

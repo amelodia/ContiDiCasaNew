@@ -124,8 +124,10 @@ def _max_source_index_for_year(db: dict, year: int) -> int:
     return 0
 
 
-def _sanitize_line(value: str, *, max_len: int | None = None) -> str:
-    out = (value or "").replace("\r", " ").replace("\n", " ").strip()
+def _sanitize_line(value: str, *, max_len: int | None = None, strip_edges: bool = True) -> str:
+    out = (value or "").replace("\r", " ").replace("\n", " ")
+    if strip_edges:
+        out = out.strip()
     return out[:max_len] if max_len is not None else out
 
 
@@ -155,8 +157,8 @@ def build_periodic_record(
     acc2_code = str(tpl.get("account_secondary_code") or "") if giro else ""
     acc2_name = str(tpl.get("account_secondary_name") or "") if giro else ""
     acc2_flags = str(tpl.get("account_secondary_flags") or "")
-    chq = _sanitize_line(str(tpl.get("cheque") or ""), max_len=MAX_CHEQUE_LEN) or "-"
-    note = _sanitize_line(str(tpl.get("note") or ""), max_len=MAX_RECORD_NOTE_LEN) or "-"
+    chq = _sanitize_line(str(tpl.get("cheque") or ""), max_len=MAX_CHEQUE_LEN, strip_edges=False) or "-"
+    note = _sanitize_line(str(tpl.get("note") or ""), max_len=MAX_RECORD_NOTE_LEN, strip_edges=False) or "-"
     cadence = str(rule.get("cadence") or "")
     suffix = _periodic_auto_note_suffix(cadence, y, movement_date_iso)
     if suffix:
@@ -166,7 +168,7 @@ def build_periodic_record(
             note = suffix
         else:
             merged = f"{base.rstrip()} {suffix}"
-            note = _sanitize_line(merged, max_len=MAX_RECORD_NOTE_LEN) or suffix
+            note = _sanitize_line(merged, max_len=MAX_RECORD_NOTE_LEN, strip_edges=False) or suffix
     amt_eur = str(tpl.get("amount_eur") or "0.00")
     amt_dec = Decimal(str(amt_eur.replace(",", ".")))
     return {

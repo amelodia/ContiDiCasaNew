@@ -194,6 +194,8 @@ def configure_data_workspace_interactive(parent) -> bool:
     import tkinter as tk
     from tkinter import filedialog, messagebox
 
+    import security_auth
+
     saved = load_saved_workspace_path()
     if saved is not None:
         set_data_workspace_root(saved)
@@ -235,6 +237,22 @@ def configure_data_workspace_interactive(parent) -> bool:
     btn_row = tk.Frame(frm)
     btn_row.pack(pady=(18, 0))
 
+    _cw_btn = {
+        "font": ("TkDefaultFont", 11, "bold"),
+        "bg": security_auth.CDC_TIPO_TASTI_BTN_BG,
+        "fg": security_auth.CDC_TIPO_TASTI_BTN_FG,
+        "activebackground": security_auth.CDC_TIPO_TASTI_BTN_HOVER_BG,
+        "activeforeground": security_auth.CDC_TIPO_TASTI_BTN_FG,
+        "relief": tk.RAISED,
+        "bd": security_auth.CDC_TIPO_TASTI_BTN_BD,
+        "highlightthickness": 1,
+        "highlightbackground": security_auth.CDC_TIPO_TASTI_BTN_RING,
+        "highlightcolor": security_auth.CDC_TIPO_TASTI_BTN_RING,
+        "padx": 12,
+        "pady": 6,
+        "cursor": "hand2",
+    }
+
     def on_pick() -> None:
         choice[0] = "pick"
         win.destroy()
@@ -247,11 +265,11 @@ def configure_data_workspace_interactive(parent) -> bool:
         choice[0] = None
         win.destroy()
 
-    tk.Button(btn_row, text="Scegli cartella…", command=on_pick, width=18).pack(side=tk.LEFT, padx=(0, 8))
-    tk.Button(btn_row, text="Ripristina da backup (Library)…", command=on_restore, width=28).pack(
+    tk.Button(btn_row, text="Scegli cartella…", command=on_pick, width=18, **_cw_btn).pack(side=tk.LEFT, padx=(0, 8))
+    tk.Button(btn_row, text="Ripristina da backup (Library)…", command=on_restore, width=28, **_cw_btn).pack(
         side=tk.LEFT, padx=(0, 8)
     )
-    tk.Button(btn_row, text="Esci", command=on_exit, width=10).pack(side=tk.LEFT)
+    tk.Button(btn_row, text="Esci", command=on_exit, width=10, **_cw_btn).pack(side=tk.LEFT)
 
     win.grab_set()
     try:
