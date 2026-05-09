@@ -118,6 +118,79 @@ COLOR_AMOUNT_POS = "#006400"
 COLOR_AMOUNT_NEG = "#b22222"
 
 
+def _configure_windows_cdc_color_theme(root: tk.Misc) -> None:
+    """Su Windows i temi ttk nativi ignorano molti colori: usare ``clam`` rende applicabile la palette CdC."""
+    if platform.system() != "Windows":
+        return
+    try:
+        style = ttk.Style(root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure(".", background=MOVIMENTI_PAGE_BG, foreground="#1a1a1a")
+        style.configure("TFrame", background=MOVIMENTI_PAGE_BG)
+        style.configure("TLabel", background=MOVIMENTI_PAGE_BG, foreground="#1a1a1a")
+        style.configure(
+            "TEntry",
+            fieldbackground=CDC_ENTRY_FIELD_BG,
+            background=CDC_ENTRY_FIELD_BG,
+            foreground="#111111",
+            insertcolor="#111111",
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground=CDC_ENTRY_FIELD_BG,
+            background=CDC_ENTRY_FIELD_BG,
+            foreground="#111111",
+            arrowcolor="#1a1a1a",
+            selectbackground=CDC_CAL_SELECTED_BG,
+            selectforeground="#111111",
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", CDC_ENTRY_FIELD_BG), ("!disabled", CDC_ENTRY_FIELD_BG)],
+            foreground=[("readonly", "#111111"), ("!disabled", "#111111")],
+        )
+        style.configure(
+            "TButton",
+            background=security_auth.CDC_TIPO_TASTI_BTN_BG,
+            foreground=security_auth.CDC_TIPO_TASTI_BTN_FG,
+        )
+        style.map(
+            "TButton",
+            background=[
+                ("active", security_auth.CDC_TIPO_TASTI_BTN_ACTIVE_BG),
+                ("pressed", security_auth.CDC_TIPO_TASTI_BTN_ACTIVE_BG),
+            ],
+            foreground=[("active", security_auth.CDC_TIPO_TASTI_BTN_FG)],
+        )
+        style.configure(
+            "Treeview",
+            background=CDC_GRID_STRIPE0_BG,
+            fieldbackground=CDC_GRID_STRIPE0_BG,
+            foreground="#111111",
+            bordercolor=CDC_GRID_HEADING_BG,
+            lightcolor=CDC_GRID_HEADING_BG,
+            darkcolor=CDC_GRID_HEADING_BG,
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=CDC_GRID_HEADING_BG,
+            foreground="#1a1a1a",
+            relief=tk.RAISED,
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", CDC_CAL_SELECTED_BG)],
+            foreground=[("selected", "#000000")],
+        )
+        root.option_add("*TCombobox*Listbox.background", CDC_ENTRY_FIELD_BG)
+        root.option_add("*TCombobox*Listbox.foreground", "#111111")
+        root.option_add("*TCombobox*Listbox.selectBackground", CDC_CAL_SELECTED_BG)
+        root.option_add("*TCombobox*Listbox.selectForeground", "#000000")
+    except Exception as exc:
+        _startup_log(f"Windows color theme setup failed: {exc!r}")
+
+
 def _windows_startup_log_path() -> Path | None:
     if platform.system() != "Windows":
         return None
@@ -8265,6 +8338,7 @@ def build_ui(
         pass
 
     try:
+        _configure_windows_cdc_color_theme(root)
         root.configure(bg=MOVIMENTI_PAGE_BG)
     except Exception:
         pass
@@ -30705,6 +30779,7 @@ def main() -> None:
     _darwin_prepare_stdin_for_tk_aqua()
 
     root = tk.Tk()
+    _configure_windows_cdc_color_theme(root)
     root.title("Conti di casa")
     _windows_show_bootstrap_root(root, "Avvio dell'applicazione…")
     # La root resta nascosta fino al bisogno (evita la grande finestra vuota dietro i dialoghi).
