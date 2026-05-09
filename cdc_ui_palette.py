@@ -84,31 +84,31 @@ PALETTE_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
     (
         "Movimenti — pulsanti e messaggi correzione",
         [
-            ("mov_btn_print_search_bg", "Rosso «Stampa ricerca» / correzione Movimenti / «Conferma immissione» / conferme periodiche"),
-            ("mov_btn_print_search_hover_bg", "Hover dei suddetti"),
-            ("mov_btn_espandi_bg", "«Espandi ricerca»"),
-            ("mov_btn_espandi_hover_bg", "«Espandi ricerca» hover"),
-            ("mov_btn_cerca_bg", "«Cerca»"),
-            ("mov_btn_cerca_hover_bg", "«Cerca» hover"),
+            ("mov_btn_print_search_bg", "Sfondo «Stampa ricerca», «Stampa saldi», «Conferma immissione» e conferme periodiche"),
+            ("mov_btn_print_search_hover_bg", "Hover di Stampa/Conferma"),
+            ("mov_btn_espandi_bg", "Sfondo «Espandi ricerca»"),
+            ("mov_btn_espandi_hover_bg", "Hover «Espandi ricerca»"),
+            ("mov_btn_cerca_bg", "Sfondo «Cerca» nella pagina Movimenti"),
+            ("mov_btn_cerca_hover_bg", "Hover «Cerca» nella pagina Movimenti"),
             (
                 "mov_pulisci_accedi_bg",
-                "«Pulisci filtri» (Movimenti), «Accedi» (login), «Cancella valori» (Nuova registrazione e Periodiche)",
+                "Sfondo «Pulisci filtri» e «Cancella valori» in Nuova registrazione/Periodiche",
             ),
-            ("mov_pulisci_accedi_hover_bg", "Passaggio mouse su quei pulsanti"),
+            ("mov_pulisci_accedi_hover_bg", "Hover «Pulisci filtri» / «Cancella valori»"),
         ],
     ),
     (
         "Pulsanti e link — blu (Aggrega categorie, Modifica, «Nuova utenza», Verifica, Opzioni…)",
         [
-            ("ui_action_blue_bg", "Sfondo normale (collegamenti Opzioni e altri pulsanti blu elencati nel titolo del gruppo)"),
-            ("ui_action_blue_hover_bg", "Passaggio mouse"),
+            ("ui_action_blue_bg", "Sfondo azioni blu: Aggrega categorie, Modifica, Ripristina layout, link Opzioni e alcuni tasti Verifica"),
+            ("ui_action_blue_hover_bg", "Hover azioni blu"),
         ],
     ),
     (
         "Pulsanti e link — rosso (Opzioni, Elimina in Verifica e Periodiche)",
         [
-            ("ui_action_red_bg", "Sfondo normale"),
-            ("ui_action_red_hover_bg", "Passaggio mouse"),
+            ("ui_action_red_bg", "Sfondo azioni rosse: reset/salvataggi critici in Opzioni ed eliminazioni"),
+            ("ui_action_red_hover_bg", "Hover azioni rosse"),
         ],
     ),
     (

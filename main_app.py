@@ -209,6 +209,53 @@ def _apply_ui_palette_runtime(db: dict | None) -> None:
     cdc_ui_palette.invalidate_base_palette_cache()
 
 
+def _ui_color_overrides_from_db(db: dict | None) -> dict[str, str]:
+    raw = (db or {}).get(cdc_ui_theme._OVERRIDES_KEY) if isinstance(db, dict) else {}
+    out: dict[str, str] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if isinstance(k, str) and isinstance(v, str):
+                n = cdc_ui_theme.normalize_hex_color(v)
+                if n is not None:
+                    out[k.strip()] = n
+    return out
+
+
+def _adopt_ui_color_overrides_from_available_dbs(db: dict, key_path: Path) -> bool:
+    """Se il DB corrente non ha override colori, prova a recuperarli da altri .enc nella cartella dati."""
+    if _ui_color_overrides_from_db(db):
+        return False
+    candidates: list[Path] = []
+    try:
+        candidates.extend(_discover_existing_user_db_candidates())
+    except Exception:
+        pass
+    try:
+        boot = data_workspace.session_bootstrap_enc_path()
+        if boot.is_file():
+            candidates.append(boot)
+    except Exception:
+        pass
+    seen: set[Path] = set()
+    for p in candidates:
+        try:
+            rp = p.resolve()
+        except Exception:
+            rp = p
+        if rp in seen:
+            continue
+        seen.add(rp)
+        try:
+            other = load_encrypted_db(p, key_path)
+        except Exception:
+            continue
+        overrides = _ui_color_overrides_from_db(other)
+        if overrides:
+            db[cdc_ui_theme._OVERRIDES_KEY] = dict(overrides)
+            return True
+    return False
+
+
 def _ui_palette_extras_defaults() -> dict[str, str]:
     return {
         "ui_action_blue_bg": "#1565c0",
@@ -29564,14 +29611,18 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     def _opz_color_commit(token: str, value: str | None) -> None:
         d = cur_db()
         cdc_ui_theme.migrate_ensure_ui_color_overrides(d)
+        prev_overrides = dict(_opz_color_overrides())
         d[cdc_ui_theme._OVERRIDES_KEY] = cdc_ui_theme.merge_overrides(
-            _opz_color_overrides(), token, value
+            prev_overrides, token, value
         )
         _apply_ui_palette_runtime(d)
         _configure_windows_cdc_color_theme(root)
         try:
-            save_encrypted_db_dual(d, Path(data_file_var.get()), Path(key_file_var.get()))
+            save_encrypted_db_dual(d, path_holder[0], key_path_holder[0])
         except Exception as exc:
+            d[cdc_ui_theme._OVERRIDES_KEY] = prev_overrides
+            _apply_ui_palette_runtime(d)
+            _configure_windows_cdc_color_theme(root)
             messagebox.showerror("Palette colori", str(exc), parent=root)
             return
         messagebox.showinfo(
@@ -30809,10 +30860,14 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 root.deiconify()
                 tk_foreground.present_window(root)
                 def _zoom_and_present_windows() -> None:
+                    try:
+                        root.state("zoomed")
+                    except Exception:
+                        pass
                     tk_foreground.present_window(root)
 
                 try:
-                    root.after(120, _zoom_and_present_windows)
+                    root.after(450, _zoom_and_present_windows)
                 except Exception:
                     pass
             tk_foreground.present_window(root)
@@ -31108,6 +31163,7 @@ def main() -> None:
     db_holder: list[dict] = [db]
     path_holder: list[Path] = [resolved_path]
     key_path_holder: list[Path] = [data_workspace.default_key_file().resolve()]
+    _adopt_ui_color_overrides_from_available_dbs(db_holder[0], key_path_holder[0])
     _apply_ui_palette_runtime(db_holder[0])
     _configure_windows_cdc_color_theme(root)
 
@@ -31201,9 +31257,14 @@ def main() -> None:
         except Exception:
             pass
 
-    wait_win = _show_post_login_wait(root)
     _windows_show_bootstrap_root(root, "Apertura dati utente…")
     path_holder[0] = migrate_data_path_after_login(db_holder[0], session, path_holder[0])
+    if _adopt_ui_color_overrides_from_available_dbs(db_holder[0], key_path_holder[0]):
+        try:
+            save_encrypted_db_dual(db_holder[0], path_holder[0], key_path_holder[0])
+        except Exception:
+            pass
+    _apply_ui_palette_runtime(db_holder[0])
     _startup_log(f"user data path ready: {path_holder[0]}")
     if session.entered_via_backdoor:
         security_auth.ensure_security(db_holder[0])
@@ -31212,11 +31273,6 @@ def main() -> None:
         )
     _startup_log("building main UI")
     _windows_clear_bootstrap_root(root)
-    if wait_win is not None:
-        try:
-            root.after(700, lambda w=wait_win: _close_post_login_wait(w))
-        except Exception:
-            _close_post_login_wait(wait_win)
     build_ui(db_holder[0], root, session, path_holder, key_path_holder)
     _startup_log("main UI exited")
 
