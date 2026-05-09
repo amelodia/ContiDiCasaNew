@@ -8440,6 +8440,25 @@ def build_ui(
     def cur_db() -> dict:
         return db_holder[0]
 
+    def _ui_overrides_for_runtime() -> dict[str, str]:
+        raw = cur_db().get(cdc_ui_theme._OVERRIDES_KEY) or {}
+        out: dict[str, str] = {}
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    n = cdc_ui_theme.normalize_hex_color(v)
+                    if n is not None:
+                        out[k.strip()] = n
+        return out
+
+    def _ui_color(token: str) -> str:
+        return cdc_ui_theme.resolved_hex(
+            token,
+            base=cdc_ui_palette.get_base_palette_map_copy(),
+            extras=_ui_palette_extras_defaults(),
+            overrides=_ui_overrides_for_runtime(),
+        )
+
     def refresh_window_title() -> None:
         root.title(window_title_for_session(cur_db(), session_holder[0], show_clock=True))
 
@@ -8855,8 +8874,8 @@ def build_ui(
     )
     category_entry.pack(side=tk.LEFT, padx=(0, 6))
 
-    _MOV_AGG_CAT_BTN_BG = "#1565c0"
-    _MOV_AGG_CAT_BTN_ACT = "#0d47a1"
+    _MOV_AGG_CAT_BTN_BG = _ui_color("ui_action_blue_bg")
+    _MOV_AGG_CAT_BTN_ACT = _ui_color("ui_action_blue_hover_bg")
 
     def _mov_refresh_aggregate_category_button_caption() -> None:
         s = (text_aggregate_category_applied_var.get() or "").strip()
@@ -9234,8 +9253,8 @@ def build_ui(
     records_frame.pack(fill=tk.BOTH, expand=True)
 
     search_title_var = tk.StringVar(value="")
-    _PRINT_RICERCA_RED = "#c62828"
-    _PRINT_RICERCA_RED_ACTIVE = "#8e0000"
+    _PRINT_RICERCA_RED = _ui_color("mov_btn_print_search_bg")
+    _PRINT_RICERCA_RED_ACTIVE = _ui_color("mov_btn_print_search_hover_bg")
     search_title_row = tk.Frame(records_frame, bg=MOVIMENTI_PAGE_BG)
     search_title_label = tk.Label(
         search_title_row,
@@ -9720,11 +9739,11 @@ def build_ui(
     # Correzione: solo righe presenti in griglia = già filtrate da «Cerca»; nessuna ricerca fuori dai filtri.
     # Stessa riga del tasto Modifica (col. 0) così l’altezza della barra non cambia al primo clic.
     _movimenti_elenco_expanded: list[bool] = [False]
-    _CORREZIONE_BLUE = "#1565c0"
+    _CORREZIONE_BLUE = _ui_color("ui_action_blue_bg")
     correzione_row = tk.Frame(records_frame, bg=MOVIMENTI_PAGE_BG)
     corr_left_btns = tk.Frame(correzione_row, bg=MOVIMENTI_PAGE_BG)
-    _RIPRISTINA_LAYOUT_BG = "#1565c0"
-    _RIPRISTINA_LAYOUT_BG_ACT = "#0d47a1"
+    _RIPRISTINA_LAYOUT_BG = _ui_color("ui_action_blue_bg")
+    _RIPRISTINA_LAYOUT_BG_ACT = _ui_color("ui_action_blue_hover_bg")
     btn_mov_griglia_ripristina = tk.Label(
         corr_left_btns,
         text="Torna a filtri e saldi",
@@ -9762,8 +9781,8 @@ def build_ui(
         relief=tk.RAISED,
         bd=1,
     )
-    _ESPANDI_ELENCO_BG = "#00695c"
-    _ESPANDI_ELENCO_BG_ACT = "#004d40"
+    _ESPANDI_ELENCO_BG = _ui_color("mov_btn_espandi_bg")
+    _ESPANDI_ELENCO_BG_ACT = _ui_color("mov_btn_espandi_hover_bg")
     btn_espandi_elenco_mov = tk.Label(
         corr_left_btns,
         text="Espandi ricerca",
@@ -11838,10 +11857,10 @@ th {{ background:#efefef; text-align:left; }}
         except Exception:
             pass
 
-    _CERCA_GREEN = "#2e7d32"
-    _CERCA_GREEN_ACTIVE = "#1b5e20"
-    _PULISCI_BLUE = "#1565c0"
-    _PULISCI_BLUE_ACTIVE = "#0d47a1"
+    _CERCA_GREEN = _ui_color("mov_btn_cerca_bg")
+    _CERCA_GREEN_ACTIVE = _ui_color("mov_btn_cerca_hover_bg")
+    _PULISCI_BLUE = _ui_color("mov_pulisci_accedi_bg")
+    _PULISCI_BLUE_ACTIVE = _ui_color("mov_pulisci_accedi_hover_bg")
     filters_action_wrap = tk.Frame(movimenti_body, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
     cerca_wrap = tk.Frame(filters_action_wrap, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
     lbl_cerca = tk.Label(
@@ -11884,9 +11903,11 @@ th {{ background:#efefef; text-align:left; }}
         bd=1,
     )
     filters_action_wrap.pack(fill=tk.X, pady=(0, 4), before=records_frame)
-    lbl_pulisci_filtri.pack(side=tk.RIGHT)
-    cerca_wrap.pack(side=tk.RIGHT, padx=(0, _FILTER_ROW_BUTTON_GAP))
+    filters_action_inner = tk.Frame(filters_action_wrap, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
+    filters_action_inner.pack(anchor=tk.CENTER)
+    cerca_wrap.pack(in_=filters_action_inner, side=tk.LEFT, padx=(0, _FILTER_ROW_BUTTON_GAP))
     lbl_cerca.pack(side=tk.TOP, fill=tk.X)
+    lbl_pulisci_filtri.pack(in_=filters_action_inner, side=tk.LEFT)
 
     def _pulisci_enter(_e: tk.Event) -> None:
         lbl_pulisci_filtri.configure(bg=_PULISCI_BLUE_ACTIVE)
@@ -13869,8 +13890,8 @@ th {{ background:#efefef; text-align:left; }}
         _debug_log(run_id, "H3", "main_app.py:_print_saldi_direct", "fallback_browser_used", {})
         # #endregion
 
-    _PRINT_RED = "#c62828"
-    _PRINT_RED_ACTIVE = "#8e0000"
+    _PRINT_RED = _ui_color("mov_btn_print_search_bg")
+    _PRINT_RED_ACTIVE = _ui_color("mov_btn_print_search_hover_bg")
     btn_stampa_saldi = tk.Label(
         balance_left,
         text="Stampa\nsaldi",
@@ -17795,17 +17816,17 @@ th {{ background:#efefef; text-align:left; }}
     _ver_ui_font = ("TkDefaultFont", 11)
     _ver_ui_font_b = ("TkDefaultFont", 11, "bold")
     _ver_cand_promo_font = ("TkDefaultFont", 14, "bold")
-    _VER_GRID_AMT_POS_FG = "#156716"
-    _VER_GRID_AMT_NEG_FG = "#b71c1c"
-    _VER_GRID_AMT_ZERO_FG = "#424242"
+    _VER_GRID_AMT_POS_FG = _ui_color("ver_grid_amount_pos_fg")
+    _VER_GRID_AMT_NEG_FG = _ui_color("ver_grid_amount_neg_fg")
+    _VER_GRID_AMT_ZERO_FG = _ui_color("ver_grid_amount_zero_fg")
     # Tasti azioni sospesi: stessi colori/dimensioni della barra «registrazioni non verificate».
-    _VER_PENDING_BTN_EDIT_BG = "#1565c0"
-    _VER_PENDING_BTN_DEL_BG = "#b71c1c"
-    _VER_PENDING_BTN_NEW_BG = "#2e7d32"
-    _VER_PENDING_BTN_CLEARSEL_BG = "#616161"
-    _VER_FOOT_PRINT_BG = "#546e7a"
-    _VER_FOOT_CYCLE_BG = "#ef6c00"
-    _VER_FOOT_CLOSE_BG = "#c62828"
+    _VER_PENDING_BTN_EDIT_BG = _ui_color("ui_action_blue_bg")
+    _VER_PENDING_BTN_DEL_BG = _ui_color("ui_action_red_bg")
+    _VER_PENDING_BTN_NEW_BG = _ui_color("ver_btn_pending_new_bg")
+    _VER_PENDING_BTN_CLEARSEL_BG = _ui_color("ver_btn_pending_clear_bg")
+    _VER_FOOT_PRINT_BG = _ui_color("ver_footer_print_bg")
+    _VER_FOOT_CYCLE_BG = _ui_color("ver_footer_cycle_bg")
+    _VER_FOOT_CLOSE_BG = _ui_color("ver_footer_close_bg")
     _VER_ACTION_BTN_FONT = ("TkDefaultFont", 15, "bold")
 
     _ver_res_style = ttk.Style()
@@ -19669,7 +19690,7 @@ th {{ background:#efefef; text-align:left; }}
         ver_unver_amt_tree.column("amount_eur", width=min(amt_w, 200), minwidth=92)
 
     # Barra correzione registrazioni non verificate (stesse regole della pagina Movimenti).
-    _VER_CORR_BLUE = "#1565c0"
+    _VER_CORR_BLUE = _ui_color("ui_action_blue_bg")
     ver_unver_correzione_row = tk.Frame(ver_results_frame, bg=_VER_BG, highlightthickness=0)
     ver_unver_btn_modifica_reg = tk.Label(
         ver_unver_correzione_row,
@@ -29456,10 +29477,10 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     opz_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     opz_vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
-    _OPZ_BLUE = "#1565c0"
-    _OPZ_BLUE_ACTIVE = "#0d47a1"
-    _OPZ_RED = "#b71c1c"
-    _OPZ_RED_ACTIVE = "#7f0000"
+    _OPZ_BLUE = _ui_color("ui_action_blue_bg")
+    _OPZ_BLUE_ACTIVE = _ui_color("ui_action_blue_hover_bg")
+    _OPZ_RED = _ui_color("ui_action_red_bg")
+    _OPZ_RED_ACTIVE = _ui_color("ui_action_red_hover_bg")
     _OPZ_TITLE_FONT = ("TkDefaultFont", 14, "bold")
     _OPZ_PATH_ENTRY_WIDTH = 64
     _OPZ_PATH_BTN_WIDTH = 14
