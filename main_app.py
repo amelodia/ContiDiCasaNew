@@ -118,6 +118,69 @@ COLOR_AMOUNT_POS = "#006400"
 COLOR_AMOUNT_NEG = "#b22222"
 
 
+def _windows_startup_log_path() -> Path | None:
+    if platform.system() != "Windows":
+        return None
+    base = (os.environ.get("LOCALAPPDATA") or "").strip()
+    if base:
+        return Path(base) / "ContiDiCasa" / "startup.log"
+    return Path.home() / "ContiDiCasa_startup.log"
+
+
+def _startup_log(message: str) -> None:
+    path = _windows_startup_log_path()
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with path.open("a", encoding="utf-8") as f:
+            f.write(f"{ts} {message}\n")
+    except Exception:
+        pass
+
+
+def _windows_show_bootstrap_root(root: tk.Tk, text: str) -> None:
+    if platform.system() != "Windows":
+        return
+    _startup_log(text)
+    try:
+        frame = getattr(root, "_cdc_bootstrap_frame", None)
+        label = getattr(root, "_cdc_bootstrap_label", None)
+        if frame is None or label is None:
+            frame = ttk.Frame(root, padding=18)
+            label_title = ttk.Label(frame, text="Conti di casa", font=("TkDefaultFont", 13, "bold"))
+            label_title.pack(anchor=tk.W)
+            label = ttk.Label(frame, text=text, wraplength=420, justify=tk.LEFT)
+            label.pack(anchor=tk.W, pady=(10, 0))
+            frame.pack(fill=tk.BOTH, expand=True)
+            root._cdc_bootstrap_frame = frame  # type: ignore[attr-defined]
+            root._cdc_bootstrap_label = label  # type: ignore[attr-defined]
+            root.geometry("480x150+120+120")
+        else:
+            label.configure(text=text)
+        root.deiconify()
+        tk_foreground.present_window(root)
+        root.update_idletasks()
+        root.update()
+    except Exception as exc:
+        _startup_log(f"bootstrap UI error: {exc!r}")
+
+
+def _windows_clear_bootstrap_root(root: tk.Tk) -> None:
+    if platform.system() != "Windows":
+        return
+    try:
+        frame = getattr(root, "_cdc_bootstrap_frame", None)
+        if frame is not None:
+            frame.destroy()
+        root._cdc_bootstrap_frame = None  # type: ignore[attr-defined]
+        root._cdc_bootstrap_label = None  # type: ignore[attr-defined]
+        root.update_idletasks()
+    except Exception as exc:
+        _startup_log(f"clear bootstrap UI error: {exc!r}")
+
+
 def _darwin_prepare_stdin_for_tk_aqua() -> None:
     """Su macOS, se lo stdin (fd 0) non è un tty, Tk Aqua può aprire ``Tk_CreateConsoleWindow``; quel
     percorso costruisce la menu bar nativa e su build .app senza console ha causato SIGABRT in
@@ -30625,7 +30688,9 @@ def _ask_boot_dropbox_updated(root: tk.Tk) -> bool:
 
 
 def main() -> None:
+    _startup_log("main() start")
     if Fernet is None:
+        _startup_log("cryptography missing")
         print("Installa cryptography: pip install cryptography", file=sys.stderr)
         sys.exit(1)
 
@@ -30633,13 +30698,17 @@ def main() -> None:
 
     root = tk.Tk()
     root.title("Conti di casa")
+    _windows_show_bootstrap_root(root, "Avvio dell'applicazione…")
     # La root resta nascosta fino al bisogno (evita la grande finestra vuota dietro i dialoghi).
-    try:
-        root.withdraw()
-    except Exception:
-        pass
+    if platform.system() != "Windows":
+        try:
+            root.withdraw()
+        except Exception:
+            pass
 
+    _windows_show_bootstrap_root(root, "Verifica componenti grafici…")
     if not security_auth.verify_pillow_for_login_ui(parent=None):
+        _startup_log("Pillow check failed")
         print("Avvio interrotto: Pillow non disponibile per UI login.", file=sys.stderr)
         try:
             root.destroy()
@@ -30650,7 +30719,9 @@ def main() -> None:
     # Non mostrare la root qui: evita il flash di una cornice vuota prima del dialogo cartella dati / login
     # (i Toplevel usano ``parent`` anche con root ``withdraw()``).
 
+    _windows_show_bootstrap_root(root, "Configurazione cartella dati…")
     if not data_workspace.configure_data_workspace_interactive(root):
+        _startup_log("workspace configuration cancelled")
         print("Avvio annullato: cartella dati non configurata.", file=sys.stderr)
         try:
             root.destroy()
@@ -30658,9 +30729,12 @@ def main() -> None:
             pass
         return
     data_dir = data_workspace.data_dir()
+    _startup_log(f"workspace configured: {data_dir}")
     try:
+        _windows_show_bootstrap_root(root, "Controllo cartella dati in uso…")
         acquire_data_workspace_lock(data_dir, app_kind="desktop")
     except Exception as exc:
+        _startup_log(f"workspace lock failed: {exc!r}")
         # Non abbiamo creato il segnaposto: non va cancellato un file altrui ancora valido.
         try:
             messagebox.showerror("Cartella dati in uso", str(exc), parent=None)
@@ -30674,8 +30748,10 @@ def main() -> None:
 
     atexit.register(release_data_workspace_lock, data_dir)
     try:
+        _windows_show_bootstrap_root(root, "Controllo file Dropbox in conflitto…")
         _assert_no_dropbox_conflicted_enc_files(data_dir / "conti_utente_placeholder.enc")
     except Exception as exc:
+        _startup_log(f"conflicted enc check failed: {exc!r}")
         release_data_workspace_lock(data_dir)
         try:
             messagebox.showerror("Conti di casa", str(exc), parent=None)
@@ -30687,14 +30763,17 @@ def main() -> None:
             pass
         return
 
-    try:
-        root.withdraw()
-    except Exception:
-        pass
+    if platform.system() != "Windows":
+        try:
+            root.withdraw()
+        except Exception:
+            pass
 
     up = os_boot_time.seconds_since_os_boot()
     if up is not None and up < _BOOT_DROPBOX_CONFIRM_WITHIN_SECONDS:
+        _windows_show_bootstrap_root(root, "Conferma sincronizzazione Dropbox…")
         if not _ask_boot_dropbox_updated(root):
+            _startup_log("Dropbox confirmation cancelled")
             print("Avvio annullato: conferma Dropbox dopo boot non accettata.", file=sys.stderr)
             try:
                 root.destroy()
@@ -30704,7 +30783,9 @@ def main() -> None:
 
     # Root resta nascosta: lo splash Dropbox è un Toplevel; ``deiconify`` qui causava un flash visivo.
 
+    _windows_show_bootstrap_root(root, "Caricamento database cifrato…")
     db, resolved_path = load_database_at_startup(sync_ui_parent=root)
+    _startup_log(f"database loaded: {resolved_path}")
 
     db_holder: list[dict] = [db]
     path_holder: list[Path] = [resolved_path]
@@ -30721,7 +30802,9 @@ def main() -> None:
         )
 
     security_auth.ensure_security(db_holder[0])
+    _windows_show_bootstrap_root(root, "Verifica configurazione posta…")
     if not mail_gate.run_startup_mail_gate(root, db_holder[0], save_db):
+        _startup_log("startup mail gate cancelled")
         try:
             messagebox.showwarning(
                 "Conti di casa",
@@ -30736,7 +30819,9 @@ def main() -> None:
         except Exception:
             pass
         return
+    _windows_show_bootstrap_root(root, "Verifica primo accesso…")
     if not security_auth.run_first_access_wizard_if_needed(root, db_holder[0], save_db):
+        _startup_log("first access wizard cancelled")
         try:
             messagebox.showwarning(
                 "Conti di casa",
@@ -30773,6 +30858,7 @@ def main() -> None:
         after_prepare_nuova_utenza=reset_contabili_for_nuova_utenza,
     )
     if not ok or session is None:
+        _startup_log("login cancelled")
         try:
             messagebox.showinfo(
                 "Conti di casa",
@@ -30795,14 +30881,32 @@ def main() -> None:
         except Exception:
             pass
 
+    _windows_show_bootstrap_root(root, "Apertura dati utente…")
     path_holder[0] = migrate_data_path_after_login(db_holder[0], session, path_holder[0])
+    _startup_log(f"user data path ready: {path_holder[0]}")
     if session.entered_via_backdoor:
         security_auth.ensure_security(db_holder[0])
         session.is_registered = bool(
             (db_holder[0].get("user_profile") or {}).get("registration_verified")
         )
+    _startup_log("building main UI")
+    _windows_clear_bootstrap_root(root)
     build_ui(db_holder[0], root, session, path_holder, key_path_holder)
+    _startup_log("main UI exited")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        _startup_log(f"fatal exception: {exc!r}")
+        try:
+            import traceback
+
+            path = _windows_startup_log_path()
+            if path is not None:
+                with path.open("a", encoding="utf-8") as f:
+                    traceback.print_exc(file=f)
+        except Exception:
+            pass
+        raise
