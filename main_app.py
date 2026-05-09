@@ -7511,6 +7511,11 @@ def filter_and_sort_movements_for_grid(
 
 
 def _user_library_conti_support_dir() -> Path:
+    if platform.system() == "Windows":
+        base = (os.environ.get("LOCALAPPDATA") or "").strip()
+        if base:
+            return Path(base) / "ContiDiCasa"
+        return Path.home() / "AppData" / "Local" / "ContiDiCasa"
     return Path.home() / "Library" / "Application Support" / "ContiDiCasa"
 
 
@@ -7832,25 +7837,28 @@ def save_encrypted_db_dual(
     key = get_or_create_key(key_path)
     token = Fernet(key).encrypt(json.dumps(db, ensure_ascii=True, indent=2).encode("utf-8"))
 
-    targets: list[Path] = [primary_output_path]
+    backup_targets: list[Path] = []
     try:
         if resolved_backup.resolve() != primary_output_path.resolve():
-            targets.append(resolved_backup)
+            backup_targets.append(resolved_backup)
     except OSError:
-        targets.append(resolved_backup)
+        backup_targets.append(resolved_backup)
 
-    errors: list[str] = []
-    for t in targets:
+    try:
+        _write_timestamped_presave_backup(primary_output_path)
+        _atomic_write_bytes(primary_output_path, token)
+    except Exception as exc:
+        raise RuntimeError(
+            "Salvataggio cifrato non riuscito sul file operativo:\n"
+            f"{primary_output_path}: {exc}"
+        ) from exc
+
+    for t in backup_targets:
         try:
             _write_timestamped_presave_backup(t)
             _atomic_write_bytes(t, token)
         except Exception as exc:
-            errors.append(f"{t}: {exc}")
-
-    if errors:
-        raise RuntimeError(
-            "Salvataggio cifrato non completato su tutti i target:\n" + "\n".join(errors)
-        )
+            _startup_log(f"local backup save skipped: {t}: {exc!r}")
 
     try:
         import light_enc_sidecar
