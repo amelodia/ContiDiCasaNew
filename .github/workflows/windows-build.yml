@@ -22,14 +22,26 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
       - name: Build Windows package
         shell: pwsh
         run: .\scripts\build_windows_app.ps1
 
-      - name: Upload Windows package
+      - name: Upload Windows zip package
         uses: actions/upload-artifact@v4
         with:
           name: ContiDiCasa-Windows-${{ github.sha }}
           path: dist/ContiDiCasa-Windows.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ContiDiCasa-Windows-Setup-${{ github.sha }}
+          path: dist/ContiDiCasa-Windows-Setup.exe
           if-no-files-found: error
           retention-days: 14

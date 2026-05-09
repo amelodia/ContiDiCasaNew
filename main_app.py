@@ -318,57 +318,16 @@ def _windows_startup_log_path() -> Path | None:
 
 
 def _startup_log(message: str) -> None:
-    path = _windows_startup_log_path()
-    if path is None:
-        return
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with path.open("a", encoding="utf-8") as f:
-            f.write(f"{ts} {message}\n")
-    except Exception:
-        pass
+    # Diagnostica d'avvio disattivata: mantenere il call-site innocuo evita rumore all'apertura.
+    return
 
 
 def _windows_show_bootstrap_root(root: tk.Tk, text: str) -> None:
-    if platform.system() != "Windows":
-        return
-    _startup_log(text)
-    try:
-        frame = getattr(root, "_cdc_bootstrap_frame", None)
-        label = getattr(root, "_cdc_bootstrap_label", None)
-        if frame is None or label is None:
-            frame = ttk.Frame(root, padding=18)
-            label_title = ttk.Label(frame, text="Conti di casa", font=("TkDefaultFont", 13, "bold"))
-            label_title.pack(anchor=tk.W)
-            label = ttk.Label(frame, text=text, wraplength=420, justify=tk.LEFT)
-            label.pack(anchor=tk.W, pady=(10, 0))
-            frame.pack(fill=tk.BOTH, expand=True)
-            root._cdc_bootstrap_frame = frame  # type: ignore[attr-defined]
-            root._cdc_bootstrap_label = label  # type: ignore[attr-defined]
-            root.geometry("480x150+120+120")
-        else:
-            label.configure(text=text)
-        root.deiconify()
-        tk_foreground.present_window(root)
-        root.update_idletasks()
-        root.update()
-    except Exception as exc:
-        _startup_log(f"bootstrap UI error: {exc!r}")
+    return
 
 
 def _windows_clear_bootstrap_root(root: tk.Tk) -> None:
-    if platform.system() != "Windows":
-        return
-    try:
-        frame = getattr(root, "_cdc_bootstrap_frame", None)
-        if frame is not None:
-            frame.destroy()
-        root._cdc_bootstrap_frame = None  # type: ignore[attr-defined]
-        root._cdc_bootstrap_label = None  # type: ignore[attr-defined]
-        root.update_idletasks()
-    except Exception as exc:
-        _startup_log(f"clear bootstrap UI error: {exc!r}")
+    return
 
 
 def _darwin_prepare_stdin_for_tk_aqua() -> None:
@@ -11871,7 +11830,8 @@ th {{ background:#efefef; text-align:left; }}
     _CERCA_GREEN_ACTIVE = "#1b5e20"
     _PULISCI_BLUE = "#1565c0"
     _PULISCI_BLUE_ACTIVE = "#0d47a1"
-    cerca_wrap = tk.Frame(filters_row, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
+    filters_action_wrap = tk.Frame(filters_search_row, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
+    cerca_wrap = tk.Frame(filters_action_wrap, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
     lbl_cerca = tk.Label(
         cerca_wrap,
         text="Cerca",
@@ -11898,7 +11858,7 @@ th {{ background:#efefef; text-align:left; }}
     lbl_cerca.bind("<Leave>", _cerca_leave)
 
     lbl_pulisci_filtri = tk.Label(
-        filters_row,
+        filters_action_wrap,
         text="Pulisci filtri",
         cursor="hand2",
         highlightthickness=0,
@@ -11911,9 +11871,10 @@ th {{ background:#efefef; text-align:left; }}
         relief=tk.RAISED,
         bd=1,
     )
-    cerca_wrap.pack(side=tk.LEFT, padx=(_FILTER_ROW_BUTTON_GAP, 0))
+    filters_action_wrap.pack(side=tk.RIGHT, padx=(_FILTER_ROW_BUTTON_GAP, 0), anchor=tk.NE)
+    cerca_wrap.pack(side=tk.LEFT, padx=(0, _FILTER_ROW_BUTTON_GAP))
     lbl_cerca.pack(side=tk.TOP, fill=tk.X)
-    lbl_pulisci_filtri.pack(side=tk.LEFT, padx=(_FILTER_ROW_BUTTON_GAP, 0))
+    lbl_pulisci_filtri.pack(side=tk.LEFT)
 
     def _pulisci_enter(_e: tk.Event) -> None:
         lbl_pulisci_filtri.configure(bg=_PULISCI_BLUE_ACTIVE)
@@ -31154,17 +31115,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        _startup_log(f"fatal exception: {exc!r}")
-        try:
-            import traceback
-
-            path = _windows_startup_log_path()
-            if path is not None:
-                with path.open("a", encoding="utf-8") as f:
-                    traceback.print_exc(file=f)
-        except Exception:
-            pass
-        raise
+    main()

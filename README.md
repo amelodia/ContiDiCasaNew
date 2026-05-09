@@ -47,9 +47,11 @@ L'app generata si trova in:
 ```text
 dist\ContiDiCasa\ContiDiCasa.exe
 dist\ContiDiCasa-Windows.zip
+dist\ContiDiCasa-Windows-Setup.exe
 ```
 
-Su GitHub Actions, la workflow **Windows build** pubblica lo zip come artifact del run.
+Su GitHub Actions, la workflow **Windows build** pubblica sia lo zip sia l'installer `.exe`
+come artifact del run. L'eseguibile e l'installer usano l'icona euro incorporata.
 
 ## File dati
 

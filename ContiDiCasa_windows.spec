@@ -7,6 +7,8 @@ _vpath = os.path.join(SPECPATH, "app_version.py")
 _vspec = importlib.util.spec_from_file_location("cdc_app_version", _vpath)
 _vmod = importlib.util.module_from_spec(_vspec)
 _vspec.loader.exec_module(_vmod)
+_ICO_PATH = os.path.join(SPECPATH, "build", "ContiDiCasa.ico")
+_EXE_ICON = _ICO_PATH if os.path.isfile(_ICO_PATH) else None
 
 block_cipher = None
 
@@ -20,6 +22,9 @@ hidden = [
     "PIL._imagingtk",
     "certifi",
     "cloud_sync_wait",
+    "cdc_round_color_wheel",
+    "cdc_ui_palette",
+    "cdc_ui_theme",
     "email_client",
     "os_boot_time",
     "data_workspace",
@@ -68,6 +73,7 @@ exe = EXE(
     upx=True,
     console=False,
     disable_windowed_traceback=False,
+    icon=_EXE_ICON,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
