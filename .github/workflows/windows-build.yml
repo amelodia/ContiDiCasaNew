@@ -1,0 +1,34 @@
+name: Windows build
+
+on:
+  push:
+    branches:
+      - main
+      - "cursor/**"
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build Windows bundle
+        shell: pwsh
+        run: .\scripts\build_windows_app.ps1
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ContiDiCasa-windows
+          path: dist\ContiDiCasa-windows.zip
+          if-no-files-found: error
