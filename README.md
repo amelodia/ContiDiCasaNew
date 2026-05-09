@@ -36,6 +36,23 @@ dist/ContiDiCasa.app
 
 Su macOS, se l'app non e firmata, al primo avvio puo servire aprirla con tasto Ctrl sull'icona e poi **Apri**.
 
+Creazione dell'app Windows, da PowerShell su Windows:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+.\scripts\build_windows_app.ps1
+```
+
+L'app generata si trova in:
+
+```text
+dist\ContiDiCasa\ContiDiCasa.exe
+dist\ContiDiCasa-windows.zip
+```
+
+Lo zip contiene la cartella one-folder PyInstaller da distribuire; non e firmato digitalmente.
+
 ## File dati
 
 Nella cartella dati scelta dall'utente devono stare insieme:
@@ -143,6 +160,7 @@ I test coprono le parti piu delicate: importi euro, saldi consolidati, regole st
 | `iphone_light/` | Client light iPhone e strumenti di prova. |
 | `tests/` | Test automatici. |
 | `scripts/build_macos_app.sh` | Build macOS `.app`. |
+| `scripts/build_windows_app.ps1` | Build Windows `.exe` one-folder. |
 
 ## Note per sviluppo prudente
 
