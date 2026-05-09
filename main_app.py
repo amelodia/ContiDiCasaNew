@@ -30460,13 +30460,22 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 sw = root.winfo_screenwidth()
                 sh = root.winfo_screenheight()
                 root.geometry(f"{sw}x{sh}+0+0")
+                root.deiconify()
             else:
                 root.geometry("1200x760")
+                root.deiconify()
+                tk_foreground.present_window(root)
+                def _zoom_and_present_windows() -> None:
+                    try:
+                        root.state("zoomed")
+                    except Exception:
+                        pass
+                    tk_foreground.present_window(root)
+
                 try:
-                    root.state("zoomed")
+                    root.after(120, _zoom_and_present_windows)
                 except Exception:
                     pass
-            root.deiconify()
             tk_foreground.present_window(root)
             root.update_idletasks()
 
@@ -30548,6 +30557,73 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     root.mainloop()
 
 
+def _ask_boot_dropbox_updated(root: tk.Tk) -> bool:
+    if platform.system() != "Windows":
+        return messagebox.askokcancel(
+            "Conti di casa",
+            "Hai controllato che Dropbox sia aggiornato?\n\n"
+            "Se la cartella dati è in Dropbox e non ha ancora finito di sincronizzare, attendere "
+            "prima di continuare.\n\n"
+            "OK = continua e carica il database\n"
+            "Annulla = esci dall'applicazione",
+            parent=None,
+        )
+
+    result: list[bool] = [False]
+    win = tk.Toplevel(root)
+    win.title("Conti di casa")
+    win.resizable(False, False)
+    try:
+        win.withdraw()
+    except Exception:
+        pass
+    frm = ttk.Frame(win, padding=16)
+    frm.pack(fill=tk.BOTH, expand=True)
+    ttk.Label(
+        frm,
+        text=(
+            "Hai controllato che Dropbox sia aggiornato?\n\n"
+            "Se la cartella dati è in Dropbox e non ha ancora finito di sincronizzare, "
+            "attendere prima di continuare.\n\n"
+            "OK = continua e carica il database\n"
+            "Annulla = esci dall'applicazione"
+        ),
+        justify=tk.LEFT,
+        wraplength=440,
+    ).pack(anchor=tk.W)
+    row = ttk.Frame(frm)
+    row.pack(pady=(14, 0))
+
+    def _ok() -> None:
+        result[0] = True
+        win.destroy()
+
+    def _cancel() -> None:
+        result[0] = False
+        win.destroy()
+
+    ttk.Button(row, text="OK", command=_ok, width=12).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Button(row, text="Annulla", command=_cancel, width=12).pack(side=tk.LEFT)
+    win.protocol("WM_DELETE_WINDOW", _cancel)
+    try:
+        win.update_idletasks()
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        w = max(460, win.winfo_reqwidth())
+        h = win.winfo_reqheight()
+        win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 3}")
+    except Exception:
+        pass
+    try:
+        win.deiconify()
+        win.grab_set()
+    except Exception:
+        pass
+    tk_foreground.present_window(win, parent=root)
+    root.wait_window(win)
+    return result[0]
+
+
 def main() -> None:
     if Fernet is None:
         print("Installa cryptography: pip install cryptography", file=sys.stderr)
@@ -30618,15 +30694,7 @@ def main() -> None:
 
     up = os_boot_time.seconds_since_os_boot()
     if up is not None and up < _BOOT_DROPBOX_CONFIRM_WITHIN_SECONDS:
-        if not messagebox.askokcancel(
-            "Conti di casa",
-            "Hai controllato che Dropbox sia aggiornato?\n\n"
-            "Se la cartella dati è in Dropbox e non ha ancora finito di sincronizzare, attendere "
-            "prima di continuare.\n\n"
-            "OK = continua e carica il database\n"
-            "Annulla = esci dall'applicazione",
-            parent=None,
-        ):
+        if not _ask_boot_dropbox_updated(root):
             print("Avvio annullato: conferma Dropbox dopo boot non accettata.", file=sys.stderr)
             try:
                 root.destroy()

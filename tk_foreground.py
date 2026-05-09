@@ -20,6 +20,7 @@ def present_window(
                     parent.update_idletasks()
                 except tk.TclError:
                     pass
+            _ensure_tk_window_visible(win)
             win.update_idletasks()
             _lift_tk_window(win, parent=parent)
             _present_win32_window(win)
@@ -39,6 +40,23 @@ def present_window(
             win.after(delay, _once)
         except tk.TclError:
             break
+
+
+def _ensure_tk_window_visible(win: tk.Misc) -> None:
+    try:
+        state = str(win.state())
+    except Exception:
+        state = ""
+    try:
+        if state in ("withdrawn", "iconic"):
+            win.deiconify()
+    except tk.TclError:
+        pass
+    if platform.system() == "Windows" and state in ("withdrawn", "iconic"):
+        try:
+            win.state("normal")
+        except tk.TclError:
+            pass
 
 
 def _lift_tk_window(win: tk.Misc, *, parent: tk.Misc | None) -> None:
