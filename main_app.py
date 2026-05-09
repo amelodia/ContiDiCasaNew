@@ -8312,9 +8312,19 @@ def migrate_data_path_after_login(
 
     def _replace_db_from_enc(primary: Path) -> bool:
         """Sostituisce il contenuto di ``db`` con il JSON decrittato da ``primary`` (stesso riferimento dict)."""
+        previous_color_overrides = db.get(cdc_ui_theme._OVERRIDES_KEY)
         loaded = load_encrypted_db(primary, key_path)
         if not loaded:
             return False
+        loaded_overrides = loaded.get(cdc_ui_theme._OVERRIDES_KEY)
+        if (
+            (not isinstance(loaded_overrides, dict) or not loaded_overrides)
+            and isinstance(previous_color_overrides, dict)
+            and previous_color_overrides
+        ):
+            # Se il bootstrap caricato contiene la palette aggiornata ma il file
+            # canonico per-utente no, non perdere le attribuzioni colore fatte sul Mac.
+            loaded[cdc_ui_theme._OVERRIDES_KEY] = dict(previous_color_overrides)
         db.clear()
         db.update(loaded)
         periodiche.ensure_periodic_registrations(db)
@@ -11862,7 +11872,8 @@ th {{ background:#efefef; text-align:left; }}
     _PULISCI_BLUE = _ui_color("mov_pulisci_accedi_bg")
     _PULISCI_BLUE_ACTIVE = _ui_color("mov_pulisci_accedi_hover_bg")
     filters_action_wrap = tk.Frame(movimenti_body, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
-    cerca_wrap = tk.Frame(filters_action_wrap, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
+    filters_action_inner = tk.Frame(filters_action_wrap, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
+    cerca_wrap = tk.Frame(filters_action_inner, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
     lbl_cerca = tk.Label(
         cerca_wrap,
         text="Cerca",
@@ -11889,7 +11900,7 @@ th {{ background:#efefef; text-align:left; }}
     lbl_cerca.bind("<Leave>", _cerca_leave)
 
     lbl_pulisci_filtri = tk.Label(
-        filters_action_wrap,
+        filters_action_inner,
         text="Pulisci filtri",
         cursor="hand2",
         highlightthickness=0,
@@ -11903,11 +11914,10 @@ th {{ background:#efefef; text-align:left; }}
         bd=1,
     )
     filters_action_wrap.pack(fill=tk.X, pady=(0, 4), before=records_frame)
-    filters_action_inner = tk.Frame(filters_action_wrap, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
     filters_action_inner.pack(anchor=tk.CENTER)
-    cerca_wrap.pack(in_=filters_action_inner, side=tk.LEFT, padx=(0, _FILTER_ROW_BUTTON_GAP))
+    cerca_wrap.pack(side=tk.LEFT, padx=(0, _FILTER_ROW_BUTTON_GAP))
     lbl_cerca.pack(side=tk.TOP, fill=tk.X)
-    lbl_pulisci_filtri.pack(in_=filters_action_inner, side=tk.LEFT)
+    lbl_pulisci_filtri.pack(side=tk.LEFT)
 
     def _pulisci_enter(_e: tk.Event) -> None:
         lbl_pulisci_filtri.configure(bg=_PULISCI_BLUE_ACTIVE)
@@ -30953,6 +30963,48 @@ def _ask_boot_dropbox_updated(root: tk.Tk) -> bool:
     return result[0]
 
 
+def _show_post_login_wait(root: tk.Tk) -> tk.Toplevel | None:
+    try:
+        win = tk.Toplevel(root)
+        win.title("Conti di casa")
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=18)
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            frm,
+            text="Accesso riuscito",
+            font=("TkDefaultFont", 12, "bold"),
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            frm,
+            text="Attendere: sto aprendo il database e preparando la finestra principale…",
+            wraplength=420,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(8, 0))
+        win.update_idletasks()
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        w = max(460, win.winfo_reqwidth())
+        h = max(120, win.winfo_reqheight())
+        win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 3}")
+        win.deiconify()
+        tk_foreground.present_window(win, parent=root)
+        root.update_idletasks()
+        root.update()
+        return win
+    except Exception:
+        return None
+
+
+def _close_post_login_wait(win: tk.Toplevel | None) -> None:
+    if win is None:
+        return
+    try:
+        win.destroy()
+    except Exception:
+        pass
+
+
 def main() -> None:
     _startup_log("main() start")
     if Fernet is None:
@@ -31149,6 +31201,7 @@ def main() -> None:
         except Exception:
             pass
 
+    wait_win = _show_post_login_wait(root)
     _windows_show_bootstrap_root(root, "Apertura dati utente…")
     path_holder[0] = migrate_data_path_after_login(db_holder[0], session, path_holder[0])
     _startup_log(f"user data path ready: {path_holder[0]}")
@@ -31159,6 +31212,11 @@ def main() -> None:
         )
     _startup_log("building main UI")
     _windows_clear_bootstrap_root(root)
+    if wait_win is not None:
+        try:
+            root.after(700, lambda w=wait_win: _close_post_login_wait(w))
+        except Exception:
+            _close_post_login_wait(wait_win)
     build_ui(db_holder[0], root, session, path_holder, key_path_holder)
     _startup_log("main UI exited")
 
