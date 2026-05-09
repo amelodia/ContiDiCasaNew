@@ -6,7 +6,8 @@ Il terzo numero (**APP_VERSION_BUILD**) viene incrementato automaticamente esegu
 
     python3 scripts/bump_version_build.py
 
-oppure lanciando ``scripts/build_macos_app.sh`` (che invoca lo script prima di PyInstaller).
+oppure lanciando ``scripts/build_macos_app.sh`` / ``scripts/build_windows_app.ps1``
+(che invocano lo script prima di PyInstaller).
 """
 
 APP_VERSION_MAJOR = 1

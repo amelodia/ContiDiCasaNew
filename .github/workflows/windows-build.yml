@@ -1,0 +1,35 @@
+name: Windows build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - "cursor/**"
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build Windows package
+        shell: pwsh
+        run: .\scripts\build_windows_app.ps1
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ContiDiCasa-Windows-${{ github.sha }}
+          path: dist/ContiDiCasa-Windows.zip
+          if-no-files-found: error
+          retention-days: 14
