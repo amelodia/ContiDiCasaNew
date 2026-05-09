@@ -743,9 +743,19 @@ def run_login_dialog(
     except Exception:
         pass
 
+    def _focus_password_entry() -> None:
+        try:
+            ent_pw.focus_set()
+            ent_pw.focus_force()
+            ent_pw.icursor(tk.END)
+        except Exception:
+            pass
+
     _present_modal_dialog(win, parent)
+    _focus_password_entry()
     try:
-        ent_pw.focus_set()
+        win.after_idle(_focus_password_entry)
+        win.after(80, _focus_password_entry)
     except Exception:
         pass
     parent.wait_window(win)
