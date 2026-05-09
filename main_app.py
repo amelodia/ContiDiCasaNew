@@ -37,6 +37,8 @@ except Exception:  # pragma: no cover - runtime optional dependency check
 
 import app_help_text
 import cloud_sync_wait
+import cdc_ui_palette
+import cdc_ui_theme
 import email_client
 import os_boot_time
 import data_workspace
@@ -57,14 +59,27 @@ VER_PDF_DISABLE_CUTOFF_DATE_FILTER = False
 
 # Sfondo pagina Movimenti (allineato al login).
 MOVIMENTI_PAGE_BG = security_auth.CDC_AZZURRO_CHIARO_BG
-# Toni azzurri per griglie, calendari e campi (coerenza tra tutte le schede).
-CDC_GRID_STRIPE0_BG = "#d0e8f4"
-CDC_GRID_STRIPE1_BG = "#e4f3fa"
-CDC_GRID_HEADING_BG = "#bdddf0"
+# Chip «tipo tab» per la selezione dei filtri in Movimenti.
+MOV_FILTER_TAB_BTN_BG = security_auth.CDC_TIPO_TASTI_BTN_BG
+MOV_FILTER_TAB_BTN_HOVER_BG = getattr(
+    security_auth, "CDC_TIPO_TASTI_BTN_HOVER_BG", security_auth.CDC_TIPO_TASTI_BTN_ACTIVE_BG
+)
+MOV_FILTER_TAB_BTN_ACTIVE_BG = security_auth.CDC_TIPO_TASTI_BTN_ACTIVE_BG
+MOV_FILTER_TAB_BTN_FG = security_auth.CDC_TIPO_TASTI_BTN_FG
+CDC_FILTER_TAB_CHIP_BD = getattr(security_auth, "CDC_TIPO_TASTI_BTN_BD", 1)
+
+# Griglie Treeview: due righe beige molto chiari, tono neutro.
+CDC_GRID_STRIPE0_BG = "#eae9e7"
+CDC_GRID_STRIPE1_BG = "#f7f6f4"
+CDC_GRID_HEADING_BG = "#e2e1de"
+CDC_GRID_TREEVIEW_SEL_BG = "#7eb9e0"
+CDC_GRID_TREEVIEW_SEL_FG = "#1a1a1a"
 CDC_ENTRY_FIELD_BG = "#f2f9fc"
 CDC_CAL_CELL_BG = "#f6fbfe"
 CDC_CAL_SELECTED_BG = "#8ecae6"
 CDC_CAL_DISABLED_BG = "#dfeaf1"
+CDC_CAL_DISABLED_LABEL_FG = "#999999"
+OPZIONI_SCROLL_CANVAS_BG = "#f0f0f0"
 
 from import_legacy import (
     EURO_CONVERSION_RATE,
@@ -116,6 +131,108 @@ _BOOT_DROPBOX_CONFIRM_WITHIN_SECONDS = 5 * 60
 # Stessa regola della colonna Importo nella griglia movimenti.
 COLOR_AMOUNT_POS = "#006400"
 COLOR_AMOUNT_NEG = "#b22222"
+UI_FG_GRID_PRIMARY = "#1a1a1a"
+UI_FG_MOV_SEARCH_CAPTION = "#1a1a1a"
+UI_FG_FILTER_LABEL = "#1a1a1a"
+UI_FG_FILTER_ENTRY = "#111111"
+
+
+def _mirror_palette_runtime_global(name: str, value: object) -> None:
+    import sys
+
+    setattr(sys.modules[__name__], name, value)
+    other = sys.modules.get("main_app")
+    if other is not None and other is not sys.modules[__name__]:
+        setattr(other, name, value)
+
+
+def _apply_ui_palette_runtime(db: dict | None) -> None:
+    """Applica al runtime gli override salvati in DB per i token colore supportati."""
+    cdc_ui_palette.invalidate_base_palette_cache()
+    base = cdc_ui_palette.get_base_palette_map_copy()
+    extras = _ui_palette_extras_defaults()
+    raw = (db or {}).get(cdc_ui_theme._OVERRIDES_KEY) if isinstance(db, dict) else {}
+    overrides: dict[str, str] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if isinstance(k, str) and isinstance(v, str):
+                n = cdc_ui_theme.normalize_hex_color(v)
+                if n is not None:
+                    overrides[k.strip()] = n
+
+    def _r(token: str) -> str:
+        return cdc_ui_theme.resolved_hex(token, base=base, extras=extras, overrides=overrides)
+
+    main_targets = {
+        "bg_page_primary": "MOVIMENTI_PAGE_BG",
+        "bg_opzioni_scroll_canvas": "OPZIONI_SCROLL_CANVAS_BG",
+        "grid_stripe0": "CDC_GRID_STRIPE0_BG",
+        "grid_stripe1": "CDC_GRID_STRIPE1_BG",
+        "grid_heading_bg": "CDC_GRID_HEADING_BG",
+        "fg_grid_primary": "UI_FG_GRID_PRIMARY",
+        "fg_mov_search_caption": "UI_FG_MOV_SEARCH_CAPTION",
+        "grid_tree_selection_bg": "CDC_GRID_TREEVIEW_SEL_BG",
+        "grid_tree_selection_fg": "CDC_GRID_TREEVIEW_SEL_FG",
+        "amount_positive": "COLOR_AMOUNT_POS",
+        "amount_negative": "COLOR_AMOUNT_NEG",
+        "field_bg_moduli": "CDC_ENTRY_FIELD_BG",
+        "fg_filter_label": "UI_FG_FILTER_LABEL",
+        "fg_filter_entry": "UI_FG_FILTER_ENTRY",
+        "mov_filter_tab_btn_bg": "MOV_FILTER_TAB_BTN_BG",
+        "mov_filter_tab_btn_hover_bg": "MOV_FILTER_TAB_BTN_HOVER_BG",
+        "mov_filter_tab_btn_active_bg": "MOV_FILTER_TAB_BTN_ACTIVE_BG",
+        "mov_filter_tab_btn_fg": "MOV_FILTER_TAB_BTN_FG",
+        "cal_cell_bg": "CDC_CAL_CELL_BG",
+        "cal_selected_bg": "CDC_CAL_SELECTED_BG",
+        "cal_disabled_bg": "CDC_CAL_DISABLED_BG",
+        "cal_disabled_label_fg": "CDC_CAL_DISABLED_LABEL_FG",
+    }
+    for token, attr in main_targets.items():
+        _mirror_palette_runtime_global(attr, _r(token))
+
+    for token, attr in {
+        "login_window_bg": "CDC_LOGIN_WIN_BG",
+        "tipo_btn_bg": "CDC_TIPO_TASTI_BTN_BG",
+        "tipo_btn_hover_bg": "CDC_TIPO_TASTI_BTN_HOVER_BG",
+        "tipo_btn_active_bg": "CDC_TIPO_TASTI_BTN_ACTIVE_BG",
+        "tipo_btn_fg": "CDC_TIPO_TASTI_BTN_FG",
+        "tipo_btn_ring": "CDC_TIPO_TASTI_BTN_RING",
+        "tipo_btn_ring_focus": "CDC_TIPO_TASTI_BTN_RING_FOCUS",
+        "tipo_field_bg": "CDC_TIPO_TASTI_FIELD_BG",
+    }.items():
+        setattr(security_auth, attr, _r(token))
+    security_auth._LOGIN_IMG_CANVAS_BG = security_auth.CDC_LOGIN_WIN_BG  # type: ignore[attr-defined]
+    security_auth._LOGIN_BTN_FG = security_auth.CDC_TIPO_TASTI_BTN_FG  # type: ignore[attr-defined]
+    security_auth._LOGIN_BTN_BG = security_auth.CDC_TIPO_TASTI_BTN_BG  # type: ignore[attr-defined]
+    security_auth._LOGIN_BTN_ACTIVE_BG = security_auth.CDC_TIPO_TASTI_BTN_HOVER_BG  # type: ignore[attr-defined]
+
+    cdc_ui_palette.invalidate_base_palette_cache()
+
+
+def _ui_palette_extras_defaults() -> dict[str, str]:
+    return {
+        "ui_action_blue_bg": "#1565c0",
+        "ui_action_blue_hover_bg": "#0d47a1",
+        "ui_action_red_bg": "#b71c1c",
+        "ui_action_red_hover_bg": "#7f0000",
+        "correction_error_fg": "#b71c1c",
+        "mov_btn_print_search_bg": "#c62828",
+        "mov_btn_print_search_hover_bg": "#8e0000",
+        "mov_btn_espandi_bg": "#00695c",
+        "mov_btn_espandi_hover_bg": "#004d40",
+        "mov_btn_cerca_bg": "#2e7d32",
+        "mov_btn_cerca_hover_bg": "#1b5e20",
+        "mov_pulisci_accedi_bg": "#1565c0",
+        "mov_pulisci_accedi_hover_bg": "#0d47a1",
+        "ver_grid_amount_pos_fg": "#156716",
+        "ver_grid_amount_neg_fg": "#b71c1c",
+        "ver_grid_amount_zero_fg": "#424242",
+        "ver_btn_pending_new_bg": "#2e7d32",
+        "ver_btn_pending_clear_bg": "#616161",
+        "ver_footer_print_bg": "#ff0000",
+        "ver_footer_cycle_bg": "#ef6c00",
+        "ver_footer_close_bg": "#c62828",
+    }
 
 
 def _configure_windows_cdc_color_theme(root: tk.Misc) -> None:
@@ -8316,6 +8433,7 @@ def build_ui(
     periodiche.ensure_periodic_registrations(db_holder[0])
     email_client.ensure_email_settings(db_holder[0])
     security_auth.ensure_security(db_holder[0])
+    _apply_ui_palette_runtime(db_holder[0])
     try:
         changed = False
         if migrate_dotazione_remove_from_plan_charts(db_holder[0]):
@@ -8332,10 +8450,15 @@ def build_ui(
             changed = True
         if migrate_ensure_budget_ui_prefs(db_holder[0]):
             changed = True
+        if cdc_ui_theme.migrate_ensure_ui_color_overrides(db_holder[0]):
+            changed = True
+        if cdc_ui_theme.migrate_ui_color_token_consolidation(db_holder[0]):
+            changed = True
         if changed:
             save_encrypted_db_dual(db_holder[0], path_holder[0], key_path_holder[0])
     except Exception:
         pass
+    _apply_ui_palette_runtime(db_holder[0])
 
     try:
         _configure_windows_cdc_color_theme(root)
@@ -29340,7 +29463,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         pass
 
     # Opzioni page (scroll verticale: posta, percorsi, legacy possono superare l’altezza finestra)
-    _OPZ_PAGE_BG = "#f0f0f0"
+    _OPZ_PAGE_BG = OPZIONI_SCROLL_CANVAS_BG
     opz_scroll_outer = ttk.Frame(opzioni_frame)
     opz_scroll_outer.pack(fill=tk.BOTH, expand=True)
     opz_canvas = tk.Canvas(opz_scroll_outer, highlightthickness=0, bg=_OPZ_PAGE_BG)
@@ -29411,6 +29534,56 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         "Apri scheda Conti…",
         lambda: (_ensure_plan_conti_tab(), notebook.select(plan_conti_frame), _reload_plan_conti_form()),
     ).pack(side=tk.LEFT, padx=(0, 0))
+
+    _opz_palette_extras = _ui_palette_extras_defaults()
+    cdc_ui_palette.assert_extras_defined_for_dynamic_tokens(_opz_palette_extras)
+
+    def _opz_color_overrides() -> dict[str, str]:
+        raw = cur_db().get(cdc_ui_theme._OVERRIDES_KEY) or {}
+        out: dict[str, str] = {}
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    n = cdc_ui_theme.normalize_hex_color(v)
+                    if n is not None:
+                        out[k.strip()] = n
+        return out
+
+    def _opz_color_resolver(token: str) -> str:
+        return cdc_ui_theme.resolved_hex(
+            token,
+            base=cdc_ui_palette.get_base_palette_map_copy(),
+            extras=_opz_palette_extras,
+            overrides=_opz_color_overrides(),
+        )
+
+    def _opz_color_commit(token: str, value: str | None) -> None:
+        d = cur_db()
+        cdc_ui_theme.migrate_ensure_ui_color_overrides(d)
+        d[cdc_ui_theme._OVERRIDES_KEY] = cdc_ui_theme.merge_overrides(
+            _opz_color_overrides(), token, value
+        )
+        _apply_ui_palette_runtime(d)
+        _configure_windows_cdc_color_theme(root)
+        try:
+            save_encrypted_db_dual(d, Path(data_file_var.get()), Path(key_file_var.get()))
+        except Exception as exc:
+            messagebox.showerror("Palette colori", str(exc), parent=root)
+            return
+        messagebox.showinfo(
+            "Palette colori",
+            "Colore salvato. Alcune parti gia' visibili potrebbero aggiornarsi completamente al prossimo avvio.",
+            parent=root,
+        )
+
+    cdc_ui_palette.pack_opzioni_color_palette_section(
+        opz_scrollable,
+        extras=_opz_palette_extras,
+        title_font=_OPZ_TITLE_FONT,
+        section_bg=_OPZ_PAGE_BG,
+        get_resolved_hex=_opz_color_resolver,
+        on_color_commit=_opz_color_commit,
+    )
 
     mail_outer = ttk.LabelFrame(opz_scrollable, padding=10)
     mail_outer.configure(
@@ -30873,6 +31046,8 @@ def main() -> None:
     db_holder: list[dict] = [db]
     path_holder: list[Path] = [resolved_path]
     key_path_holder: list[Path] = [data_workspace.default_key_file().resolve()]
+    _apply_ui_palette_runtime(db_holder[0])
+    _configure_windows_cdc_color_theme(root)
 
     def save_db() -> None:
         periodiche.ensure_periodic_registrations(db_holder[0])

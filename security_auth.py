@@ -24,20 +24,26 @@ from app_version import APP_VERSION
 
 SaveFn = Callable[[], None]
 
-# Sfondo azzurro chiaro (login, pagina Movimenti e altre UI allineate).
+# Sfondo azzurro chiaro (pagine principali dopo l'accesso).
 CDC_AZZURRO_CHIARO_BG = "#d8ecf5"
-# Finestra di accesso: stesso azzurro.
-_LOGIN_IMG_CANVAS_BG = CDC_AZZURRO_CHIARO_BG
+# Finestra di accesso: pesca molto chiaro.
+CDC_LOGIN_WIN_BG = "#fff5f0"
+_LOGIN_IMG_CANVAS_BG = CDC_LOGIN_WIN_BG
 
-# Palette «tipo tasti» (ocra chiaro, testo nero): unica fonte per riuso in altre schermate.
-CDC_TIPO_TASTI_BTN_BG = "#efe4b8"
-CDC_TIPO_TASTI_BTN_ACTIVE_BG = "#e2d696"
-CDC_TIPO_TASTI_BTN_FG = "#1a1a1a"
+# Palette «tipo tasti»: tab pagine, login e bottoni-chip.
+CDC_TIPO_TASTI_BTN_BG = "#ffe4c4"
+CDC_TIPO_TASTI_BTN_HOVER_BG = "#ffb078"
+CDC_TIPO_TASTI_BTN_ACTIVE_BG = "#c45a18"
+CDC_TIPO_TASTI_BTN_FG = "#3d1a0a"
+CDC_TIPO_TASTI_BTN_RING = "#e88840"
+CDC_TIPO_TASTI_BTN_RING_FOCUS = "#9a4810"
+CDC_TIPO_TASTI_FIELD_BG = "#fff4ea"
+CDC_TIPO_TASTI_BTN_BD = 3
 
 # Login: stessi colori del tipo tasti (`tk.Label`, colori fedeli su macOS).
 _LOGIN_BTN_FG = CDC_TIPO_TASTI_BTN_FG
 _LOGIN_BTN_BG = CDC_TIPO_TASTI_BTN_BG
-_LOGIN_BTN_ACTIVE_BG = CDC_TIPO_TASTI_BTN_ACTIVE_BG
+_LOGIN_BTN_ACTIVE_BG = CDC_TIPO_TASTI_BTN_HOVER_BG
 # Larghezza in caratteri allineata ad «Accedi» per tasti corti (es. «Esci»).
 _LOGIN_BTN_WIDTH_ACCEDI_CHARS = len("Accedi")
 
@@ -68,7 +74,7 @@ def _security_auth_package_dir() -> Path:
 def _login_bg_rgb() -> tuple[int, int, int]:
     s = _LOGIN_IMG_CANVAS_BG.strip().lstrip("#")
     if len(s) != 6:
-        return 216, 236, 245
+        return 255, 245, 240
     return int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
 
 
