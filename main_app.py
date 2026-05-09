@@ -308,6 +308,18 @@ def _configure_windows_cdc_color_theme(root: tk.Misc) -> None:
         _startup_log(f"Windows color theme setup failed: {exc!r}")
 
 
+def _configure_windows_ui_scale(root: tk.Misc) -> None:
+    """Riduce leggermente l'ingombro generale della UI su Windows."""
+    if platform.system() != "Windows":
+        return
+    try:
+        cur = float(root.tk.call("tk", "scaling"))
+        target = max(0.8, cur * 0.85)
+        root.tk.call("tk", "scaling", target)
+    except Exception:
+        pass
+
+
 def _windows_startup_log_path() -> Path | None:
     if platform.system() != "Windows":
         return None
@@ -11830,7 +11842,7 @@ th {{ background:#efefef; text-align:left; }}
     _CERCA_GREEN_ACTIVE = "#1b5e20"
     _PULISCI_BLUE = "#1565c0"
     _PULISCI_BLUE_ACTIVE = "#0d47a1"
-    filters_action_wrap = tk.Frame(filters_search_row, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
+    filters_action_wrap = tk.Frame(movimenti_body, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
     cerca_wrap = tk.Frame(filters_action_wrap, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
     lbl_cerca = tk.Label(
         cerca_wrap,
@@ -11871,10 +11883,10 @@ th {{ background:#efefef; text-align:left; }}
         relief=tk.RAISED,
         bd=1,
     )
-    filters_action_wrap.pack(side=tk.RIGHT, padx=(_FILTER_ROW_BUTTON_GAP, 0), anchor=tk.NE)
-    cerca_wrap.pack(side=tk.LEFT, padx=(0, _FILTER_ROW_BUTTON_GAP))
+    filters_action_wrap.pack(fill=tk.X, pady=(0, 4), before=records_frame)
+    lbl_pulisci_filtri.pack(side=tk.RIGHT)
+    cerca_wrap.pack(side=tk.RIGHT, padx=(0, _FILTER_ROW_BUTTON_GAP))
     lbl_cerca.pack(side=tk.TOP, fill=tk.X)
-    lbl_pulisci_filtri.pack(side=tk.LEFT)
 
     def _pulisci_enter(_e: tk.Event) -> None:
         lbl_pulisci_filtri.configure(bg=_PULISCI_BLUE_ACTIVE)
@@ -30710,6 +30722,20 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         _startup_periodic_due_check()
         _startup_check_virtuale_pending()
 
+    def _stabilize_initial_movimenti_layout() -> None:
+        if _cdc_current[0] is not movimenti_frame:
+            return
+        try:
+            refresh_movement_filter_button_styles()
+            refresh_date_controls_visibility()
+            _sync_filters_search_spacer_width()
+            populate_movements_trees(preserve_scroll=True)
+            refresh_balance_footer()
+            root.update_idletasks()
+        except Exception:
+            pass
+
+    root.after(60, _stabilize_initial_movimenti_layout)
     root.after(200, _open_opzioni_if_mail_incomplete)
     root.after(350, _startup_periodic_then_virtuale)
     root.after(900, _try_open_plan_conti_pending)
@@ -30741,14 +30767,17 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 root.geometry(f"{sw}x{sh}+0+0")
                 root.deiconify()
             else:
-                root.geometry("1200x760")
+                try:
+                    sw = int(root.winfo_screenwidth())
+                    sh = int(root.winfo_screenheight())
+                    ww = min(1100, max(900, int(sw * 0.86)))
+                    wh = min(700, max(620, int(sh * 0.84)))
+                    root.geometry(f"{ww}x{wh}+{max(0, (sw - ww) // 2)}+{max(0, (sh - wh) // 3)}")
+                except Exception:
+                    root.geometry("1100x700")
                 root.deiconify()
                 tk_foreground.present_window(root)
                 def _zoom_and_present_windows() -> None:
-                    try:
-                        root.state("zoomed")
-                    except Exception:
-                        pass
                     tk_foreground.present_window(root)
 
                 try:
@@ -30913,15 +30942,15 @@ def main() -> None:
     _darwin_prepare_stdin_for_tk_aqua()
 
     root = tk.Tk()
+    _configure_windows_ui_scale(root)
     _configure_windows_cdc_color_theme(root)
     root.title("Conti di casa")
     _windows_show_bootstrap_root(root, "Avvio dell'applicazione…")
     # La root resta nascosta fino al bisogno (evita la grande finestra vuota dietro i dialoghi).
-    if platform.system() != "Windows":
-        try:
-            root.withdraw()
-        except Exception:
-            pass
+    try:
+        root.withdraw()
+    except Exception:
+        pass
 
     _windows_show_bootstrap_root(root, "Verifica componenti grafici…")
     if not security_auth.verify_pillow_for_login_ui(parent=None):
@@ -30980,11 +31009,10 @@ def main() -> None:
             pass
         return
 
-    if platform.system() != "Windows":
-        try:
-            root.withdraw()
-        except Exception:
-            pass
+    try:
+        root.withdraw()
+    except Exception:
+        pass
 
     up = os_boot_time.seconds_since_os_boot()
     if up is not None and up < _BOOT_DROPBOX_CONFIRM_WITHIN_SECONDS:
