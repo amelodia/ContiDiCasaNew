@@ -8,7 +8,6 @@ import base64
 import hashlib
 import io
 import os
-import platform
 import re
 import secrets
 import sys
@@ -21,6 +20,7 @@ from tkinter import messagebox, ttk
 from typing import Any, Callable
 
 from app_version import APP_VERSION
+from window_focus import present_window
 
 SaveFn = Callable[[], None]
 
@@ -138,26 +138,7 @@ def _load_login_euro_photo(*, max_side: int) -> tk.PhotoImage | None:
 
 def _present_modal_dialog(win: tk.Toplevel, parent: tk.Tk) -> None:
     """Porta in primo piano la finestra modale (utile su macOS)."""
-    try:
-        parent.update_idletasks()
-        win.update_idletasks()
-        try:
-            parent_visible = bool(int(str(parent.winfo_viewable())))
-        except (tk.TclError, TypeError, ValueError):
-            parent_visible = False
-        if parent_visible:
-            win.lift(parent)
-        else:
-            win.lift()
-        win.focus_force()
-        if platform.system() == "Darwin":
-            try:
-                win.attributes("-topmost", True)
-                win.after(100, lambda: win.attributes("-topmost", False))
-            except Exception:
-                pass
-    except Exception:
-        pass
+    present_window(win, parent)
 
 
 DEFAULT_USER_PROFILE: dict[str, Any] = {

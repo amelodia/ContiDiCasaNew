@@ -43,6 +43,7 @@ import data_workspace
 import mail_gate
 import periodiche
 import security_auth
+from window_focus import present_window
 
 try:
     from app_version import APP_VERSION
@@ -30465,9 +30466,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                     root.state("zoomed")
                 except Exception:
                     pass
-            root.deiconify()
-            root.lift()
-            root.focus_force()
+            present_window(root)
             root.update_idletasks()
 
             def _dock_icon_when_safe() -> None:

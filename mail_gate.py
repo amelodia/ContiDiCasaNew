@@ -10,6 +10,7 @@ from tkinter import messagebox, ttk
 from typing import Any
 
 import email_client
+from window_focus import present_window
 
 SaveFn = Callable[[], None]
 
@@ -244,18 +245,7 @@ def run_startup_mail_gate(parent: tk.Misc, db: dict, save: SaveFn) -> bool:
     except Exception:
         pass
 
-    try:
-        try:
-            parent_visible = bool(int(str(parent.winfo_viewable())))
-        except (tk.TclError, TypeError, ValueError):
-            parent_visible = False
-        if parent_visible:
-            win.lift(parent)
-        else:
-            win.lift()
-        win.focus_force()
-    except Exception:
-        pass
+    present_window(win, parent)
 
     parent.wait_window(win)
     return outcome[0] is True
