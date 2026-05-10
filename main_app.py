@@ -8967,13 +8967,15 @@ def build_ui(
 
     filters_row = ttk.Frame(movimenti_body, style="MovCdc.TFrame")
     filters_row.pack(fill=tk.X, pady=(0, 2))
+    filters_top_inner = ttk.Frame(filters_row, style="MovCdc.TFrame")
+    filters_top_inner.pack(anchor=tk.CENTER)
 
     filters_search_row = ttk.Frame(movimenti_body, style="MovCdc.TFrame")
     filters_search_row.pack(fill=tk.X, pady=(0, 4))
 
     # Riga controlli per Ricerca per registrazione (visibile solo in quella modalità)
     reg_controls_row = ttk.Frame(filters_search_row, style="MovCdc.TFrame")
-    reg_controls_row.pack(side=tk.LEFT, anchor=tk.W)
+    reg_controls_row.pack(anchor=tk.CENTER)
     reg_controls_row.pack_forget()
 
     filters_text_row = ttk.Frame(movimenti_body, style="MovCdc.TFrame")
@@ -8981,7 +8983,7 @@ def build_ui(
 
     # Riga filtri testuali (visibile solo in Ricerca per data)
     filters_text_inner = ttk.Frame(filters_text_row, style="MovCdc.TFrame")
-    filters_text_inner.pack(fill=tk.X, anchor=tk.W)
+    filters_text_inner.pack(anchor=tk.CENTER)
 
     # Zona filtri: testo in bold (etichette, entry, combobox, pulsanti).
     filter_ui_font = ("TkDefaultFont", 12, "bold")
@@ -9451,6 +9453,29 @@ def build_ui(
     _MOV_AMOUNT_HDR_W = _MOV_AMOUNT_COL_BASE + _MOV_AMOUNT_HDR_EXTRA
     _MOV_CHEQUE_COL_MIN = 68
     _MOV_AMOUNT_COL_MIN = 96
+    _MOV_GRID_BASE_COL_W = {
+        "mov_pad": 1,
+        "reg_display": 58,
+        "date_it": 78,
+        "category_name": 146,
+        "account_primary_name": 110,
+        "account_primary_flags": 24,
+        "account_secondary_name": 110,
+        "account_secondary_flags": 24,
+        "cheque": _MOV_CHEQUE_COL_W,
+    }
+    _MOV_GRID_LARGE_EXTRA_CAPS = {
+        "category_name": 130,
+        "account_primary_name": 100,
+        "account_secondary_name": 100,
+        "cheque": 44,
+    }
+    _MOV_GRID_LARGE_EXTRA_WEIGHTS = {
+        "category_name": 0.36,
+        "account_primary_name": 0.27,
+        "account_secondary_name": 0.27,
+        "cheque": 0.10,
+    }
     _mov_f_grid_cell = tkfont.Font(root, font=("TkDefaultFont", 11, "bold"))
     _mov_f_amt_cell = tkfont.Font(root, font=("TkDefaultFont", 12, "bold"))
     _mov_note_hdr_lpad = 2
@@ -9794,6 +9819,98 @@ def build_ui(
     ).grid(row=0, column=1, sticky="nsew")
 
     yscroll = ttk.Scrollbar(records_frame, orient=tk.VERTICAL, command=mov_tree.yview)
+
+    def _mov_grid_widths_for_available_space(available: int) -> dict[str, int]:
+        widths = dict(_MOV_GRID_BASE_COL_W)
+        fixed_outside_mov = (_SEP_CH_W * 2) + _MOV_AMOUNT_COL_W + 24
+        min_note_space = 520 if available >= 1500 else 420
+        base_total = sum(widths.values()) + fixed_outside_mov + min_note_space
+        extra = max(0, int(available) - base_total)
+        if extra <= 0:
+            return widths
+        for cid, weight in _MOV_GRID_LARGE_EXTRA_WEIGHTS.items():
+            cap = int(_MOV_GRID_LARGE_EXTRA_CAPS[cid])
+            inc = min(cap, int(extra * weight))
+            widths[cid] += inc
+        used = sum(widths[cid] - _MOV_GRID_BASE_COL_W[cid] for cid in _MOV_GRID_LARGE_EXTRA_CAPS)
+        remainder = min(
+            extra - used,
+            sum(_MOV_GRID_LARGE_EXTRA_CAPS.values()) - used,
+        )
+        for cid in ("category_name", "account_primary_name", "account_secondary_name", "cheque"):
+            if remainder <= 0:
+                break
+            cap_left = _MOV_GRID_LARGE_EXTRA_CAPS[cid] - (widths[cid] - _MOV_GRID_BASE_COL_W[cid])
+            inc = min(cap_left, remainder)
+            widths[cid] += inc
+            remainder -= inc
+        return widths
+
+    def _apply_mov_grid_responsive_columns(_event: tk.Event | None = None) -> None:
+        try:
+            available = int(records_frame.winfo_width())
+        except Exception:
+            available = 0
+        if available <= 1:
+            try:
+                available = int(root.winfo_screenwidth()) - 80
+            except Exception:
+                available = 0
+        if available <= 1:
+            return
+        widths = _mov_grid_widths_for_available_space(available)
+        col_to_hdr_idx = {
+            "mov_pad": 0,
+            "reg_display": 1,
+            "date_it": 2,
+            "category_name": 3,
+            "account_primary_name": 4,
+            "account_primary_flags": 5,
+            "account_secondary_name": 6,
+            "account_secondary_flags": 7,
+            "cheque": 8,
+        }
+        for cid, width in widths.items():
+            try:
+                mov_tree.column(cid, width=width)
+                mov_hdr.grid_columnconfigure(col_to_hdr_idx[cid], minsize=width)
+            except Exception:
+                pass
+        try:
+            mov_hdr.grid_columnconfigure(8, minsize=widths["cheque"] + _MOV_CHEQUE_HDR_EXTRA)
+        except Exception:
+            pass
+        try:
+            used_before_note = sum(widths.values()) + (_SEP_CH_W * 2) + _MOV_AMOUNT_HDR_W + 24
+            note_min = max(420, int(available) - used_before_note)
+            note_hdr.grid_columnconfigure(1, minsize=max(180, note_min - _mov_note_hdr_lpad))
+        except Exception:
+            pass
+        try:
+            _position_mov_tree_vlines()
+            _position_mov_hdr_vlines()
+        except Exception:
+            pass
+
+    _mov_grid_responsive_after: list[str | None] = [None]
+
+    def _schedule_mov_grid_responsive_columns(_event: tk.Event | None = None) -> None:
+        jid = _mov_grid_responsive_after[0]
+        if jid is not None:
+            try:
+                root.after_cancel(jid)
+            except (tk.TclError, ValueError, TypeError):
+                pass
+            _mov_grid_responsive_after[0] = None
+
+        def _fire() -> None:
+            _mov_grid_responsive_after[0] = None
+            _apply_mov_grid_responsive_columns()
+
+        _mov_grid_responsive_after[0] = root.after(80, _fire)
+
+    records_frame.bind("<Configure>", _schedule_mov_grid_responsive_columns, add=True)
+    root.after_idle(_apply_mov_grid_responsive_columns)
 
     _yscroll_lock = False
 
@@ -11766,7 +11883,7 @@ th {{ background:#efefef; text-align:left; }}
 
     _FILTER_ROW_BUTTON_GAP = 8
 
-    g1 = ttk.Frame(filters_row, style="MovCdc.TFrame")
+    g1 = ttk.Frame(filters_top_inner, style="MovCdc.TFrame")
     g1.pack(side=tk.LEFT, anchor=tk.W)
     btn_order_date = tk.Label(
         g1,
@@ -11791,7 +11908,7 @@ th {{ background:#efefef; text-align:left; }}
     btn_order_date.pack(side=tk.LEFT, padx=(0, _FILTER_ROW_BUTTON_GAP))
     btn_order_reg.pack(side=tk.LEFT)
 
-    g2 = ttk.Frame(filters_row, style="MovCdc.TFrame")
+    g2 = ttk.Frame(filters_top_inner, style="MovCdc.TFrame")
     g2.pack(side=tk.LEFT, padx=(_FILTER_ROW_BUTTON_GAP, 0), anchor=tk.W)
     btn_future_include = tk.Label(
         g2,
@@ -11816,7 +11933,7 @@ th {{ background:#efefef; text-align:left; }}
     btn_future_include.pack(side=tk.LEFT, padx=(0, _FILTER_ROW_BUTTON_GAP))
     btn_future_exclude.pack(side=tk.LEFT)
 
-    g3 = ttk.Frame(filters_row, style="MovCdc.TFrame")
+    g3 = ttk.Frame(filters_top_inner, style="MovCdc.TFrame")
     g3.pack(side=tk.LEFT, padx=(_FILTER_ROW_BUTTON_GAP, 0), anchor=tk.W)
     btn_dir_backward = tk.Label(
         g3,
@@ -12224,7 +12341,7 @@ th {{ background:#efefef; text-align:left; }}
     _CERCA_GREEN_ACTIVE = "#1b5e20"
     _MOV_PULISCI_ACCEDI_BG = "#1565c0"
     _MOV_PULISCI_ACCEDI_HOVER_BG = "#0d47a1"
-    cerca_wrap = tk.Frame(filters_row, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
+    cerca_wrap = tk.Frame(filters_top_inner, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
     lbl_cerca = tk.Label(
         cerca_wrap,
         text="Cerca",
@@ -12251,7 +12368,7 @@ th {{ background:#efefef; text-align:left; }}
     lbl_cerca.bind("<Leave>", _cerca_leave)
 
     lbl_pulisci_filtri = tk.Label(
-        filters_row,
+        filters_top_inner,
         text="Pulisci filtri",
         cursor="hand2",
         highlightthickness=0,
@@ -12810,14 +12927,14 @@ th {{ background:#efefef; text-align:left; }}
         mode = filter_order_preview_var.get()
         if mode == "date":
             reg_controls_row.pack_forget()
-            date_controls_left.pack(side=tk.LEFT, anchor=tk.W)
+            date_controls_left.pack(anchor=tk.CENTER)
             # Re-pack before grid area so it doesn't end up after it.
             filters_text_row.pack(fill=tk.X, pady=(0, 6), before=records_frame)
             refresh_category_account_dropdowns()
         elif mode == "registration":
             date_controls_left.pack_forget()
             filters_text_row.pack_forget()
-            reg_controls_row.pack(side=tk.LEFT, anchor=tk.W)
+            reg_controls_row.pack(anchor=tk.CENTER)
             try:
                 refresh_registration_scope_and_controls()
             except Exception:
@@ -12881,7 +12998,7 @@ th {{ background:#efefef; text-align:left; }}
         except Exception:
             pass
 
-    date_controls_left.pack(side=tk.LEFT, anchor=tk.W)
+    date_controls_left.pack(anchor=tk.CENTER)
 
     _PRESETS: list[tuple[str, str]] = [
         ("last_12", "Ultimi 12 mesi"),
@@ -32386,6 +32503,83 @@ def _apply_sun_valley_ttk_theme(root: tk.Tk) -> None:
         pass
 
 
+def _confirm_dropbox_ready_after_recent_boot(root: tk.Tk) -> bool:
+    up = os_boot_time.seconds_since_os_boot()
+    if up is None or up >= _BOOT_DROPBOX_CONFIRM_WITHIN_SECONDS:
+        return True
+
+    result: list[bool] = [False]
+    win = tk.Toplevel(root)
+    win.title("Conti di casa")
+    win.resizable(False, False)
+    try:
+        win.transient(root)
+    except Exception:
+        pass
+
+    frm = tk.Frame(win, padx=22, pady=18)
+    frm.pack(fill=tk.BOTH, expand=True)
+    tk.Label(
+        frm,
+        text="Hai controllato che Dropbox sia aggiornato?",
+        font=("TkDefaultFont", 12, "bold"),
+        justify=tk.LEFT,
+        wraplength=430,
+    ).pack(anchor=tk.W)
+    tk.Label(
+        frm,
+        text=(
+            "Se la cartella dati è in Dropbox e non ha ancora finito di sincronizzare, "
+            "attendere prima di continuare.\n\n"
+            "OK = continua e carica il database\n"
+            "Annulla = esci dall'applicazione"
+        ),
+        justify=tk.LEFT,
+        wraplength=430,
+    ).pack(anchor=tk.W, pady=(10, 0))
+
+    btn_row = tk.Frame(frm)
+    btn_row.pack(anchor=tk.E, pady=(18, 0))
+
+    def _continue() -> None:
+        result[0] = True
+        win.destroy()
+
+    def _cancel() -> None:
+        result[0] = False
+        win.destroy()
+
+    tk.Button(btn_row, text="OK", width=12, command=_continue).pack(side=tk.LEFT, padx=(0, 8))
+    tk.Button(btn_row, text="Annulla", width=12, command=_cancel).pack(side=tk.LEFT)
+    win.protocol("WM_DELETE_WINDOW", _cancel)
+
+    try:
+        win.update_idletasks()
+        ww = max(win.winfo_reqwidth(), 360)
+        wh = max(win.winfo_reqheight(), 1)
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        win.geometry(f"{ww}x{wh}+{max(0, (sw - ww) // 2)}+{max(0, (sh - wh) // 2)}")
+        win.lift()
+        win.attributes("-topmost", True)
+
+        def _topmost_off() -> None:
+            try:
+                if win.winfo_exists():
+                    win.attributes("-topmost", False)
+            except Exception:
+                pass
+
+        win.after(800, _topmost_off)
+        win.focus_force()
+        win.grab_set()
+    except Exception:
+        pass
+
+    root.wait_window(win)
+    return result[0]
+
+
 def main() -> None:
     if Fernet is None:
         print("Installa cryptography: pip install cryptography", file=sys.stderr)
@@ -32421,6 +32615,15 @@ def main() -> None:
             pass
         return
     data_dir = data_workspace.data_dir()
+
+    if not _confirm_dropbox_ready_after_recent_boot(root):
+        print("Avvio annullato: conferma Dropbox dopo boot non accettata.", file=sys.stderr)
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        return
+
     try:
         acquire_data_workspace_lock(data_dir, app_kind="desktop")
     except Exception as exc:
@@ -32454,24 +32657,6 @@ def main() -> None:
         root.withdraw()
     except Exception:
         pass
-
-    up = os_boot_time.seconds_since_os_boot()
-    if up is not None and up < _BOOT_DROPBOX_CONFIRM_WITHIN_SECONDS:
-        if not messagebox.askokcancel(
-            "Conti di casa",
-            "Hai controllato che Dropbox sia aggiornato?\n\n"
-            "Se la cartella dati è in Dropbox e non ha ancora finito di sincronizzare, attendere "
-            "prima di continuare.\n\n"
-            "OK = continua e carica il database\n"
-            "Annulla = esci dall'applicazione",
-            parent=None,
-        ):
-            print("Avvio annullato: conferma Dropbox dopo boot non accettata.", file=sys.stderr)
-            try:
-                root.destroy()
-            except Exception:
-                pass
-            return
 
     # Root resta nascosta: lo splash Dropbox è un Toplevel; ``deiconify`` qui causava un flash visivo.
 
