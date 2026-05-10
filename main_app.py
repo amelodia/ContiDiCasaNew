@@ -135,6 +135,11 @@ _BOOT_DROPBOX_CONFIRM_WITHIN_SECONDS = 5 * 60
 
 # Limite numerico categorie/conti: ``MAX_CATEGORIES_COUNT`` / ``MAX_ACCOUNTS_COUNT`` in ``import_legacy``.
 
+_DEFAULT_WINDOWS_UI_SCALE = 0.88
+_DEFAULT_NON_WINDOWS_UI_SCALE = 1.0
+_UI_SCALE_PREF_KEY = "_ui_scale_factor"
+_CURRENT_UI_SCALE_FACTOR: float | None = None
+
 # Stessa regola della colonna Importo nella griglia movimenti.
 COLOR_AMOUNT_POS = "#006400"
 COLOR_AMOUNT_NEG = "#b22222"
@@ -163,6 +168,141 @@ def _mirror_palette_runtime_global(name: str, value: object) -> None:
     dup = sys.modules.get("main_app")
     if dup is not None and dup is not primary:
         setattr(dup, name, value)
+
+
+def _normalized_ui_color_overrides_from_db(db: dict) -> dict[str, str]:
+    raw = db.get(cdc_ui_theme._OVERRIDES_KEY) or {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        n = cdc_ui_theme.normalize_hex_color(v)
+        if n is not None:
+            out[k.strip()] = n
+    return out
+
+
+def _preapply_ui_color_base_overrides(db: dict) -> None:
+    """Applica i token base prima di costruire i widget, evitando un ripasso completo a UI pronta."""
+    overrides = _normalized_ui_color_overrides_from_db(db)
+    if not overrides:
+        return
+    main_tokens = {
+        "bg_page_primary": "MOVIMENTI_PAGE_BG",
+        "bg_opzioni_scroll_canvas": "OPZIONI_SCROLL_CANVAS_BG",
+        "grid_stripe0": "CDC_GRID_STRIPE0_BG",
+        "grid_stripe1": "CDC_GRID_STRIPE1_BG",
+        "grid_heading_bg": "CDC_GRID_HEADING_BG",
+        "fg_grid_primary": "UI_FG_GRID_PRIMARY",
+        "fg_mov_search_caption": "UI_FG_MOV_SEARCH_CAPTION",
+        "grid_tree_selection_bg": "CDC_GRID_TREEVIEW_SEL_BG",
+        "grid_tree_selection_fg": "CDC_GRID_TREEVIEW_SEL_FG",
+        "amount_positive": "COLOR_AMOUNT_POS",
+        "amount_negative": "COLOR_AMOUNT_NEG",
+        "field_bg_moduli": "CDC_ENTRY_FIELD_BG",
+        "fg_filter_label": "UI_FG_FILTER_LABEL",
+        "fg_filter_entry": "UI_FG_FILTER_ENTRY",
+        "mov_filter_tab_btn_bg": "MOV_FILTER_TAB_BTN_BG",
+        "mov_filter_tab_btn_hover_bg": "MOV_FILTER_TAB_BTN_HOVER_BG",
+        "mov_filter_tab_btn_active_bg": "MOV_FILTER_TAB_BTN_ACTIVE_BG",
+        "mov_filter_tab_btn_fg": "MOV_FILTER_TAB_BTN_FG",
+        "cal_cell_bg": "CDC_CAL_CELL_BG",
+        "cal_selected_bg": "CDC_CAL_SELECTED_BG",
+        "cal_disabled_bg": "CDC_CAL_DISABLED_BG",
+        "cal_disabled_label_fg": "CDC_CAL_DISABLED_LABEL_FG",
+    }
+    security_tokens = {
+        "login_window_bg": "CDC_LOGIN_WIN_BG",
+        "tipo_btn_bg": "CDC_TIPO_TASTI_BTN_BG",
+        "tipo_btn_hover_bg": "CDC_TIPO_TASTI_BTN_HOVER_BG",
+        "tipo_btn_active_bg": "CDC_TIPO_TASTI_BTN_ACTIVE_BG",
+        "tipo_btn_fg": "CDC_TIPO_TASTI_BTN_FG",
+        "tipo_btn_ring": "CDC_TIPO_TASTI_BTN_RING",
+        "tipo_btn_ring_focus": "CDC_TIPO_TASTI_BTN_RING_FOCUS",
+        "tipo_field_bg": "CDC_TIPO_TASTI_FIELD_BG",
+    }
+    changed = False
+    for token, attr in main_tokens.items():
+        h = overrides.get(token)
+        if h is None:
+            continue
+        if str(_palette_runtime_attr(attr)).lower() != h:
+            _mirror_palette_runtime_global(attr, h)
+            changed = True
+    for token, attr in security_tokens.items():
+        h = overrides.get(token)
+        if h is None:
+            continue
+        if str(getattr(security_auth, attr, "")).lower() != h:
+            setattr(security_auth, attr, h)
+            changed = True
+            if token == "login_window_bg":
+                try:
+                    security_auth._LOGIN_IMG_CANVAS_BG = h
+                except Exception:
+                    pass
+    if changed:
+        try:
+            cdc_ui_palette.invalidate_base_palette_cache()
+        except Exception:
+            pass
+
+
+def _default_ui_scale_for_platform() -> float:
+    return _DEFAULT_WINDOWS_UI_SCALE if platform.system() == "Windows" else _DEFAULT_NON_WINDOWS_UI_SCALE
+
+
+def _normalize_ui_scale_factor(value: object) -> float | None:
+    try:
+        scale = float(str(value).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    if 0.75 <= scale <= 1.25:
+        return scale
+    return None
+
+
+def _ui_scale_from_db(db: dict | None) -> float | None:
+    if not isinstance(db, dict):
+        return None
+    return _normalize_ui_scale_factor(db.get(_UI_SCALE_PREF_KEY))
+
+
+def _app_ui_scale_factor(db: dict | None = None) -> float:
+    raw = (os.environ.get("CONTI_UI_SCALE") or os.environ.get("CDC_UI_SCALE") or "").strip()
+    if raw:
+        scale = _normalize_ui_scale_factor(raw)
+        if scale is not None:
+            return scale
+    scale = _ui_scale_from_db(db)
+    if scale is not None:
+        return scale
+    if _CURRENT_UI_SCALE_FACTOR is not None:
+        return _CURRENT_UI_SCALE_FACTOR
+    return _default_ui_scale_for_platform()
+
+
+def _apply_tk_ui_scale(root: tk.Tk, db: dict | None = None) -> float:
+    global _CURRENT_UI_SCALE_FACTOR
+    target = _app_ui_scale_factor(db)
+    previous = _CURRENT_UI_SCALE_FACTOR or 1.0
+    if abs(target - previous) < 0.001:
+        _CURRENT_UI_SCALE_FACTOR = target
+        return target
+    try:
+        current = float(root.tk.call("tk", "scaling"))
+        if previous > 0:
+            root.tk.call("tk", "scaling", current * (target / previous))
+    except Exception:
+        pass
+    _CURRENT_UI_SCALE_FACTOR = target
+    return target
+
+
+def _ui_scaled_int(value: int, *, min_value: int = 1) -> int:
+    return max(min_value, int(round(value * _app_ui_scale_factor())))
 
 
 def _darwin_prepare_stdin_for_tk_aqua() -> None:
@@ -8542,6 +8682,10 @@ def build_ui(
             save_encrypted_db_dual(db_holder[0], path_holder[0], key_path_holder[0])
     except Exception:
         pass
+    try:
+        _preapply_ui_color_base_overrides(db_holder[0])
+    except Exception:
+        pass
 
     try:
         root.configure(bg=MOVIMENTI_PAGE_BG)
@@ -9418,7 +9562,7 @@ def build_ui(
         "MovGrid.Treeview",
         borderwidth=1,
         relief="solid",
-        rowheight=22,
+        rowheight=_ui_scaled_int(22, min_value=18),
         background=CDC_GRID_STRIPE1_BG,
         fieldbackground=CDC_GRID_STRIPE1_BG,
         font=("TkDefaultFont", 11, "bold"),
@@ -9427,7 +9571,7 @@ def build_ui(
         "MovGridAmount.Treeview",
         borderwidth=1,
         relief="solid",
-        rowheight=22,
+        rowheight=_ui_scaled_int(22, min_value=18),
         background=CDC_GRID_STRIPE1_BG,
         fieldbackground=CDC_GRID_STRIPE1_BG,
         font=("TkDefaultFont", 12, "bold"),
@@ -9442,11 +9586,11 @@ def build_ui(
     )
 
     # Larghezze colonne dati e celle header custom. Le colonne Treeview restano base:
-    # il piccolo extra serve solo all'intestazione, che su macOS risulta leggermente più stretta.
+    # header custom e Treeview devono usare le stesse larghezze per mantenere i titoli allineati.
     _MOV_CHEQUE_COL_BASE = 76
     _MOV_AMOUNT_COL_BASE = 116
-    _MOV_CHEQUE_HDR_EXTRA = 10
-    _MOV_AMOUNT_HDR_EXTRA = 8
+    _MOV_CHEQUE_HDR_EXTRA = 0
+    _MOV_AMOUNT_HDR_EXTRA = 0
     _MOV_CHEQUE_COL_W = _MOV_CHEQUE_COL_BASE
     _MOV_AMOUNT_COL_W = _MOV_AMOUNT_COL_BASE
     _MOV_CHEQUE_HDR_W = _MOV_CHEQUE_COL_BASE + _MOV_CHEQUE_HDR_EXTRA
@@ -9699,8 +9843,8 @@ def build_ui(
     hdr_sep_2_line = tk.Frame(hdr_sep_2, bg="#c0c0c0", width=1)
 
     # La riga header deve seguire la griglia principale (mov / amt / note).
-    # Stesso spessore delle righe Treeview Movimenti (vedi ``rowheight=22`` negli stili sopra).
-    _MOV_HDR_ROW_H = 22
+    # Stesso spessore delle righe Treeview Movimenti.
+    _MOV_HDR_ROW_H = _ui_scaled_int(22, min_value=18)
     mov_records_header_row.grid_rowconfigure(0, minsize=_MOV_HDR_ROW_H)
     mov_hdr.grid_rowconfigure(0, minsize=_MOV_HDR_ROW_H)
     amt_hdr.grid_rowconfigure(0, minsize=_MOV_HDR_ROW_H)
@@ -9800,7 +9944,7 @@ def build_ui(
     amt_hdr.grid_columnconfigure(0, weight=1, minsize=_MOV_AMOUNT_HDR_W)
     tk.Label(
         amt_hdr,
-        text="Importo  ",
+        text="Importo",
         bg=header_bg,
         fg=header_fg,
         font=header_font,
@@ -30752,8 +30896,88 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         lambda: (_ensure_plan_conti_tab(), notebook.select(plan_conti_frame), _reload_plan_conti_form()),
     ).pack(side=tk.LEFT, padx=(0, 0))
 
-    # Snapshot codice (costanti modulo + esempi pulsanti Movimenti) prima di Applicare tema da DB overrides.
+    ui_scale_outer = ttk.LabelFrame(opz_scrollable, padding=(10, 8))
+    ui_scale_outer.configure(
+        labelwidget=ttk.Label(ui_scale_outer, text="Dimensione interfaccia", font=_OPZ_TITLE_FONT)
+    )
+    ui_scale_outer.pack(fill=tk.X, padx=(28, 10), pady=(0, 10))
+    ui_scale_row = ttk.Frame(ui_scale_outer)
+    ui_scale_row.pack(fill=tk.X, anchor="w")
+    ui_scale_choices = [
+        ("75%", 0.75),
+        ("80%", 0.80),
+        ("85%", 0.85),
+        ("88% (default Windows)", 0.88),
+        ("90%", 0.90),
+        ("95%", 0.95),
+        ("100% (default Mac)", 1.00),
+        ("105%", 1.05),
+        ("110%", 1.10),
+        ("115%", 1.15),
+        ("120%", 1.20),
+        ("125%", 1.25),
+    ]
+    ui_scale_by_label = {label: value for label, value in ui_scale_choices}
+    ui_scale_label_by_value = {value: label for label, value in ui_scale_choices}
+
+    def _ui_scale_label_for(value: float) -> str:
+        closest = min(ui_scale_label_by_value, key=lambda v: abs(v - value))
+        return ui_scale_label_by_value[closest]
+
+    saved_ui_scale = _ui_scale_from_db(cur_db())
+    ui_scale_var = tk.StringVar(
+        value=_ui_scale_label_for(saved_ui_scale if saved_ui_scale is not None else _default_ui_scale_for_platform())
+    )
+    ui_scale_status_var = tk.StringVar(value="La modifica viene applicata al prossimo riavvio.")
+    ttk.Label(ui_scale_row, text="Scala:").pack(side=tk.LEFT, padx=(0, 6))
+    ui_scale_combo = ttk.Combobox(
+        ui_scale_row,
+        textvariable=ui_scale_var,
+        state="readonly",
+        width=24,
+        values=[label for label, _value in ui_scale_choices],
+    )
+    ui_scale_combo.pack(side=tk.LEFT, padx=(0, 8))
+
+    def _save_ui_scale_pref(value: float | None) -> None:
+        if value is None:
+            cur_db().pop(_UI_SCALE_PREF_KEY, None)
+            status = f"Ripristinato default piattaforma ({int(_default_ui_scale_for_platform() * 100)}%)."
+        else:
+            cur_db()[_UI_SCALE_PREF_KEY] = round(float(value), 3)
+            status = f"Scala {int(round(value * 100))}% salvata."
+        try:
+            save_encrypted_db_dual(cur_db(), Path(data_file_var.get()), Path(key_file_var.get()))
+            ui_scale_status_var.set(status + " Riavvia l'app per applicarla.")
+            messagebox.showinfo(
+                "Dimensione interfaccia",
+                status + "\n\nLa nuova dimensione sarà applicata al prossimo riavvio.",
+                parent=root,
+            )
+        except Exception as exc:
+            ui_scale_status_var.set(f"Errore salvataggio scala: {exc}")
+            messagebox.showerror("Dimensione interfaccia", str(exc), parent=root)
+
+    ttk.Button(
+        ui_scale_row,
+        text="Salva",
+        command=lambda: _save_ui_scale_pref(ui_scale_by_label.get(ui_scale_var.get())),
+    ).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Button(
+        ui_scale_row,
+        text="Default piattaforma",
+        command=lambda: _save_ui_scale_pref(None),
+    ).pack(side=tk.LEFT)
+    ttk.Label(
+        ui_scale_outer,
+        textvariable=ui_scale_status_var,
+        wraplength=760,
+        justify=tk.LEFT,
+    ).pack(fill=tk.X, anchor="w", pady=(8, 0))
+
+    # Snapshot runtime (costanti modulo + esempi pulsanti Movimenti) dopo il preapply dei colori DB.
     _palette_defaults = dict(cdc_ui_palette.get_base_palette_map_copy())
+    _palette_runtime_defaults = dict(cdc_ui_palette.get_base_palette_map_copy())
     _opz_palette_extras = {
         "ui_action_blue_bg": _OPZ_BLUE,
         "ui_action_blue_hover_bg": _OPZ_BLUE_ACTIVE,
@@ -30780,21 +31004,14 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     _palette_extras_default = dict(_opz_palette_extras)
 
     def _get_ui_color_overrides() -> dict[str, str]:
-        raw = cur_db().get(cdc_ui_theme._OVERRIDES_KEY) or {}
-        if not isinstance(raw, dict):
-            return {}
-        out: dict[str, str] = {}
-        for k, v in raw.items():
-            if isinstance(k, str) and isinstance(v, str):
-                out[k] = v
-        return out
+        return _normalized_ui_color_overrides_from_db(cur_db())
 
-    def _resolved_ui_palette_hex(token: str) -> str:
+    def _resolved_ui_palette_hex(token: str, overrides: dict[str, str] | None = None) -> str:
         return cdc_ui_theme.resolved_hex(
             token,
             base=_palette_defaults,
             extras=_palette_extras_default,
-            overrides=_get_ui_color_overrides(),
+            overrides=_get_ui_color_overrides() if overrides is None else overrides,
         )
 
     _PATCH_TK_SUBTREE_MAX_NODES = 14_000
@@ -31296,17 +31513,42 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             pass
 
     def _apply_all_ui_theme_tokens() -> None:
+        overrides = _get_ui_color_overrides()
+        runtime_defaults = dict(_palette_runtime_defaults)
+        runtime_defaults.update(_opz_palette_extras)
         for tid in cdc_ui_palette.ALL_UI_COLOR_TOKEN_IDS:
-            _apply_ui_theme_token(tid, _resolved_ui_palette_hex(tid))
+            h = _resolved_ui_palette_hex(tid, overrides)
+            cur = runtime_defaults.get(tid)
+            if isinstance(cur, str) and cur.strip().lower() == h.strip().lower():
+                continue
+            _apply_ui_theme_token(tid, h)
 
-    cdc_ui_palette.pack_opzioni_color_palette_section(
-        opz_scrollable,
-        extras=_opz_palette_extras,
-        title_font=_OPZ_TITLE_FONT,
-        section_bg=OPZIONI_SCROLL_CANVAS_BG,
-        get_resolved_hex=_resolved_ui_palette_hex,
-        on_color_commit=_on_ui_palette_color_commit,
-    )
+    opz_palette_host = tk.Frame(opz_scrollable, bg=OPZIONI_SCROLL_CANVAS_BG, highlightthickness=0)
+    opz_palette_host.pack(fill=tk.X)
+    _opz_palette_section_built = [False]
+
+    def _ensure_opzioni_color_palette_section() -> None:
+        if _opz_palette_section_built[0]:
+            return
+        _opz_palette_section_built[0] = True
+        cdc_ui_palette.pack_opzioni_color_palette_section(
+            opz_palette_host,
+            extras=_opz_palette_extras,
+            title_font=_OPZ_TITLE_FONT,
+            section_bg=OPZIONI_SCROLL_CANVAS_BG,
+            get_resolved_hex=_resolved_ui_palette_hex,
+            on_color_commit=_on_ui_palette_color_commit,
+        )
+        try:
+            _bind_opz_mousewheel_recursive(opz_palette_host)
+        except Exception:
+            pass
+        try:
+            root.after_idle(_opz_on_frame_map)
+        except Exception:
+            pass
+
+    opzioni_frame.bind("<Map>", lambda _e: _ensure_opzioni_color_palette_section(), add="+")
 
     mail_outer = ttk.LabelFrame(opz_scrollable, padding=10)
     mail_outer.configure(
@@ -32588,6 +32830,7 @@ def main() -> None:
     _darwin_prepare_stdin_for_tk_aqua()
 
     root = tk.Tk()
+    _apply_tk_ui_scale(root)
     _apply_sun_valley_ttk_theme(root)
     root.title("Conti di casa")
     # La root resta nascosta fino al bisogno (evita la grande finestra vuota dietro i dialoghi).
@@ -32661,6 +32904,10 @@ def main() -> None:
     # Root resta nascosta: lo splash Dropbox è un Toplevel; ``deiconify`` qui causava un flash visivo.
 
     db, resolved_path = load_database_at_startup(sync_ui_parent=root)
+    try:
+        _apply_tk_ui_scale(root, db)
+    except Exception:
+        pass
 
     db_holder: list[dict] = [db]
     path_holder: list[Path] = [resolved_path]
