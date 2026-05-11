@@ -870,35 +870,21 @@ def run_login_dialog(
 
     loading_row = tk.Frame(frm, bg=CDC_LOGIN_WIN_BG)
     loading_row.columnconfigure(0, weight=1)
-    loading_label = ttk.Label(
+    loading_label = tk.Label(
         loading_row,
         text="Caricamento in corso...",
+        bg=CDC_LOGIN_WIN_BG,
+        fg=CDC_LOGIN_WIN_BG,
         font=("TkDefaultFont", 11, "bold"),
-        style="CdcLogin.TLabel",
     )
-    loading_label.grid(row=0, column=0, sticky="", pady=(8, 4))
-    loading_progress = ttk.Progressbar(
-        loading_row,
-        mode="indeterminate",
-        length=220,
-    )
-    loading_progress.grid(row=1, column=0, sticky="", pady=(0, 2))
+    loading_label.grid(row=0, column=0, sticky="", pady=(8, 2))
+    # Riserva lo spazio già alla prima apertura: quando compare il testo, il dialog non cambia dimensione.
+    loading_row.grid(row=email_row + 5, column=0, columnspan=2, sticky="we", pady=(4, 0))
 
     def _show_login_loading_indicator() -> None:
         try:
-            loading_row.grid(row=email_row + 5, column=0, columnspan=2, sticky="we", pady=(4, 0))
-            loading_progress.start(12)
+            loading_label.configure(fg=CDC_TIPO_TASTI_BTN_FG)
             win.update_idletasks()
-            sw = max(1, int(win.winfo_screenwidth()))
-            sh = max(1, int(win.winfo_screenheight()))
-            w = max(int(win.winfo_width()), int(win.winfo_reqwidth()), _LOGIN_WIN_MIN_W)
-            h = max(int(win.winfo_height()), int(win.winfo_reqheight()), _LOGIN_WIN_MIN_H)
-            w = min(w, int(sw * 0.92))
-            h = min(h, int(sh * 0.88))
-            x = max(0, (sw - w) // 2)
-            y = max(0, (sh - h) // 3)
-            win.geometry(f"{w}x{h}+{x}+{y}")
-            win.minsize(w, h)
             win.lift()
             win.update()
         except Exception:
