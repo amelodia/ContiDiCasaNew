@@ -340,6 +340,14 @@ def _ui_scaled_int(value: int, *, min_value: int = 1) -> int:
     return max(min_value, int(round(value * _app_ui_scale_factor())))
 
 
+def _ui_font_tuple(size: int, *modifiers: str, family: str = "TkDefaultFont") -> tuple:
+    scale = _app_ui_scale_factor()
+    scaled = max(1, int(round(abs(int(size)) * scale)))
+    if int(size) < 0:
+        scaled = -scaled
+    return (family, scaled, *modifiers)
+
+
 def _darwin_prepare_stdin_for_tk_aqua() -> None:
     """Su macOS, se lo stdin (fd 0) non è un tty, Tk Aqua può aprire ``Tk_CreateConsoleWindow``; quel
     percorso costruisce la menu bar nativa e su build .app senza console ha causato SIGABRT in
@@ -8768,24 +8776,24 @@ def build_ui(
     cdc_content.rowconfigure(0, weight=1)
     cdc_content.columnconfigure(0, weight=1)
 
-    _TAB_BAR_FONT = ("TkDefaultFont", 13, "bold")
+    _TAB_BAR_FONT = _ui_font_tuple(13, "bold")
     _nb_style = ttk.Style(root)
     _nb_style.configure("MovCdc.TFrame", background=MOVIMENTI_PAGE_BG, fieldbackground=MOVIMENTI_PAGE_BG)
     _nb_style.configure(
         "MovCdc.TLabel",
-        font=("TkDefaultFont", 12, "bold"),
+        font=_ui_font_tuple(12, "bold"),
         background=MOVIMENTI_PAGE_BG,
         foreground="#1a1a1a",
     )
     _nb_style.configure(
         "MovCdc.TEntry",
-        font=("TkDefaultFont", 12, "bold"),
+        font=_ui_font_tuple(12, "bold"),
         fieldbackground=CDC_ENTRY_FIELD_BG,
         foreground="#111111",
     )
     _nb_style.configure(
         "MovCdc.TCombobox",
-        font=("TkDefaultFont", 12, "bold"),
+        font=_ui_font_tuple(12, "bold"),
         fieldbackground=CDC_ENTRY_FIELD_BG,
     )
 
@@ -9145,12 +9153,12 @@ def build_ui(
         _dataset_years_with_records = [_td.year]
 
     filters_row = ttk.Frame(movimenti_body, style="MovCdc.TFrame")
-    filters_row.pack(fill=tk.X, pady=(0, 2))
+    filters_row.pack(fill=tk.X, pady=(0, 0))
     filters_top_inner = ttk.Frame(filters_row, style="MovCdc.TFrame")
     filters_top_inner.pack(anchor=tk.CENTER)
 
     filters_search_row = ttk.Frame(movimenti_body, style="MovCdc.TFrame")
-    filters_search_row.pack(fill=tk.X, pady=(0, 4))
+    filters_search_row.pack(fill=tk.X, pady=(0, 1))
 
     # Riga controlli per Ricerca per registrazione (visibile solo in quella modalità)
     reg_controls_row = ttk.Frame(filters_search_row, style="MovCdc.TFrame")
@@ -9158,14 +9166,14 @@ def build_ui(
     reg_controls_row.pack_forget()
 
     filters_text_row = ttk.Frame(movimenti_body, style="MovCdc.TFrame")
-    filters_text_row.pack(fill=tk.X, pady=(0, 2))
+    filters_text_row.pack(fill=tk.X, pady=(0, 0))
 
     # Riga filtri testuali (visibile solo in Ricerca per data)
     filters_text_inner = ttk.Frame(filters_text_row, style="MovCdc.TFrame")
     filters_text_inner.pack(anchor=tk.CENTER)
 
     # Zona filtri: compatta, per restare visibile anche con metrica font diversa tra macOS e Windows.
-    filter_ui_font = ("TkDefaultFont", 11, "bold")
+    filter_ui_font = _ui_font_tuple(10, "bold")
     ttk.Style(root).configure("Filters.TLabel", font=filter_ui_font)
     ttk.Style(root).configure("Filters.TEntry", font=filter_ui_font)
     ttk.Style(root).configure("Filters.TCombobox", font=filter_ui_font)
@@ -9234,8 +9242,8 @@ def build_ui(
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=10,
-        pady=5,
+        padx=8,
+        pady=3,
         bg=_MOV_AGG_CAT_BTN_BG,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -9393,8 +9401,8 @@ def build_ui(
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=10,
-        pady=5,
+        padx=8,
+        pady=3,
     )
     reg_btn_all = tk.Label(
         reg_controls_inner,
@@ -9402,11 +9410,11 @@ def build_ui(
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=10,
-        pady=5,
+        padx=8,
+        pady=3,
     )
-    reg_btn_last12.pack(side=tk.LEFT, padx=(0, 8))
-    reg_btn_all.pack(side=tk.LEFT, padx=(0, 16))
+    reg_btn_last12.pack(side=tk.LEFT, padx=(0, 6))
+    reg_btn_all.pack(side=tk.LEFT, padx=(0, 10))
 
     ttk.Label(reg_controls_inner, text="Dalla reg. #", style="MovCdc.TLabel").pack(side=tk.LEFT, padx=(0, 6))
     reg_from_entry = ttk.Entry(reg_controls_inner, textvariable=reg_from_preview_var, width=7, style="MovCdc.TEntry")
@@ -9582,7 +9590,7 @@ def build_ui(
     search_title_label = tk.Label(
         search_title_row,
         textvariable=search_title_var,
-        font=("TkDefaultFont", 12, "bold"),
+        font=_ui_font_tuple(12, "bold"),
         fg=UI_FG_MOV_SEARCH_CAPTION,
         bg=MOVIMENTI_PAGE_BG,
         anchor="w",
@@ -9600,7 +9608,7 @@ def build_ui(
         rowheight=_ui_scaled_int(22, min_value=18),
         background=CDC_GRID_STRIPE1_BG,
         fieldbackground=CDC_GRID_STRIPE1_BG,
-        font=("TkDefaultFont", 11, "bold"),
+        font=_ui_font_tuple(11, "bold"),
     )
     mov_style.configure(
         "MovGridAmount.Treeview",
@@ -9609,7 +9617,7 @@ def build_ui(
         rowheight=_ui_scaled_int(22, min_value=18),
         background=CDC_GRID_STRIPE1_BG,
         fieldbackground=CDC_GRID_STRIPE1_BG,
-        font=("TkDefaultFont", 12, "bold"),
+        font=_ui_font_tuple(12, "bold"),
     )
     mov_style.configure(
         "MovGrid.Treeview.Heading",
@@ -9617,7 +9625,7 @@ def build_ui(
         relief="flat",
         background=CDC_GRID_HEADING_BG,
         foreground=UI_FG_GRID_PRIMARY,
-        font=("TkDefaultFont", 10, "bold"),
+        font=_ui_font_tuple(10, "bold"),
     )
 
     # Larghezze colonne dati e celle header custom. Le colonne Treeview restano base:
@@ -9655,8 +9663,8 @@ def build_ui(
         "account_secondary_name": 0.27,
         "cheque": 0.12,
     }
-    _mov_f_grid_cell = tkfont.Font(root, font=("TkDefaultFont", 11, "bold"))
-    _mov_f_amt_cell = tkfont.Font(root, font=("TkDefaultFont", 12, "bold"))
+    _mov_f_grid_cell = tkfont.Font(root, font=_ui_font_tuple(11, "bold"))
+    _mov_f_amt_cell = tkfont.Font(root, font=_ui_font_tuple(12, "bold"))
     _mov_note_hdr_lpad = 0
 
     # Prima colonna `mov_pad` vuota (1px): su macOS la prima colonna dati ha bug/troncamenti; Reg è la seconda.
@@ -9861,7 +9869,7 @@ def build_ui(
     # Intestazioni custom (su macOS ttk può ignorare l'allineamento delle headings).
     header_bg = CDC_GRID_HEADING_BG
     header_fg = UI_FG_GRID_PRIMARY
-    header_font = ("TkDefaultFont", 10, "bold")
+    header_font = _ui_font_tuple(10, "bold")
     try:
         root.update_idletasks()
     except tk.TclError:
@@ -11606,9 +11614,9 @@ th {{ background:#efefef; text-align:left; }}
                 pass
             movimenti_main_stack.rowconfigure(0, weight=1, minsize=0)
             movimenti_main_stack.rowconfigure(1, weight=0, minsize=0)
-            filters_row.pack(fill=tk.X, pady=(0, 2), before=records_frame)
-            filters_search_row.pack(fill=tk.X, pady=(0, 4), before=records_frame)
-            filters_text_row.pack(fill=tk.X, pady=(0, 6), before=records_frame)
+            filters_row.pack(fill=tk.X, pady=(0, 0), before=records_frame)
+            filters_search_row.pack(fill=tk.X, pady=(0, 1), before=records_frame)
+            filters_text_row.pack(fill=tk.X, pady=(0, 1), before=records_frame)
             balance_footer.grid(row=1, column=0, sticky="ew")
             records_frame.pack(fill=tk.BOTH, expand=True)
             try:
@@ -12071,8 +12079,8 @@ th {{ background:#efefef; text-align:left; }}
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=8,
-        pady=5,
+        padx=7,
+        pady=3,
     )
     btn_order_reg = tk.Label(
         g1,
@@ -12080,8 +12088,8 @@ th {{ background:#efefef; text-align:left; }}
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=8,
-        pady=5,
+        padx=7,
+        pady=3,
     )
     btn_order_date.bind("<Button-1>", lambda _e: pick_order("date"))
     btn_order_reg.bind("<Button-1>", lambda _e: pick_order("registration"))
@@ -12096,8 +12104,8 @@ th {{ background:#efefef; text-align:left; }}
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=8,
-        pady=5,
+        padx=7,
+        pady=3,
     )
     btn_future_exclude = tk.Label(
         g2,
@@ -12105,8 +12113,8 @@ th {{ background:#efefef; text-align:left; }}
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=8,
-        pady=5,
+        padx=7,
+        pady=3,
     )
     btn_future_include.bind("<Button-1>", lambda _e: pick_future("include"))
     btn_future_exclude.bind("<Button-1>", lambda _e: pick_future("exclude"))
@@ -12121,8 +12129,8 @@ th {{ background:#efefef; text-align:left; }}
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=8,
-        pady=5,
+        padx=7,
+        pady=3,
     )
     btn_dir_forward = tk.Label(
         g3,
@@ -12130,8 +12138,8 @@ th {{ background:#efefef; text-align:left; }}
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=8,
-        pady=5,
+        padx=7,
+        pady=3,
     )
     btn_dir_backward.bind("<Button-1>", lambda _e: pick_direction("backward"))
     btn_dir_forward.bind("<Button-1>", lambda _e: pick_direction("forward"))
@@ -12528,9 +12536,9 @@ th {{ background:#efefef; text-align:left; }}
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        width=8,
-        padx=7,
-        pady=5,
+        width=7,
+        padx=6,
+        pady=3,
         bg=_CERCA_GREEN,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -12549,13 +12557,13 @@ th {{ background:#efefef; text-align:left; }}
 
     lbl_pulisci_filtri = tk.Label(
         cerca_wrap,
-        text="Pulisci filtri",
+        text="Pulisci",
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        width=12,
-        padx=7,
-        pady=5,
+        width=7,
+        padx=6,
+        pady=3,
         bg=_MOV_PULISCI_ACCEDI_BG,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -12563,7 +12571,7 @@ th {{ background:#efefef; text-align:left; }}
     )
     cerca_wrap.pack(side=tk.LEFT, padx=(_FILTER_ROW_BUTTON_GAP, 0))
     lbl_cerca.pack(side=tk.TOP, fill=tk.X)
-    lbl_pulisci_filtri.pack(side=tk.TOP, fill=tk.X, pady=(3, 0))
+    lbl_pulisci_filtri.pack(side=tk.TOP, fill=tk.X, pady=(1, 0))
 
     def _pulisci_enter(_e: tk.Event) -> None:
         lbl_pulisci_filtri.configure(bg=_MOV_PULISCI_ACCEDI_HOVER_BG)
@@ -13109,7 +13117,7 @@ th {{ background:#efefef; text-align:left; }}
             reg_controls_row.pack_forget()
             date_controls_left.pack(anchor=tk.CENTER)
             # Re-pack before grid area so it doesn't end up after it.
-            filters_text_row.pack(fill=tk.X, pady=(0, 6), before=records_frame)
+            filters_text_row.pack(fill=tk.X, pady=(0, 1), before=records_frame)
             refresh_category_account_dropdowns()
         elif mode == "registration":
             date_controls_left.pack_forget()
@@ -13172,7 +13180,7 @@ th {{ background:#efefef; text-align:left; }}
                 return
             main_end = main.winfo_x() + main.winfo_width()
             w = max(0, int(target_x - main_end))
-            h = 34
+            h = 24
             filters_search_spacer.configure(width=w, height=h)
             filters_search_spacer.pack_propagate(False)
         except Exception:
@@ -13240,11 +13248,11 @@ th {{ background:#efefef; text-align:left; }}
             cursor="hand2",
             highlightthickness=0,
             font=filter_ui_font,
-            padx=9,
-            pady=5,
+            padx=7,
+            pady=3,
         )
         b.bind("<Button-1>", lambda _e, _pid=pid: pick_date_preset(_pid))
-        b.pack(side=tk.LEFT, padx=(0, 8))
+        b.pack(side=tk.LEFT, padx=(0, 6))
         date_preset_buttons[pid] = b
 
     for _p_h, _b_h in date_preset_buttons.items():
@@ -13255,7 +13263,7 @@ th {{ background:#efefef; text-align:left; }}
         )
 
     fields_row = ttk.Frame(date_controls_left, style="MovCdc.TFrame")
-    fields_row.pack(side=tk.LEFT, padx=(10, 0))
+    fields_row.pack(side=tk.LEFT, padx=(8, 0))
 
     ttk.Label(fields_row, text="dal", style="MovCdc.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 5))
     date_from_disp_var = tk.StringVar()
@@ -15944,8 +15952,6 @@ th {{ background:#efefef; text-align:left; }}
                 pass
 
     def _apply_sign(sign: str) -> None:
-        if _is_giro_label(newreg_cat_var.get()) and sign == "+":
-            sign = "-"
         newreg_sign_var.set(sign)
         raw = (newreg_amount_var.get() or "").strip().replace(" ", "")
         if not raw:
@@ -15961,7 +15967,7 @@ th {{ background:#efefef; text-align:left; }}
         try:
             amt = normalize_euro_input(raw)
             if _is_giro_label(newreg_cat_var.get()):
-                amt = -abs(amt)
+                pass
             elif newreg_sign_var.get() == "-":
                 amt = -abs(amt)
             else:
@@ -15974,7 +15980,7 @@ th {{ background:#efefef; text-align:left; }}
             else:
                 newreg_amount_var.set("+" + txt)
             if _is_giro_label(newreg_cat_var.get()):
-                newreg_sign_var.set("-")
+                newreg_sign_var.set("-" if amt < 0 else "+")
         except Exception:
             pass
 
@@ -16191,7 +16197,7 @@ th {{ background:#efefef; text-align:left; }}
                 pass
             return None
         if giro:
-            amt = -abs(amt)
+            pass
         elif newreg_sign_var.get() == "-":
             amt = -abs(amt)
         else:
@@ -17075,8 +17081,6 @@ th {{ background:#efefef; text-align:left; }}
         _per_apply_periodic_creation_defaults()
 
     def _per_apply_sign(sign: str) -> None:
-        if _is_giro_label(per_cat_var.get()) and sign == "+":
-            sign = "-"
         per_sign_var.set(sign)
         raw = (per_amount_var.get() or "").strip().replace(" ", "")
         if not raw:
@@ -17092,7 +17096,7 @@ th {{ background:#efefef; text-align:left; }}
         try:
             amt = normalize_euro_input(raw)
             if _is_giro_label(per_cat_var.get()):
-                amt = -abs(amt)
+                pass
             elif per_sign_var.get() == "-":
                 amt = -abs(amt)
             else:
@@ -17100,7 +17104,7 @@ th {{ background:#efefef; text-align:left; }}
             txt = format_euro_it(abs(amt))
             per_amount_var.set(("-" if amt < 0 else "+") + txt)
             if _is_giro_label(per_cat_var.get()):
-                per_sign_var.set("-")
+                per_sign_var.set("-" if amt < 0 else "+")
         except Exception:
             pass
 
@@ -17380,7 +17384,7 @@ th {{ background:#efefef; text-align:left; }}
                 pass
             return None
         if giro:
-            amt = -abs(amt)
+            pass
         elif per_sign_var.get() == "-":
             amt = -abs(amt)
         else:
@@ -17896,7 +17900,7 @@ th {{ background:#efefef; text-align:left; }}
                     messagebox.showerror("Registrazioni periodiche", str(exc), parent=top)
                     return
                 if bool(tpl.get("is_giroconto")):
-                    amt = -abs(amt)
+                    pass
                 elif str(v.get()).strip().startswith("-"):
                     amt = -abs(amt)
                 else:
