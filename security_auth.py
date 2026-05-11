@@ -888,6 +888,19 @@ def run_login_dialog(
         try:
             loading_row.grid(row=email_row + 5, column=0, columnspan=2, sticky="we", pady=(4, 0))
             loading_progress.start(12)
+            win.update_idletasks()
+            sw = max(1, int(win.winfo_screenwidth()))
+            sh = max(1, int(win.winfo_screenheight()))
+            w = max(int(win.winfo_width()), int(win.winfo_reqwidth()), _LOGIN_WIN_MIN_W)
+            h = max(int(win.winfo_height()), int(win.winfo_reqheight()), _LOGIN_WIN_MIN_H)
+            w = min(w, int(sw * 0.92))
+            h = min(h, int(sh * 0.88))
+            x = max(0, (sw - w) // 2)
+            y = max(0, (sh - h) // 3)
+            win.geometry(f"{w}x{h}+{x}+{y}")
+            win.minsize(w, h)
+            win.lift()
+            win.update()
         except Exception:
             pass
 
