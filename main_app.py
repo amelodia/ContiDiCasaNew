@@ -19168,6 +19168,94 @@ th {{ background:#efefef; text-align:left; }}
         """Mappa ``codice_conto`` → dati salvati; ogni conto ha memoria indipendente dagli altri."""
         return cur_db().get("verification_pending") or {}
 
+    # --- Modalità verifica (automatica PDF / manuale): chip come «scelta filtri» Movimenti, colori `MOV_FILTER_TAB_*`. ---
+    ver_mode_choice: list[str] = ["manual"]  # "auto" | "manual"
+    ver_mode_chips_locked: list[bool] = [False]
+    ver_mode_bar = tk.Frame(ver_body, bg=_VER_BG, highlightthickness=0)
+    ver_mode_inner = tk.Frame(ver_mode_bar, bg=_VER_BG, highlightthickness=0)
+    ver_mode_inner.pack(anchor=tk.CENTER)
+    ver_chip_mode_gap = _FILTER_ROW_BUTTON_GAP
+    ver_chip_auto = tk.Label(
+        ver_mode_inner,
+        text="Verifica automatica da PDF",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=7,
+        pady=_mov_filter_btn_pady,
+    )
+    ver_chip_manual = tk.Label(
+        ver_mode_inner,
+        text="Verifica manuale",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=7,
+        pady=_mov_filter_btn_pady,
+    )
+    ver_chip_auto.pack(side=tk.LEFT, padx=(0, ver_chip_mode_gap))
+    ver_chip_manual.pack(side=tk.LEFT)
+
+    def _ver_refresh_mode_chips_style() -> None:
+        sel_auto = ver_mode_choice[0] == "auto"
+        _set_filter_toggle_style(ver_chip_auto, sel_auto)
+        _set_filter_toggle_style(ver_chip_manual, not sel_auto)
+        try:
+            cur = "hand2" if not ver_mode_chips_locked[0] else ""
+            ver_chip_auto.configure(cursor=cur)
+            ver_chip_manual.configure(cursor=cur)
+        except tk.TclError:
+            pass
+
+    def _ver_unbind_mode_chip_hover() -> None:
+        for w in (ver_chip_auto, ver_chip_manual):
+            try:
+                w.unbind("<Enter>")
+                w.unbind("<Leave>")
+            except tk.TclError:
+                pass
+
+    def _ver_bind_mode_chip_hover() -> None:
+        _ver_unbind_mode_chip_hover()
+        _filter_chip_hover(ver_chip_auto, _ver_refresh_mode_chips_style, lambda: ver_mode_choice[0] == "auto")
+        _filter_chip_hover(ver_chip_manual, _ver_refresh_mode_chips_style, lambda: ver_mode_choice[0] == "manual")
+
+    def _ver_set_mode_chips_locked(locked: bool) -> None:
+        ver_mode_chips_locked[0] = bool(locked)
+        if ver_mode_chips_locked[0]:
+            _ver_unbind_mode_chip_hover()
+        else:
+            _ver_bind_mode_chip_hover()
+        _ver_refresh_mode_chips_style()
+
+    def _ver_on_mode_chip_auto(_e: tk.Event | None = None) -> None:
+        if ver_mode_chips_locked[0]:
+            return
+        ver_mode_choice[0] = "auto"
+        _ver_refresh_mode_chips_style()
+        _ver_show_auto_folder_box(True)
+        try:
+            _ver_setup_start_buttons_state()
+        except Exception:
+            pass
+
+    def _ver_on_mode_chip_manual(_e: tk.Event | None = None) -> None:
+        if ver_mode_chips_locked[0]:
+            return
+        ver_mode_choice[0] = "manual"
+        _ver_refresh_mode_chips_style()
+        _ver_show_auto_folder_box(False)
+        try:
+            _ver_setup_start_buttons_state()
+        except Exception:
+            pass
+
+    ver_chip_auto.bind("<Button-1>", _ver_on_mode_chip_auto)
+    ver_chip_manual.bind("<Button-1>", _ver_on_mode_chip_manual)
+    _ver_bind_mode_chip_hover()
+    _ver_refresh_mode_chips_style()
+    ver_mode_bar.pack(fill=tk.X, anchor=tk.CENTER, pady=(0, 6))
+
     # --- setup: scelta conto e data chiusura ---
     ver_setup_frame = tk.Frame(ver_body, bg=_VER_BG, highlightthickness=0)
     ver_setup_frame.pack(fill=tk.X, anchor=tk.W, pady=(0, 4))
@@ -19531,6 +19619,11 @@ th {{ background:#efefef; text-align:left; }}
         return True
 
     def _ver_on_start_auto() -> bool:
+        ver_mode_choice[0] = "auto"
+        try:
+            _ver_refresh_mode_chips_style()
+        except Exception:
+            pass
         ver_pdf_auto_diag_var.set("")
         try:
             aid0 = ver_auto_start_defer_after[0]
@@ -19671,6 +19764,11 @@ th {{ background:#efefef; text-align:left; }}
 
     def _ver_on_start_with_selected_pdf_path() -> None:
         """Dopo ricerca automatica PDF fallita: avvio usando il percorso nel campo / scelto con Sfoglia."""
+        ver_mode_choice[0] = "auto"
+        try:
+            _ver_refresh_mode_chips_style()
+        except Exception:
+            pass
         acc_name = ver_account_name_var.get().strip()
         if not acc_name:
             messagebox.showerror("Verifica", "Seleziona un conto da verificare.")
@@ -19742,10 +19840,25 @@ th {{ background:#efefef; text-align:left; }}
         ver_bancoposta_pdf_var.set("")
         _ver_on_start()
 
-    ver_btn_start_auto.bind("<Button-1>", lambda _e: _ver_show_auto_folder_box(True))
-    ver_btn_auto_folder_browse.bind("<Button-1>", lambda _e: _ver_browse_estratti_pdf_root_for_auto())
-    ver_btn_auto_folder_confirm.bind("<Button-1>", lambda _e: _ver_confirm_auto_folder_and_start())
-    ver_btn_start_manual.bind("<Button-1>", lambda _e: _ver_on_start_resume(explicit_manual=True))
+    def _ver_on_click_start_auto_folder(_e: tk.Event | None = None) -> None:
+        if ver_mode_chips_locked[0]:
+            return
+        ver_mode_choice[0] = "auto"
+        _ver_refresh_mode_chips_style()
+        _ver_show_auto_folder_box(True)
+        _ver_setup_start_buttons_state()
+
+    ver_btn_start_auto.bind("<Button-1>", _ver_on_click_start_auto_folder)
+
+    def _ver_on_click_start_manual_session(_e: tk.Event | None = None) -> None:
+        if ver_mode_chips_locked[0]:
+            return
+        ver_mode_choice[0] = "manual"
+        _ver_refresh_mode_chips_style()
+        _ver_show_auto_folder_box(False)
+        _ver_on_start_resume(explicit_manual=True)
+
+    ver_btn_start_manual.bind("<Button-1>", _ver_on_click_start_manual_session)
     ver_btn_start_with_pdf.bind("<Button-1>", lambda _e: _ver_on_start_with_selected_pdf_path())
     ver_btn_start_resume.bind("<Button-1>", lambda _e: _ver_on_start_resume(explicit_manual=False))
 
@@ -21819,12 +21932,22 @@ th {{ background:#efefef; text-align:left; }}
             ver_btn_start_resume.grid_remove()
         except tk.TclError:
             pass
-        ver_btn_start_auto.grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 2))
-        ver_btn_start_manual.grid(row=2, column=1, sticky="w", padx=(0, 8), pady=(6, 2))
+        if ver_mode_choice[0] == "auto":
+            ver_btn_start_auto.grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 2))
+            try:
+                ver_btn_start_manual.grid_remove()
+            except tk.TclError:
+                pass
+            pdf_col = 1
+        else:
+            ver_btn_start_manual.grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 2))
+            try:
+                ver_btn_start_auto.grid_remove()
+            except tk.TclError:
+                pass
+            pdf_col = 1
         if ver_setup_pdf_path_after_auto_fail[0] and ver_bancoposta_pdf_var.get().strip():
-            ver_btn_start_with_pdf.grid(
-                row=2, column=2, sticky="w", padx=(0, 8), pady=(6, 2)
-            )
+            ver_btn_start_with_pdf.grid(row=2, column=pdf_col, sticky="w", padx=(0, 8), pady=(6, 2))
         else:
             try:
                 ver_btn_start_with_pdf.grid_remove()
@@ -22720,6 +22843,8 @@ th {{ background:#efefef; text-align:left; }}
         ver_manual_any_amount_submitted[0] = bool(ver_bancoposta_queue[0]) or resuming_manual_batch
         ver_session_title_var.set(f"Verifica conto: {acc_name}  —  Chiusura: {cutoff_raw}")
         ver_setup_saved_var.set("")
+        ver_mode_choice[0] = "auto" if bool(ver_bancoposta_queue[0]) else "manual"
+        _ver_set_mode_chips_locked(True)
 
         ver_setup_frame.pack_forget()
         ver_results_frame.pack_forget()
@@ -22752,6 +22877,7 @@ th {{ background:#efefef; text-align:left; }}
                     ver_verifica_used_pdf_coda[0] = False
                     ver_setup_pdf_path_after_auto_fail[0] = False
                     ver_setup_frame.pack(fill=tk.X)
+                    _ver_set_mode_chips_locked(False)
                     _ver_setup_start_buttons_state()
                 return
 
@@ -23786,6 +23912,7 @@ th {{ background:#efefef; text-align:left; }}
                 ver_setup_saved_var.set("")
                 ver_setup_pdf_path_after_auto_fail[0] = False
                 ver_setup_frame.pack(fill=tk.X, anchor=tk.W, pady=(0, 4), in_=ver_body)
+                _ver_set_mode_chips_locked(False)
                 _ver_populate_account_combo()
                 _ver_update_pending_action_buttons_visibility()
                 return
@@ -23850,6 +23977,7 @@ th {{ background:#efefef; text-align:left; }}
                 ver_setup_saved_var.set("")
                 ver_setup_pdf_path_after_auto_fail[0] = False
                 ver_setup_frame.pack(fill=tk.X, anchor=tk.W, pady=(0, 4), in_=ver_body)
+                _ver_set_mode_chips_locked(False)
                 _ver_populate_account_combo()
                 _ver_update_pending_action_buttons_visibility()
                 return
@@ -24635,6 +24763,7 @@ th {{ background:#efefef; text-align:left; }}
         ver_inp_note_var.set("")
         ver_setup_saved_var.set("")
         ver_setup_frame.pack(fill=tk.X, anchor=tk.W, pady=(0, 4), in_=ver_body)
+        _ver_set_mode_chips_locked(False)
         _ver_populate_account_combo()
         _ver_refresh_setup_saved_banner_global()
 
@@ -31268,6 +31397,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 _stat_refresh_report_buttons()
                 _nuovi_sync_subtab_style()
                 _per_refresh_cadence_button_styles()
+                _ver_refresh_mode_chips_style()
             except Exception:
                 pass
 

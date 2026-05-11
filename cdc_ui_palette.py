@@ -48,7 +48,7 @@ PALETTE_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "Movimenti — pulsanti scelta filtri (tab chip)",
+        "Movimenti e Verifica — pulsanti scelta modalità (chip tab)",
         [
             ("mov_filter_tab_btn_bg", "Chip non selezionato"),
             ("mov_filter_tab_btn_hover_bg", "Chip — passaggio mouse"),
