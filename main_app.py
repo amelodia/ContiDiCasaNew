@@ -135,10 +135,11 @@ _BOOT_DROPBOX_CONFIRM_WITHIN_SECONDS = 5 * 60
 
 # Limite numerico categorie/conti: ``MAX_CATEGORIES_COUNT`` / ``MAX_ACCOUNTS_COUNT`` in ``import_legacy``.
 
-_DEFAULT_WINDOWS_UI_SCALE = 0.88
+_DEFAULT_WINDOWS_UI_SCALE = 0.82
 _DEFAULT_NON_WINDOWS_UI_SCALE = 1.0
 _UI_SCALE_PREF_KEY = "_ui_scale_factor"
 _CURRENT_UI_SCALE_FACTOR: float | None = None
+_BASE_NAMED_FONT_SIZES: dict[str, int] | None = None
 
 # Stessa regola della colonna Importo nella griglia movimenti.
 COLOR_AMOUNT_POS = "#006400"
@@ -298,7 +299,41 @@ def _apply_tk_ui_scale(root: tk.Tk, db: dict | None = None) -> float:
     except Exception:
         pass
     _CURRENT_UI_SCALE_FACTOR = target
+    if platform.system() == "Darwin":
+        _apply_named_font_ui_scale(root, target)
     return target
+
+
+def _apply_named_font_ui_scale(root: tk.Tk, scale: float) -> None:
+    """Su macOS `tk scaling` incide poco sui widget nativi: scala anche i font Tk nominati."""
+    global _BASE_NAMED_FONT_SIZES
+    names = (
+        "TkDefaultFont",
+        "TkTextFont",
+        "TkFixedFont",
+        "TkMenuFont",
+        "TkHeadingFont",
+        "TkCaptionFont",
+        "TkSmallCaptionFont",
+        "TkIconFont",
+        "TkTooltipFont",
+    )
+    if _BASE_NAMED_FONT_SIZES is None:
+        _BASE_NAMED_FONT_SIZES = {}
+        for name in names:
+            try:
+                f = tkfont.nametofont(name, root=root)
+                size = int(f.cget("size"))
+                _BASE_NAMED_FONT_SIZES[name] = size
+            except Exception:
+                pass
+    for name, base_size in (_BASE_NAMED_FONT_SIZES or {}).items():
+        try:
+            f = tkfont.nametofont(name, root=root)
+            sign = -1 if base_size < 0 else 1
+            f.configure(size=sign * max(1, int(round(abs(base_size) * float(scale)))))
+        except Exception:
+            pass
 
 
 def _ui_scaled_int(value: int, *, min_value: int = 1) -> int:
@@ -9129,8 +9164,8 @@ def build_ui(
     filters_text_inner = ttk.Frame(filters_text_row, style="MovCdc.TFrame")
     filters_text_inner.pack(anchor=tk.CENTER)
 
-    # Zona filtri: testo in bold (etichette, entry, combobox, pulsanti).
-    filter_ui_font = ("TkDefaultFont", 12, "bold")
+    # Zona filtri: compatta, per restare visibile anche con metrica font diversa tra macOS e Windows.
+    filter_ui_font = ("TkDefaultFont", 11, "bold")
     ttk.Style(root).configure("Filters.TLabel", font=filter_ui_font)
     ttk.Style(root).configure("Filters.TEntry", font=filter_ui_font)
     ttk.Style(root).configure("Filters.TCombobox", font=filter_ui_font)
@@ -9150,7 +9185,7 @@ def build_ui(
         filters_text_inner,
         textvariable=text_category_preview_var,
         state="readonly",
-        width=13,
+        width=12,
         values=("",),
         style="MovCdc.TCombobox",
     )
@@ -9199,8 +9234,8 @@ def build_ui(
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=14,
-        pady=7,
+        padx=10,
+        pady=5,
         bg=_MOV_AGG_CAT_BTN_BG,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -9274,7 +9309,7 @@ def build_ui(
         filters_text_inner,
         textvariable=text_account_preview_var,
         state="readonly",
-        width=12,
+        width=11,
         values=("",),
         style="MovCdc.TCombobox",
     )
@@ -9294,7 +9329,7 @@ def build_ui(
     amount_filter_entry = ttk.Entry(
         amount_filter_row,
         textvariable=text_amount_preview_var,
-        width=14,
+        width=12,
         style="MovCdc.TEntry",
     )
     amount_filter_entry.pack(side=tk.LEFT)
@@ -9326,7 +9361,7 @@ def build_ui(
     cheque_entry = ttk.Entry(
         filters_text_inner,
         textvariable=text_cheque_preview_var,
-        width=10,
+        width=9,
         style="MovCdc.TEntry",
     )
     cheque_entry.pack(side=tk.LEFT, padx=(0, 8))
@@ -9338,7 +9373,7 @@ def build_ui(
     note_entry = ttk.Entry(
         filters_text_inner,
         textvariable=text_note_preview_var,
-        width=28,
+        width=24,
         style="MovCdc.TEntry",
     )
     bind_limited_single_line_text_entry(
@@ -9358,8 +9393,8 @@ def build_ui(
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=12,
-        pady=7,
+        padx=10,
+        pady=5,
     )
     reg_btn_all = tk.Label(
         reg_controls_inner,
@@ -9367,26 +9402,26 @@ def build_ui(
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=12,
-        pady=7,
+        padx=10,
+        pady=5,
     )
     reg_btn_last12.pack(side=tk.LEFT, padx=(0, 8))
     reg_btn_all.pack(side=tk.LEFT, padx=(0, 16))
 
     ttk.Label(reg_controls_inner, text="Dalla reg. #", style="MovCdc.TLabel").pack(side=tk.LEFT, padx=(0, 6))
-    reg_from_entry = ttk.Entry(reg_controls_inner, textvariable=reg_from_preview_var, width=8, style="MovCdc.TEntry")
-    reg_from_entry.pack(side=tk.LEFT, padx=(0, 14))
+    reg_from_entry = ttk.Entry(reg_controls_inner, textvariable=reg_from_preview_var, width=7, style="MovCdc.TEntry")
+    reg_from_entry.pack(side=tk.LEFT, padx=(0, 10))
 
     ttk.Label(reg_controls_inner, text="Alla reg. #", style="MovCdc.TLabel").pack(side=tk.LEFT, padx=(0, 6))
-    reg_to_entry = ttk.Entry(reg_controls_inner, textvariable=reg_to_preview_var, width=8, style="MovCdc.TEntry")
-    reg_to_entry.pack(side=tk.LEFT, padx=(0, 18))
+    reg_to_entry = ttk.Entry(reg_controls_inner, textvariable=reg_to_preview_var, width=7, style="MovCdc.TEntry")
+    reg_to_entry.pack(side=tk.LEFT, padx=(0, 12))
 
     ttk.Label(reg_controls_inner, text="Conto", style="MovCdc.TLabel").pack(side=tk.LEFT, padx=(0, 6))
     reg_account_entry = ttk.Combobox(
         reg_controls_inner,
         textvariable=text_account_preview_var,
         state="readonly",
-        width=16,
+        width=14,
         values=(_ALL_ACCOUNTS_LABEL,),
         style="MovCdc.TCombobox",
     )
@@ -9587,7 +9622,7 @@ def build_ui(
 
     # Larghezze colonne dati e celle header custom. Le colonne Treeview restano base:
     # header custom e Treeview devono usare le stesse larghezze per mantenere i titoli allineati.
-    _MOV_CHEQUE_COL_BASE = 76
+    _MOV_CHEQUE_COL_BASE = 96
     _MOV_AMOUNT_COL_BASE = 116
     _MOV_CHEQUE_HDR_EXTRA = 0
     _MOV_AMOUNT_HDR_EXTRA = 0
@@ -9595,7 +9630,7 @@ def build_ui(
     _MOV_AMOUNT_COL_W = _MOV_AMOUNT_COL_BASE
     _MOV_CHEQUE_HDR_W = _MOV_CHEQUE_COL_BASE + _MOV_CHEQUE_HDR_EXTRA
     _MOV_AMOUNT_HDR_W = _MOV_AMOUNT_COL_BASE + _MOV_AMOUNT_HDR_EXTRA
-    _MOV_CHEQUE_COL_MIN = 68
+    _MOV_CHEQUE_COL_MIN = 80
     _MOV_AMOUNT_COL_MIN = 96
     _MOV_GRID_BASE_COL_W = {
         "mov_pad": 1,
@@ -9612,17 +9647,17 @@ def build_ui(
         "category_name": 130,
         "account_primary_name": 100,
         "account_secondary_name": 100,
-        "cheque": 44,
+        "cheque": 56,
     }
     _MOV_GRID_LARGE_EXTRA_WEIGHTS = {
         "category_name": 0.36,
         "account_primary_name": 0.27,
         "account_secondary_name": 0.27,
-        "cheque": 0.10,
+        "cheque": 0.12,
     }
     _mov_f_grid_cell = tkfont.Font(root, font=("TkDefaultFont", 11, "bold"))
     _mov_f_amt_cell = tkfont.Font(root, font=("TkDefaultFont", 12, "bold"))
-    _mov_note_hdr_lpad = 2
+    _mov_note_hdr_lpad = 0
 
     # Prima colonna `mov_pad` vuota (1px): su macOS la prima colonna dati ha bug/troncamenti; Reg è la seconda.
     # Solo `show=headings` (no colonna albero #0): così `anchor=e` su Reg allinea a destra correttamente.
@@ -9857,15 +9892,8 @@ def build_ui(
     mov_records_header_row.grid_columnconfigure(4, weight=1, minsize=180)  # note_hdr
 
     # Mov header columns (pixel widths = come Treeview)
-    mov_hdr.grid_columnconfigure(0, minsize=1)    # mov_pad
-    mov_hdr.grid_columnconfigure(1, minsize=58)   # Reg #
-    mov_hdr.grid_columnconfigure(2, minsize=78)   # Data
-    mov_hdr.grid_columnconfigure(3, minsize=146)  # Categoria
-    mov_hdr.grid_columnconfigure(4, minsize=110)  # Dal conto
-    mov_hdr.grid_columnconfigure(5, minsize=24)   # flags
-    mov_hdr.grid_columnconfigure(6, minsize=110)  # al conto
-    mov_hdr.grid_columnconfigure(7, minsize=24)   # flags2
-    mov_hdr.grid_columnconfigure(8, minsize=_MOV_CHEQUE_HDR_W)   # Assegno
+    for _hdr_idx, _hdr_cid in enumerate(mov_cols):
+        mov_hdr.grid_columnconfigure(_hdr_idx, minsize=_MOV_GRID_BASE_COL_W[_hdr_cid])
 
     tk.Label(mov_hdr, text="", bg=header_bg, fg=header_fg, font=header_font).grid(row=0, column=0, sticky="ew")
     tk.Label(mov_hdr, text="Reg #", bg=header_bg, fg=header_fg, font=header_font, anchor="center").grid(row=0, column=1, sticky="ew")
@@ -10020,6 +10048,14 @@ def build_ui(
                 mov_hdr.grid_columnconfigure(col_to_hdr_idx[cid], minsize=width)
             except Exception:
                 pass
+        try:
+            mov_total = sum(widths.values())
+            records_frame.grid_columnconfigure(0, minsize=mov_total)
+            mov_records_header_row.grid_columnconfigure(0, minsize=mov_total)
+            records_frame.grid_columnconfigure(2, minsize=_MOV_AMOUNT_COL_W)
+            mov_records_header_row.grid_columnconfigure(2, minsize=_MOV_AMOUNT_HDR_W)
+        except Exception:
+            pass
         try:
             mov_hdr.grid_columnconfigure(8, minsize=widths["cheque"] + _MOV_CHEQUE_HDR_EXTRA)
         except Exception:
@@ -11510,8 +11546,8 @@ th {{ background:#efefef; text-align:left; }}
     note_tree.grid(row=3, column=4, sticky="nsew")
     yscroll.grid(row=3, column=5, sticky="ns", padx=(2, 0))
 
-    sep_1_line.place(x=-3, y=0, relheight=1.0)
-    sep_2_line.place(x=-3, y=0, relheight=1.0)
+    sep_1_line.place(x=0, y=0, relheight=1.0)
+    sep_2_line.place(x=0, y=0, relheight=1.0)
 
     no_results_block = tk.Frame(records_frame, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     no_results_label = tk.Label(
@@ -12025,27 +12061,27 @@ th {{ background:#efefef; text-align:left; }}
         lbl.bind("<Enter>", _ent)
         lbl.bind("<Leave>", _lev)
 
-    _FILTER_ROW_BUTTON_GAP = 8
+    _FILTER_ROW_BUTTON_GAP = 6
 
     g1 = ttk.Frame(filters_top_inner, style="MovCdc.TFrame")
     g1.pack(side=tk.LEFT, anchor=tk.W)
     btn_order_date = tk.Label(
         g1,
-        text="Ricerca per data",
+        text="Per data",
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=10,
-        pady=6,
+        padx=8,
+        pady=5,
     )
     btn_order_reg = tk.Label(
         g1,
-        text="Ricerca per registrazione",
+        text="Per registrazione",
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=10,
-        pady=6,
+        padx=8,
+        pady=5,
     )
     btn_order_date.bind("<Button-1>", lambda _e: pick_order("date"))
     btn_order_reg.bind("<Button-1>", lambda _e: pick_order("registration"))
@@ -12056,21 +12092,21 @@ th {{ background:#efefef; text-align:left; }}
     g2.pack(side=tk.LEFT, padx=(_FILTER_ROW_BUTTON_GAP, 0), anchor=tk.W)
     btn_future_include = tk.Label(
         g2,
-        text="Date future comprese",
+        text="Future comprese",
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=10,
-        pady=6,
+        padx=8,
+        pady=5,
     )
     btn_future_exclude = tk.Label(
         g2,
-        text="Date future escluse",
+        text="Future escluse",
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=10,
-        pady=6,
+        padx=8,
+        pady=5,
     )
     btn_future_include.bind("<Button-1>", lambda _e: pick_future("include"))
     btn_future_exclude.bind("<Button-1>", lambda _e: pick_future("exclude"))
@@ -12081,21 +12117,21 @@ th {{ background:#efefef; text-align:left; }}
     g3.pack(side=tk.LEFT, padx=(_FILTER_ROW_BUTTON_GAP, 0), anchor=tk.W)
     btn_dir_backward = tk.Label(
         g3,
-        text="All'indietro, dalla più recente",
+        text="Indietro, recenti",
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=10,
-        pady=6,
+        padx=8,
+        pady=5,
     )
     btn_dir_forward = tk.Label(
         g3,
-        text="In avanti, dalla più lontana",
+        text="Avanti, lontane",
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        padx=10,
-        pady=6,
+        padx=8,
+        pady=5,
     )
     btn_dir_backward.bind("<Button-1>", lambda _e: pick_direction("backward"))
     btn_dir_forward.bind("<Button-1>", lambda _e: pick_direction("forward"))
@@ -12493,8 +12529,8 @@ th {{ background:#efefef; text-align:left; }}
         highlightthickness=0,
         font=filter_ui_font,
         width=8,
-        padx=8,
-        pady=6,
+        padx=7,
+        pady=5,
         bg=_CERCA_GREEN,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -12512,14 +12548,14 @@ th {{ background:#efefef; text-align:left; }}
     lbl_cerca.bind("<Leave>", _cerca_leave)
 
     lbl_pulisci_filtri = tk.Label(
-        filters_top_inner,
+        cerca_wrap,
         text="Pulisci filtri",
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        width=19,
-        padx=12,
-        pady=6,
+        width=12,
+        padx=7,
+        pady=5,
         bg=_MOV_PULISCI_ACCEDI_BG,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -12527,7 +12563,7 @@ th {{ background:#efefef; text-align:left; }}
     )
     cerca_wrap.pack(side=tk.LEFT, padx=(_FILTER_ROW_BUTTON_GAP, 0))
     lbl_cerca.pack(side=tk.TOP, fill=tk.X)
-    lbl_pulisci_filtri.pack(side=tk.LEFT, padx=(_FILTER_ROW_BUTTON_GAP, 0))
+    lbl_pulisci_filtri.pack(side=tk.TOP, fill=tk.X, pady=(3, 0))
 
     def _pulisci_enter(_e: tk.Event) -> None:
         lbl_pulisci_filtri.configure(bg=_MOV_PULISCI_ACCEDI_HOVER_BG)
@@ -13145,13 +13181,13 @@ th {{ background:#efefef; text-align:left; }}
     date_controls_left.pack(anchor=tk.CENTER)
 
     _PRESETS: list[tuple[str, str]] = [
-        ("last_12", "Ultimi 12 mesi"),
-        ("all_time", "Intero periodo"),
-        ("last_6", "6 mesi"),
-        ("last_4", "4 mesi"),
-        ("last_3", "3 mesi"),
-        ("last_2", "2 mesi"),
-        ("last_1", "1 mese"),
+        ("last_12", "Ultimi 12m"),
+        ("all_time", "Tutto"),
+        ("last_6", "6m"),
+        ("last_4", "4m"),
+        ("last_3", "3m"),
+        ("last_2", "2m"),
+        ("last_1", "1m"),
         ("custom", "Date a scelta"),
     ]
 
@@ -13204,8 +13240,8 @@ th {{ background:#efefef; text-align:left; }}
             cursor="hand2",
             highlightthickness=0,
             font=filter_ui_font,
-            padx=12,
-            pady=7,
+            padx=9,
+            pady=5,
         )
         b.bind("<Button-1>", lambda _e, _pid=pid: pick_date_preset(_pid))
         b.pack(side=tk.LEFT, padx=(0, 8))
@@ -13219,9 +13255,9 @@ th {{ background:#efefef; text-align:left; }}
         )
 
     fields_row = ttk.Frame(date_controls_left, style="MovCdc.TFrame")
-    fields_row.pack(side=tk.LEFT, padx=(16, 0))
+    fields_row.pack(side=tk.LEFT, padx=(10, 0))
 
-    ttk.Label(fields_row, text="dalla data", style="MovCdc.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 6))
+    ttk.Label(fields_row, text="dal", style="MovCdc.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 5))
     date_from_disp_var = tk.StringVar()
     date_to_disp_var = tk.StringVar()
     calendar_popup_from: tk.Toplevel | None = None
@@ -13247,7 +13283,7 @@ th {{ background:#efefef; text-align:left; }}
         style="DateEntry.TEntry",
     )
     date_from_entry.grid(row=0, column=1, sticky="w")
-    ttk.Label(fields_row, text="alla data", style="MovCdc.TLabel").grid(row=0, column=2, sticky="w", padx=(8, 6))
+    ttk.Label(fields_row, text="al", style="MovCdc.TLabel").grid(row=0, column=2, sticky="w", padx=(6, 5))
     date_to_entry = ttk.Entry(
         fields_row,
         textvariable=date_to_disp_var,
@@ -13255,7 +13291,7 @@ th {{ background:#efefef; text-align:left; }}
         style="DateEntry.TEntry",
     )
     date_to_entry.grid(row=0, column=3, sticky="w")
-    ttk.Label(fields_row, text="anno", style="MovCdc.TLabel").grid(row=0, column=4, sticky="w", padx=(10, 6))
+    ttk.Label(fields_row, text="anno", style="MovCdc.TLabel").grid(row=0, column=4, sticky="w", padx=(8, 5))
     date_year_var = tk.StringVar(value="Anno")
 
     def _date_year_choices() -> list[int]:
@@ -32719,11 +32755,17 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
 
     root.after(250, _banner_clock_tick)
 
-    try:
-        _apply_all_ui_theme_tokens()
-    except Exception:
-        pass
+    def _apply_theme_tokens_after_first_paint() -> None:
+        try:
+            _apply_all_ui_theme_tokens()
+        except Exception:
+            pass
+
     _present_main_window()
+    try:
+        root.after(1200, _apply_theme_tokens_after_first_paint)
+    except Exception:
+        _apply_theme_tokens_after_first_paint()
     root.mainloop()
 
 
@@ -32739,8 +32781,9 @@ def _apply_sun_valley_ttk_theme(root: tk.Tk) -> None:
     try:
         sty = ttk.Style(root)
         if sty.theme_use() == "sun-valley-light":
-            sty.configure("TButton", padding=(14, 9))
-            sty.configure("Accent.TButton", padding=(14, 9))
+            pad = (10, 6) if platform.system() == "Windows" else (14, 9)
+            sty.configure("TButton", padding=pad)
+            sty.configure("Accent.TButton", padding=pad)
     except tk.TclError:
         pass
 
