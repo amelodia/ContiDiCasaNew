@@ -13,7 +13,6 @@ _HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 _LEGACY_UI_BLUE_BG = (
     "mov_btn_agg_cat_bg",
     "mov_btn_modifica_reg_bg",
-    "mov_btn_ripristina_layout_bg",
     "mov_btn_pulisci_filtri_bg",
     "ver_btn_pending_edit_bg",
     "ver_btn_modifica_nonver_bg",
@@ -21,10 +20,11 @@ _LEGACY_UI_BLUE_BG = (
 )
 _LEGACY_UI_BLUE_HOVER = (
     "mov_btn_agg_cat_hover_bg",
-    "mov_btn_ripristina_layout_hover_bg",
     "mov_btn_pulisci_filtri_hover_bg",
     "opz_action_blue_hover_bg",
 )
+_LEGACY_MOV_ESPANDI_BG = ("mov_btn_ripristina_layout_bg",)
+_LEGACY_MOV_ESPANDI_HOVER = ("mov_btn_ripristina_layout_hover_bg",)
 _LEGACY_UI_RED_BG = ("opz_action_red_bg", "ver_btn_pending_delete_bg")
 _LEGACY_UI_RED_HOVER = ("opz_action_red_hover_bg",)
 _LEGACY_CORRECTION_ERROR_FG = ("mov_correction_error_fg", "ver_correction_error_fg")
@@ -70,6 +70,8 @@ def migrate_ui_color_token_consolidation(db: dict) -> bool:
 
     _absorb_canonical("ui_action_blue_bg", _LEGACY_UI_BLUE_BG)
     _absorb_canonical("ui_action_blue_hover_bg", _LEGACY_UI_BLUE_HOVER)
+    _absorb_canonical("mov_btn_espandi_bg", _LEGACY_MOV_ESPANDI_BG)
+    _absorb_canonical("mov_btn_espandi_hover_bg", _LEGACY_MOV_ESPANDI_HOVER)
     _absorb_canonical("ui_action_red_bg", _LEGACY_UI_RED_BG)
     _absorb_canonical("ui_action_red_hover_bg", _LEGACY_UI_RED_HOVER)
     _absorb_canonical("correction_error_fg", _LEGACY_CORRECTION_ERROR_FG)

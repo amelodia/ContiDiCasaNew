@@ -10399,8 +10399,10 @@ def build_ui(
     correzione_row = tk.Frame(records_frame, bg=MOVIMENTI_PAGE_BG)
     corr_left_btns = tk.Frame(correzione_row, bg=MOVIMENTI_PAGE_BG)
     _mov_correction_btn_pady = 4 if _is_macos_ui else 7
-    _RIPRISTINA_LAYOUT_BG = "#00695c"
-    _RIPRISTINA_LAYOUT_BG_ACT = "#004d40"
+    _ESPANDI_ELENCO_BG = "#00695c"
+    _ESPANDI_ELENCO_BG_ACT = "#004d40"
+    _RIPRISTINA_LAYOUT_BG = _ESPANDI_ELENCO_BG
+    _RIPRISTINA_LAYOUT_BG_ACT = _ESPANDI_ELENCO_BG_ACT
     btn_mov_griglia_ripristina = tk.Label(
         corr_left_btns,
         text="Torna a filtri e saldi",
@@ -10417,10 +10419,10 @@ def build_ui(
     btn_mov_griglia_ripristina.pack_forget()
 
     def _ripristina_btn_enter(_e: tk.Event | None = None) -> None:
-        btn_mov_griglia_ripristina.configure(bg=_RIPRISTINA_LAYOUT_BG_ACT)
+        btn_mov_griglia_ripristina.configure(bg=_ESPANDI_ELENCO_BG_ACT)
 
     def _ripristina_btn_leave(_e: tk.Event | None = None) -> None:
-        btn_mov_griglia_ripristina.configure(bg=_RIPRISTINA_LAYOUT_BG)
+        btn_mov_griglia_ripristina.configure(bg=_ESPANDI_ELENCO_BG)
 
     btn_mov_griglia_ripristina.bind("<Enter>", _ripristina_btn_enter)
     btn_mov_griglia_ripristina.bind("<Leave>", _ripristina_btn_leave)
@@ -10438,8 +10440,6 @@ def build_ui(
         relief=tk.RAISED,
         bd=1,
     )
-    _ESPANDI_ELENCO_BG = "#00695c"
-    _ESPANDI_ELENCO_BG_ACT = "#004d40"
     btn_espandi_elenco_mov = tk.Label(
         corr_left_btns,
         text="Espandi ricerca",
@@ -31507,14 +31507,12 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             elif token == "ui_action_blue_bg":
                 _MOV_AGG_CAT_BTN_BG = h
                 _CORREZIONE_BLUE = h
-                _RIPRISTINA_LAYOUT_BG = h
                 _VER_PENDING_BTN_EDIT_BG = h
                 _VER_CORR_BLUE = h
                 _OPZ_BLUE = h
                 try:
                     mov_aggregate_cat_btn.configure(bg=h)
                     btn_modifica_reg.configure(bg=h)
-                    btn_mov_griglia_ripristina.configure(bg=h)
                     ver_btn_edit_pending.configure(bg=h)
                     ver_btn_new_ver_data.configure(bg=h)
                     ver_btn_cancel_immissione.configure(bg=h)
@@ -31525,7 +31523,6 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 _opz_refresh_link_hover_binds()
             elif token == "ui_action_blue_hover_bg":
                 _MOV_AGG_CAT_BTN_ACT = h
-                _RIPRISTINA_LAYOUT_BG_ACT = h
                 _OPZ_BLUE_ACTIVE = h
                 _opz_refresh_link_hover_binds()
             elif token == "mov_btn_print_search_bg":
@@ -31543,12 +31540,15 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 _PRINT_RICERCA_RED_ACTIVE = h
             elif token == "mov_btn_espandi_bg":
                 _ESPANDI_ELENCO_BG = h
+                _RIPRISTINA_LAYOUT_BG = h
                 try:
                     btn_espandi_elenco_mov.configure(bg=h)
+                    btn_mov_griglia_ripristina.configure(bg=h)
                 except tk.TclError:
                     pass
             elif token == "mov_btn_espandi_hover_bg":
                 _ESPANDI_ELENCO_BG_ACT = h
+                _RIPRISTINA_LAYOUT_BG_ACT = h
             elif token == "mov_btn_cerca_bg":
                 _CERCA_GREEN = h
                 try:

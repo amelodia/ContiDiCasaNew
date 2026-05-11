@@ -86,8 +86,8 @@ PALETTE_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         [
             ("mov_btn_print_search_bg", "Rosso «Stampa ricerca» / correzione Movimenti / «Conferma immissione» / conferme periodiche"),
             ("mov_btn_print_search_hover_bg", "Hover dei suddetti"),
-            ("mov_btn_espandi_bg", "«Espandi ricerca»"),
-            ("mov_btn_espandi_hover_bg", "«Espandi ricerca» hover"),
+            ("mov_btn_espandi_bg", "«Espandi ricerca» / «Torna a filtri e saldi»"),
+            ("mov_btn_espandi_hover_bg", "«Espandi ricerca» / «Torna a filtri e saldi» hover"),
             ("mov_btn_cerca_bg", "«Cerca»"),
             ("mov_btn_cerca_hover_bg", "«Cerca» hover"),
             (
