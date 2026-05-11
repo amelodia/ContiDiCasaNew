@@ -9263,7 +9263,7 @@ def build_ui(
     filters_text_inner.pack(anchor=tk.CENTER)
 
     # Zona filtri: compatta, per restare visibile anche con metrica font diversa tra macOS e Windows.
-    filter_ui_font = _ui_font_tuple(9 if _is_macos_ui else 10, "bold")
+    filter_ui_font = _ui_font_tuple(10, "bold")
     ttk.Style(root).configure("Filters.TLabel", font=filter_ui_font)
     ttk.Style(root).configure("Filters.TEntry", font=filter_ui_font)
     ttk.Style(root).configure("Filters.TCombobox", font=filter_ui_font)
@@ -9326,7 +9326,7 @@ def build_ui(
         _mov_refresh_aggregate_category_button_caption()
         apply_movement_search()
 
-    _mov_filter_btn_pady = 2 if _is_macos_ui else 3
+    _mov_filter_btn_pady = 2
     mov_aggregate_cat_btn = tk.Label(
         filters_text_inner,
         text="Aggrega",
@@ -12653,11 +12653,11 @@ th {{ background:#efefef; text-align:left; }}
 
     lbl_pulisci_filtri = tk.Label(
         cerca_wrap,
-        text="Pulisci",
+        text="Pulisci filtri",
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        width=7,
+        width=11,
         padx=6,
         pady=_mov_filter_btn_pady,
         bg=_MOV_PULISCI_ACCEDI_BG,
@@ -12666,8 +12666,8 @@ th {{ background:#efefef; text-align:left; }}
         bd=1,
     )
     cerca_wrap.pack(side=tk.LEFT, padx=(_FILTER_ROW_BUTTON_GAP, 0))
-    lbl_cerca.pack(side=tk.TOP, fill=tk.X)
-    lbl_pulisci_filtri.pack(side=tk.TOP, fill=tk.X, pady=(1, 0))
+    lbl_cerca.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 4))
+    lbl_pulisci_filtri.pack(side=tk.LEFT, fill=tk.Y)
 
     def _pulisci_enter(_e: tk.Event) -> None:
         lbl_pulisci_filtri.configure(bg=_MOV_PULISCI_ACCEDI_HOVER_BG)
