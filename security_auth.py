@@ -601,10 +601,14 @@ def run_login_dialog(
 
     out: list[tuple[bool, AppSession | None]] = [(False, None)]
     done_var = tk.BooleanVar(master=parent, value=False)
+    success_in_progress: list[bool] = [False]
 
     backdoor = _BackdoorState()
 
     def _finish_success(sess: AppSession) -> None:
+        if success_in_progress[0]:
+            return
+        success_in_progress[0] = True
         out[0] = (True, sess)
         if keep_window_on_success is None:
             win.destroy()
@@ -623,6 +627,11 @@ def run_login_dialog(
                 _disable_login_widget_tree(child)
         except Exception:
             pass
+        _show_login_loading_indicator()
+        try:
+            win.update_idletasks()
+        except Exception:
+            pass
         keep_window_on_success(win)
         done_var.set(True)
 
@@ -637,6 +646,8 @@ def run_login_dialog(
                 pass
 
     def _disable_login_widget_tree(widget: tk.Misc) -> None:
+        if widget is loading_row:
+            return
         try:
             widget.configure(state="disabled")
         except Exception:
@@ -652,6 +663,8 @@ def run_login_dialog(
             pass
 
     def do_login() -> None:
+        if success_in_progress[0]:
+            return
         ensure_security(db)
         up_now = db["user_profile"]
         if not (up_now.get("password_hash") or "").strip():
@@ -677,6 +690,8 @@ def run_login_dialog(
         _finish_success(sess)
 
     def do_nuova_utenza() -> None:
+        if success_in_progress[0]:
+            return
         if not messagebox.askyesno(
             "Nuova utenza",
             "Si crea un nuovo profilo di accesso (nome visualizzato, email e password, come al primo accesso).\n\n"
@@ -735,6 +750,8 @@ def run_login_dialog(
 
     def do_backdoor() -> None:
         """Ctrl+Z poi Ctrl+X: sessione legata all’email nel campo userid; ``is_registered`` dal profilo dopo migrazione."""
+        if success_in_progress[0]:
+            return
         ensure_security(db)
         em_field = (email_var.get() or "").strip().lower()
         if not em_field or "@" not in em_field:
@@ -850,6 +867,29 @@ def run_login_dialog(
         btn_active_bg=esc_act,
         btn_fg="#ffffff",
     ).pack(side=tk.LEFT)
+
+    loading_row = tk.Frame(frm, bg=CDC_LOGIN_WIN_BG)
+    loading_row.columnconfigure(0, weight=1)
+    loading_label = ttk.Label(
+        loading_row,
+        text="Caricamento in corso...",
+        font=("TkDefaultFont", 11, "bold"),
+        style="CdcLogin.TLabel",
+    )
+    loading_label.grid(row=0, column=0, sticky="", pady=(8, 4))
+    loading_progress = ttk.Progressbar(
+        loading_row,
+        mode="indeterminate",
+        length=220,
+    )
+    loading_progress.grid(row=1, column=0, sticky="", pady=(0, 2))
+
+    def _show_login_loading_indicator() -> None:
+        try:
+            loading_row.grid(row=email_row + 5, column=0, columnspan=2, sticky="we", pady=(4, 0))
+            loading_progress.start(12)
+        except Exception:
+            pass
 
     win.bind("<Control-z>", on_ctrl_z)
     win.bind("<Control-Z>", on_ctrl_z)

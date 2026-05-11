@@ -33087,7 +33087,7 @@ def main() -> None:
         save_db,
         before_nuova_utenza=persist_utenza_precedente_before_nuova_utenza,
         after_prepare_nuova_utenza=reset_contabili_for_nuova_utenza,
-        keep_window_on_success=_keep_login_visible_until_main_window if platform.system() == "Windows" else None,
+        keep_window_on_success=_keep_login_visible_until_main_window,
     )
     if not ok or session is None:
         try:
