@@ -15432,6 +15432,37 @@ th {{ background:#efefef; text-align:left; }}
             return None
         return None
 
+    def _newreg_norm_acc_label(s: str) -> str:
+        return (s or "").replace("\u00a0", " ").strip()
+
+    def _newreg_chart_acc_code_for_display_name(display_name: str) -> str:
+        nm = _newreg_norm_acc_label(display_name)
+        if not nm:
+            return ""
+        c = next((c for n, c in acc_opts_cache if _newreg_norm_acc_label(n) == nm), "")
+        if c:
+            return str(c).strip()
+        c = next(
+            (c for n, c in acc_opts_cache if _newreg_norm_acc_label(n).casefold() == nm.casefold()),
+            "",
+        )
+        return str(c).strip() if c else ""
+
+    def _newreg_chart_acc_display_name_for_code(acc_code: str) -> str:
+        ref = (acc_code or "").strip()
+        if not ref:
+            return ""
+        for n, c in acc_opts_cache:
+            if account_codes_match_for_verification(str(c), ref):
+                return n
+        return ""
+
+    def _newreg_default_acc1_chart_display_name() -> str:
+        for n, _c in acc_opts_cache:
+            if _newreg_norm_acc_label(n).casefold() == "cassa":
+                return n
+        return (acc_opts_cache[0][0] if acc_opts_cache else "")
+
     def _is_consumi_ordinari_e_cassa_selection() -> bool:
         code = _selected_category_code() or newreg_cat_code_var.get().strip()
         cat_lbl = (newreg_cat_var.get() or "").strip()
@@ -15446,11 +15477,14 @@ th {{ background:#efefef; text-align:left; }}
                 return False
 
         a1_name = (newreg_acc1_var.get() or "").strip()
-        a1_code = next((c for n, c in acc_opts_cache if n == a1_name), "")
-        cassa_code = next((c for n, c in acc_opts_cache if n.strip().lower() == "cassa"), "")
+        a1_code = _newreg_chart_acc_code_for_display_name(a1_name)
+        cassa_code = next(
+            (c for n, c in acc_opts_cache if _newreg_norm_acc_label(n).casefold() == "cassa"),
+            "",
+        )
         if a1_code and cassa_code:
             return a1_code == cassa_code
-        return a1_name.lower() == "cassa"
+        return _newreg_norm_acc_label(a1_name).casefold() == "cassa"
 
     def _round_down_first_digit(val: Decimal) -> Decimal:
         if val <= 0:
@@ -16221,12 +16255,18 @@ th {{ background:#efefef; text-align:left; }}
         elif keep_last:
             newreg_date_var.set(to_italian_date(last_date_iso))
             _set_category_by_code(last_cat_code if last_cat_code else next((c for n, c in cat_opts_cache if n.lower() == "consumi ordinari"), ""))
-            if _is_virtuale_account(last_acc1_code):
-                a1_name = next((n for n, _c in acc_opts_cache if n.strip().lower() == "cassa"), acc_opts_cache[0][0] if acc_opts_cache else "")
+            lac = (last_acc1_code or "").strip()
+            if lac:
+                a1_name = _newreg_chart_acc_display_name_for_code(lac)
+                if not a1_name:
+                    a1_name = _newreg_default_acc1_chart_display_name()
             else:
-                a1_name = next((n for n, c in acc_opts_cache if c == last_acc1_code), "Cassa")
-            newreg_acc1_var.set(a1_name if a1_name else (acc_opts_cache[0][0] if acc_opts_cache else ""))
-            a2_name = next((n for n, c in acc_opts_cache if c == last_acc2_code), "")
+                a1_name = _newreg_default_acc1_chart_display_name()
+            newreg_acc1_var.set(a1_name or (acc_opts_cache[0][0] if acc_opts_cache else ""))
+            a2_name = next(
+                (n for n, c in acc_opts_cache if account_codes_match_for_verification(str(c), last_acc2_code)),
+                "",
+            ) if (last_acc2_code or "").strip() else ""
             newreg_acc2_var.set(a2_name)
         else:
             newreg_date_var.set(to_italian_date(date.today().isoformat()))
@@ -16240,7 +16280,7 @@ th {{ background:#efefef; text-align:left; }}
                     "",
                 )
             )
-            newreg_acc1_var.set(next((n for n, _c in acc_opts_cache if n == "Cassa"), acc_opts_cache[0][0] if acc_opts_cache else ""))
+            newreg_acc1_var.set(_newreg_default_acc1_chart_display_name() or (acc_opts_cache[0][0] if acc_opts_cache else ""))
             newreg_acc2_var.set("")
             last_date_iso = date.today().isoformat()
             last_cat_code = ""
@@ -16254,6 +16294,30 @@ th {{ background:#efefef; text-align:left; }}
         _sync_cat_note_and_second_account()
         newreg_baseline_snapshot[0] = _newreg_form_snapshot()
         newreg_last_account_touched[0] = "acc1"
+        try:
+            vals1 = list(cb_acc1.cget("values") or ())
+            a1n = (newreg_acc1_var.get() or "").strip()
+            if a1n and a1n in vals1:
+                cb_acc1.current(vals1.index(a1n))
+        except Exception:
+            pass
+        try:
+            vals2 = list(cb_acc2.cget("values") or ())
+            a2n = (newreg_acc2_var.get() or "").strip()
+            if a2n and a2n in vals2:
+                cb_acc2.current(vals2.index(a2n))
+        except Exception:
+            pass
+        try:
+            ent_amt.configure(state="normal")
+            ent_amt.selection_clear()
+            ra = (newreg_amount_var.get() or "").strip()
+            if ra in ("+", "-"):
+                ent_amt.icursor(1)
+            else:
+                ent_amt.icursor(tk.END)
+        except Exception:
+            pass
 
     def _collect_new_record_payload() -> tuple[dict, str] | None:
         d_iso = parse_italian_ddmmyyyy_to_iso(newreg_date_var.get())
@@ -16278,16 +16342,22 @@ th {{ background:#efefef; text-align:left; }}
             return None
         acc1_name = newreg_acc1_var.get().strip()
         is_acc1_virtuale = _is_virtuale_account(acc1_name)
-        acc1_code = (VIRTUALE_ACCOUNT_NAME if is_acc1_virtuale
-                     else next((c for n, c in acc_opts_cache if n == acc1_name), ""))
+        acc1_code = (
+            VIRTUALE_ACCOUNT_NAME
+            if is_acc1_virtuale
+            else _newreg_chart_acc_code_for_display_name(acc1_name)
+        )
         if not acc1_code:
             messagebox.showerror("Nuova registrazione", "Conto obbligatorio.")
             return None
         giro = _is_giro_label(cat_name)
         acc2_name = newreg_acc2_var.get().strip() if giro else ""
         is_acc2_virtuale = _is_virtuale_account(acc2_name) if giro else False
-        acc2_code = (VIRTUALE_ACCOUNT_NAME if is_acc2_virtuale
-                     else (next((c for n, c in acc_opts_cache if n == acc2_name), "") if giro else ""))
+        acc2_code = (
+            VIRTUALE_ACCOUNT_NAME
+            if is_acc2_virtuale
+            else (_newreg_chart_acc_code_for_display_name(acc2_name) if giro else "")
+        )
         if giro and (not acc2_code or acc2_code == acc1_code):
             messagebox.showerror("Nuova registrazione", "Nel giroconto il secondo conto è obbligatorio e diverso dal primo.")
             return None
