@@ -16093,12 +16093,6 @@ th {{ background:#efefef; text-align:left; }}
             return
         try:
             amt = normalize_euro_input(raw)
-            if _is_giro_label(newreg_cat_var.get()):
-                pass
-            elif newreg_sign_var.get() == "-":
-                amt = -abs(amt)
-            else:
-                amt = abs(amt)
             txt = format_euro_it(abs(amt))
             if amt < 0:
                 newreg_amount_var.set("-" + txt)
@@ -16106,8 +16100,7 @@ th {{ background:#efefef; text-align:left; }}
                 newreg_amount_var.set(txt)
             else:
                 newreg_amount_var.set("+" + txt)
-            if _is_giro_label(newreg_cat_var.get()):
-                newreg_sign_var.set("-" if amt < 0 else "+")
+            newreg_sign_var.set("-" if amt < 0 else "+")
         except Exception:
             pass
 
@@ -16323,12 +16316,6 @@ th {{ background:#efefef; text-align:left; }}
             except Exception:
                 pass
             return None
-        if giro:
-            pass
-        elif newreg_sign_var.get() == "-":
-            amt = -abs(amt)
-        else:
-            amt = abs(amt)
         if amt == Decimal("0.00") and not saldo_aggiorna_locked[0]:
             messagebox.showerror("Nuova registrazione", "Importo a zero non ammesso.")
             try:
@@ -17222,16 +17209,9 @@ th {{ background:#efefef; text-align:left; }}
             return
         try:
             amt = normalize_euro_input(raw)
-            if _is_giro_label(per_cat_var.get()):
-                pass
-            elif per_sign_var.get() == "-":
-                amt = -abs(amt)
-            else:
-                amt = abs(amt)
             txt = format_euro_it(abs(amt))
             per_amount_var.set(("-" if amt < 0 else "+") + txt)
-            if _is_giro_label(per_cat_var.get()):
-                per_sign_var.set("-" if amt < 0 else "+")
+            per_sign_var.set("-" if amt < 0 else "+")
         except Exception:
             pass
 
@@ -17510,12 +17490,6 @@ th {{ background:#efefef; text-align:left; }}
             except Exception:
                 pass
             return None
-        if giro:
-            pass
-        elif per_sign_var.get() == "-":
-            amt = -abs(amt)
-        else:
-            amt = abs(amt)
         if amt == Decimal("0.00"):
             messagebox.showerror("Registrazioni periodiche", "Importo a zero non ammesso.")
             try:
@@ -18245,10 +18219,6 @@ th {{ background:#efefef; text-align:left; }}
             amt_chk = normalize_euro_input(raw)
             if _is_giro_label(per_cat_var.get()):
                 amt_chk = -abs(amt_chk)
-            elif per_sign_var.get() == "-":
-                amt_chk = -abs(amt_chk)
-            else:
-                amt_chk = abs(amt_chk)
             if amt_chk == Decimal("0.00"):
                 return "break"
         except Exception:
@@ -18656,8 +18626,6 @@ th {{ background:#efefef; text-align:left; }}
             amt_chk = normalize_euro_input(raw)
             if _is_giro_label(newreg_cat_var.get()):
                 amt_chk = -abs(amt_chk)
-            else:
-                amt_chk = -abs(amt_chk) if newreg_sign_var.get() == "-" else abs(amt_chk)
             if amt_chk == Decimal("0.00"):
                 return "break"
         except Exception:
