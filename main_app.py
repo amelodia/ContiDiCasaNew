@@ -8840,20 +8840,33 @@ def build_ui(
         except Exception:
             pass
 
+    _is_macos_ui = platform.system() == "Darwin"
     main_nb_shell = tk.Frame(root, bg=MOVIMENTI_PAGE_BG)
-    main_nb_shell.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+    main_nb_shell.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 6) if _is_macos_ui else 8)
     cdc_tab_bar = tk.Frame(main_nb_shell, bg=MOVIMENTI_PAGE_BG)
-    cdc_tab_bar.pack(fill=tk.X, pady=(0, 6))
+    cdc_tab_bar.pack(fill=tk.X, pady=(0, 2 if _is_macos_ui else 6))
     cdc_tab_bar.columnconfigure(0, weight=1)
     cdc_tab_bar.columnconfigure(2, weight=1)
     cdc_tab_btn_row = tk.Frame(cdc_tab_bar, bg=MOVIMENTI_PAGE_BG)
-    cdc_tab_btn_row.grid(row=0, column=1, sticky="")
+    cdc_tab_btn_row.grid(row=1 if _is_macos_ui else 0, column=1, sticky="")
     cdc_content = tk.Frame(main_nb_shell, bg=MOVIMENTI_PAGE_BG)
     cdc_content.pack(fill=tk.BOTH, expand=True)
     cdc_content.rowconfigure(0, weight=1)
     cdc_content.columnconfigure(0, weight=1)
 
     _TAB_BAR_FONT = _ui_font_tuple(13, "bold")
+    if _is_macos_ui:
+        mac_fullscreen_title_label = tk.Label(
+            cdc_tab_bar,
+            text=window_title_for_session(db_holder[0], session_holder[0], show_clock=True),
+            font=("Helvetica Neue", 12, "bold"),
+            bg=MOVIMENTI_PAGE_BG,
+            fg="#111111",
+            anchor=tk.CENTER,
+            highlightthickness=0,
+        )
+        mac_fullscreen_title_label.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 1))
+        _BANNER_CLOCK_LABELS.append(mac_fullscreen_title_label)
     _nb_style = ttk.Style(root)
     _nb_style.configure("MovCdc.TFrame", background=MOVIMENTI_PAGE_BG, fieldbackground=MOVIMENTI_PAGE_BG)
     _nb_style.configure(
@@ -9092,7 +9105,7 @@ def build_ui(
             bg=security_auth.CDC_TIPO_TASTI_BTN_BG,
             fg=security_auth.CDC_TIPO_TASTI_BTN_FG,
             padx=14,
-            pady=8,
+            pady=4 if _is_macos_ui else 8,
             cursor="hand2",
             relief=tk.RAISED,
             bd=CDC_FILTER_TAB_CHIP_BD,
