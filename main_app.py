@@ -12623,6 +12623,7 @@ th {{ background:#efefef; text-align:left; }}
 
     _CERCA_GREEN = "#2e7d32"
     _CERCA_GREEN_ACTIVE = "#1b5e20"
+    _CERCA_FG = "#ffffff"
     _MOV_PULISCI_ACCEDI_BG = "#1565c0"
     _MOV_PULISCI_ACCEDI_HOVER_BG = "#0d47a1"
     cerca_wrap = tk.Frame(filters_top_inner, highlightthickness=0, bg=MOVIMENTI_PAGE_BG)
@@ -12636,7 +12637,7 @@ th {{ background:#efefef; text-align:left; }}
         padx=6,
         pady=_mov_filter_btn_pady,
         bg=_CERCA_GREEN,
-        fg="#ffffff",
+        fg=_CERCA_FG,
         relief=tk.RAISED,
         bd=1,
     )
@@ -31128,6 +31129,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         "mov_btn_espandi_hover_bg": _ESPANDI_ELENCO_BG_ACT,
         "mov_btn_cerca_bg": _CERCA_GREEN,
         "mov_btn_cerca_hover_bg": _CERCA_GREEN_ACTIVE,
+        "mov_btn_cerca_fg": _CERCA_FG,
         "mov_pulisci_accedi_bg": _MOV_PULISCI_ACCEDI_BG,
         "mov_pulisci_accedi_hover_bg": _MOV_PULISCI_ACCEDI_HOVER_BG,
         "ver_grid_amount_pos_fg": _VER_GRID_AMT_POS_FG,
@@ -31250,7 +31252,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         nonlocal _CORREZIONE_BLUE
         nonlocal _RIPRISTINA_LAYOUT_BG, _RIPRISTINA_LAYOUT_BG_ACT
         nonlocal _ESPANDI_ELENCO_BG, _ESPANDI_ELENCO_BG_ACT
-        nonlocal _CERCA_GREEN, _CERCA_GREEN_ACTIVE
+        nonlocal _CERCA_GREEN, _CERCA_GREEN_ACTIVE, _CERCA_FG
         nonlocal _MOV_PULISCI_ACCEDI_BG, _MOV_PULISCI_ACCEDI_HOVER_BG
         nonlocal _VER_GRID_AMT_POS_FG, _VER_GRID_AMT_NEG_FG, _VER_GRID_AMT_ZERO_FG
         nonlocal _VER_PENDING_BTN_EDIT_BG, _VER_PENDING_BTN_DEL_BG, _VER_PENDING_BTN_NEW_BG, _VER_PENDING_BTN_CLEARSEL_BG
@@ -31557,6 +31559,12 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                     pass
             elif token == "mov_btn_cerca_hover_bg":
                 _CERCA_GREEN_ACTIVE = h
+            elif token == "mov_btn_cerca_fg":
+                _CERCA_FG = h
+                try:
+                    lbl_cerca.configure(fg=h)
+                except tk.TclError:
+                    pass
             elif token == "mov_pulisci_accedi_bg":
                 _MOV_PULISCI_ACCEDI_BG = h
                 try:

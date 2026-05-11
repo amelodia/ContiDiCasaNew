@@ -38,6 +38,7 @@ def _extras_defaults_synced_with_build_ui() -> dict[str, str]:
         "mov_btn_espandi_hover_bg": "#004d40",
         "mov_btn_cerca_bg": "#2e7d32",
         "mov_btn_cerca_hover_bg": "#1b5e20",
+        "mov_btn_cerca_fg": "#ffffff",
         "mov_pulisci_accedi_bg": "#1565c0",
         "mov_pulisci_accedi_hover_bg": "#0d47a1",
         "ver_grid_amount_pos_fg": "#156716",
@@ -167,6 +168,7 @@ def main() -> int:
             "mov_btn_espandi_hover_bg": "_ESPANDI_ELENCO_BG_ACT",
             "mov_btn_cerca_bg": "_CERCA_GREEN",
             "mov_btn_cerca_hover_bg": "_CERCA_GREEN_ACTIVE",
+            "mov_btn_cerca_fg": "_CERCA_FG",
             "mov_pulisci_accedi_bg": "_MOV_PULISCI_ACCEDI_BG",
             "mov_pulisci_accedi_hover_bg": "_MOV_PULISCI_ACCEDI_HOVER_BG",
         }

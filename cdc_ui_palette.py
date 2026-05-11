@@ -90,6 +90,7 @@ PALETTE_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
             ("mov_btn_espandi_hover_bg", "«Espandi ricerca» / «Torna a filtri e saldi» hover"),
             ("mov_btn_cerca_bg", "«Cerca»"),
             ("mov_btn_cerca_hover_bg", "«Cerca» hover"),
+            ("mov_btn_cerca_fg", "Testo «Cerca»"),
             (
                 "mov_pulisci_accedi_bg",
                 "«Pulisci filtri» (Movimenti), «Accedi» (login), «Cancella valori» (Nuova registrazione e Periodiche)",
