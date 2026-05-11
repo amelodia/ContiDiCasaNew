@@ -9,7 +9,7 @@ Il terzo numero (**APP_VERSION_BUILD**) viene incrementato automaticamente esegu
 oppure compilando con PyInstaller tramite ``ContiDiCasa.spec``.
 """
 
-APP_VERSION_MAJOR = 1
-APP_VERSION_MINOR = 0
-APP_VERSION_BUILD = 118
+APP_VERSION_MAJOR = 11
+APP_VERSION_MINOR = 1
+APP_VERSION_BUILD = 1
 APP_VERSION = f"{APP_VERSION_MAJOR}.{APP_VERSION_MINOR}.{APP_VERSION_BUILD}"
