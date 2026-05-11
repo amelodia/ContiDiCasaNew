@@ -9248,7 +9248,7 @@ def build_ui(
     filters_top_inner.pack(anchor=tk.CENTER)
 
     filters_search_row = ttk.Frame(movimenti_body, style="MovCdc.TFrame")
-    filters_search_row.pack(fill=tk.X, pady=(0, 1))
+    filters_search_row.pack(fill=tk.X, pady=(0, 0 if _is_macos_ui else 1))
 
     # Riga controlli per Ricerca per registrazione (visibile solo in quella modalità)
     reg_controls_row = ttk.Frame(filters_search_row, style="MovCdc.TFrame")
@@ -9263,7 +9263,7 @@ def build_ui(
     filters_text_inner.pack(anchor=tk.CENTER)
 
     # Zona filtri: compatta, per restare visibile anche con metrica font diversa tra macOS e Windows.
-    filter_ui_font = _ui_font_tuple(10, "bold")
+    filter_ui_font = _ui_font_tuple(9 if _is_macos_ui else 10, "bold")
     ttk.Style(root).configure("Filters.TLabel", font=filter_ui_font)
     ttk.Style(root).configure("Filters.TEntry", font=filter_ui_font)
     ttk.Style(root).configure("Filters.TCombobox", font=filter_ui_font)
@@ -9326,6 +9326,7 @@ def build_ui(
         _mov_refresh_aggregate_category_button_caption()
         apply_movement_search()
 
+    _mov_filter_btn_pady = 2 if _is_macos_ui else 3
     mov_aggregate_cat_btn = tk.Label(
         filters_text_inner,
         text="Aggrega",
@@ -9333,7 +9334,7 @@ def build_ui(
         highlightthickness=0,
         font=filter_ui_font,
         padx=8,
-        pady=3,
+        pady=_mov_filter_btn_pady,
         bg=_MOV_AGG_CAT_BTN_BG,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -9492,7 +9493,7 @@ def build_ui(
         highlightthickness=0,
         font=filter_ui_font,
         padx=8,
-        pady=3,
+        pady=_mov_filter_btn_pady,
     )
     reg_btn_all = tk.Label(
         reg_controls_inner,
@@ -9501,7 +9502,7 @@ def build_ui(
         highlightthickness=0,
         font=filter_ui_font,
         padx=8,
-        pady=3,
+        pady=_mov_filter_btn_pady,
     )
     reg_btn_last12.pack(side=tk.LEFT, padx=(0, 6))
     reg_btn_all.pack(side=tk.LEFT, padx=(0, 10))
@@ -9670,7 +9671,11 @@ def build_ui(
         ):
             text_account_preview_var.set(_ALL_ACCOUNTS_LABEL)
 
-    records_frame = ttk.Frame(movimenti_body, padding=(8, 2, 8, 4), style="MovCdc.TFrame")
+    records_frame = ttk.Frame(
+        movimenti_body,
+        padding=(8, 0 if _is_macos_ui else 2, 8, 2 if _is_macos_ui else 4),
+        style="MovCdc.TFrame",
+    )
     records_frame.pack(fill=tk.BOTH, expand=True)
 
     search_title_var = tk.StringVar(value="")
@@ -10393,8 +10398,9 @@ def build_ui(
     _CORREZIONE_BLUE = "#1565c0"
     correzione_row = tk.Frame(records_frame, bg=MOVIMENTI_PAGE_BG)
     corr_left_btns = tk.Frame(correzione_row, bg=MOVIMENTI_PAGE_BG)
-    _RIPRISTINA_LAYOUT_BG = "#1565c0"
-    _RIPRISTINA_LAYOUT_BG_ACT = "#0d47a1"
+    _mov_correction_btn_pady = 4 if _is_macos_ui else 7
+    _RIPRISTINA_LAYOUT_BG = "#00695c"
+    _RIPRISTINA_LAYOUT_BG_ACT = "#004d40"
     btn_mov_griglia_ripristina = tk.Label(
         corr_left_btns,
         text="Torna a filtri e saldi",
@@ -10402,7 +10408,7 @@ def build_ui(
         highlightthickness=0,
         font=filter_ui_font,
         padx=14,
-        pady=7,
+        pady=_mov_correction_btn_pady,
         bg=_RIPRISTINA_LAYOUT_BG,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -10426,7 +10432,7 @@ def build_ui(
         highlightthickness=0,
         font=filter_ui_font,
         padx=14,
-        pady=7,
+        pady=_mov_correction_btn_pady,
         bg=_PRINT_RICERCA_RED,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -10441,7 +10447,7 @@ def build_ui(
         highlightthickness=0,
         font=filter_ui_font,
         padx=14,
-        pady=7,
+        pady=_mov_correction_btn_pady,
         bg=_ESPANDI_ELENCO_BG,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -10468,7 +10474,7 @@ def build_ui(
         highlightthickness=0,
         font=filter_ui_font,
         padx=14,
-        pady=7,
+        pady=_mov_correction_btn_pady,
         bg=_CORREZIONE_BLUE,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -10488,7 +10494,7 @@ def build_ui(
         highlightthickness=0,
         font=filter_ui_font,
         padx=14,
-        pady=7,
+        pady=_mov_correction_btn_pady,
         bg=_PRINT_RICERCA_RED,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -10501,7 +10507,7 @@ def build_ui(
         highlightthickness=0,
         font=filter_ui_font,
         padx=14,
-        pady=7,
+        pady=_mov_correction_btn_pady,
         bg=_PRINT_RICERCA_RED,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -11616,10 +11622,10 @@ th {{ background:#efefef; text-align:left; }}
     records_frame.grid_rowconfigure(1, weight=0)
     records_frame.grid_rowconfigure(2, weight=0)
     records_frame.grid_rowconfigure(3, weight=1)
-    search_title_row.grid(row=0, column=0, columnspan=6, sticky="ew", pady=(0, 6))
-    correzione_row.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(0, 4))
+    search_title_row.grid(row=0, column=0, columnspan=6, sticky="ew", pady=(0, 2 if _is_macos_ui else 6))
+    correzione_row.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(0, 2 if _is_macos_ui else 4))
     corr_left_btns.grid(row=0, column=0, sticky="w", padx=(0, 10))
-    mov_records_header_row.grid(row=2, column=0, columnspan=6, sticky="ew", pady=(0, 2))
+    mov_records_header_row.grid(row=2, column=0, columnspan=6, sticky="ew", pady=(0, 0 if _is_macos_ui else 2))
     mov_hdr.grid(row=0, column=0, sticky="ew")
     hdr_sep_1.grid(row=0, column=1, sticky="nsw")
     amt_hdr.grid(row=0, column=2, sticky="ew")
@@ -11705,8 +11711,8 @@ th {{ background:#efefef; text-align:left; }}
             movimenti_main_stack.rowconfigure(0, weight=1, minsize=0)
             movimenti_main_stack.rowconfigure(1, weight=0, minsize=0)
             filters_row.pack(fill=tk.X, pady=(0, 0), before=records_frame)
-            filters_search_row.pack(fill=tk.X, pady=(0, 1), before=records_frame)
-            filters_text_row.pack(fill=tk.X, pady=(0, 1), before=records_frame)
+            filters_search_row.pack(fill=tk.X, pady=(0, 0 if _is_macos_ui else 1), before=records_frame)
+            filters_text_row.pack(fill=tk.X, pady=(0, 0 if _is_macos_ui else 1), before=records_frame)
             balance_footer.grid(row=1, column=0, sticky="ew")
             records_frame.pack(fill=tk.BOTH, expand=True)
             try:
@@ -12170,7 +12176,7 @@ th {{ background:#efefef; text-align:left; }}
         highlightthickness=0,
         font=filter_ui_font,
         padx=7,
-        pady=3,
+        pady=_mov_filter_btn_pady,
     )
     btn_order_reg = tk.Label(
         g1,
@@ -12179,7 +12185,7 @@ th {{ background:#efefef; text-align:left; }}
         highlightthickness=0,
         font=filter_ui_font,
         padx=7,
-        pady=3,
+        pady=_mov_filter_btn_pady,
     )
     btn_order_date.bind("<Button-1>", lambda _e: pick_order("date"))
     btn_order_reg.bind("<Button-1>", lambda _e: pick_order("registration"))
@@ -12195,7 +12201,7 @@ th {{ background:#efefef; text-align:left; }}
         highlightthickness=0,
         font=filter_ui_font,
         padx=7,
-        pady=3,
+        pady=_mov_filter_btn_pady,
     )
     btn_future_exclude = tk.Label(
         g2,
@@ -12204,7 +12210,7 @@ th {{ background:#efefef; text-align:left; }}
         highlightthickness=0,
         font=filter_ui_font,
         padx=7,
-        pady=3,
+        pady=_mov_filter_btn_pady,
     )
     btn_future_include.bind("<Button-1>", lambda _e: pick_future("include"))
     btn_future_exclude.bind("<Button-1>", lambda _e: pick_future("exclude"))
@@ -12220,7 +12226,7 @@ th {{ background:#efefef; text-align:left; }}
         highlightthickness=0,
         font=filter_ui_font,
         padx=7,
-        pady=3,
+        pady=_mov_filter_btn_pady,
     )
     btn_dir_forward = tk.Label(
         g3,
@@ -12229,7 +12235,7 @@ th {{ background:#efefef; text-align:left; }}
         highlightthickness=0,
         font=filter_ui_font,
         padx=7,
-        pady=3,
+        pady=_mov_filter_btn_pady,
     )
     btn_dir_backward.bind("<Button-1>", lambda _e: pick_direction("backward"))
     btn_dir_forward.bind("<Button-1>", lambda _e: pick_direction("forward"))
@@ -12628,7 +12634,7 @@ th {{ background:#efefef; text-align:left; }}
         font=filter_ui_font,
         width=7,
         padx=6,
-        pady=3,
+        pady=_mov_filter_btn_pady,
         bg=_CERCA_GREEN,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -12653,7 +12659,7 @@ th {{ background:#efefef; text-align:left; }}
         font=filter_ui_font,
         width=7,
         padx=6,
-        pady=3,
+        pady=_mov_filter_btn_pady,
         bg=_MOV_PULISCI_ACCEDI_BG,
         fg="#ffffff",
         relief=tk.RAISED,
@@ -13207,7 +13213,7 @@ th {{ background:#efefef; text-align:left; }}
             reg_controls_row.pack_forget()
             date_controls_left.pack(anchor=tk.CENTER)
             # Re-pack before grid area so it doesn't end up after it.
-            filters_text_row.pack(fill=tk.X, pady=(0, 1), before=records_frame)
+            filters_text_row.pack(fill=tk.X, pady=(0, 0 if _is_macos_ui else 1), before=records_frame)
             refresh_category_account_dropdowns()
         elif mode == "registration":
             date_controls_left.pack_forget()
@@ -13339,7 +13345,7 @@ th {{ background:#efefef; text-align:left; }}
             highlightthickness=0,
             font=filter_ui_font,
             padx=7,
-            pady=3,
+            pady=_mov_filter_btn_pady,
         )
         b.bind("<Button-1>", lambda _e, _pid=pid: pick_date_preset(_pid))
         b.pack(side=tk.LEFT, padx=(0, 6))
