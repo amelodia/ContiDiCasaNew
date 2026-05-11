@@ -145,6 +145,36 @@ def _load_login_euro_photo(*, max_side: int) -> tk.PhotoImage | None:
     return _load_login_euro_from_jpeg_bytes(raw, max_side=max_side)
 
 
+def pulse_login_loading_window(win: tk.Misc | None) -> None:
+    """Mantiene visibile cursore «busy» e messaggio di caricamento sulla finestra login (se ancora aperta).
+
+    Utile durante operazioni lunghe (es. ricarico .enc dopo l’accesso) anche senza passare da errori su email/password.
+    """
+    if win is None:
+        return
+    try:
+        if not win.winfo_exists():
+            return
+    except tk.TclError:
+        return
+    try:
+        win.lift()
+        win.configure(cursor="watch")
+    except Exception:
+        pass
+    lbl = getattr(win, "_cdc_login_loading_label", None)
+    if lbl is not None:
+        try:
+            lbl.configure(fg=CDC_TIPO_TASTI_BTN_FG)
+        except Exception:
+            pass
+    try:
+        win.update_idletasks()
+        win.update()
+    except Exception:
+        pass
+
+
 def _present_modal_dialog(win: tk.Toplevel, parent: tk.Tk) -> None:
     """Porta in primo piano la finestra modale (utile su macOS)."""
     try:
@@ -662,24 +692,65 @@ def run_login_dialog(
         except Exception:
             pass
 
+    def _refocus_login_after_field_error(*, focus_email: bool = False) -> None:
+        """Dopo messagebox su errori di immissione: restituisce grab/focus alla finestra login (macOS)."""
+
+        def _go() -> None:
+            try:
+                win.lift()
+            except Exception:
+                pass
+            if platform.system() == "Darwin":
+                try:
+                    win.attributes("-topmost", True)
+                    win.after(150, lambda: win.attributes("-topmost", False))
+                except Exception:
+                    pass
+            try:
+                win.focus_force()
+            except Exception:
+                pass
+            try:
+                win.grab_set()
+            except Exception:
+                pass
+            try:
+                if focus_email:
+                    ent_email.focus_set()
+                    ent_email.icursor(tk.END)
+                else:
+                    ent_pw.focus_set()
+                    ent_pw.icursor(tk.END)
+            except Exception:
+                pass
+
+        try:
+            win.after(1, _go)
+        except Exception:
+            _go()
+
     def do_login() -> None:
         if success_in_progress[0]:
             return
         ensure_security(db)
         up_now = db["user_profile"]
         if not (up_now.get("password_hash") or "").strip():
-            messagebox.showerror("Accesso", "Profilo non inizializzato.")
+            messagebox.showerror("Accesso", "Profilo non inizializzato.", parent=win)
+            _refocus_login_after_field_error(focus_email=True)
             return
         em = (email_var.get() or "").strip().lower()
         pw = pw_var.get() or ""
         if not em or not pw:
-            messagebox.showerror("Accesso", "Inserisci email e password.")
+            messagebox.showerror("Accesso", "Inserisci email e password.", parent=win)
+            _refocus_login_after_field_error(focus_email=not bool(em))
             return
         if em != (up_now.get("email") or "").strip().lower():
-            messagebox.showerror("Accesso", "Email non riconosciuta.")
+            messagebox.showerror("Accesso", "Email non riconosciuta.", parent=win)
+            _refocus_login_after_field_error(focus_email=True)
             return
         if not verify_password(up_now, pw):
-            messagebox.showerror("Accesso", "Password non corretta.")
+            messagebox.showerror("Accesso", "Password non corretta.", parent=win)
+            _refocus_login_after_field_error(focus_email=False)
             return
         verified = bool(up_now.get("registration_verified"))
         sess = AppSession(
@@ -880,6 +951,10 @@ def run_login_dialog(
     loading_label.grid(row=0, column=0, sticky="", pady=(8, 2))
     # Riserva lo spazio già alla prima apertura: quando compare il testo, il dialog non cambia dimensione.
     loading_row.grid(row=email_row + 5, column=0, columnspan=2, sticky="we", pady=(4, 0))
+    try:
+        win._cdc_login_loading_label = loading_label  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
     def _show_login_loading_indicator() -> None:
         try:

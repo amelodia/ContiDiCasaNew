@@ -16546,9 +16546,38 @@ th {{ background:#efefef; text-align:left; }}
         return True
 
     def _clear_values() -> None:
-        if not messagebox.askyesno("Cancella valori", "Confermi cancellazione valori immessi?"):
+        if not messagebox.askyesno(
+            "Cancella valori", "Confermi cancellazione valori immessi?", parent=root
+        ):
             return
         _populate_form_defaults(keep_last=False)
+
+        def _defer_newreg_amount_focus_after_clear() -> None:
+            try:
+                if nuovi_submode[0] != "new":
+                    return
+                ent_amt.focus_set()
+                try:
+                    ent_amt.focus_force()
+                except Exception:
+                    pass
+                ent_amt.selection_clear()
+                ra = (newreg_amount_var.get() or "").strip()
+                if ra in ("+", "-"):
+                    ent_amt.icursor(1)
+                else:
+                    ent_amt.icursor(tk.END)
+                try:
+                    root.update_idletasks()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        try:
+            root.after_idle(lambda: root.after(1, _defer_newreg_amount_focus_after_clear))
+        except Exception:
+            _defer_newreg_amount_focus_after_clear()
 
     per_edit_rule_id: list[str | None] = [None]
     # Dopo «Modifica (per le registrazioni future)»: cambiando riga nel grid il modulo segue la selezione.
@@ -33554,12 +33583,15 @@ def main() -> None:
         except Exception:
             pass
 
+    security_auth.pulse_login_loading_window(login_window_holder[0])
     path_holder[0] = migrate_data_path_after_login(db_holder[0], session, path_holder[0])
+    security_auth.pulse_login_loading_window(login_window_holder[0])
     if session.entered_via_backdoor:
         security_auth.ensure_security(db_holder[0])
         session.is_registered = bool(
             (db_holder[0].get("user_profile") or {}).get("registration_verified")
         )
+    security_auth.pulse_login_loading_window(login_window_holder[0])
     try:
         build_ui(db_holder[0], root, session, path_holder, key_path_holder)
     except Exception:
