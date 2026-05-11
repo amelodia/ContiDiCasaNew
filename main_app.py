@@ -8765,14 +8765,10 @@ def build_ui(
     _main_window_presented: list[bool] = [False]
     login_window_to_close = getattr(root, "_cdc_login_window_to_close", None)
 
-    def _apply_macos_maximized_geometry() -> None:
-        """Tk/Aqua spesso ignora ``state("zoomed")``: forza la geometria dopo il map della finestra."""
+    def _apply_macos_fullscreen_window() -> None:
+        """Tk/Aqua ignora spesso ``state("zoomed")``: usa il fullscreen nativo dopo il map."""
         if platform.system() != "Darwin":
             return
-        try:
-            root.attributes("-fullscreen", False)
-        except Exception:
-            pass
         try:
             sw = max(1, int(root.winfo_vrootwidth() or root.winfo_screenwidth()))
             sh = max(1, int(root.winfo_vrootheight() or root.winfo_screenheight()))
@@ -8794,6 +8790,10 @@ def build_ui(
                 _try_zoom()
             except Exception:
                 pass
+        try:
+            root.attributes("-fullscreen", True)
+        except Exception:
+            pass
 
     def _present_main_window_once() -> None:
         """Mostra la finestra appena la pagina iniziale è usabile; chiamate successive sono no-op."""
@@ -8802,7 +8802,7 @@ def build_ui(
         _main_window_presented[0] = True
         try:
             if platform.system() == "Darwin":
-                _apply_macos_maximized_geometry()
+                _apply_macos_fullscreen_window()
             else:
                 root.geometry("1200x760")
                 try:
@@ -8811,7 +8811,7 @@ def build_ui(
                     pass
             root.deiconify()
             if platform.system() == "Darwin":
-                _apply_macos_maximized_geometry()
+                _apply_macos_fullscreen_window()
             root.lift()
             root.focus_force()
             root.update_idletasks()
@@ -8821,9 +8821,9 @@ def build_ui(
                 except Exception:
                     pass
             if platform.system() == "Darwin":
-                for _delay in (50, 250, 700):
+                for _delay in (50, 250, 700, 1400):
                     try:
-                        root.after(_delay, _apply_macos_maximized_geometry)
+                        root.after(_delay, _apply_macos_fullscreen_window)
                     except tk.TclError:
                         pass
 
