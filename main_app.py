@@ -2423,6 +2423,34 @@ def resolve_estratto_pdf_for_account(
     return None, "\n".join(lines)
 
 
+def ver_auto_pdf_missing_user_message(db: dict, acc_code: str, cutoff_raw_ggmmyyyy: str) -> str:
+    """Testo utente quando il PDF automatico non risulta nella cartella radice (cartella da impostazioni Conti / Verifica automatica)."""
+    root_raw = (estratti_pdf_settings_from_db(db).get("root_folder") or "").strip()
+    folder_disp = root_raw or "(non impostata)"
+    if root_raw:
+        try:
+            r = Path(root_raw).expanduser().resolve()
+            if r.is_dir():
+                folder_disp = str(r)
+        except Exception:
+            folder_disp = root_raw
+
+    stem = (account_estratti_pdf_stem_for_code(db, acc_code) or "").strip()
+    if not stem:
+        file_disp = "(nome base file PDF mancante in Conti).pdf"
+    else:
+        iso = parse_italian_ddmmyyyy_to_iso((cutoff_raw_ggmmyyyy or "").strip())
+        if not iso:
+            file_disp = f"{stem} ….pdf"
+        else:
+            dco = date.fromisoformat(iso)
+            allow_next = account_is_credit_card_by_code(db, acc_code)
+            cut_m = min(12, dco.month + (1 if allow_next else 0))
+            file_disp = f"{stem} {cut_m:02d}.pdf"
+
+    return f"File «{file_disp}» non trovato nella cartella «{folder_disp}»."
+
+
 def _ver_account_expects_auto_estratto_pdf(db: dict, acc_code: str) -> bool:
     """True se in Conti è impostato il nome base PDF e in Opzioni la cartella radice (ricerca automatica prevista)."""
     if not (account_estratti_pdf_stem_for_code(db, acc_code) or "").strip():
@@ -18782,6 +18810,7 @@ th {{ background:#efefef; text-align:left; }}
     _VER_FOOT_CYCLE_BG = "#ef6c00"
     _VER_FOOT_CLOSE_BG = "#c62828"
     _VER_ACTION_BTN_FONT = ("TkDefaultFont", 15, "bold")
+    # Messaggio unico ricerca PDF automatica (dopo data di chiusura e scelta cartella).
 
     _ver_res_style = ttk.Style()
     _ver_res_style.configure(
@@ -18892,6 +18921,8 @@ th {{ background:#efefef; text-align:left; }}
     ver_accounts_declined_memory_keep: list[set[str]] = [set()]
     # Coalescing trace su data/PDF nella schermata setup verifica (evita raffiche di callback).
     ver_setup_buttons_trace_after: list[str | None] = [None]
+    ver_setup_autostart_after: list[str | None] = [None]
+    ver_autostart_in_flight: list[bool] = [False]
     # Ritardo post-«Ricerca automatica PDF»: annullabile se l'utente cambia conto prima dell'avvio.
     ver_auto_start_defer_after: list[str | None] = [None]
     # Dialogo ripresa memoria senza tasti intermedi: schedulato dopo selezione conto / ingresso tab.
@@ -19233,9 +19264,50 @@ th {{ background:#efefef; text-align:left; }}
             return
         ver_mode_choice[0] = "auto"
         _ver_refresh_mode_chips_style()
-        _ver_show_auto_folder_box(True)
+        try:
+            _ver_populate_account_combo()
+        except Exception:
+            pass
+        try:
+            vals = ver_acc_combo.cget("values") or ()
+        except Exception:
+            vals = ()
+        if isinstance(vals, str):
+            vals = (vals,) if vals.strip() else ()
+        if not vals:
+            p_win = _ver_activate_ui_for_modal_dialog()
+            messagebox.showwarning(
+                "Verifica automatica da PDF",
+                "Nessun conto è stato predisposto per la verifica automatica da PDF.\n\n"
+                "Nella pagina Opzioni, scheda Conti, va compilato il nome base file per l’estratto PDF "
+                "di almeno un conto.",
+                parent=p_win,
+            )
+            ver_mode_choice[0] = "manual"
+            _ver_refresh_mode_chips_style()
+            try:
+                _ver_populate_account_combo()
+            except Exception:
+                pass
+            try:
+                _ver_setup_start_buttons_state()
+            except Exception:
+                pass
+            try:
+                _ver_schedule_setup_autostart()
+            except Exception:
+                pass
+            try:
+                _ver_sync_mode_chips_lock_for_cutoff()
+            except Exception:
+                pass
+            return
         try:
             _ver_setup_start_buttons_state()
+        except Exception:
+            pass
+        try:
+            _ver_schedule_setup_autostart()
         except Exception:
             pass
 
@@ -19244,9 +19316,16 @@ th {{ background:#efefef; text-align:left; }}
             return
         ver_mode_choice[0] = "manual"
         _ver_refresh_mode_chips_style()
-        _ver_show_auto_folder_box(False)
+        try:
+            _ver_populate_account_combo()
+        except Exception:
+            pass
         try:
             _ver_setup_start_buttons_state()
+        except Exception:
+            pass
+        try:
+            _ver_schedule_setup_autostart()
         except Exception:
             pass
 
@@ -19319,6 +19398,10 @@ th {{ background:#efefef; text-align:left; }}
                 _ver_setup_start_buttons_state()
             except Exception:
                 pass
+            try:
+                _ver_sync_mode_chips_lock_for_cutoff()
+            except Exception:
+                pass
 
         top = build_immissione_calendar_toplevel(
             root, title="Data chiusura estratto conto", anchor=ver_cutoff_entry,
@@ -19357,6 +19440,10 @@ th {{ background:#efefef; text-align:left; }}
                 ver_cutoff_entry.icursor(0)
             except Exception:
                 pass
+            try:
+                _ver_sync_mode_chips_lock_for_cutoff()
+            except Exception:
+                pass
             return
         _open_ver_cutoff_calendar()
 
@@ -19365,27 +19452,43 @@ th {{ background:#efefef; text-align:left; }}
     def _ver_validate_cutoff_on_focusout(_e: tk.Event | None = None) -> None:
         raw = ver_cutoff_date_var.get().strip()
         if not raw or raw == "__/__/____":
+            try:
+                _ver_sync_mode_chips_lock_for_cutoff()
+            except Exception:
+                pass
             return
         try:
             iso = parse_italian_ddmmyyyy_to_iso(raw)
             d = date.fromisoformat(iso)
         except Exception:
-            messagebox.showerror("Verifica", "Data non valida (formato gg/mm/aaaa).")
+            messagebox.showerror("Verifica", "Data non valida.", parent=verifica_frame.winfo_toplevel())
             ver_cutoff_date_var.set("")
+            try:
+                _ver_sync_mode_chips_lock_for_cutoff()
+            except Exception:
+                pass
             return
         dmin, dmax = _ver_cutoff_date_bounds()
         if d < dmin or d > dmax:
             messagebox.showerror(
                 "Verifica",
-                f"Data fuori intervallo.\n"
-                f"Ammesse dal {to_italian_date(dmin.isoformat())} al {to_italian_date(dmax.isoformat())}.",
+                f"Data fuori intervallo ({to_italian_date(dmin.isoformat())}–{to_italian_date(dmax.isoformat())}).",
+                parent=verifica_frame.winfo_toplevel(),
             )
             ver_cutoff_date_var.set("")
+            try:
+                _ver_sync_mode_chips_lock_for_cutoff()
+            except Exception:
+                pass
             return
         ver_cutoff_date_var.set(to_italian_date(iso))
         ver_cutoff_manual_mode[0] = False
         try:
             _ver_setup_start_buttons_state()
+        except Exception:
+            pass
+        try:
+            _ver_sync_mode_chips_lock_for_cutoff()
         except Exception:
             pass
 
@@ -19493,7 +19596,7 @@ th {{ background:#efefef; text-align:left; }}
 
     ver_btn_auto_folder_browse = tk.Label(
         ver_auto_folder_btns,
-        text="Seleziona",
+        text="Cerca nuovo percorso",
         cursor="hand2",
         highlightthickness=0,
         font=_VER_ACTION_BTN_FONT,
@@ -19518,7 +19621,21 @@ th {{ background:#efefef; text-align:left; }}
         relief=tk.RAISED,
         bd=1,
     )
-    ver_btn_auto_folder_confirm.pack(side=tk.LEFT)
+    ver_btn_auto_folder_confirm.pack(side=tk.LEFT, padx=(0, 8))
+    ver_btn_auto_folder_cancel = tk.Label(
+        ver_auto_folder_btns,
+        text="Annulla",
+        cursor="hand2",
+        highlightthickness=0,
+        font=_VER_ACTION_BTN_FONT,
+        padx=12,
+        pady=6,
+        bg=_VER_FOOT_CLOSE_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
+    ver_btn_auto_folder_cancel.pack(side=tk.LEFT)
     ver_auto_folder_note = tk.Label(
         ver_auto_folder_box,
         text=(
@@ -19596,6 +19713,31 @@ th {{ background:#efefef; text-align:left; }}
                 pass
             ver_auto_folder_box_visible[0] = False
 
+    def _ver_on_auto_folder_cancel_click(_e: tk.Event | None = None) -> None:
+        """Esce dalla scelta cartella PDF automatico senza avviare la verifica."""
+        _ver_cancel_setup_autostart_scheduled()
+        ver_pdf_auto_diag_var.set("")
+        ver_setup_pdf_path_after_auto_fail[0] = False
+        try:
+            ver_account_name_var.set("")
+            ver_account_code_var.set("")
+            ver_cutoff_date_var.set("")
+            ver_cutoff_manual_mode[0] = False
+            ver_cutoff_restore_iso[0] = None
+        except tk.TclError:
+            pass
+        _ver_show_auto_folder_box(False)
+        if not ver_session_active[0]:
+            _ver_set_mode_chips_locked(False)
+        try:
+            _ver_setup_start_buttons_state()
+        except Exception:
+            pass
+        try:
+            _ver_sync_mode_chips_lock_for_cutoff()
+        except Exception:
+            pass
+
     def _ver_declined_memory_blocks_new_verification_until_resolved(acc_code: str) -> bool:
         """Dopo Annulla ripresa + No cancellazione: blocca ogni avvio «nuovo» (manuale o PDF) finché la memoria resta."""
         dcl = ver_accounts_declined_memory_keep[0]
@@ -19619,6 +19761,7 @@ th {{ background:#efefef; text-align:left; }}
         return True
 
     def _ver_on_start_auto() -> bool:
+        _ver_cancel_setup_autostart_scheduled()
         ver_mode_choice[0] = "auto"
         try:
             _ver_refresh_mode_chips_style()
@@ -19634,11 +19777,9 @@ th {{ background:#efefef; text-align:left; }}
         ver_auto_start_defer_after[0] = None
         acc_name = ver_account_name_var.get().strip()
         if not acc_name:
-            messagebox.showerror("Verifica", "Seleziona un conto da verificare.")
             return False
         acc_code = _ver_account_code_for_name(acc_name)
         if not acc_code:
-            messagebox.showerror("Verifica", f"Conto '{acc_name}' non trovato.")
             return False
         if _ver_has_saved_session_for_account(acc_code):
             ver_setup_pdf_path_after_auto_fail[0] = False
@@ -19648,31 +19789,39 @@ th {{ background:#efefef; text-align:left; }}
             return False
         cutoff_raw = ver_cutoff_date_var.get().strip()
         if not cutoff_raw:
-            messagebox.showerror("Verifica", "Immetti la data di chiusura dell'estratto conto.")
-            ver_cutoff_entry.focus_set()
             return False
         try:
             parse_italian_ddmmyyyy_to_iso(cutoff_raw)
         except Exception:
-            messagebox.showerror("Verifica", "Data non valida (formato gg/mm/aaaa).")
-            ver_cutoff_entry.focus_set()
             return False
         ver_setup_pdf_path_after_auto_fail[0] = False
         _ver_setup_start_buttons_state()
-        p, diag = resolve_estratto_pdf_for_account(cur_db(), acc_code, cutoff_raw)
+        p, _diag = resolve_estratto_pdf_for_account(cur_db(), acc_code, cutoff_raw)
         try:
             root.update_idletasks()
         except Exception:
             pass
         if not p or not p.is_file():
-            if _ver_account_expects_auto_estratto_pdf(cur_db(), acc_code):
-                ver_setup_pdf_path_after_auto_fail[0] = True
+            ver_setup_pdf_path_after_auto_fail[0] = False
+            try:
                 _ver_setup_start_buttons_state()
-            _ver_report_pdf_load_failure(
-                "Verifica — ricerca automatica PDF",
-                diag + "\n\nIndicare il PDF nel campo sotto (o «Sfoglia…») e premere «Avvia con PDF selezionato».",
+            except Exception:
+                pass
+            stem_chk = (account_estratti_pdf_stem_for_code(cur_db(), acc_code) or "").strip()
+            msg_nf = (
+                "Compilare il nome base file PDF nella pagina Conti per questo conto."
+                if not stem_chk
+                else ver_auto_pdf_missing_user_message(cur_db(), acc_code, cutoff_raw)
             )
+            ver_pdf_auto_diag_var.set(msg_nf)
+            try:
+                p_win = _ver_activate_ui_for_modal_dialog()
+                messagebox.showwarning("Verifica automatica", msg_nf, parent=p_win)
+            except tk.TclError:
+                pass
+            _ver_show_auto_folder_box(True)
             return False
+        _ver_show_auto_folder_box(False)
         ver_pdf_auto_diag_var.set("")
         try:
             root.update_idletasks()
@@ -19697,23 +19846,47 @@ th {{ background:#efefef; text-align:left; }}
         ver_auto_start_defer_after[0] = root.after(350, _defer_ver_start)
         return True
 
+    def _ver_release_possible_stale_grab() -> None:
+        """Dopo filedialog su Windows/macOS a volte resta un grab «fantasma» e i messagebox successivi non rispondono."""
+        for w in (verifica_frame.winfo_toplevel(), root):
+            try:
+                w.grab_release()
+            except tk.TclError:
+                pass
+        try:
+            root.update_idletasks()
+        except tk.TclError:
+            pass
+
     def _ver_browse_estratti_pdf_root_for_auto() -> None:
         init = (estratti_pdf_root_var.get() or "").strip()
-        picked = filedialog.askdirectory(
-            parent=verifica_frame,
-            initialdir=init if init and Path(init).is_dir() else str(Path.home()),
-            title="Cartella radice estratti PDF",
-        )
+        try:
+            picked = filedialog.askdirectory(
+                parent=root,
+                initialdir=init if init and Path(init).is_dir() else str(Path.home()),
+                title="Cartella radice estratti PDF",
+            )
+        finally:
+            try:
+                root.update_idletasks()
+            except tk.TclError:
+                pass
+            try:
+                verifica_frame.winfo_toplevel().lift()
+                verifica_frame.lift()
+            except tk.TclError:
+                pass
         if picked:
             estratti_pdf_root_var.set(picked)
 
     def _ver_confirm_auto_folder_and_start() -> None:
+        p_win = _ver_activate_ui_for_modal_dialog()
         raw = (estratti_pdf_root_var.get() or "").strip()
         if not raw:
             messagebox.showwarning(
                 "Verifica automatica",
-                "Indicare prima la cartella radice degli estratti conto PDF.",
-                parent=verifica_frame,
+                "Indicare una cartella nell'apposito campo o con «Cerca nuovo percorso».",
+                parent=p_win,
             )
             _ver_show_auto_folder_box(True)
             return
@@ -19724,16 +19897,9 @@ th {{ background:#efefef; text-align:left; }}
         if not root_dir.is_dir():
             messagebox.showwarning(
                 "Verifica automatica",
-                "La cartella indicata non esiste o non e accessibile.\n\nSelezionare un percorso valido e riprovare.",
-                parent=verifica_frame,
+                "Cartella non valida o non accessibile.",
+                parent=p_win,
             )
-            _ver_show_auto_folder_box(True)
-            return
-        if not messagebox.askyesno(
-            "Verifica automatica",
-            "Confermare questa cartella per la verifica automatica ed avviare la ricerca PDF?",
-            parent=verifica_frame,
-        ):
             _ver_show_auto_folder_box(True)
             return
         try:
@@ -19747,20 +19913,17 @@ th {{ background:#efefef; text-align:left; }}
         except Exception as exc:
             messagebox.showwarning(
                 "Verifica automatica",
-                f"Impossibile registrare la cartella nel database cifrato:\n{exc}\n\nRiprova.",
-                parent=verifica_frame,
+                f"Salvataggio cartella non riuscito: {exc}",
+                parent=p_win,
             )
             _ver_show_auto_folder_box(True)
             return
-        _ver_show_auto_folder_box(False)
-        if not _ver_on_start_auto():
-            messagebox.showwarning(
-                "Verifica automatica",
-                "Ricerca automatica non avviata: controllare i dati e riprovare.",
-                parent=verifica_frame,
-            )
-            _ver_show_auto_folder_box(True)
-            return
+        _ver_release_possible_stale_grab()
+        _ver_on_start_auto()
+
+    ver_btn_auto_folder_browse.bind("<Button-1>", lambda _e: _ver_browse_estratti_pdf_root_for_auto())
+    ver_btn_auto_folder_confirm.bind("<Button-1>", lambda _e: _ver_confirm_auto_folder_and_start())
+    ver_btn_auto_folder_cancel.bind("<Button-1>", lambda _e: _ver_on_auto_folder_cancel_click())
 
     def _ver_on_start_with_selected_pdf_path() -> None:
         """Dopo ricerca automatica PDF fallita: avvio usando il percorso nel campo / scelto con Sfoglia."""
@@ -19812,6 +19975,7 @@ th {{ background:#efefef; text-align:left; }}
 
     def _ver_on_start_resume(*, explicit_manual: bool = False) -> None:
         """Avvio immissione manuale; se per il conto c'è memoria salvata (PDF e/o sospesi), passa a ``_ver_on_start()``."""
+        _ver_cancel_setup_autostart_scheduled()
         acc_name = ver_account_name_var.get().strip()
         if not acc_name:
             messagebox.showerror("Verifica", "Seleziona un conto da verificare.")
@@ -19840,35 +20004,96 @@ th {{ background:#efefef; text-align:left; }}
         ver_bancoposta_pdf_var.set("")
         _ver_on_start()
 
-    def _ver_on_click_start_auto_folder(_e: tk.Event | None = None) -> None:
-        if ver_mode_chips_locked[0]:
+    def _ver_cancel_setup_autostart_scheduled() -> None:
+        try:
+            tid = ver_setup_autostart_after[0]
+            if tid is not None:
+                root.after_cancel(tid)
+        except Exception:
+            pass
+        ver_setup_autostart_after[0] = None
+        ver_autostart_in_flight[0] = False
+
+    def _ver_schedule_setup_autostart() -> None:
+        if ver_session_active[0]:
             return
-        ver_mode_choice[0] = "auto"
-        _ver_refresh_mode_chips_style()
-        _ver_show_auto_folder_box(True)
-        _ver_setup_start_buttons_state()
+        try:
+            tid = ver_setup_autostart_after[0]
+            if tid is not None:
+                root.after_cancel(tid)
+        except Exception:
+            pass
+        ver_setup_autostart_after[0] = None
 
-    ver_btn_start_auto.bind("<Button-1>", _ver_on_click_start_auto_folder)
+        def _go() -> None:
+            ver_setup_autostart_after[0] = None
+            _ver_run_setup_autostart()
 
-    def _ver_on_click_start_manual_session(_e: tk.Event | None = None) -> None:
-        if ver_mode_chips_locked[0]:
+        try:
+            ver_setup_autostart_after[0] = root.after(150, _go)
+        except Exception:
+            try:
+                root.after_idle(_ver_run_setup_autostart)
+            except Exception:
+                pass
+
+    def _ver_run_setup_autostart() -> None:
+        if ver_session_active[0]:
             return
-        ver_mode_choice[0] = "manual"
-        _ver_refresh_mode_chips_style()
-        _ver_show_auto_folder_box(False)
-        _ver_on_start_resume(explicit_manual=True)
+        try:
+            if ver_auto_start_defer_after[0] is not None:
+                return
+        except Exception:
+            pass
+        if ver_autostart_in_flight[0]:
+            return
+        acc_name = ver_account_name_var.get().strip()
+        acc_code = _ver_account_code_for_name(acc_name) if acc_name else ""
+        if not acc_code or not _ver_has_valid_cutoff_for_setup():
+            return
+        saved_pending = _ver_load_pending_from_db(acc_code)
+        if _ver_saved_has_verification_in_sospeso(saved_pending):
+            return
+        dcl_setup = ver_accounts_declined_memory_keep[0]
+        if acc_code in dcl_setup and _ver_saved_has_verification_in_sospeso(saved_pending):
+            return
 
-    ver_btn_start_manual.bind("<Button-1>", _ver_on_click_start_manual_session)
-    ver_btn_start_with_pdf.bind("<Button-1>", lambda _e: _ver_on_start_with_selected_pdf_path())
-    ver_btn_start_resume.bind("<Button-1>", lambda _e: _ver_on_start_resume(explicit_manual=False))
+        ver_autostart_in_flight[0] = True
+        try:
+            if ver_mode_choice[0] == "manual":
+                _ver_show_auto_folder_box(False)
+                _ver_on_start_resume(explicit_manual=True)
+                return
+
+            root_db = (estratti_pdf_settings_from_db(cur_db()).get("root_folder") or "").strip()
+            if root_db:
+                try:
+                    rd_db = Path(root_db).expanduser().resolve()
+                except Exception:
+                    rd_db = Path(root_db).expanduser()
+                if rd_db.is_dir():
+                    if (estratti_pdf_root_var.get() or "").strip() != root_db:
+                        try:
+                            estratti_pdf_root_var.set(root_db)
+                        except tk.TclError:
+                            pass
+                    _ver_on_start_auto()
+                    return
+            _ver_show_auto_folder_box(True)
+        finally:
+            ver_autostart_in_flight[0] = False
 
     def _ver_update_reset_saved_button_visibility(_e: object = None) -> None:
         """Riservato al layout verifica; la cancellazione memoria è solo dal dialogo di ripresa."""
         pass
 
+    ver_btn_start_with_pdf.bind("<Button-1>", lambda _e: _ver_on_start_with_selected_pdf_path())
+    ver_btn_start_resume.bind("<Button-1>", lambda _e: _ver_on_start_resume(explicit_manual=False))
+
     def _ver_on_account_combo_selected(_e: tk.Event | None = None) -> None:
         try:
             ver_pdf_auto_diag_var.set("")
+            _ver_cancel_setup_autostart_scheduled()
             try:
                 aid_d = ver_auto_start_defer_after[0]
                 if aid_d is not None:
@@ -19935,6 +20160,14 @@ th {{ background:#efefef; text-align:left; }}
             _ver_apply_bancoposta_pdf_lock_for_setup()
             _ver_setup_start_buttons_state()
             _ver_apply_bancoposta_pdf_lock_for_setup()
+            try:
+                _ver_schedule_setup_autostart()
+            except Exception:
+                pass
+            try:
+                _ver_sync_mode_chips_lock_for_cutoff()
+            except Exception:
+                pass
             acc_nm_f = ver_account_name_var.get().strip()
             if acc_nm_f:
                 ac_f = _ver_account_code_for_name(acc_nm_f)
@@ -21845,8 +22078,19 @@ th {{ background:#efefef; text-align:left; }}
         except Exception:
             return False
 
+    def _ver_sync_mode_chips_lock_for_cutoff() -> None:
+        """Blocca i chip manuale/automatica appena la data di chiusura è valida (fuori da sessione attiva)."""
+        if ver_session_active[0]:
+            return
+        if _ver_has_valid_cutoff_for_setup():
+            _ver_set_mode_chips_locked(True)
+        else:
+            _ver_set_mode_chips_locked(False)
+
     def _ver_setup_start_buttons_state(_e: object = None) -> None:
-        """Riga PDF e tasti coerenti con conto; i tasti di avvio solo con data di chiusura valida (salvo sessione salvata)."""
+        """Riga PDF e tasti coerenti con conto; avvio automatico dopo conto+data (niente tasti «Verifica automatica» / «Avvia manuale»)."""
+        if ver_session_active[0]:
+            return
         acc_name = ver_account_name_var.get().strip()
         acc_code = _ver_account_code_for_name(acc_name) if acc_name else ""
 
@@ -21922,30 +22166,18 @@ th {{ background:#efefef; text-align:left; }}
             return
 
         try:
-            ver_btn_start_resume.configure(
-                text="Verifica manuale"
-            )
-        except tk.TclError:
-            pass
-
-        try:
             ver_btn_start_resume.grid_remove()
         except tk.TclError:
             pass
-        if ver_mode_choice[0] == "auto":
-            ver_btn_start_auto.grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 2))
-            try:
-                ver_btn_start_manual.grid_remove()
-            except tk.TclError:
-                pass
-            pdf_col = 1
-        else:
-            ver_btn_start_manual.grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 2))
-            try:
-                ver_btn_start_auto.grid_remove()
-            except tk.TclError:
-                pass
-            pdf_col = 1
+        try:
+            ver_btn_start_auto.grid_remove()
+        except tk.TclError:
+            pass
+        try:
+            ver_btn_start_manual.grid_remove()
+        except tk.TclError:
+            pass
+        pdf_col = 0
         if ver_setup_pdf_path_after_auto_fail[0] and ver_bancoposta_pdf_var.get().strip():
             ver_btn_start_with_pdf.grid(row=2, column=pdf_col, sticky="w", padx=(0, 8), pady=(6, 2))
         else:
@@ -21961,6 +22193,10 @@ th {{ background:#efefef; text-align:left; }}
             ver_setup_buttons_trace_after[0] = None
             try:
                 _ver_setup_start_buttons_state()
+            except Exception:
+                pass
+            try:
+                _ver_schedule_setup_autostart()
             except Exception:
                 pass
 
@@ -22018,6 +22254,13 @@ th {{ background:#efefef; text-align:left; }}
 
     def _ver_populate_account_combo() -> None:
         eligible = _ver_eligible_accounts()
+        if ver_mode_choice[0] == "auto":
+            d_pf = cur_db()
+            eligible = [
+                (n, c)
+                for (n, c) in eligible
+                if (account_estratti_pdf_stem_for_code(d_pf, c) or "").strip()
+            ]
         ver_acc_combo.configure(values=[n for n, _c in eligible])
         if ver_account_name_var.get() and ver_account_name_var.get() not in [n for n, _c in eligible]:
             ver_account_name_var.set("")
@@ -24944,6 +25187,10 @@ th {{ background:#efefef; text-align:left; }}
     _ver_apply_bancoposta_pdf_lock_for_setup()
     _ver_setup_start_buttons_state()
     _ver_apply_bancoposta_pdf_lock_for_setup()
+    try:
+        _ver_sync_mode_chips_lock_for_cutoff()
+    except Exception:
+        pass
     # ========================  FINE PAGINA VERIFICA  ========================
     # ========================  PAGINA STATISTICHE — saldi mensili  ========================
     statistiche_frame.columnconfigure(0, weight=1)
