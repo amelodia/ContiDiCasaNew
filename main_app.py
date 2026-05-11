@@ -135,7 +135,7 @@ _BOOT_DROPBOX_CONFIRM_WITHIN_SECONDS = 5 * 60
 
 # Limite numerico categorie/conti: ``MAX_CATEGORIES_COUNT`` / ``MAX_ACCOUNTS_COUNT`` in ``import_legacy``.
 
-_DEFAULT_WINDOWS_UI_SCALE = 0.82
+_DEFAULT_WINDOWS_UI_SCALE = 0.90
 _DEFAULT_NON_WINDOWS_UI_SCALE = 1.0
 _UI_SCALE_PREF_KEY = "_ui_scale_factor"
 _CURRENT_UI_SCALE_FACTOR: float | None = None
@@ -8762,6 +8762,54 @@ def build_ui(
     except Exception:
         pass
     root.title(window_title_for_session(db_holder[0], session_holder[0], show_clock=True))
+    _main_window_presented: list[bool] = [False]
+
+    def _present_main_window_once() -> None:
+        """Mostra la finestra appena la pagina iniziale è usabile; chiamate successive sono no-op."""
+        if _main_window_presented[0]:
+            return
+        _main_window_presented[0] = True
+        try:
+            if platform.system() == "Darwin":
+                try:
+                    root.attributes("-fullscreen", False)
+                except Exception:
+                    pass
+                sw = root.winfo_screenwidth()
+                sh = root.winfo_screenheight()
+                root.geometry(f"{sw}x{sh}+0+0")
+                try:
+                    root.state("zoomed")
+                except Exception:
+                    pass
+            else:
+                root.geometry("1200x760")
+                try:
+                    root.state("zoomed")
+                except Exception:
+                    pass
+            root.deiconify()
+            if platform.system() == "Darwin":
+                try:
+                    root.state("zoomed")
+                except Exception:
+                    pass
+            root.lift()
+            root.focus_force()
+            root.update_idletasks()
+
+            def _dock_icon_when_safe() -> None:
+                try:
+                    apply_macos_dock_icon_from_login_euro_jpeg(tk_anchor=root)
+                except Exception:
+                    pass
+
+            try:
+                root.after(450, _dock_icon_when_safe)
+            except tk.TclError:
+                pass
+        except Exception:
+            pass
 
     main_nb_shell = tk.Frame(root, bg=MOVIMENTI_PAGE_BG)
     main_nb_shell.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -14784,6 +14832,8 @@ th {{ background:#efefef; text-align:left; }}
             pass
 
     refresh_balance_footer()
+    if platform.system() == "Windows":
+        _present_main_window_once()
 
     root.bind_all("<FocusIn>", _saldi_footer_on_app_focus_in, add="+")
 
@@ -32646,8 +32696,9 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         _startup_check_virtuale_pending()
 
     root.after(200, _open_opzioni_if_mail_incomplete)
-    root.after(350, _startup_periodic_then_virtuale)
-    root.after(900, _try_open_plan_conti_pending)
+    _post_open_delay = 1600 if platform.system() == "Windows" else 350
+    root.after(_post_open_delay, _startup_periodic_then_virtuale)
+    root.after(_post_open_delay + 550, _try_open_plan_conti_pending)
 
     def _poll_registration_once() -> None:
         try:
@@ -32661,44 +32712,11 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         except Exception:
             pass
 
-    root.after(900, _poll_registration_once)
+    root.after(_post_open_delay + 550, _poll_registration_once)
 
     def _present_main_window() -> None:
         """Mostra la finestra principale solo a UI pronta; evita flash nero (fullscreen Cocoa) su macOS."""
-        try:
-            if platform.system() == "Darwin":
-                try:
-                    root.attributes("-fullscreen", False)
-                except Exception:
-                    pass
-                sw = root.winfo_screenwidth()
-                sh = root.winfo_screenheight()
-                root.geometry(f"{sw}x{sh}+0+0")
-            else:
-                root.geometry("1200x760")
-                try:
-                    root.state("zoomed")
-                except Exception:
-                    pass
-            root.deiconify()
-            root.lift()
-            root.focus_force()
-            root.update_idletasks()
-
-            def _dock_icon_when_safe() -> None:
-                try:
-                    apply_macos_dock_icon_from_login_euro_jpeg(tk_anchor=root)
-                except Exception:
-                    pass
-
-            # Ritardo: subito dopo map/focus, ``setApplicationIconImage_`` su NSApplication condiviso
-            # con Tk-Aqua ha causato SIGABRT intermittente (crash reporter) su build PyInstaller.
-            try:
-                root.after(450, _dock_icon_when_safe)
-            except tk.TclError:
-                pass
-        except Exception:
-            pass
+        _present_main_window_once()
 
     def _on_app_close() -> None:
         if ver_session_active[0]:
