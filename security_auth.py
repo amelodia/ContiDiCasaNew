@@ -504,6 +504,7 @@ def run_login_dialog(
     *,
     before_nuova_utenza: Callable[[], None] | None = None,
     after_prepare_nuova_utenza: Callable[[dict], None] | None = None,
+    keep_window_on_success: Callable[[tk.Toplevel], None] | None = None,
 ) -> tuple[bool, AppSession | None]:
     """Finestra login. Ritorna (True, session) o (False, None)."""
     ensure_security(db)
@@ -599,8 +600,56 @@ def run_login_dialog(
     ent_pw.grid(row=email_row + 3, column=0, columnspan=2, sticky="we", pady=(2, 6))
 
     out: list[tuple[bool, AppSession | None]] = [(False, None)]
+    done_var = tk.BooleanVar(master=parent, value=False)
 
     backdoor = _BackdoorState()
+
+    def _finish_success(sess: AppSession) -> None:
+        out[0] = (True, sess)
+        if keep_window_on_success is None:
+            win.destroy()
+            return
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        try:
+            win.protocol("WM_DELETE_WINDOW", lambda: None)
+        except Exception:
+            pass
+        try:
+            win.configure(cursor="watch")
+            for child in win.winfo_children():
+                _disable_login_widget_tree(child)
+        except Exception:
+            pass
+        keep_window_on_success(win)
+        done_var.set(True)
+
+    def _finish_cancel() -> None:
+        out[0] = (False, None)
+        try:
+            win.destroy()
+        finally:
+            try:
+                done_var.set(True)
+            except Exception:
+                pass
+
+    def _disable_login_widget_tree(widget: tk.Misc) -> None:
+        try:
+            widget.configure(state="disabled")
+        except Exception:
+            pass
+        try:
+            widget.configure(cursor="watch")
+        except Exception:
+            pass
+        try:
+            for child in widget.winfo_children():
+                _disable_login_widget_tree(child)
+        except Exception:
+            pass
 
     def do_login() -> None:
         ensure_security(db)
@@ -625,8 +674,7 @@ def run_login_dialog(
             entered_via_backdoor=False,
             user_email=em,
         )
-        out[0] = (True, sess)
-        win.destroy()
+        _finish_success(sess)
 
     def do_nuova_utenza() -> None:
         if not messagebox.askyesno(
@@ -708,8 +756,7 @@ def run_login_dialog(
             entered_via_backdoor=True,
             user_email=em_field,
         )
-        out[0] = (True, sess)
-        win.destroy()
+        _finish_success(sess)
 
     def on_ctrl_z(_e: tk.Event) -> str | None:
         backdoor.mark_z()
@@ -797,7 +844,7 @@ def run_login_dialog(
     _login_action_label(
         btn_bar,
         "Esci",
-        lambda: win.destroy(),
+        _finish_cancel,
         width_chars=_LOGIN_BTN_WIDTH_ACCEDI_CHARS,
         btn_bg=esc_bg,
         btn_active_bg=esc_act,
@@ -827,7 +874,7 @@ def run_login_dialog(
     ent_pw.bind("<KP_Enter>", on_return_login)
 
     def on_close() -> None:
-        win.destroy()
+        _finish_cancel()
 
     win.protocol("WM_DELETE_WINDOW", on_close)
 
@@ -858,7 +905,7 @@ def run_login_dialog(
         ent_pw.focus_set()
     except Exception:
         pass
-    parent.wait_window(win)
+    parent.wait_variable(done_var) if keep_window_on_success is not None else parent.wait_window(win)
     ok, sess = out[0]
     return ok, sess
 

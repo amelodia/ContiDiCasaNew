@@ -8763,6 +8763,37 @@ def build_ui(
         pass
     root.title(window_title_for_session(db_holder[0], session_holder[0], show_clock=True))
     _main_window_presented: list[bool] = [False]
+    login_window_to_close = getattr(root, "_cdc_login_window_to_close", None)
+
+    def _apply_macos_maximized_geometry() -> None:
+        """Tk/Aqua spesso ignora ``state("zoomed")``: forza la geometria dopo il map della finestra."""
+        if platform.system() != "Darwin":
+            return
+        try:
+            root.attributes("-fullscreen", False)
+        except Exception:
+            pass
+        try:
+            sw = max(1, int(root.winfo_vrootwidth() or root.winfo_screenwidth()))
+            sh = max(1, int(root.winfo_vrootheight() or root.winfo_screenheight()))
+        except Exception:
+            try:
+                sw = max(1, int(root.winfo_screenwidth()))
+                sh = max(1, int(root.winfo_screenheight()))
+            except Exception:
+                return
+        try:
+            root.geometry(f"{sw}x{sh}+0+0")
+        except Exception:
+            pass
+        for _try_zoom in (
+            lambda: root.state("zoomed"),
+            lambda: root.attributes("-zoomed", True),
+        ):
+            try:
+                _try_zoom()
+            except Exception:
+                pass
 
     def _present_main_window_once() -> None:
         """Mostra la finestra appena la pagina iniziale è usabile; chiamate successive sono no-op."""
@@ -8771,17 +8802,7 @@ def build_ui(
         _main_window_presented[0] = True
         try:
             if platform.system() == "Darwin":
-                try:
-                    root.attributes("-fullscreen", False)
-                except Exception:
-                    pass
-                sw = root.winfo_screenwidth()
-                sh = root.winfo_screenheight()
-                root.geometry(f"{sw}x{sh}+0+0")
-                try:
-                    root.state("zoomed")
-                except Exception:
-                    pass
+                _apply_macos_maximized_geometry()
             else:
                 root.geometry("1200x760")
                 try:
@@ -8790,13 +8811,21 @@ def build_ui(
                     pass
             root.deiconify()
             if platform.system() == "Darwin":
-                try:
-                    root.state("zoomed")
-                except Exception:
-                    pass
+                _apply_macos_maximized_geometry()
             root.lift()
             root.focus_force()
             root.update_idletasks()
+            if login_window_to_close is not None:
+                try:
+                    login_window_to_close.destroy()
+                except Exception:
+                    pass
+            if platform.system() == "Darwin":
+                for _delay in (50, 250, 700):
+                    try:
+                        root.after(_delay, _apply_macos_maximized_geometry)
+                    except tk.TclError:
+                        pass
 
             def _dock_icon_when_safe() -> None:
                 try:
@@ -33043,12 +33072,22 @@ def main() -> None:
         security_auth.ensure_security(d)
         save_encrypted_db_dual(d, target, key_path_holder[0])
 
+    login_window_holder: list[tk.Toplevel | None] = [None]
+
+    def _keep_login_visible_until_main_window(win: tk.Toplevel) -> None:
+        login_window_holder[0] = win
+        try:
+            setattr(root, "_cdc_login_window_to_close", win)
+        except Exception:
+            pass
+
     ok, session = security_auth.run_login_dialog(
         root,
         db_holder[0],
         save_db,
         before_nuova_utenza=persist_utenza_precedente_before_nuova_utenza,
         after_prepare_nuova_utenza=reset_contabili_for_nuova_utenza,
+        keep_window_on_success=_keep_login_visible_until_main_window if platform.system() == "Windows" else None,
     )
     if not ok or session is None:
         try:
