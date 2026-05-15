@@ -6206,6 +6206,58 @@ def budget_clear_all_overrides_for_year(db: dict, year: int) -> None:
         bs.pop(str(int(year)), None)
 
 
+def budget_sheet_matches_any_saved_scenario(db: dict, year: int) -> bool:
+    """True se ``budget_sheet`` per l'anno coincide con uno scenario nell'archivio (budget «salvato»)."""
+    y = int(year)
+    for nm in budget_snapshot_names_for_year(db, y):
+        if budget_named_snapshot_matches_current_sheet(db, y, nm):
+            return True
+    return False
+
+
+def budget_prune_overrides_equal_to_previous_year_movements(db: dict, year: int) -> bool:
+    """Elimina override che duplicano ancora i movimenti dello stesso mese dell'anno precedente.
+
+    Così le celle «di base» non restano congelate su valori obsoleti dopo nuovi movimenti nell'anno prec.
+    Non modifica nulla se il ramo budget coincide con uno **scenario salvato** (tabellone salvato).
+    Ritorna True se il database è stato modificato.
+    """
+    y = int(year)
+    if y <= 1:
+        return False
+    if budget_sheet_matches_any_saved_scenario(db, y):
+        return False
+    mov_prev = budget_collect_movement_totals_by_cat_month(db, y - 1)
+    bs = db.get("budget_sheet")
+    if not isinstance(bs, dict):
+        return False
+    ym = bs.get(str(y))
+    if not isinstance(ym, dict) or not ym:
+        return False
+    changed = False
+    for cat_key, cm in list(ym.items()):
+        if not isinstance(cm, dict):
+            continue
+        cc = str(cat_key).strip()
+        for mk in list(cm.keys()):
+            try:
+                m = int(mk)
+            except (TypeError, ValueError):
+                continue
+            if m < 1 or m > 12:
+                continue
+            ov = budget_get_manual_override(db, y, cc, m)
+            if ov is None:
+                continue
+            base = mov_prev.get((cc, m), Decimal("0"))
+            if ov.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) == base.quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            ):
+                budget_clear_manual_override(db, y, cc, m)
+                changed = True
+    return changed
+
+
 def _budget_ov_from_year_branch(ym: dict, cat_code: str, month: int) -> Decimal | None:
     cm = ym.get(str(cat_code).strip())
     if not isinstance(cm, dict):
@@ -26782,6 +26834,10 @@ th {{ background:#efefef; text-align:left; }}
 
     def _stat_on_frame_map(_e: tk.Event | None = None) -> None:
         try:
+            _stat_refresh_trees()
+        except Exception:
+            pass
+        try:
             statistiche_frame.update_idletasks()
         except tk.TclError:
             pass
@@ -29663,6 +29719,24 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             y_head = int(str(budget_year_var.get()).strip())
         except (TypeError, ValueError):
             y_head = int(_bud_default_year)
+        try:
+            if budget_prune_overrides_equal_to_previous_year_movements(cur_db(), y_head):
+                save_encrypted_db_dual(cur_db(), path_holder[0], key_path_holder[0])
+                em = (session_holder[0].user_email or "").strip().lower()
+                if em:
+                    canonical_target = per_user_encrypted_db_path(em).resolve()
+                    current_target = path_holder[0].resolve()
+                    if canonical_target != current_target:
+                        save_encrypted_db_dual(cur_db(), canonical_target, key_path_holder[0])
+        except Exception as exc:
+            try:
+                messagebox.showerror(
+                    "Budget",
+                    f"Salvataggio dopo allineamento budget con l'anno precedente non riuscito.\n{exc}",
+                    parent=root,
+                )
+            except Exception:
+                pass
         _bud_select_suppress[0] = True
         try:
             _bud_last_sel_by_tree.clear()
@@ -29897,8 +29971,15 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
 
     _budget_on_tab_enter_fn[0] = _budget_refresh_grid
     _budget_refresh_grid()
+
+    def _bud_on_budget_frame_map(_e: tk.Event | None = None) -> None:
+        try:
+            _budget_refresh_grid()
+        except Exception:
+            pass
+
     try:
-        budget_frame.bind("<Map>", lambda _e: _bud_refresh_tab_chips(), add="+")
+        budget_frame.bind("<Map>", lambda _e: root.after_idle(_bud_on_budget_frame_map), add="+")
     except tk.TclError:
         pass
 
@@ -33186,6 +33267,18 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             refresh_window_title()
         except Exception:
             pass
+        try:
+            fn_bud = _budget_on_tab_enter_fn[0]
+            if fn_bud is not None:
+                fn_bud()
+        except Exception:
+            pass
+        try:
+            fn_st = _stat_on_tab_enter_fn[0]
+            if fn_st is not None:
+                fn_st()
+        except Exception:
+            pass
         _refresh_backup_path_hint()
         try:
             estratti_pdf_root_var.set(
@@ -33330,6 +33423,18 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         populate_movements_trees()
         refresh_balance_footer()
         refresh_window_title()
+        try:
+            fn_bud = _budget_on_tab_enter_fn[0]
+            if fn_bud is not None:
+                fn_bud()
+        except Exception:
+            pass
+        try:
+            fn_st = _stat_on_tab_enter_fn[0]
+            if fn_st is not None:
+                fn_st()
+        except Exception:
+            pass
         _refresh_backup_path_hint()
         try:
             estratti_pdf_root_var.set(
