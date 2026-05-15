@@ -479,8 +479,8 @@ def _login_movimenti_action_button_colors(db: dict) -> dict[str, tuple[str, str]
 
     base = cup.get_base_palette_map_copy()
     extras = {
-        "mov_btn_cerca_bg": "#2e7d32",
-        "mov_btn_cerca_hover_bg": "#1b5e20",
+        "mov_btn_cerca_bg": "#ffff0b",
+        "mov_btn_cerca_hover_bg": "#e6e600",
         "mov_pulisci_accedi_bg": "#1565c0",
         "mov_pulisci_accedi_hover_bg": "#0d47a1",
         "ui_action_blue_bg": "#1565c0",

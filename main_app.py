@@ -12735,9 +12735,9 @@ th {{ background:#efefef; text-align:left; }}
     lbl_pulisci_filtri.bind("<Leave>", _pulisci_leave)
     lbl_pulisci_filtri.bind("<Button-1>", lambda _e: clear_movement_filters_to_defaults())
 
-    _CERCA_GREEN = "#2e7d32"
-    _CERCA_GREEN_ACTIVE = "#1b5e20"
-    _CERCA_FG = "#ffffff"
+    _CERCA_GREEN = "#ffff0b"
+    _CERCA_GREEN_ACTIVE = "#e6e600"
+    _CERCA_FG = "#1a1a1a"
     _mov_cerca_col_w = _ui_scaled_int(96, min_value=88)
     mov_cerca_btn_col = tk.Frame(
         mov_cerca_sidebar,
