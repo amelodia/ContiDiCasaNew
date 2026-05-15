@@ -106,20 +106,39 @@ def default_key_file() -> Path:
     return data_dir() / "conti_di_casa.key"
 
 
-def primary_user_enc_files_sorted(workspace: Path) -> list[Path]:
-    """File ``conti_utente_<hash>.enc`` nella cartella dati, **senza** il sidecar ``*_light.enc`` dell'app iOS.
+def is_workspace_primary_enc_file(path: Path) -> bool:
+    """True se ``path`` è un candidato **database completo** nella cartella dati (directory).
 
-    Ordine: ``st_mtime`` decrescente (il più recentemente modificato per primo). Il pattern ``conti_utente_*.enc``
-    altrimenti includerebbe anche ``…_light.enc``, spesso più recente del file completo e scelto per errore.
+    Esclude il sidecar iOS/desktop ``*_light.enc``, copie ``*_backup.enc`` e nomi tipici delle
+    conflicted copy Dropbox. Qualsiasi altro ``*.enc`` nella cartella (anche con nome rinominato
+    dall'utente) resta incluso finché passa quei filtri.
     """
-    out: list[Path] = []
-    for p in workspace.glob("conti_utente_*.enc"):
-        if not p.is_file():
-            continue
-        if p.name.endswith("_light.enc"):
-            continue
-        out.append(p)
-    return sorted(out, key=lambda p: p.stat().st_mtime, reverse=True)
+    if not path.is_file():
+        return False
+    name_lower = path.name.lower()
+    if not name_lower.endswith(".enc"):
+        return False
+    if name_lower.endswith("_light.enc"):
+        return False
+    if name_lower.endswith("_backup.enc"):
+        return False
+    if "conflicted copy" in name_lower or "copia in conflitto" in name_lower:
+        return False
+    return True
+
+
+def primary_user_enc_files_sorted(workspace: Path) -> list[Path]:
+    """File ``*.enc`` nella cartella indicata che sono database completi (**non** ``*_light.enc``).
+
+    Ordine: ``st_mtime`` decrescente (più recente per primo). I nomi canonici sono
+    ``conti_utente_<hash>.enc``; sono ammessi anche altri stem per cartelle di prova.
+
+    NB: gli ``*.enc`` sotto sole sottocartelle non vengono elencati (solo nella ``workspace`` diretta).
+    """
+    if not workspace.is_dir():
+        return []
+    out = [p for p in workspace.glob("*.enc") if is_workspace_primary_enc_file(p)]
+    return sorted(out, key=lambda p: p.stat().st_mtime if p.exists() else 0.0, reverse=True)
 
 
 def legacy_import_dir() -> Path:
@@ -141,7 +160,7 @@ def legacy_project_data_dir() -> Path:
 
 def try_migrate_from_legacy_relative_data() -> Path | None:
     """
-    Se esiste ``./data`` (cwd) con almeno un file ``conti_utente_*.enc`` o ``conti_di_casa.key``,
+    Se esiste ``./data`` (cwd) con ``conti_di_casa.key`` o almeno un file ``*.enc`` di database completo,
     restituisce quel percorso per proporre la migrazione.
     """
     d = legacy_project_data_dir()
@@ -149,7 +168,7 @@ def try_migrate_from_legacy_relative_data() -> Path | None:
         return None
     if (d / "conti_di_casa.key").is_file():
         return d
-    if list(d.glob("conti_utente_*.enc")):
+    if any(is_workspace_primary_enc_file(p) for p in d.glob("*.enc")):
         return d
     return None
 

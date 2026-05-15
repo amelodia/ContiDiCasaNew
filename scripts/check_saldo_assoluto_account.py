@@ -55,7 +55,7 @@ def main() -> int:
 
     cands = data_workspace.primary_user_enc_files_sorted(saved)
     if not cands:
-        print(f"Nessun conti_utente_*.enc in {saved}", file=sys.stderr)
+        print(f"Nessun file .enc database (completo) in {saved}", file=sys.stderr)
         return 5
 
     db = load_encrypted_db(cands[0], key_path)
