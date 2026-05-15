@@ -376,13 +376,15 @@ def _darwin_prepare_stdin_for_tk_aqua() -> None:
                 pass
         # Mantenere il master aperto: chiusura lascerebbe stdin (slave) senza peer.
         setattr(sys.modules[__name__], "_CDC_TK_STDIN_PTY_MASTER_FD", master_fd)
+        return
     except OSError:
-        try:
-            tty_fd = os.open("/dev/tty", os.O_RDONLY)
-            os.dup2(tty_fd, 0)
-            os.close(tty_fd)
-        except OSError:
-            pass
+        pass
+    try:
+        tty_fd = os.open("/dev/tty", os.O_RDONLY)
+        os.dup2(tty_fd, 0)
+        os.close(tty_fd)
+    except OSError:
+        pass
 
 
 def app_title_text() -> str:
@@ -12743,15 +12745,21 @@ th {{ background:#efefef; text-align:left; }}
     lbl_cerca.bind("<Enter>", _cerca_enter)
     lbl_cerca.bind("<Leave>", _cerca_leave)
 
+    # Su Windows il `Label` con pady troppo basso può risultare come una riga sottilissima; allineamento a «Cerca».
+    _pulisci_filtri_pady = (
+        max(_mov_filter_btn_pady, _ui_scaled_int(10, min_value=8))
+        if platform.system() == "Windows"
+        else _mov_filter_btn_pady
+    )
     lbl_pulisci_filtri = tk.Label(
         mov_cerca_btn_col,
         text="Pulisci filtri",
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
-        width=16,
+        anchor="center",
         padx=6,
-        pady=_mov_filter_btn_pady,
+        pady=_pulisci_filtri_pady,
         bg=_MOV_PULISCI_ACCEDI_BG,
         fg="#ffffff",
         relief=tk.RAISED,
