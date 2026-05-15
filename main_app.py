@@ -9558,7 +9558,8 @@ def build_ui(
     )
     bind_entry_first_char_uppercase(text_note_preview_var, note_entry)
 
-    # Nota, Cerca e Pulisci filtri: pack differito dopo definizione di apply_movement_search / clear_movement_filters_to_defaults.
+    # Nota: pack differito dopo definizione di apply_movement_search / clear_movement_filters_to_defaults;
+    # «Pulisci filtri» è sulla prima riga chip (vedi dopo clear_movement_filters_to_defaults).
 
     # ---- UI Ricerca per registrazione (preset + range reg + conto) ----
     reg_controls_inner = ttk.Frame(reg_controls_row, style="MovCdc.TFrame")
@@ -12695,11 +12696,42 @@ th {{ background:#efefef; text-align:left; }}
         except Exception:
             pass
 
+    _MOV_PULISCI_ACCEDI_BG = "#1565c0"
+    _MOV_PULISCI_ACCEDI_HOVER_BG = "#0d47a1"
+    _pulisci_filtri_pady = (
+        max(_mov_filter_btn_pady, _ui_scaled_int(10, min_value=8))
+        if platform.system() == "Windows"
+        else _mov_filter_btn_pady
+    )
+    lbl_pulisci_filtri = tk.Label(
+        filters_top_inner,
+        text="Pulisci filtri",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        anchor="center",
+        padx=8,
+        pady=_pulisci_filtri_pady,
+        bg=_MOV_PULISCI_ACCEDI_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=CDC_FILTER_TAB_CHIP_BD,
+    )
+    lbl_pulisci_filtri.pack(side=tk.LEFT, padx=(0, _FILTER_ROW_BUTTON_GAP), before=g1)
+
+    def _pulisci_enter(_e: tk.Event) -> None:
+        lbl_pulisci_filtri.configure(bg=_MOV_PULISCI_ACCEDI_HOVER_BG)
+
+    def _pulisci_leave(_e: tk.Event) -> None:
+        lbl_pulisci_filtri.configure(bg=_MOV_PULISCI_ACCEDI_BG)
+
+    lbl_pulisci_filtri.bind("<Enter>", _pulisci_enter)
+    lbl_pulisci_filtri.bind("<Leave>", _pulisci_leave)
+    lbl_pulisci_filtri.bind("<Button-1>", lambda _e: clear_movement_filters_to_defaults())
+
     _CERCA_GREEN = "#2e7d32"
     _CERCA_GREEN_ACTIVE = "#1b5e20"
     _CERCA_FG = "#ffffff"
-    _MOV_PULISCI_ACCEDI_BG = "#1565c0"
-    _MOV_PULISCI_ACCEDI_HOVER_BG = "#0d47a1"
     _mov_cerca_col_w = _ui_scaled_int(96, min_value=88)
     mov_cerca_btn_col = tk.Frame(
         mov_cerca_sidebar,
@@ -12710,7 +12742,7 @@ th {{ background:#efefef; text-align:left; }}
     mov_cerca_btn_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     mov_cerca_btn_col.pack_propagate(False)
     mov_cerca_square = tk.Frame(mov_cerca_btn_col, bg=_CERCA_GREEN, highlightthickness=0)
-    mov_cerca_square.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 8))
+    mov_cerca_square.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
     _cerca_btn_font = (filter_ui_font[0], filter_ui_font[1] + 3, "bold") if len(filter_ui_font) >= 2 else filter_ui_font
     lbl_cerca = tk.Label(
         mov_cerca_square,
@@ -12744,38 +12776,6 @@ th {{ background:#efefef; text-align:left; }}
 
     lbl_cerca.bind("<Enter>", _cerca_enter)
     lbl_cerca.bind("<Leave>", _cerca_leave)
-
-    # Su Windows il `Label` con pady troppo basso può risultare come una riga sottilissima; allineamento a «Cerca».
-    _pulisci_filtri_pady = (
-        max(_mov_filter_btn_pady, _ui_scaled_int(10, min_value=8))
-        if platform.system() == "Windows"
-        else _mov_filter_btn_pady
-    )
-    lbl_pulisci_filtri = tk.Label(
-        mov_cerca_btn_col,
-        text="Pulisci filtri",
-        cursor="hand2",
-        highlightthickness=0,
-        font=filter_ui_font,
-        anchor="center",
-        padx=6,
-        pady=_pulisci_filtri_pady,
-        bg=_MOV_PULISCI_ACCEDI_BG,
-        fg="#ffffff",
-        relief=tk.RAISED,
-        bd=1,
-    )
-    lbl_pulisci_filtri.pack(side=tk.BOTTOM, fill=tk.X)
-
-    def _pulisci_enter(_e: tk.Event) -> None:
-        lbl_pulisci_filtri.configure(bg=_MOV_PULISCI_ACCEDI_HOVER_BG)
-
-    def _pulisci_leave(_e: tk.Event) -> None:
-        lbl_pulisci_filtri.configure(bg=_MOV_PULISCI_ACCEDI_BG)
-
-    lbl_pulisci_filtri.bind("<Enter>", _pulisci_enter)
-    lbl_pulisci_filtri.bind("<Leave>", _pulisci_leave)
-    lbl_pulisci_filtri.bind("<Button-1>", lambda _e: clear_movement_filters_to_defaults())
 
     filters_search_spacer = tk.Frame(
         filters_search_row, highlightthickness=0, borderwidth=0, bg=MOVIMENTI_PAGE_BG
