@@ -9314,19 +9314,25 @@ def build_ui(
         _dataset_years_with_records = [_td.year]
 
     mov_filters_block = tk.Frame(movimenti_body, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    mov_cerca_sidebar = tk.Frame(mov_filters_block, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    mov_filters_inner = ttk.Frame(mov_filters_block, style="MovCdc.TFrame")
-    mov_cerca_sidebar.pack(side=tk.LEFT, fill=tk.BOTH, padx=(0, 10))
-    mov_filters_inner.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    mov_filters_block.pack(fill=tk.X, pady=(0, 0))
 
-    filters_row = ttk.Frame(mov_filters_inner, style="MovCdc.TFrame")
+    # Prime due righe chip / data: tutta la larghezza pagina (centrate in ``filters_row`` / ``filters_search_row``).
+    filters_row = ttk.Frame(mov_filters_block, style="MovCdc.TFrame")
     filters_row.pack(fill=tk.X, pady=(0, 0))
     filters_top_inner = ttk.Frame(filters_row, style="MovCdc.TFrame")
     filters_top_inner.pack(anchor=tk.CENTER)
 
-    filters_search_row = ttk.Frame(mov_filters_inner, style="MovCdc.TFrame")
+    filters_search_row = ttk.Frame(mov_filters_block, style="MovCdc.TFrame")
     filters_search_row.pack(fill=tk.X, pady=(0, 0 if _is_macos_ui else 1))
+
+    # Terza riga (filtri testuali): come prima — colonna «Cerca» a sinistra e contenuto a destra.
+    mov_filters_bottom = tk.Frame(mov_filters_block, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
+    mov_filters_bottom.pack(fill=tk.X, pady=(0, 0))
+    mov_cerca_sidebar = tk.Frame(mov_filters_bottom, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
+    mov_filters_inner = ttk.Frame(mov_filters_bottom, style="MovCdc.TFrame")
+    mov_cerca_sidebar.pack(side=tk.LEFT, fill=tk.BOTH, padx=(0, 10))
+    mov_filters_inner.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    mov_filters_block.pack(fill=tk.X, pady=(0, 0))
 
     # Riga controlli per Ricerca per registrazione (visibile solo in quella modalità)
     reg_controls_row = ttk.Frame(filters_search_row, style="MovCdc.TFrame")
@@ -13357,7 +13363,7 @@ th {{ background:#efefef; text-align:left; }}
     bind_return_and_kp_enter(reg_from_entry, apply_movement_search)
     bind_return_and_kp_enter(reg_to_entry, apply_movement_search)
 
-    # Seconda riga: controlli data/reg. a sinistra, tasto Cerca allineato a destra.
+    # Seconda riga: preset date / controlli registrazione centrati su tutta la larghezza (riga sotto i chip).
     date_controls_left = ttk.Frame(filters_search_row, style="MovCdc.TFrame")
 
     def _sync_filters_search_spacer_width(_event: object | None = None) -> None:
