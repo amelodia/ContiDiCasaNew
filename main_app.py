@@ -6288,6 +6288,18 @@ def budget_effective_budget_cell(
     return ov if ov is not None else base
 
 
+def budget_parziale_budget_sum_months_with_movements(
+    mov_row_m: list[Decimal], bud_row_m: list[Decimal]
+) -> Decimal:
+    """Somma dei budget mensili solo nei mesi in cui la riga ha movimento (importo ≠ 0) — colonna Parziale tabellone Budget."""
+    s = Decimal("0")
+    n = min(len(mov_row_m), len(bud_row_m), 12)
+    for j in range(n):
+        if mov_row_m[j] != 0:
+            s += bud_row_m[j]
+    return s
+
+
 def budget_category_apply_monthly_average(db: dict, year: int, cat_code: str) -> Decimal:
     """Imposta i 12 budget al valore medio dei budget mensili **già in tabella** (override o default da anno prec.)."""
     cc = str(cat_code).strip()
@@ -6397,7 +6409,7 @@ def _budget_tabellone_rows_for_export_month_range(
     *,
     ym_override: dict | None = None,
 ) -> tuple[list[str], list[list[str]]] | None:
-    """Righe tabellone con colonne mensili solo per month_lo–month_hi; Σ Mov, Σ Bud e Δ riga sono sempre totali **anno intero** (1–12)."""
+    """Righe tabellone con colonne mensili solo per month_lo–month_hi; Σ Mov e Δ riga sono totali anno intero (1–12); la colonna budget è il parziale (somma budget solo nei mesi con movimento)."""
     if month_lo < 1 or month_hi > 12 or month_lo > month_hi:
         raise ValueError("Intervallo mesi non valido.")
     y_ref = int(year)
@@ -6408,7 +6420,7 @@ def _budget_tabellone_rows_for_export_month_range(
     if not cats_ordered:
         return None
     abb = tuple(m[:3] for m in _BUDGET_MONTH_FULL_IT)
-    heads: list[str] = ["Categoria", "Σ Mov", "Σ Bud", "Δ riga"]
+    heads: list[str] = ["Categoria", "Σ Mov", "Parz. bud", "Δ riga"]
     for mi in range(month_lo, month_hi + 1):
         heads.append(f"{abb[mi - 1]} M")
         heads.append(f"{abb[mi - 1]} B")
@@ -6422,29 +6434,45 @@ def _budget_tabellone_rows_for_export_month_range(
             bud.append(budget_effective_budget_cell(db, y_ref, code, m, mov_prev, ym_override=ym_override))
         cat_rows.append((code, label, mm, bud))
 
-    def _pack_row_rng(mov_row_m: list[Decimal], bud_row_m: list[Decimal]) -> list[str]:
-        tr_m_y = sum(mov_row_m)
-        tr_b_y = sum(bud_row_m)
-        out = [
-            format_euro_it(tr_m_y),
-            format_euro_it(tr_b_y),
-            format_euro_it(tr_m_y - tr_b_y),
-        ]
+    def _pack_month_cols_rng(mov_row_m: list[Decimal], bud_row_m: list[Decimal]) -> list[str]:
+        out: list[str] = []
         for m in range(month_lo, month_hi + 1):
             out.append(format_euro_it(mov_row_m[m - 1]))
             out.append(format_euro_it(bud_row_m[m - 1]))
         return out
 
+    def _pack_row_rng(mov_row_m: list[Decimal], bud_row_m: list[Decimal]) -> list[str]:
+        tr_m_y = sum(mov_row_m)
+        tr_b_par = budget_parziale_budget_sum_months_with_movements(mov_row_m, bud_row_m)
+        return [
+            format_euro_it(tr_m_y),
+            format_euro_it(tr_b_par),
+            format_euro_it(tr_m_y - tr_b_par),
+            *_pack_month_cols_rng(mov_row_m, bud_row_m),
+        ]
+
     rows: list[list[str]] = []
     tot_mov_m = [sum(cat_rows[i][2][j] for i in range(len(cat_rows))) for j in range(12)]
     tot_bud_m = [sum(cat_rows[i][3][j] for i in range(len(cat_rows))) for j in range(12)]
-    grand_diff_year = sum(tot_mov_m[j] - tot_bud_m[j] for j in range(12))
-    rows.append(["TOTALI", *_pack_row_rng(tot_mov_m, tot_bud_m)])
+    tot_mov_sum_y = sum(tot_mov_m)
+    parziale_tot_cats = sum(
+        budget_parziale_budget_sum_months_with_movements(r[2], r[3]) for r in cat_rows
+    )
+    grand_diff_head = tot_mov_sum_y - parziale_tot_cats
+    rows.append(
+        [
+            "TOTALI",
+            format_euro_it(tot_mov_sum_y),
+            format_euro_it(parziale_tot_cats),
+            format_euro_it(tot_mov_sum_y - parziale_tot_cats),
+            *_pack_month_cols_rng(tot_mov_m, tot_bud_m),
+        ]
+    )
     diff_tail: list[str] = []
     for j in range(month_lo - 1, month_hi):
         diff_tail.append(format_euro_it(tot_mov_m[j] - tot_bud_m[j]))
         diff_tail.append("")
-    rows.append(["DIFFERENZE", format_euro_it(grand_diff_year), "", ""] + diff_tail)
+    rows.append(["DIFFERENZE", format_euro_it(grand_diff_head), "", ""] + diff_tail)
     for _code, label, mm, bb in cat_rows:
         rows.append([label, *_pack_row_rng(mm, bb)])
     return heads, rows
@@ -29397,6 +29425,8 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     budget_br_r_vlines: list[tk.Frame] = []
     _bud_grid_outer_cfg_after: list[str | None] = [None]
     _bud_vline_fp: dict[int, tuple[int, tuple[int, ...]]] = {}
+    _bud_xsync_lock: list[bool] = [False]
+    _bud_vline_sched: list[str | None] = [None]
 
     def _bud_r_content_width(tv: ttk.Treeview) -> int:
         tw = 0
@@ -29406,12 +29436,6 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             except (tk.TclError, ValueError, TypeError):
                 pass
         return max(1, tw)
-
-    def _bud_vline_anchor_iid(tv: ttk.Treeview) -> str:
-        if tv.exists("bud_r_sub"):
-            return "bud_r_sub"
-        ch = tv.get_children()
-        return str(ch[0]) if ch else ""
 
     def _bud_math_boundary_screen_x(
         tv: ttk.Treeview, boundary_after_month: int, vw: int, lo_override: float | None
@@ -29445,10 +29469,10 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     def _bud_position_r_month_vlines(
         tv: ttk.Treeview, store: list[tk.Frame], lo_override: float | None = None
     ) -> None:
-        """Segmenti verticali tra una coppia mese (MOV+BUD) e la successiva (non tra MOV e BUD).
+        """Segmenti verticali tra una coppia mese (MOV+BUD) e la successiva.
 
-        Si basa preferibilmente su ``bbox`` (stesso sistema di coordinate del disegno delle celle)
-        e usa il fallback analitico solo se la cella non è misurabile (fuori viewport / riga assente).
+        Solo calcolo analitico (stesso ``lo`` per TR e BR da ``_bud_refresh_both_r_vlines`` / scroll):
+        ``bbox`` per righe diverse tra testata e corpo causava sfasamenti in scroll orizzontale.
         """
         _bud_ensure_r_vlines(store, tv)
         try:
@@ -29459,21 +29483,16 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             vw = max(1, int(tv.winfo_width()))
         except (tk.TclError, ValueError, TypeError):
             vw = 1
-        aid = _bud_vline_anchor_iid(tv)
+        if lo_override is not None:
+            lo = float(lo_override)
+        else:
+            try:
+                lo = float(tv.xview()[0])
+            except (tk.TclError, ValueError, TypeError):
+                lo = 0.0
         placements: list[int] = []
         for m in range(11):
-            x_vis: int | None = None
-            if aid:
-                try:
-                    cid = _bud_names_r[2 * m + 1]
-                    bb = tv.bbox(aid, cid)
-                    if bb and len(bb) >= 4 and int(bb[2]) > 0:
-                        x_vis = int(bb[0] + bb[2])
-                except tk.TclError:
-                    pass
-            if x_vis is None:
-                x_vis = _bud_math_boundary_screen_x(tv, m, vw, lo_override)
-            placements.append(x_vis)
+            placements.append(_bud_math_boundary_screen_x(tv, m, vw, lo))
         fp = (vw, tuple(placements))
         tid = id(tv)
         if _bud_vline_fp.get(tid) == fp:
@@ -29490,6 +29509,30 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                     ln.place_forget()
                 except tk.TclError:
                     pass
+
+    def _bud_schedule_vlines() -> None:
+        """Dopo scroll orizzontale, ricalcola le linee quando Tk ha aggiornato il Treeview (evita sfasamenti)."""
+        jid = _bud_vline_sched[0]
+        if jid is not None:
+            try:
+                root.after_cancel(jid)
+            except (tk.TclError, ValueError, TypeError):
+                pass
+            _bud_vline_sched[0] = None
+
+        def _apply() -> None:
+            _bud_vline_sched[0] = None
+            try:
+                lo = float(budget_tv_tr.xview()[0])
+            except (tk.TclError, ValueError, TypeError):
+                lo = 0.0
+            try:
+                _bud_position_r_month_vlines(budget_tv_tr, budget_tr_r_vlines, lo)
+                _bud_position_r_month_vlines(budget_tv_br, budget_br_r_vlines, lo)
+            except Exception:
+                pass
+
+        _bud_vline_sched[0] = root.after_idle(_apply)
 
     def _bud_on_grid_outer_configure(_e: tk.Event | None = None) -> None:
         """Ridisegna linee su resize finestra. Non su <Configure> del Treeview: place() sulle linee
@@ -29513,15 +29556,6 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
 
     def _bud_refresh_both_r_vlines() -> None:
         try:
-            _bud_position_r_month_vlines(budget_tv_tr, budget_tr_r_vlines)
-            _bud_position_r_month_vlines(budget_tv_br, budget_br_r_vlines)
-        except Exception:
-            pass
-
-    def _bud_xscroll_cmd(*args: object) -> None:
-        budget_tv_tr.xview(*args)
-        budget_tv_br.xview(*args)
-        try:
             lo = float(budget_tv_tr.xview()[0])
         except (tk.TclError, ValueError, TypeError):
             lo = 0.0
@@ -29531,41 +29565,58 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         except Exception:
             pass
 
+    def _bud_xscroll_cmd(*args: object) -> None:
+        if _bud_xsync_lock[0]:
+            return
+        _bud_xsync_lock[0] = True
+        try:
+            budget_tv_tr.xview(*args)
+            budget_tv_br.xview(*args)
+            xf = budget_tv_tr.xview()
+            _budget_xsb.set(xf[0], xf[1])
+        except (tk.TclError, ValueError, TypeError):
+            pass
+        finally:
+            _bud_xsync_lock[0] = False
+        _bud_schedule_vlines()
+
     def _bud_yscroll_cmd(*args: object) -> None:
         budget_tv_bl.yview(*args)
         budget_tv_br.yview(*args)
 
     def _bud_tr_xscroll_set(first: str, last: str) -> None:
-        _budget_xsb.set(first, last)
         try:
-            lo = float(first)
-        except (ValueError, TypeError):
-            lo = 0.0
+            _budget_xsb.set(first, last)
+        except tk.TclError:
+            return
+        if _bud_xsync_lock[0]:
+            return
+        _bud_xsync_lock[0] = True
         try:
-            budget_tv_br.xview_moveto(lo)
-        except (tk.TclError, ValueError, TypeError):
-            pass
-        try:
-            _bud_position_r_month_vlines(budget_tv_tr, budget_tr_r_vlines, lo)
-            _bud_position_r_month_vlines(budget_tv_br, budget_br_r_vlines, lo)
-        except Exception:
-            pass
+            try:
+                budget_tv_br.xview_moveto(float(first))
+            except (tk.TclError, ValueError, TypeError):
+                pass
+        finally:
+            _bud_xsync_lock[0] = False
+        _bud_schedule_vlines()
 
     def _bud_br_xscroll_set(first: str, last: str) -> None:
-        _budget_xsb.set(first, last)
         try:
-            lo = float(first)
-        except (ValueError, TypeError):
-            lo = 0.0
+            _budget_xsb.set(first, last)
+        except tk.TclError:
+            return
+        if _bud_xsync_lock[0]:
+            return
+        _bud_xsync_lock[0] = True
         try:
-            budget_tv_tr.xview_moveto(lo)
-        except (tk.TclError, ValueError, TypeError):
-            pass
-        try:
-            _bud_position_r_month_vlines(budget_tv_tr, budget_tr_r_vlines, lo)
-            _bud_position_r_month_vlines(budget_tv_br, budget_br_r_vlines, lo)
-        except Exception:
-            pass
+            try:
+                budget_tv_tr.xview_moveto(float(first))
+            except (tk.TclError, ValueError, TypeError):
+                pass
+        finally:
+            _bud_xsync_lock[0] = False
+        _bud_schedule_vlines()
 
     def _bud_bl_yscroll_set(first: str, last: str) -> None:
         _budget_ysb.set(first, last)
@@ -29587,6 +29638,35 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     budget_tv_br.configure(xscrollcommand=_bud_br_xscroll_set)
     budget_tv_bl.configure(yscrollcommand=_bud_bl_yscroll_set)
     budget_tv_br.configure(yscrollcommand=_bud_br_yscroll_set)
+
+    for _bud_tv_horiz in (budget_tv_tr, budget_tv_br):
+        try:
+            _bud_tv_horiz.configure(xscrollincrement=32)
+        except tk.TclError:
+            pass
+
+    def _bud_hscroll_steps(event: tk.Event) -> int:
+        d = int(getattr(event, "delta", 0) or 0)
+        if not d:
+            return 0
+        if platform.system() == "Darwin":
+            n = -int(round(d / 12.0))
+            if n == 0:
+                n = -1 if d > 0 else 1
+            return max(-12, min(12, n))
+        n = int(-d / 120)
+        if n == 0:
+            n = -1 if d > 0 else 1
+        return max(-8, min(8, n))
+
+    def _bud_on_shift_wheel(_event: tk.Event) -> str:
+        n = _bud_hscroll_steps(_event)
+        if n:
+            _bud_xscroll_cmd("scroll", n, "units")
+        return "break"
+
+    for _tv_hw in (budget_tv_tr, budget_tv_br):
+        _tv_hw.bind("<Shift-MouseWheel>", _bud_on_shift_wheel, add="+")
 
     budget_tv_tl.grid(row=0, column=0, sticky="nsew", padx=(0, 1), pady=(0, 1))
     budget_tv_tr.grid(row=0, column=1, sticky="nsew", padx=(0, 0), pady=(0, 1))
@@ -29781,23 +29861,34 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 sum(cat_rows[i][3][j] for i in range(len(cat_rows))) for j in range(12)
             ]
             tot_mov_sum = sum(sum(r[2]) for r in cat_rows)
-            tot_bud_sum = sum(sum(r[3]) for r in cat_rows)
-            grand_diff = tot_mov_sum - tot_bud_sum
+            tot_parziale_bud = sum(
+                budget_parziale_budget_sum_months_with_movements(r[2], r[3]) for r in cat_rows
+            )
+            grand_diff = tot_mov_sum - tot_parziale_bud
 
             def _pack_row_vals(mov_row_m: list[Decimal], bud_row_m: list[Decimal]) -> tuple[str, ...]:
                 tr_m = sum(mov_row_m)
-                tr_b = sum(bud_row_m)
+                tr_b_par = budget_parziale_budget_sum_months_with_movements(mov_row_m, bud_row_m)
                 cells: list[str] = [
                     _budget_fmt_eur(tr_m),
-                    _budget_fmt_eur(tr_b),
-                    _budget_fmt_eur(tr_m - tr_b),
+                    _budget_fmt_eur(tr_b_par),
+                    _budget_fmt_eur(tr_m - tr_b_par),
                 ]
                 for m in range(12):
                     cells.append(_budget_fmt_eur(mov_row_m[m]))
                     cells.append(_budget_fmt_eur(bud_row_m[m]))
                 return tuple(cells)
 
-            tot_vals = ("TOTALI",) + _pack_row_vals(tot_mov_m, tot_bud_m)
+            tot_vals = (
+                "TOTALI",
+                _budget_fmt_eur(tot_mov_sum),
+                _budget_fmt_eur(tot_parziale_bud),
+                _budget_fmt_eur(tot_mov_sum - tot_parziale_bud),
+            ) + tuple(
+                x
+                for j in range(12)
+                for x in (_budget_fmt_eur(tot_mov_m[j]), _budget_fmt_eur(tot_bud_m[j]))
+            )
             diff_mov_cols: list[Decimal] = [tot_mov_m[j] - tot_bud_m[j] for j in range(12)]
             diff_row_label = ("DIFFERENZE", _budget_fmt_eur(grand_diff), "", "")
             diff_tail: list[str] = []
