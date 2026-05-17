@@ -24,7 +24,7 @@ import atexit
 from collections import defaultdict
 from collections.abc import Callable
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from pathlib import Path
+from pathlib import Path, PurePath
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 from dataclasses import asdict
 from datetime import date, datetime, timedelta
@@ -2271,7 +2271,110 @@ def estratti_pdf_settings_from_db(db: dict) -> dict:
         ep = {}
         db["estratti_pdf"] = ep
     ep.setdefault("root_folder", "")
+    # Cartella destinazione PDF «fine verifica»; vuota = usa la stessa di root_folder.
+    ep.setdefault("reports_folder", "")
+    # Modello nome file (placeholder); vuoto → default modulo.
+    ep.setdefault("report_pdf_pattern", "")
     return ep
+
+
+DEFAULT_VERIFICA_REPORT_PDF_PATTERN = "Verifica conto [conto] data [aaaa]_[mm]_[gg].pdf"
+
+
+def resolve_verifica_report_pdf_output_directory(ep: dict) -> tuple[Path | None, str | None]:
+    """Destinazione directory per il PDF riepilogo verifica.
+
+    Ordine: ``reports_folder`` se impostata, altrimenti ``root_folder`` (estratti PDF).
+    Ritorna (None, motivo_it) per ricadere sul file temporaneo.
+    """
+    rpt_raw = str(ep.get("reports_folder") or "").strip()
+    root_raw = str(ep.get("root_folder") or "").strip()
+    order: list[str] = []
+    if rpt_raw:
+        order.append(rpt_raw)
+    if root_raw and root_raw not in order:
+        order.append(root_raw)
+    if not order:
+        return (
+            None,
+            "Nessuna cartella impostata in Opzioni per estratti né per i rapporti di fine verifica;\n"
+            "il PDF viene salvato come file temporaneo.\n\n",
+        )
+    failures: list[str] = []
+    for raw in order:
+        try:
+            pr = Path(raw).expanduser().resolve()
+        except OSError as exc:
+            failures.append(f"{raw} ({exc})")
+            continue
+        if pr.is_dir():
+            return pr, None
+        failures.append(f"{raw}")
+    headline = (
+        "Le cartelle di salvataggio rapporti fine verifica e di estratti (Opzioni) non sono valide;\n"
+        if rpt_raw and root_raw
+        else (
+            "La cartella di salvataggio rapporti fine verifica (Opzioni) non è valida;\n"
+            if rpt_raw
+            else "La cartella radice degli estratti PDF (Opzioni) non è valida;\n"
+        )
+    )
+    tail = (
+        ("\nPercorsi controllati:\n" + "\n".join(f"• {f}" for f in failures) + "\n\n") if failures else ""
+    )
+    return None, headline + tail
+
+
+def sanitize_verifica_pdf_report_filename_basename(raw: str) -> str:
+    """Solo nome file (senza percorsi), caratteri sicuri sulle piattaforme supportate."""
+    t = (raw or "").strip().strip("/").strip("\\").replace("\x00", "")
+    t = PurePath(str(t)).name
+    for ch in '<>:"/\\|?*\n\r\t\x00':
+        t = t.replace(ch, " ")
+    t = " ".join(t.split()).strip(".").strip()
+    # Evita nome vuoto dopo sanificazione
+    return (t[:200] if len(t) > 200 else t).strip()
+
+
+def build_verifica_report_pdf_basename(ep: dict, *, acc_name: str, cutoff_display: str) -> str:
+    pattern_raw = str(ep.get("report_pdf_pattern") or "").strip()
+    pattern = pattern_raw or DEFAULT_VERIFICA_REPORT_PDF_PATTERN
+
+    iso_full = parse_italian_ddmmyyyy_to_iso((cutoff_display or "").strip())
+    iso_day = iso_full[:10] if iso_full else date.today().strftime("%Y-%m-%d")
+    try:
+        dcut = date.fromisoformat(iso_day)
+    except Exception:
+        dcut = date.today()
+
+    safe_conto = _verifica_pdf_safe_filename_segment(acc_name)
+    rep_defs: list[tuple[str, str]] = [
+        ("aaaa_mm_gg", f"{dcut.year:04d}_{dcut.month:02d}_{dcut.day:02d}"),
+        ("aaaa_mm", f"{dcut.year:04d}-{dcut.month:02d}"),
+        ("aa_mm", f"{dcut.year % 100:02d}-{dcut.month:02d}"),
+        ("conto", safe_conto),
+        ("aaaa", f"{dcut.year:04d}"),
+        ("aa", f"{dcut.year % 100:02d}"),
+        ("mm", f"{dcut.month:02d}"),
+        ("gg", f"{dcut.day:02d}"),
+    ]
+    reps: list[tuple[str, str]] = []
+    for key, repl in rep_defs:
+        reps.append((f"[{key}]", repl))
+        reps.append((f"{{{key}}}", repl))  # modelli storici con graffe
+    reps.sort(key=lambda t: (-len(t[0]), t[0]))
+    out = pattern
+    for tok, repl in reps:
+        out = out.replace(tok, repl)
+    bn = sanitize_verifica_pdf_report_filename_basename(out)
+    if not bn:
+        out2 = DEFAULT_VERIFICA_REPORT_PDF_PATTERN
+        for tok, repl in reps:
+            out2 = out2.replace(tok, repl)
+        bn = sanitize_verifica_pdf_report_filename_basename(out2) or "Verifica_finale.pdf"
+    if not bn.lower().endswith(".pdf"):
+        bn = bn + ".pdf"
+    return bn
 
 
 def propagate_account_estratti_pdf_stem_by_code(db: dict, code: str, stem: str) -> None:
@@ -5623,7 +5726,7 @@ def save_verifica_results_pdf(
     pd: dict,
     match_ok: bool,
 ) -> bool:
-    """Scrive il rapporto stampa-verifica come PDF nella cartella estratti (Opzioni) se configurata."""
+    """Scrive il PDF «Stampa risultati»: cartella da Opzioni (rapporto fine verifica e/o estratti), nome da modello."""
     try:
         from fpdf import FPDF
         from fpdf.enums import XPos, YPos
@@ -5634,40 +5737,21 @@ def save_verifica_results_pdf(
             parent=parent,
         )
         return False
-    cutoff_iso_file = parse_italian_ddmmyyyy_to_iso(cutoff_display.strip()) or date.today().isoformat()
-    ymd_u = cutoff_iso_file[:10].replace("-", "_")
-
-    fname_hint = (
-        "Verifica conto "
-        + _verifica_pdf_safe_filename_segment(acc_name)
-        + " data "
-        + ymd_u
-        + ".pdf"
+    ep_pdf = estratti_pdf_settings_from_db(db)
+    fname_hint = build_verifica_report_pdf_basename(
+        ep_pdf, acc_name=acc_name, cutoff_display=cutoff_display
     )
 
-    raw_root = (estratti_pdf_settings_from_db(db).get("root_folder") or "").strip()
     out_path: Path
     informative: str | None = None
     try:
-        if raw_root:
-            pr = Path(raw_root).expanduser().resolve()
-            if pr.is_dir():
-                out_path = pr / fname_hint
-            else:
-                informative = (
-                    "La cartella radice degli estratti (Opzioni) non è valida;\n"
-                    "il PDF viene salvato come file temporaneo.\n\n"
-                    f"Nome consigliato: {fname_hint}"
-                )
-                fd, tmp = tempfile.mkstemp(suffix=".pdf", prefix="verifica_")
-                os.close(fd)
-                out_path = Path(tmp)
+        out_parent, diag = resolve_verifica_report_pdf_output_directory(ep_pdf)
+        if out_parent is not None:
+            out_path = out_parent / fname_hint
         else:
-            informative = (
-                "Cartella radice degli estratti non impostata in Opzioni;\n"
-                "il PDF viene salvato come file temporaneo.\n\n"
-                f"Nome consigliato: {fname_hint}"
-            )
+            tail = diag or ""
+            informative = tail.rstrip() + ("\n\n" if tail.strip() else "")
+            informative += f"Nome consigliato del file:\n{fname_hint}"
             fd, tmp = tempfile.mkstemp(suffix=".pdf", prefix="verifica_")
             os.close(fd)
             out_path = Path(tmp)
@@ -8917,20 +9001,38 @@ def build_ui(
     login_window_to_close = getattr(root, "_cdc_login_window_to_close", None)
 
     def _apply_macos_fullscreen_window() -> None:
-        """Tk/Aqua ignora spesso ``state("zoomed")``: usa il fullscreen nativo dopo il map."""
+        """Tk/Aqua: geometria grande + fullscreen prima del primo ``deiconify()``.
+
+        Se si mappa prima la finestra, Tk mostra il rectangolo minimo predefinito e poi l’espansione
+        («un quarto di schermo» e salto visivo).
+        Qui ``geometry`` e ``-fullscreen`` vanno mentre ``build_ui`` ha lasciato la root ``withdraw()``;
+        dopo si chiama solo ``deiconify()``.
+        Se ``-fullscreen`` non è disponibile, si usa geometry a schermo intero + tentativi di zoom.
+        """
         if platform.system() != "Darwin":
             return
         try:
-            sw = max(1, int(root.winfo_vrootwidth() or root.winfo_screenwidth()))
-            sh = max(1, int(root.winfo_vrootheight() or root.winfo_screenheight()))
+            sw = max(1, int(root.winfo_screenwidth()))
+            sh = max(1, int(root.winfo_screenheight()))
         except Exception:
-            try:
-                sw = max(1, int(root.winfo_screenwidth()))
-                sh = max(1, int(root.winfo_screenheight()))
-            except Exception:
-                return
+            sw, sh = 1440, 900
         try:
             root.geometry(f"{sw}x{sh}+0+0")
+            root.update_idletasks()
+        except Exception:
+            pass
+        try:
+            root.attributes("-fullscreen", True)
+            return
+        except Exception:
+            pass
+        try:
+            vw = max(1, int(root.winfo_vrootwidth() or root.winfo_screenwidth()))
+            vh = max(1, int(root.winfo_vrootheight() or root.winfo_screenheight()))
+        except Exception:
+            vw, vh = sw, sh
+        try:
+            root.geometry(f"{vw}x{vh}+0+0")
         except Exception:
             pass
         for _try_zoom in (
@@ -8941,10 +9043,6 @@ def build_ui(
                 _try_zoom()
             except Exception:
                 pass
-        try:
-            root.attributes("-fullscreen", True)
-        except Exception:
-            pass
 
     def _present_main_window_once() -> None:
         """Mostra la finestra appena la pagina iniziale è usabile; chiamate successive sono no-op."""
@@ -8953,16 +9051,16 @@ def build_ui(
         _main_window_presented[0] = True
         try:
             if platform.system() == "Darwin":
+                # Prep + fullscreen mentre non è ancora visibile il primo pixel (root ancora ``withdraw()``).
                 _apply_macos_fullscreen_window()
+                root.deiconify()
             else:
                 root.geometry("1200x760")
                 try:
                     root.state("zoomed")
                 except Exception:
                     pass
-            root.deiconify()
-            if platform.system() == "Darwin":
-                _apply_macos_fullscreen_window()
+                root.deiconify()
             root.lift()
             root.focus_force()
             root.update_idletasks()
@@ -8971,12 +9069,6 @@ def build_ui(
                     login_window_to_close.destroy()
                 except Exception:
                     pass
-            if platform.system() == "Darwin":
-                for _delay in (50, 250, 700, 1400):
-                    try:
-                        root.after(_delay, _apply_macos_fullscreen_window)
-                    except tk.TclError:
-                        pass
 
             def _dock_icon_when_safe() -> None:
                 try:
@@ -8993,7 +9085,10 @@ def build_ui(
 
     _is_macos_ui = platform.system() == "Darwin"
     main_nb_shell = tk.Frame(root, bg=MOVIMENTI_PAGE_BG)
-    main_nb_shell.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 6) if _is_macos_ui else 8)
+    # Margine superiore più generoso su macOS fullscreen: prima riga sempre sotto menu bar/notch.
+    main_nb_shell.pack(
+        fill=tk.BOTH, expand=True, padx=8, pady=(18, 6) if _is_macos_ui else 8
+    )
     cdc_tab_bar = tk.Frame(main_nb_shell, bg=MOVIMENTI_PAGE_BG)
     cdc_tab_bar.pack(fill=tk.X, pady=(0, 2 if _is_macos_ui else 6))
     cdc_tab_bar.columnconfigure(0, weight=1)
@@ -19197,6 +19292,17 @@ th {{ background:#efefef; text-align:left; }}
     ver_pdf_auto_diag_var = tk.StringVar(value="")
     _ep_init = estratti_pdf_settings_from_db(cur_db())
     estratti_pdf_root_var = tk.StringVar(value=str(_ep_init.get("root_folder", "") or ""))
+    estratti_pdf_reports_folder_var = tk.StringVar(value=str(_ep_init.get("reports_folder", "") or ""))
+    verifica_report_pdf_pattern_var = tk.StringVar(value=str(_ep_init.get("report_pdf_pattern", "") or ""))
+
+    def _sync_estratti_pdf_ui_vars_from_db() -> None:
+        try:
+            ep = estratti_pdf_settings_from_db(cur_db())
+            estratti_pdf_root_var.set(str(ep.get("root_folder") or ""))
+            estratti_pdf_reports_folder_var.set(str(ep.get("reports_folder") or ""))
+            verifica_report_pdf_pattern_var.set(str(ep.get("report_pdf_pattern") or ""))
+        except Exception:
+            pass
 
     # --- persistenza dati di verifica in sospeso ---
     def _ver_saved_has_bancoposta(saved: dict | None) -> bool:
@@ -19913,15 +20019,9 @@ th {{ background:#efefef; text-align:left; }}
         except tk.TclError:
             pass
 
-    def _ver_refresh_estratti_root_var_from_db() -> None:
-        try:
-            estratti_pdf_root_var.set(str(estratti_pdf_settings_from_db(cur_db()).get("root_folder") or ""))
-        except Exception:
-            pass
-
     def _ver_show_auto_folder_box(show: bool) -> None:
         if show:
-            _ver_refresh_estratti_root_var_from_db()
+            _sync_estratti_pdf_ui_vars_from_db()
             try:
                 ver_auto_folder_box.grid()
             except tk.TclError:
@@ -33013,6 +33113,157 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         labelwidget=ttk.Label(data_outer, text="Cartella dati", font=_OPZ_TITLE_FONT)
     )
     data_outer.pack(fill=tk.X, padx=(28, 10), pady=(0, 10))
+
+    ver_estratti_outer = ttk.LabelFrame(opz_scrollable, padding=10)
+    ver_estratti_outer.configure(
+        labelwidget=ttk.Label(
+            ver_estratti_outer, text="Estratti PDF e rapporto fine verifica", font=_OPZ_TITLE_FONT
+        )
+    )
+    ver_estratti_outer.pack(fill=tk.X, padx=(28, 10), pady=(0, 10))
+
+    def browse_opz_estratti_pdf_root() -> None:
+        init = (estratti_pdf_root_var.get() or "").strip() or str(Path.home())
+        picked = filedialog.askdirectory(initialdir=init, title="Cartella estratti PDF")
+        if picked:
+            estratti_pdf_root_var.set(picked)
+
+    def browse_opz_verifica_report_folder() -> None:
+        init = (
+            (estratti_pdf_reports_folder_var.get() or "").strip()
+            or (estratti_pdf_root_var.get() or "").strip()
+            or str(Path.home())
+        )
+        picked = filedialog.askdirectory(
+            initialdir=init, title="Cartella salvataggio PDF fine verifica"
+        )
+        if picked:
+            estratti_pdf_reports_folder_var.set(picked)
+
+    def save_estratti_pdf_verifica_prefs() -> None:
+        ep = estratti_pdf_settings_from_db(cur_db())
+        root_v = (estratti_pdf_root_var.get() or "").strip()
+        reports_v = (estratti_pdf_reports_folder_var.get() or "").strip()
+        patt_v = (verifica_report_pdf_pattern_var.get() or "").strip()
+        problems: list[str] = []
+        if root_v:
+            try:
+                pr = Path(root_v).expanduser().resolve()
+                if not pr.is_dir():
+                    problems.append(f"Cartella estratti PDF non valida o non accessibile:\n{root_v}")
+            except OSError as exc:
+                problems.append(f"Percorso estratti PDF non utilizzabile:\n{root_v}\n({exc})")
+        if reports_v:
+            try:
+                pr2 = Path(reports_v).expanduser().resolve()
+                if not pr2.is_dir():
+                    problems.append(
+                        f"Cartella salvataggio rapporti fine verifica non valida o non accessibile:\n{reports_v}"
+                    )
+            except OSError as exc:
+                problems.append(
+                    f"Percorso salvataggio rapporti non utilizzabile:\n{reports_v}\n({exc})"
+                )
+        if problems:
+            messagebox.showwarning(
+                "Estratti PDF e verifica",
+                "\n\n".join(problems),
+                parent=root,
+            )
+            return
+        ep["root_folder"] = root_v
+        ep["reports_folder"] = reports_v
+        ep["report_pdf_pattern"] = patt_v
+        try:
+            save_encrypted_db_dual(
+                cur_db(),
+                Path(data_file_var.get()).expanduser().resolve(),
+                Path(key_file_var.get()).expanduser().resolve(),
+            )
+        except Exception as exc:
+            messagebox.showerror("Salvataggio", str(exc), parent=root)
+            return
+        messagebox.showinfo(
+            "Estratti PDF e verifica",
+            "Impostazioni salvate nel database cifrato.",
+            parent=root,
+        )
+
+    ves = ttk.Frame(ver_estratti_outer)
+    ves.pack(fill=tk.X)
+    ves.columnconfigure(0, weight=1)
+    r_ves = 0
+    ttk.Label(ves, text="Cartella estratti PDF", font=("TkDefaultFont", 11, "bold")).grid(
+        row=r_ves, column=0, columnspan=3, sticky="w", pady=(0, 2)
+    )
+    r_ves += 1
+    ttk.Label(
+        ves,
+        text="Percorso comune per caricare e cercare automaticamente gli estratti (nomi base file in scheda Conti).",
+        wraplength=780,
+    ).grid(row=r_ves, column=0, columnspan=3, sticky="w", pady=(0, 4))
+    r_ves += 1
+    ttk.Entry(ves, textvariable=estratti_pdf_root_var, width=_OPZ_PATH_ENTRY_WIDTH).grid(
+        row=r_ves, column=0, columnspan=2, sticky="we", padx=(0, 8)
+    )
+    ttk.Button(ves, text="Sfoglia…", command=browse_opz_estratti_pdf_root).grid(
+        row=r_ves, column=2, sticky="w"
+    )
+    r_ves += 1
+    ttk.Label(ves, text="Cartella salvataggio PDF «fine verifica» (opzionale)", font=("TkDefaultFont", 11, "bold")).grid(
+        row=r_ves, column=0, columnspan=3, sticky="w", pady=(8, 2)
+    )
+    r_ves += 1
+    ttk.Label(
+        ves,
+        text="Se vuota, «Stampa risultati» usa la cartella estratti PDF. Se impostata e valida, ha priorità.",
+        wraplength=780,
+    ).grid(row=r_ves, column=0, columnspan=3, sticky="w", pady=(0, 4))
+    r_ves += 1
+    ttk.Entry(ves, textvariable=estratti_pdf_reports_folder_var, width=_OPZ_PATH_ENTRY_WIDTH).grid(
+        row=r_ves, column=0, columnspan=2, sticky="we", padx=(0, 8)
+    )
+    ttk.Button(ves, text="Sfoglia…", command=browse_opz_verifica_report_folder).grid(
+        row=r_ves, column=2, sticky="w"
+    )
+    r_ves += 1
+    ttk.Label(ves, text="Modello nome file PDF del rapporto (opzionale)", font=("TkDefaultFont", 11, "bold")).grid(
+        row=r_ves, column=0, columnspan=3, sticky="w", pady=(8, 2)
+    )
+    r_ves += 1
+    ttk.Label(
+        ves,
+        text=(
+            "Segnaposto dalla data di chiusura estratto: [conto] nome conto; [aa_mm] anno-mese in forma aa-mm; "
+            "[gg] [mm] [aa] [aaaa] componenti; [aaaa_mm_gg] come aaaa_mm_gg. "
+            "Campo vuoto = «Verifica conto [conto] data [aaaa]_[mm]_[gg].pdf»."
+        ),
+        wraplength=780,
+        justify=tk.LEFT,
+    ).grid(row=r_ves, column=0, columnspan=3, sticky="w", pady=(0, 4))
+    r_ves += 1
+    ttk.Entry(ves, textvariable=verifica_report_pdf_pattern_var, width=_OPZ_PATH_ENTRY_WIDTH).grid(
+        row=r_ves, column=0, columnspan=2, sticky="we", padx=(0, 8)
+    )
+    ttk.Button(
+        ves,
+        text="Svuota (usa default)",
+        command=lambda: verifica_report_pdf_pattern_var.set(""),
+    ).grid(row=r_ves, column=2, sticky="w")
+    r_ves += 1
+    ves_btnrow = ttk.Frame(ves)
+    ves_btnrow.grid(row=r_ves, column=0, columnspan=3, sticky="w", pady=(10, 0))
+    ttk.Button(
+        ves_btnrow,
+        text="Salva impostazioni verifica PDF",
+        command=save_estratti_pdf_verifica_prefs,
+    ).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Button(
+        ves_btnrow,
+        text="Rileggi da database",
+        command=_sync_estratti_pdf_ui_vars_from_db,
+    ).pack(side=tk.LEFT)
+
     opzioni_inner = ttk.Frame(data_outer)
     opzioni_inner.pack(fill=tk.X)
 
@@ -33372,9 +33623,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             pass
         _refresh_backup_path_hint()
         try:
-            estratti_pdf_root_var.set(
-                str(estratti_pdf_settings_from_db(cur_db()).get("root_folder") or "")
-            )
+            _sync_estratti_pdf_ui_vars_from_db()
         except Exception:
             pass
         status_var.set(f"Cartella di lavoro: {folder}")
@@ -33528,9 +33777,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             pass
         _refresh_backup_path_hint()
         try:
-            estratti_pdf_root_var.set(
-                str(estratti_pdf_settings_from_db(cur_db()).get("root_folder") or "")
-            )
+            _sync_estratti_pdf_ui_vars_from_db()
         except Exception:
             pass
         status_var.set("Ripristino da Library completato; file light aggiornato.")
