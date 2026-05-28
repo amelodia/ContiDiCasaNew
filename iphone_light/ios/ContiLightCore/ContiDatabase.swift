@@ -2364,11 +2364,6 @@ public enum ContiDatabase {
             if a2.code == acc1.code {
                 throw ContiLightImmissioneError.message("Il secondo conto deve essere diverso dal primo.")
             }
-            if a2.isCreditCard {
-                throw ContiLightImmissioneError.message(
-                    "Nelle girate conto/conto il secondo conto non può essere un conto carta di credito."
-                )
-            }
         }
         guard let dIsoFull = parseItalianOrIsoDateToIso(dateText) else {
             throw ContiLightImmissioneError.message("Data non valida (gg/mm/aaaa).")

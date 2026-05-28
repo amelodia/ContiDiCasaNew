@@ -543,9 +543,9 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         }
     }
 
-    /// Girata conto/conto: il secondo conto non può essere carta (come sul desktop).
+    /// Girata conto/conto: stesso elenco conti del primo conto (come sul desktop).
     private var accRowsGirataSecondo: [(code: String, label: String, subtitle: String?)] {
-        (lists?.conti ?? []).filter { !$0.isCreditCard }.map { ($0.code, $0.name, nil) }
+        accRows
     }
 
     private var selectedCatNote: String {

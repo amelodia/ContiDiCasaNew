@@ -21,7 +21,7 @@ import unicodedata
 import tkinter as tk
 import webbrowser
 import atexit
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path, PurePath
@@ -8171,6 +8171,48 @@ def unified_registration_sequence_map(records_sorted: list[dict]) -> dict[str, i
     return {record_legacy_stable_key(r): i for i, r in enumerate(records_sorted, start=1)}
 
 
+def preferred_primary_account_code_for_category(
+    records_sorted: list[dict],
+    category_code: str,
+    *,
+    recent_limit: int = 3,
+) -> str:
+    """
+    Conto primario suggerito per una categoria: tra le ultime ``recent_limit`` registrazioni
+    (ordine merge, esclusi annullamenti) prevale il conto più frequente; a parità di frequenza
+    si usa l'ultimo conto impostato (registrazione più recente tra i pari merito).
+    """
+    cc = str(category_code or "").strip()
+    if not cc:
+        return ""
+    matched = [
+        r
+        for r in records_sorted
+        if not r.get("is_cancelled")
+        and _category_codes_equal_migration(str(r.get("category_code", "")).strip(), cc)
+    ]
+    recent = matched[-recent_limit:]
+    if not recent:
+        return ""
+    accs: list[str] = []
+    for r in recent:
+        ac = str(r.get("account_primary_code", "")).strip()
+        if ac:
+            accs.append(ac)
+    if not accs:
+        return ""
+    counts = Counter(accs)
+    max_count = max(counts.values())
+    winners = [a for a, c in counts.items() if c == max_count]
+    if len(winners) == 1:
+        return winners[0]
+    for r in reversed(recent):
+        ac = str(r.get("account_primary_code", "")).strip()
+        if ac in winners:
+            return ac
+    return accs[-1]
+
+
 def filter_and_sort_movements_for_grid(
     records_canonical: list[dict],
     reg_seq_map: dict[str, int],
@@ -11451,11 +11493,6 @@ def build_ui(
             return None
         return (sel[0], rec)
 
-    def _record_has_virtuale(rec: dict) -> bool:
-        p = str(rec.get("account_primary_name") or rec.get("account_primary_code") or "")
-        s = str(rec.get("account_secondary_name") or rec.get("account_secondary_code") or "")
-        return _is_virtuale_account(p) or _is_virtuale_account(s)
-
     def on_modifica_reg_click_generic(
         event: tk.Event,
         *,
@@ -11504,13 +11541,7 @@ def build_ui(
         )
 
     def _movimenti_edit_actions_for_record(rec: dict) -> list[tuple[str, Callable[[str], None]]]:
-        is_virtuale_rec = _record_has_virtuale(rec)
         giro = is_giroconto_record(rec)
-        if is_virtuale_rec:
-            return [
-                ("Assegno", open_edit_cheque),
-                ("Nota", open_edit_note),
-            ]
         if record_is_before_2022(rec) and not giro:
             return [("Categoria", open_edit_category)]
         actions: list[tuple[str, Callable[[str], None]]] = [
@@ -11810,12 +11841,6 @@ th {{ background:#efefef; text-align:left; }}
             messagebox.showwarning(
                 "Elimina registrazione",
                 "La registrazione coinvolge un conto congelato: non è eliminabile.",
-            )
-            return
-        if _record_has_virtuale(rec):
-            messagebox.showwarning(
-                "Eliminazione non ammessa",
-                "Le registrazioni che coinvolgono il conto VIRTUALE non sono eliminabili.",
             )
             return
         if not record_is_within_recent_mod_delete_window(rec):
@@ -15713,6 +15738,43 @@ th {{ background:#efefef; text-align:left; }}
                 return n
         return (acc_opts_cache[0][0] if acc_opts_cache else "")
 
+    def _newreg_category_skips_acc_history(cat_code: str, cat_name: str = "") -> bool:
+        """Consumi ordinari e Girata conto/conto: conto non derivato dallo storico categoria."""
+        nm = (cat_name or "").strip()
+        if not nm and cat_code:
+            nm = next((n for n, c in cat_opts_cache if c == cat_code), "")
+        if _is_giro_label(nm):
+            return True
+        return "consumi ordinari" in category_display_name(nm).lower()
+
+    def _newreg_preferred_acc1_display_for_category(cat_code: str) -> str:
+        code = preferred_primary_account_code_for_category(_all_records_sorted(), cat_code)
+        if code:
+            disp = _newreg_chart_acc_display_name_for_code(code)
+            if disp:
+                return disp
+        return _newreg_default_acc1_chart_display_name()
+
+    def _apply_newreg_acc1_default_for_category(cat_code: str) -> None:
+        if virtuale_discharge_active[0]:
+            return
+        cat_name = (newreg_cat_var.get() or "").strip()
+        if _newreg_category_skips_acc_history(cat_code, cat_name):
+            return
+        if _is_giro_label(cat_name):
+            return
+        pick = _newreg_preferred_acc1_display_for_category(cat_code)
+        if not pick:
+            return
+        newreg_acc1_var.set(pick)
+        try:
+            vals1 = list(cb_acc1.cget("values") or ())
+            if pick in vals1:
+                cb_acc1.current(vals1.index(pick))
+        except Exception:
+            pass
+        _sync_cat_note_and_second_account()
+
     def _is_consumi_ordinari_e_cassa_selection() -> bool:
         code = _selected_category_code() or newreg_cat_code_var.get().strip()
         cat_lbl = (newreg_cat_var.get() or "").strip()
@@ -16187,7 +16249,7 @@ th {{ background:#efefef; text-align:left; }}
         newreg_amount_var.set(("-" if sign == "-" else "+") + format_euro_it(m))
 
     def _giro_combo_pair_lists() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-        """Per Girata conto/conto: tutte le coppie nome/codice per il primo conto; per il secondo si escludono le carte."""
+        """Per Girata conto/conto: coppie nome/codice (stesso elenco per primo e secondo conto)."""
         pairs = _order_account_name_code_pairs(list(acc_opts_cache), virtuale_last=True)
         acc_names_giro = [n for n, _c in pairs]
         if VIRTUALE_ACCOUNT_NAME not in acc_names_giro:
@@ -16195,9 +16257,7 @@ th {{ background:#efefef; text-align:left; }}
                 pairs + [(VIRTUALE_ACCOUNT_NAME, "")],
                 virtuale_last=True,
             )
-        db = cur_db()
-        acc2_pairs = [(n, c) for n, c in pairs if not c or not account_is_credit_card_by_code(db, c)]
-        return pairs, acc2_pairs
+        return pairs, pairs
 
     def _sync_cat_note_and_second_account() -> None:
         if virtuale_discharge_active[0]:
@@ -16253,13 +16313,6 @@ th {{ background:#efefef; text-align:left; }}
                     pick = names2[0]
                 newreg_acc2_var.set(pick)
                 newreg_last_account_touched[0] = "acc2"
-            acc2_nm_fix = newreg_acc2_var.get().strip()
-            acc2_cd_fix = next((c for n, c in giro_pairs_full if n == acc2_nm_fix), "")
-            if acc2_cd_fix and account_is_credit_card_by_code(cur_db(), acc2_cd_fix):
-                for n, _c in giro_pairs_acc2:
-                    if n != newreg_acc1_var.get().strip():
-                        newreg_acc2_var.set(n)
-                        break
             if _is_virtuale_account(newreg_acc1_var.get()) and _is_virtuale_account(newreg_acc2_var.get()):
                 if newreg_last_account_touched[0] == "acc1":
                     newreg_acc2_var.set("Cassa")
@@ -16611,12 +16664,6 @@ th {{ background:#efefef; text-align:left; }}
         if giro and (not acc2_code or acc2_code == acc1_code):
             messagebox.showerror("Nuova registrazione", "Nel giroconto il secondo conto è obbligatorio e diverso dal primo.")
             return None
-        if giro and acc2_code and account_is_credit_card_by_code(cur_db(), acc2_code):
-            messagebox.showerror(
-                "Nuova registrazione",
-                "Nelle girate conto/conto il secondo conto non può essere un conto carta di credito.",
-            )
-            return None
         raw_amt = (newreg_amount_var.get() or "").strip()
         if not raw_amt or raw_amt in ("+", "-"):
             messagebox.showerror("Nuova registrazione", "Importo a zero non ammesso.")
@@ -16712,18 +16759,6 @@ th {{ background:#efefef; text-align:left; }}
             return False
         if not messagebox.askyesno(dialog_title, f"Confermi l'inserimento della registrazione?\n\n{preview}"):
             return False
-        has_virtuale_rec = (_is_virtuale_account(str(rec.get("account_primary_name", "")))
-                           or _is_virtuale_account(str(rec.get("account_secondary_name", ""))))
-        if has_virtuale_rec:
-            if not messagebox.askyesno(
-                "Registrazione non modificabile",
-                "Hai controllato bene questa registrazione, che non sarà modificabile?"
-            ):
-                try:
-                    cb_cat.focus_set()
-                except Exception:
-                    pass
-                return False
         y_bucket = _ensure_year_bucket(int(rec["year"]))
         y_bucket["records"].append(rec)
         try:
@@ -17604,13 +17639,6 @@ th {{ background:#efefef; text-align:left; }}
                 if pick == per_acc1_var.get() and len(names2) > 1:
                     pick = names2[0]
                 per_acc2_var.set(pick)
-            acc2_nm_pf = per_acc2_var.get().strip()
-            acc2_cd_pf = next((c for n, c in gpf if n == acc2_nm_pf), "")
-            if acc2_cd_pf and account_is_credit_card_by_code(cur_db(), acc2_cd_pf):
-                for n, _c in gpa2:
-                    if n != per_acc1_var.get().strip():
-                        per_acc2_var.set(n)
-                        break
             if per_acc1_var.get().strip() and per_acc1_var.get().strip() == per_acc2_var.get().strip():
                 for n, _c in gpa2:
                     if n != per_acc1_var.get().strip():
@@ -17812,12 +17840,6 @@ th {{ background:#efefef; text-align:left; }}
             messagebox.showerror(
                 "Registrazioni periodiche",
                 "Nel giroconto il secondo conto è obbligatorio e diverso dal primo.",
-            )
-            return None
-        if giro and acc2_code and account_is_credit_card_by_code(cur_db(), acc2_code):
-            messagebox.showerror(
-                "Registrazioni periodiche",
-                "Nelle girate conto/conto il secondo conto non può essere un conto carta di credito.",
             )
             return None
         raw_amt = (per_amount_var.get() or "").strip()
@@ -18757,6 +18779,7 @@ th {{ background:#efefef; text-align:left; }}
         code = _selected_category_code()
         newreg_cat_code_var.set(code)
         _sync_cat_note_and_second_account()
+        _apply_newreg_acc1_default_for_category(code)
 
     def _on_acc1_combo(_e: tk.Event | None = None) -> None:
         newreg_last_account_touched[0] = "acc1"

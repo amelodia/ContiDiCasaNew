@@ -31,7 +31,7 @@ Punti collegati: `ent_amt`, filtri Movimenti, `ent_per_amt`, dialog **Modifica i
 
 ## Girata conto/conto — secondo conto
 
-- Il **secondo conto** di una girata **non** può essere un **conto carta** di credito (liste tendina e validazione al salvataggio, analogamente su Conti light).
+- Il **secondo conto** di una girata può essere qualsiasi conto del piano (inclusi carta di credito e VIRTUALE), salvo che entrambi i conti siano VIRTUALE (mutua esclusione → l’altro torna a Cassa).
 
 ## Memoria virtuale (conto Virtuale)
 
@@ -40,7 +40,7 @@ Punti collegati: `ent_amt`, filtri Movimenti, `ent_per_amt`, dialog **Modifica i
 - La **prima Girata** con VIRTUALE ha effetto sul conto non-virtuale coinvolto; le registrazioni successive (fase scarico) hanno effetto **solo sul saldo virtuale** e contano solo per le categorie.
 - **Fase scarico**: l'utente è bloccato sulla pagina immissione dati; categorie: tutte esclusa Girata; conto: solo VIRTUALE; saldo virtuale sempre visibile; tasto «Scarica saldo virtuale» disponibile. Il blocco termina quando il saldo virtuale è **zero**.
 - Le registrazioni di scarico (`is_virtuale_discharge=True`) **non modificano i saldi reali** dei conti, ma sono visibili nei Movimenti e misurabili per categoria.
-- Registrazioni con conto VIRTUALE: **non modificabili** e **non eliminabili**. Doppia conferma all'inserimento.
+- Registrazioni con conto VIRTUALE: modificabili e eliminabili come le altre (salvo vincoli generali: data, verifica, conti congelati). Conferma d’inserimento unica come per le altre registrazioni.
 - Il saldo virtuale **non compare** nella pagina Saldi.
 - Girata con VIRTUALE: la nota **non** viene preimpostata a "Giroconto".
 
