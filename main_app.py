@@ -771,6 +771,13 @@ def bind_euro_amount_entry_validation(
 
     def _set_amount_text_and_cursor(text: str, *, cursor: int | None = None, select_all: bool = False) -> None:
         var.set(text)
+        if platform.system() == "Windows":
+            try:
+                entry.delete(0, tk.END)
+                if text:
+                    entry.insert(0, text)
+            except tk.TclError:
+                pass
         try:
             if select_all:
                 entry.selection_range(0, tk.END)
@@ -976,6 +983,10 @@ def bind_euro_amount_entry_validation(
         if ch and ord(ch) >= 32:
             return ch
         keysym = str(getattr(event, "keysym", "") or "")
+        if keysym in ("minus", "KP_Subtract"):
+            return "-"
+        if keysym in ("plus", "KP_Add"):
+            return "+"
         if len(keysym) == 1 and keysym.isdigit():
             return keysym
         kp_map = {
@@ -1252,9 +1263,14 @@ def bind_euro_amount_entry_validation(
             try:
                 if raw in ("+", "-"):
                     entry.icursor(1)
-                else:
+                elif platform.system() == "Windows" and _formatted_it_re.fullmatch(raw):
+                    # Windows: importo già formattato — non forzare il cursore in coda (consente correzioni).
+                    _clear_entry_selection()
+                elif cursor_after_sign_on_focus:
                     entry.icursor(tk.END)
-                _clear_entry_selection()
+                    _clear_entry_selection()
+                else:
+                    _clear_entry_selection()
             except Exception:
                 pass
 
@@ -2278,7 +2294,7 @@ def estratti_pdf_settings_from_db(db: dict) -> dict:
     return ep
 
 
-DEFAULT_VERIFICA_REPORT_PDF_PATTERN = "Verifica conto [conto] data [aaaa]_[mm]_[gg].pdf"
+DEFAULT_VERIFICA_REPORT_PDF_PATTERN = "[aa]_[mm]_[conto]_verfd.pdf"
 
 
 def resolve_verifica_report_pdf_output_directory(ep: dict) -> tuple[Path | None, str | None]:
@@ -2371,7 +2387,7 @@ def build_verifica_report_pdf_basename(ep: dict, *, acc_name: str, cutoff_displa
         out2 = DEFAULT_VERIFICA_REPORT_PDF_PATTERN
         for tok, repl in reps:
             out2 = out2.replace(tok, repl)
-        bn = sanitize_verifica_pdf_report_filename_basename(out2) or "Verifica_finale.pdf"
+        bn = sanitize_verifica_pdf_report_filename_basename(out2) or "verfd.pdf"
     if not bn.lower().endswith(".pdf"):
         bn = bn + ".pdf"
     return bn
@@ -4912,6 +4928,22 @@ def account_dict_for_code_latest_year(db: dict, acc_code: str) -> dict | None:
 def account_is_credit_card_by_code(db: dict, acc_code: str) -> bool:
     a = account_dict_for_code_latest_year(db, acc_code)
     return bool(a and a.get("credit_card"))
+
+
+def normalize_stmt_balance_hint_for_account(db: dict, acc_code: str, val: Decimal | None) -> Decimal | None:
+    """Conto carta: saldo estratto proposto sempre negativo (debito); altri conti: valore invariato."""
+    if val is None:
+        return None
+    try:
+        iq = val.quantize(Decimal("0.01"))
+    except Exception:
+        return None
+    ac = str(acc_code or "").strip()
+    if ac and account_is_credit_card_by_code(db, ac):
+        if iq == 0:
+            return iq
+        return -abs(iq)
+    return iq
 
 
 def record_touches_credit_card_account(db: dict, rec: dict) -> bool:
@@ -19448,9 +19480,15 @@ th {{ background:#efefef; text-align:left; }}
             _rows, closing, _nraw = _ver_filtered_bancoposta_rows_from_pdf(
                 pth, ver_cutoff_date_var.get().strip()
             )
-            return closing
         except Exception:
             return None
+        acc = (ver_account_code_var.get() or ver_session_account_code[0] or "").strip()
+        return normalize_stmt_balance_hint_for_account(cur_db(), acc, closing)
+
+    def _ver_store_pdf_closing_hint(closing: Decimal | None, acc_code: str) -> None:
+        norm = normalize_stmt_balance_hint_for_account(cur_db(), acc_code, closing)
+        ver_bancoposta_closing[0] = norm
+        ver_pdf_closing_balance_hint[0] = norm
 
     def _ver_restore_bancoposta_from_saved(saved: dict) -> None:
         mov = saved.get("bancoposta_movements") or saved.get("bancoposta_queue") or []
@@ -19491,7 +19529,11 @@ th {{ background:#efefef; text-align:left; }}
             ver_bancoposta_closing[0] = None
         if ver_bancoposta_closing[0] is None and closing_fallback_pdf is not None:
             ver_bancoposta_closing[0] = closing_fallback_pdf
+        acc_restore = str(saved.get("account_code") or ver_account_code_var.get() or "").strip()
         if ver_bancoposta_closing[0] is not None:
+            ver_bancoposta_closing[0] = normalize_stmt_balance_hint_for_account(
+                cur_db(), acc_restore, ver_bancoposta_closing[0]
+            )
             ver_pdf_closing_balance_hint[0] = ver_bancoposta_closing[0]
         else:
             ver_pdf_closing_balance_hint[0] = None
@@ -23416,26 +23458,8 @@ th {{ background:#efefef; text-align:left; }}
 
     def _ver_stmt_balance_initial_hint_for_dialog(val: Decimal | None) -> Decimal | None:
         """Conto carta: proposta saldo estratto in negativo (debito); conti banca: segno dall'estratto."""
-        if val is None:
-            return None
         ac = (ver_account_code_var.get().strip() or (ver_session_account_code[0] or "")).strip()
-        if not ac:
-            try:
-                return val.quantize(Decimal("0.01"))
-            except Exception:
-                return None
-        if not account_is_credit_card_by_code(cur_db(), ac):
-            try:
-                return val.quantize(Decimal("0.01"))
-            except Exception:
-                return None
-        try:
-            iq = val.quantize(Decimal("0.01"))
-        except Exception:
-            return None
-        if iq > 0:
-            return -iq
-        return iq
+        return normalize_stmt_balance_hint_for_account(cur_db(), ac, val)
 
     # ---- Avvio sessione ----
     def _ver_on_start() -> None:
@@ -23617,8 +23641,7 @@ th {{ background:#efefef; text-align:left; }}
                         parent=_ver_activate_ui_for_modal_dialog(),
                     )
                     return
-                ver_bancoposta_closing[0] = ext_closing
-                ver_pdf_closing_balance_hint[0] = ext_closing
+                _ver_store_pdf_closing_hint(ext_closing, acc_code)
                 ver_bancoposta_queue[0] = filtered
                 ver_bancoposta_idx[0] = 0 if filtered else -1
                 if not filtered:
@@ -24555,8 +24578,13 @@ th {{ background:#efefef; text-align:left; }}
                 bal_var.set(iv)
             except Exception:
                 pass
-        bal_entry = ttk.Entry(dlg, textvariable=bal_var, width=18, style="NewReg.TEntry",
-                              font=("TkDefaultFont", 13))
+        _stmt_bal_win = platform.system() == "Windows"
+        if _stmt_bal_win:
+            bal_entry = tk.Entry(dlg, textvariable=bal_var, width=20, font=("TkDefaultFont", 13), justify="right")
+        else:
+            bal_entry = ttk.Entry(
+                dlg, textvariable=bal_var, width=18, style="NewReg.TEntry", font=("TkDefaultFont", 13)
+            )
         bal_entry.pack(padx=16, pady=(0, 4))
         bind_euro_amount_entry_validation(
             bal_entry,
@@ -24565,6 +24593,7 @@ th {{ background:#efefef; text-align:left; }}
             require_leading_sign=True,
             reject_zero=False,
             cursor_after_sign_on_focus=True,
+            external_focusout=_stmt_bal_win,
         )
         if eff_initial is not None:
             try:
@@ -24591,8 +24620,22 @@ th {{ background:#efefef; text-align:left; }}
             try:
                 val = normalize_euro_input(raw)
             except Exception:
-                bal_err_var.set("Importo non valido.")
+                bal_err_var.set(
+                    "Importo non valido: usare il formato euro con al massimo due decimali (es. 1.234,56)."
+                )
                 return
+            if _stmt_bal_win:
+                body = _euro_strip_leading_signs(raw.replace(" ", ""))
+                if "," in body:
+                    dec = body.split(",", 1)[1]
+                    if not dec.isdigit() or len(dec) > 2:
+                        bal_err_var.set("Usare al massimo due cifre decimali (es. 1.234,56).")
+                        return
+                elif "." in body and body.count(".") == 1:
+                    dec = body.split(".", 1)[1]
+                    if not dec.isdigit() or len(dec) > 2:
+                        bal_err_var.set("Usare al massimo due cifre decimali (es. 1234,56).")
+                        return
             result[0] = val
             dlg.destroy()
 
@@ -24619,7 +24662,11 @@ th {{ background:#efefef; text-align:left; }}
             pass
         try:
             bal_entry.focus_set()
-            bal_entry.icursor(tk.END)
+            raw0 = (bal_var.get() or "").strip()
+            if raw0 in ("+", "-"):
+                bal_entry.icursor(1)
+            elif not _stmt_bal_win:
+                bal_entry.icursor(tk.END)
         except tk.TclError:
             pass
 
@@ -33259,7 +33306,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         text=(
             "Segnaposto dalla data di chiusura estratto: [conto] nome conto; [aa_mm] anno-mese in forma aa-mm; "
             "[gg] [mm] [aa] [aaaa] componenti; [aaaa_mm_gg] come aaaa_mm_gg. "
-            "Campo vuoto = «Verifica conto [conto] data [aaaa]_[mm]_[gg].pdf»."
+            "Campo vuoto = «[aa]_[mm]_[conto]_verfd.pdf» (es. 25_05_CC Visa_verfd.pdf)."
         ),
         wraplength=780,
         justify=tk.LEFT,
