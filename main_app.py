@@ -769,26 +769,58 @@ def bind_euro_amount_entry_validation(
             pass
         _focus_entry_select_all()
 
-    def _set_amount_text_and_cursor(text: str, *, cursor: int | None = None, select_all: bool = False) -> None:
-        var.set(text)
+    _programmatic_update: list[bool] = [False]
+
+    def _live_amount_text(w: tk.Misc | None = None) -> str:
+        """Testo corrente del campo: su Windows ``StringVar`` può restare indietro rispetto al widget."""
+        widget = w if w is not None else entry
         if platform.system() == "Windows":
             try:
-                entry.delete(0, tk.END)
-                if text:
-                    entry.insert(0, text)
+                return str(widget.get() or "")
             except tk.TclError:
                 pass
+        return var.get() or ""
+
+    def _sync_var_from_entry_if_windows() -> None:
+        if platform.system() != "Windows":
+            return
         try:
-            if select_all:
-                entry.selection_range(0, tk.END)
-            elif cursor is None:
-                entry.icursor(tk.END)
-                _clear_entry_selection()
-            else:
-                entry.icursor(cursor)
-                _clear_entry_selection()
-        except Exception:
-            pass
+            live = entry.get() or ""
+        except tk.TclError:
+            return
+        if live != (var.get() or ""):
+            _programmatic_update[0] = True
+            try:
+                var.set(live)
+            finally:
+                _programmatic_update[0] = False
+
+    def _set_amount_text_and_cursor(text: str, *, cursor: int | None = None, select_all: bool = False) -> None:
+        if _programmatic_update[0]:
+            return
+        _programmatic_update[0] = True
+        try:
+            if platform.system() == "Windows":
+                try:
+                    entry.delete(0, tk.END)
+                    if text:
+                        entry.insert(0, text)
+                except tk.TclError:
+                    pass
+            var.set(text)
+            try:
+                if select_all:
+                    entry.selection_range(0, tk.END)
+                elif cursor is None:
+                    entry.icursor(tk.END)
+                    _clear_entry_selection()
+                else:
+                    entry.icursor(cursor)
+                    _clear_entry_selection()
+            except Exception:
+                pass
+        finally:
+            _programmatic_update[0] = False
 
     def _msg_importo_non_valido() -> None:
         try:
@@ -816,6 +848,7 @@ def bind_euro_amount_entry_validation(
         _after_modal_refocus_select_all()
 
     def _normalize_on_enter() -> bool:
+        _sync_var_from_entry_if_windows()
         raw = (var.get() or "").strip().replace(" ", "")
         if not raw or raw in ("+", "-"):
             if reject_zero and require_leading_sign and allow_leading_sign:
@@ -847,6 +880,7 @@ def bind_euro_amount_entry_validation(
         return True
 
     def _format_on_focus_out(_e: tk.Event | None = None) -> None:
+        _sync_var_from_entry_if_windows()
         raw = (var.get() or "").strip().replace(" ", "")
         if not raw:
             if reject_zero and require_leading_sign and allow_leading_sign:
@@ -944,7 +978,7 @@ def bind_euro_amount_entry_validation(
 
     def _merged_after_edit(event: tk.Event, *, ins_ch: str | None = None) -> str | None:
         w = event.widget
-        s = var.get() or ""
+        s = _live_amount_text(w)
         try:
             if not int(w.selection_present()):
                 raise tk.TclError("no selection")
@@ -1088,7 +1122,7 @@ def bind_euro_amount_entry_validation(
             """' e ^ (anche fuori dalla prima posizione) invertono il segno dell'importo mostrato."""
             if not allow_leading_sign:
                 return
-            raw = (var.get() or "").strip().replace(" ", "")
+            raw = _live_amount_text().strip().replace(" ", "")
             if not raw:
                 return
             if raw in ("+", "-"):
@@ -1133,7 +1167,7 @@ def bind_euro_amount_entry_validation(
                 return "break"
             if require_leading_sign and allow_leading_sign:
                 if nxt == "":
-                    cur = var.get() or ""
+                    cur = _live_amount_text(w)
                     keep = "+"
                     if cur.startswith("-"):
                         keep = "-"
@@ -1142,33 +1176,31 @@ def bind_euro_amount_entry_validation(
                     _set_amount_text_and_cursor(keep, cursor=1)
                     return "break"
                 if not nxt.startswith(("+", "-")):
-                    cur = var.get() or ""
+                    cur = _live_amount_text(w)
                     lead = "-"
                     if cur.startswith("+"):
                         lead = "+"
                     elif cur.startswith("-"):
                         lead = "-"
                     nxt = lead + nxt.lstrip("+-")
-            if platform.system() == "Windows":
+            try:
+                if not int(w.selection_present()):
+                    raise tk.TclError("no selection")
+                a = int(w.index("sel.first"))
+                b = int(w.index("sel.last"))
+            except tk.TclError:
                 try:
-                    if not int(w.selection_present()):
-                        raise tk.TclError("no selection")
-                    a = int(w.index("sel.first"))
-                    b = int(w.index("sel.last"))
+                    a = b = int(w.index(tk.INSERT))
                 except tk.TclError:
-                    try:
-                        a = b = int(w.index(tk.INSERT))
-                    except tk.TclError:
-                        a = b = len(nxt)
-                if a != b:
-                    new_pos = a
-                elif keysym == "BackSpace":
-                    new_pos = max(1 if require_leading_sign else 0, a - 1)
-                else:
-                    new_pos = a
-                _set_amount_text_and_cursor(nxt, cursor=min(new_pos, len(nxt)))
-                return "break"
-            return None
+                    a = b = len(nxt)
+            if a != b:
+                new_pos = a
+            elif keysym == "BackSpace":
+                new_pos = max(1 if require_leading_sign else 0, a - 1)
+            else:
+                new_pos = a
+            _set_amount_text_and_cursor(nxt, cursor=min(new_pos, len(nxt)))
+            return "break"
         sym = _typed_symbol_from_key_event(event)
         if not sym:
             return None
@@ -1177,35 +1209,24 @@ def bind_euro_amount_entry_validation(
             return None
 
         w = event.widget
-        s = var.get() or ""
+        s = _live_amount_text(w)
 
         if _euro_typed_char_is_sign(sym):
             if not allow_leading_sign:
                 return "break"
             sig = _euro_sign_char_to_ascii(sym)
             body = _euro_strip_leading_signs(s)
-            if platform.system() == "Windows":
-                if not body:
-                    _set_amount_text_and_cursor(sig, cursor=1)
-                else:
-                    lead = s[:1]
-                    lead_sig = (
-                        _euro_sign_char_to_ascii(lead) if lead and _euro_typed_char_is_sign(lead) else None
-                    )
-                    if lead_sig is not None and lead_sig == sig:
-                        _flip_sign_in_entry()
-                    else:
-                        _set_amount_text_and_cursor(sig + body)
-                return "break"
             if not body:
                 _set_amount_text_and_cursor(sig, cursor=1)
             else:
                 lead = s[:1]
-                lead_sig = _euro_sign_char_to_ascii(lead) if lead and _euro_typed_char_is_sign(lead) else None
-                if lead_sig is None or lead_sig != sig:
-                    _set_amount_text_and_cursor(sig + body)
+                lead_sig = (
+                    _euro_sign_char_to_ascii(lead) if lead and _euro_typed_char_is_sign(lead) else None
+                )
+                if lead_sig is not None and lead_sig == sig:
+                    _flip_sign_in_entry()
                 else:
-                    _set_amount_text_and_cursor(s)
+                    _set_amount_text_and_cursor(sig + body)
             return "break"
 
         if sym.isdigit() or sym in ",.":
@@ -1243,7 +1264,7 @@ def bind_euro_amount_entry_validation(
         if not t:
             return "break"
         w = event.widget
-        s = var.get() or ""
+        s = _live_amount_text(w)
         try:
             a = int(w.index("sel.first"))
             b = int(w.index("sel.last"))
@@ -1262,28 +1283,27 @@ def bind_euro_amount_entry_validation(
         _set_amount_text_and_cursor(merged, cursor=cur)
         return "break"
 
-    # Esegui validazione tasti prima dei binding di classe (es. TEntry), così
-    # return "break" impedisce davvero l'inserimento predefinito (sostituzione selezione).
-    if platform.system() == "Windows":
-        entry.bind("<KeyPress>", _keypress)
-        entry.bind("<<Paste>>", _paste)
-    else:
-        try:
-            bind_tag = getattr(entry, "_cdc_euro_amount_bindtag", None)
-            if not bind_tag:
-                bind_tag = f"_cdc_euro_amt_{id(entry)}"
-                setattr(entry, "_cdc_euro_amount_bindtag", bind_tag)
-                tags = list(entry.bindtags())
-                if bind_tag not in tags:
+    # Tag dedicato in testa ai bindtag (su Windows prima del widget/TEntry) così return "break"
+    # blocca l'inserimento predefinito di tk.Entry e ttk.Entry.
+    try:
+        bind_tag = getattr(entry, "_cdc_euro_amount_bindtag", None)
+        if not bind_tag:
+            bind_tag = f"_cdc_euro_amt_{id(entry)}"
+            setattr(entry, "_cdc_euro_amount_bindtag", bind_tag)
+            tags = list(entry.bindtags())
+            if bind_tag not in tags:
+                if platform.system() == "Windows":
+                    tags.insert(0, bind_tag)
+                else:
                     ins_at = 1 if len(tags) > 1 else 0
                     tags.insert(ins_at, bind_tag)
-                    entry.bindtags(tuple(tags))
-            root = entry.winfo_toplevel()
-            root.bind_class(bind_tag, "<KeyPress>", _keypress)
-            root.bind_class(bind_tag, "<<Paste>>", _paste)
-        except Exception:
-            entry.bind("<KeyPress>", _keypress, add="+")
-            entry.bind("<<Paste>>", _paste, add="+")
+                entry.bindtags(tuple(tags))
+        root = entry.winfo_toplevel()
+        root.bind_class(bind_tag, "<KeyPress>", _keypress)
+        root.bind_class(bind_tag, "<<Paste>>", _paste)
+    except Exception:
+        entry.bind("<KeyPress>", _keypress)
+        entry.bind("<<Paste>>", _paste)
     entry.bind("<Double-Button-1>", _on_double_click_select, add="+")
     if not external_focusout:
         entry.bind("<FocusOut>", _format_on_focus_out, add="+")
@@ -8493,19 +8513,40 @@ def get_or_create_key(key_path: Path) -> bytes:
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
-    tmp = Path(tmp_name)
+    last_exc: Exception | None = None
+    attempts = 3 if platform.system() == "Windows" else 1
+    for attempt in range(attempts):
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    if platform.system() != "Windows":
+                        raise
+            os.replace(tmp, path)
+            return
+        except Exception as exc:
+            last_exc = exc
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            if attempt + 1 < attempts:
+                time.sleep(0.12 * (attempt + 1))
+                continue
+            break
     try:
-        with os.fdopen(fd, "wb") as f:
+        with open(path, "wb") as f:
             f.write(data)
             f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
+        return
     except Exception:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+        if last_exc is not None:
+            raise last_exc
         raise
 
 
@@ -8674,6 +8715,7 @@ def save_encrypted_db_dual(
         targets.append(resolved_backup)
 
     errors: list[str] = []
+    backup_errors: list[str] = []
     primary_ok = False
     for i, t in enumerate(targets):
         try:
@@ -8683,11 +8725,17 @@ def save_encrypted_db_dual(
             if i == 0:
                 primary_ok = True
         except Exception as exc:
-            errors.append(f"{t}: {exc}")
+            msg = f"{t}: {exc}"
+            errors.append(msg)
+            if i > 0:
+                backup_errors.append(msg)
 
-    if errors and not primary_ok:
+    if not primary_ok:
+        detail = "\n".join(errors)
         raise RuntimeError(
-            "Salvataggio cifrato non completato su tutti i target:\n" + "\n".join(errors)
+            "Salvataggio cifrato del database principale non riuscito.\n"
+            "Verifica che la cartella dati (es. Dropbox) sia accessibile e non bloccata.\n\n"
+            + detail
         )
 
     try:
@@ -15723,7 +15771,10 @@ th {{ background:#efefef; text-align:left; }}
     lbl_importo = tk.Label(nuova_form, text="Importo (€)", **_newreg_plain_lbl_kw)
     lbl_importo.grid(row=3, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
     row_amt = tk.Frame(nuova_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    ent_amt = ttk.Entry(row_amt, textvariable=newreg_amount_var, width=_NR_W_AMT, style="NewReg.TEntry")
+    if platform.system() == "Windows":
+        ent_amt = tk.Entry(row_amt, textvariable=newreg_amount_var, width=_NR_W_AMT, font=newreg_ui_font)
+    else:
+        ent_amt = ttk.Entry(row_amt, textvariable=newreg_amount_var, width=_NR_W_AMT, style="NewReg.TEntry")
     ent_amt.pack(side=tk.LEFT)
     newreg_saldo_cassa_var = tk.StringVar(value="")
     ent_saldo = ttk.Entry(row_amt, textvariable=newreg_saldo_cassa_var, width=_NR_W_AMT, style="NewReg.TEntry")
@@ -17546,7 +17597,10 @@ th {{ background:#efefef; text-align:left; }}
     row_per_acc2.grid(row=5, column=1, columnspan=2, sticky="w", pady=_per_py)
     tk.Label(per_form, text="Importo (€)", **_newreg_plain_lbl_kw).grid(row=6, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
     row_per_amt = tk.Frame(per_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    ent_per_amt = ttk.Entry(row_per_amt, textvariable=per_amount_var, width=_NR_W_AMT, style="NewReg.TEntry")
+    if platform.system() == "Windows":
+        ent_per_amt = tk.Entry(row_per_amt, textvariable=per_amount_var, width=_NR_W_AMT, font=newreg_ui_font)
+    else:
+        ent_per_amt = ttk.Entry(row_per_amt, textvariable=per_amount_var, width=_NR_W_AMT, style="NewReg.TEntry")
     ent_per_amt.pack(side=tk.LEFT)
     row_per_amt.grid(row=6, column=1, sticky="w", pady=_per_py)
     tk.Label(per_form, text="Nota", **_newreg_plain_lbl_kw).grid(row=7, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
@@ -24678,6 +24732,13 @@ th {{ background:#efefef; text-align:left; }}
         result: list[Decimal | None] = [None]
 
         def _on_ok(_e: object = None) -> None:
+            if _stmt_bal_win:
+                try:
+                    live = bal_entry.get() or ""
+                    if live != (bal_var.get() or ""):
+                        bal_var.set(live)
+                except tk.TclError:
+                    pass
             raw = bal_var.get().strip()
             if not raw or raw in ("+", "-"):
                 bal_err_var.set("Importo obbligatorio.")
