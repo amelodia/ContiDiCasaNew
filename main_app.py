@@ -1127,6 +1127,7 @@ def bind_euro_amount_entry_validation(
                 return "break"
 
         if keysym in ("BackSpace", "Delete"):
+            w = event.widget
             nxt = _merged_after_edit(event)
             if nxt is None or not _is_partial_valid(nxt):
                 return "break"
@@ -1138,15 +1139,35 @@ def bind_euro_amount_entry_validation(
                         keep = "-"
                     elif cur.startswith("+"):
                         keep = "+"
-                    var.set(keep)
-                    try:
-                        event.widget.icursor(1)
-                        _clear_entry_selection()
-                    except Exception:
-                        pass
+                    _set_amount_text_and_cursor(keep, cursor=1)
                     return "break"
                 if not nxt.startswith(("+", "-")):
-                    return "break"
+                    cur = var.get() or ""
+                    lead = "-"
+                    if cur.startswith("+"):
+                        lead = "+"
+                    elif cur.startswith("-"):
+                        lead = "-"
+                    nxt = lead + nxt.lstrip("+-")
+            if platform.system() == "Windows":
+                try:
+                    if not int(w.selection_present()):
+                        raise tk.TclError("no selection")
+                    a = int(w.index("sel.first"))
+                    b = int(w.index("sel.last"))
+                except tk.TclError:
+                    try:
+                        a = b = int(w.index(tk.INSERT))
+                    except tk.TclError:
+                        a = b = len(nxt)
+                if a != b:
+                    new_pos = a
+                elif keysym == "BackSpace":
+                    new_pos = max(1 if require_leading_sign else 0, a - 1)
+                else:
+                    new_pos = a
+                _set_amount_text_and_cursor(nxt, cursor=min(new_pos, len(nxt)))
+                return "break"
             return None
         sym = _typed_symbol_from_key_event(event)
         if not sym:
@@ -1163,6 +1184,19 @@ def bind_euro_amount_entry_validation(
                 return "break"
             sig = _euro_sign_char_to_ascii(sym)
             body = _euro_strip_leading_signs(s)
+            if platform.system() == "Windows":
+                if not body:
+                    _set_amount_text_and_cursor(sig, cursor=1)
+                else:
+                    lead = s[:1]
+                    lead_sig = (
+                        _euro_sign_char_to_ascii(lead) if lead and _euro_typed_char_is_sign(lead) else None
+                    )
+                    if lead_sig is not None and lead_sig == sig:
+                        _flip_sign_in_entry()
+                    else:
+                        _set_amount_text_and_cursor(sig + body)
+                return "break"
             if not body:
                 _set_amount_text_and_cursor(sig, cursor=1)
             else:
@@ -1230,22 +1264,26 @@ def bind_euro_amount_entry_validation(
 
     # Esegui validazione tasti prima dei binding di classe (es. TEntry), così
     # return "break" impedisce davvero l'inserimento predefinito (sostituzione selezione).
-    try:
-        bind_tag = getattr(entry, "_cdc_euro_amount_bindtag", None)
-        if not bind_tag:
-            bind_tag = f"_cdc_euro_amt_{id(entry)}"
-            setattr(entry, "_cdc_euro_amount_bindtag", bind_tag)
-            tags = list(entry.bindtags())
-            if bind_tag not in tags:
-                ins_at = 1 if len(tags) > 1 else 0
-                tags.insert(ins_at, bind_tag)
-                entry.bindtags(tuple(tags))
-        root = entry.winfo_toplevel()
-        root.bind_class(bind_tag, "<KeyPress>", _keypress)
-        root.bind_class(bind_tag, "<<Paste>>", _paste)
-    except Exception:
-        entry.bind("<KeyPress>", _keypress, add="+")
-        entry.bind("<<Paste>>", _paste, add="+")
+    if platform.system() == "Windows":
+        entry.bind("<KeyPress>", _keypress)
+        entry.bind("<<Paste>>", _paste)
+    else:
+        try:
+            bind_tag = getattr(entry, "_cdc_euro_amount_bindtag", None)
+            if not bind_tag:
+                bind_tag = f"_cdc_euro_amt_{id(entry)}"
+                setattr(entry, "_cdc_euro_amount_bindtag", bind_tag)
+                tags = list(entry.bindtags())
+                if bind_tag not in tags:
+                    ins_at = 1 if len(tags) > 1 else 0
+                    tags.insert(ins_at, bind_tag)
+                    entry.bindtags(tuple(tags))
+            root = entry.winfo_toplevel()
+            root.bind_class(bind_tag, "<KeyPress>", _keypress)
+            root.bind_class(bind_tag, "<<Paste>>", _paste)
+        except Exception:
+            entry.bind("<KeyPress>", _keypress, add="+")
+            entry.bind("<<Paste>>", _paste, add="+")
     entry.bind("<Double-Button-1>", _on_double_click_select, add="+")
     if not external_focusout:
         entry.bind("<FocusOut>", _format_on_focus_out, add="+")
@@ -1275,6 +1313,19 @@ def bind_euro_amount_entry_validation(
                 pass
 
         entry.bind("<FocusIn>", _focus_set_cursor, add="+")
+
+
+def _sync_tk_entry_from_stringvar(entry: tk.Misc, var: tk.StringVar) -> None:
+    """Su Windows ``StringVar`` + ``Entry`` non sempre allineano il testo visualizzato."""
+    if platform.system() != "Windows":
+        return
+    t = var.get() or ""
+    try:
+        entry.delete(0, tk.END)
+        if t:
+            entry.insert(0, t)
+    except tk.TclError:
+        pass
 
 
 def _ttk_combobox_collect_listboxes(w: tk.Misc, acc: list[tk.Misc]) -> None:
@@ -8289,6 +8340,11 @@ def filter_and_sort_movements_for_grid(
 
 
 def _user_library_conti_support_dir() -> Path:
+    if platform.system() == "Windows":
+        base = (os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or "").strip()
+        if base:
+            return Path(base) / "ContiDiCasa"
+        return Path.home() / "AppData" / "Local" / "ContiDiCasa"
     return Path.home() / "Library" / "Application Support" / "ContiDiCasa"
 
 
@@ -8618,14 +8674,18 @@ def save_encrypted_db_dual(
         targets.append(resolved_backup)
 
     errors: list[str] = []
-    for t in targets:
+    primary_ok = False
+    for i, t in enumerate(targets):
         try:
+            t.parent.mkdir(parents=True, exist_ok=True)
             _write_timestamped_presave_backup(t)
             _atomic_write_bytes(t, token)
+            if i == 0:
+                primary_ok = True
         except Exception as exc:
             errors.append(f"{t}: {exc}")
 
-    if errors:
+    if errors and not primary_ok:
         raise RuntimeError(
             "Salvataggio cifrato non completato su tutti i target:\n" + "\n".join(errors)
         )
@@ -20616,7 +20676,10 @@ th {{ background:#efefef; text-align:left; }}
     tk.Label(ver_input_frame, text="Importo (€)", font=_ver_ui_font, bg=_VER_BG).grid(
         row=0, column=0, sticky="w", padx=(0, 6), pady=2
     )
-    ver_ent_amt = ttk.Entry(ver_input_frame, textvariable=ver_inp_amt_var, width=14, style="NewReg.TEntry")
+    if platform.system() == "Windows":
+        ver_ent_amt = tk.Entry(ver_input_frame, textvariable=ver_inp_amt_var, width=16, font=_ver_ui_font)
+    else:
+        ver_ent_amt = ttk.Entry(ver_input_frame, textvariable=ver_inp_amt_var, width=14, style="NewReg.TEntry")
     ver_ent_amt.grid(row=0, column=1, sticky="w", padx=(0, 4), pady=2)
     bind_euro_amount_entry_validation(
         ver_ent_amt,
@@ -20632,9 +20695,12 @@ th {{ background:#efefef; text-align:left; }}
     def _ver_amt_set_cursor_after_sign() -> None:
         """Verifica manuale: dopo il segno +/− preimpostato (solo segno → cursore in posizione 1)."""
         raw = (ver_inp_amt_var.get() or "").strip()
+        _fmt_amt = re.compile(r"^[+-]?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2}$")
         try:
             if raw in ("+", "-"):
                 ver_ent_amt.icursor(1)
+            elif platform.system() == "Windows" and _fmt_amt.fullmatch(raw):
+                pass
             else:
                 ver_ent_amt.icursor(tk.END)
         except tk.TclError:
@@ -20704,6 +20770,7 @@ th {{ background:#efefef; text-align:left; }}
             if val >= 0 and not formatted.startswith("+"):
                 formatted = "+" + formatted
             ver_inp_amt_var.set(formatted)
+            _sync_tk_entry_from_stringvar(ver_ent_amt, ver_inp_amt_var)
         except InvalidOperation:
             messagebox.showerror("Verifica", _VER_AMT_FOCUS_MSG, parent=verifica_frame)
             try:
@@ -24569,18 +24636,24 @@ th {{ background:#efefef; text-align:left; }}
             justify=tk.LEFT,
         ).pack(padx=16, pady=(16, 8))
         bal_var = tk.StringVar(value="+")
+        _stmt_bal_initial = "+"
         if eff_initial is not None:
             try:
                 ib = eff_initial.quantize(Decimal("0.01"))
                 iv = format_euro_it(ib)
                 if ib > 0 and not iv.startswith("+") and not iv.startswith("-"):
                     iv = "+" + iv
-                bal_var.set(iv)
+                _stmt_bal_initial = iv
             except Exception:
                 pass
         _stmt_bal_win = platform.system() == "Windows"
+
+        def _stmt_bal_sync_entry(text: str) -> None:
+            bal_var.set(text)
+            _sync_tk_entry_from_stringvar(bal_entry, bal_var)
+
         if _stmt_bal_win:
-            bal_entry = tk.Entry(dlg, textvariable=bal_var, width=20, font=("TkDefaultFont", 13), justify="right")
+            bal_entry = tk.Entry(dlg, textvariable=bal_var, width=20, font=("TkDefaultFont", 13))
         else:
             bal_entry = ttk.Entry(
                 dlg, textvariable=bal_var, width=18, style="NewReg.TEntry", font=("TkDefaultFont", 13)
@@ -24595,15 +24668,7 @@ th {{ background:#efefef; text-align:left; }}
             cursor_after_sign_on_focus=True,
             external_focusout=_stmt_bal_win,
         )
-        if eff_initial is not None:
-            try:
-                ib2 = eff_initial.quantize(Decimal("0.01"))
-                iv2 = format_euro_it(ib2)
-                if ib2 > 0 and not iv2.startswith("+") and not iv2.startswith("-"):
-                    iv2 = "+" + iv2
-                bal_var.set(iv2)
-            except Exception:
-                pass
+        _stmt_bal_sync_entry(_stmt_bal_initial)
 
         bal_err_var = tk.StringVar(value="")
         tk.Label(dlg, textvariable=bal_err_var, font=("TkDefaultFont", 10), fg="#c62828").pack(
