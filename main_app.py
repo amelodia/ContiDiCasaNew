@@ -1179,65 +1179,22 @@ def bind_euro_amount_entry_validation(
 
         if keysym in ("BackSpace", "Delete"):
             w = event.widget
-            if platform.system() == "Windows":
-                if not (require_leading_sign and allow_leading_sign):
-                    return None
-                nxt = _merged_after_edit(event)
-                if nxt is None:
-                    return "break"
-                if nxt == "":
-                    cur = _live_amount_text(w)
-                    keep = "+"
-                    if cur.startswith("-"):
-                        keep = "-"
-                    elif cur.startswith("+"):
-                        keep = "+"
-                    _set_amount_text_and_cursor(keep, cursor=1)
-                    return "break"
-                if not _is_partial_valid(nxt):
-                    return "break"
-                if not nxt.startswith(("+", "-")):
-                    cur = _live_amount_text(w)
-                    lead = "-"
-                    if cur.startswith("+"):
-                        lead = "+"
-                    elif cur.startswith("-"):
-                        lead = "-"
-                    nxt = lead + nxt.lstrip("+-")
-                    try:
-                        if not int(w.selection_present()):
-                            raise tk.TclError("no selection")
-                        a = int(w.index("sel.first"))
-                    except tk.TclError:
-                        try:
-                            a = int(w.index(tk.INSERT))
-                        except tk.TclError:
-                            a = len(nxt)
-                    new_pos = min(a, len(nxt))
-                    _set_amount_text_and_cursor(nxt, cursor=new_pos)
-                    return "break"
-                return None
+            s = _live_amount_text(w)
             nxt = _merged_after_edit(event)
-            if nxt is None or not _is_partial_valid(nxt):
+            if nxt is None:
                 return "break"
             if require_leading_sign and allow_leading_sign:
                 if nxt == "":
-                    cur = _live_amount_text(w)
                     keep = "+"
-                    if cur.startswith("-"):
+                    if s.startswith("-"):
                         keep = "-"
-                    elif cur.startswith("+"):
+                    elif s.startswith("+"):
                         keep = "+"
                     _set_amount_text_and_cursor(keep, cursor=1)
                     return "break"
-                if not nxt.startswith(("+", "-")):
-                    cur = _live_amount_text(w)
-                    lead = "-"
-                    if cur.startswith("+"):
-                        lead = "+"
-                    elif cur.startswith("-"):
-                        lead = "-"
-                    nxt = lead + nxt.lstrip("+-")
+                nxt = _ensure_require_leading_sign_on_edit(nxt, s)
+            if not _is_partial_valid(nxt):
+                return "break"
             try:
                 if not int(w.selection_present()):
                     raise tk.TclError("no selection")
@@ -1274,22 +1231,10 @@ def bind_euro_amount_entry_validation(
             if not body:
                 _set_amount_text_and_cursor(sig, cursor=1)
             else:
-                lead = s[:1]
-                lead_sig = (
-                    _euro_sign_char_to_ascii(lead) if lead and _euro_typed_char_is_sign(lead) else None
-                )
-                if lead_sig is not None and lead_sig == sig:
-                    _flip_sign_in_entry()
-                else:
-                    _set_amount_text_and_cursor(sig + body)
+                _set_amount_text_and_cursor(sig + body)
             return "break"
 
         if sym.isdigit() or sym in ",.":
-            if platform.system() == "Windows" and not require_leading_sign:
-                ch = str(getattr(event, "char", "") or "")
-                ks = str(getattr(event, "keysym", "") or "")
-                if (ch and ord(ch) >= 32) or (len(ks) == 1 and ks.isdigit()) or ks in ("period", "comma"):
-                    return None
             merged_raw = _merged_after_edit(event, ins_ch=sym)
             if merged_raw is None:
                 return "break"
@@ -1343,11 +1288,10 @@ def bind_euro_amount_entry_validation(
         _set_amount_text_and_cursor(merged, cursor=cur)
         return "break"
 
-    # Windows: validate='key' blocca caratteri invalidi; KeyPress con add='+' gestisce solo casi speciali
-    # (segno, Backspace con segno obbligatorio, numpad) lasciando Entry attivo per mouse/focus/digitazione.
+    # Windows: validate='key' come rete di sicurezza; KeyPress diretto sul widget (prima del bindtag Entry).
     if platform.system() == "Windows":
 
-        def _validate_key_action(action: str, proposed: str, char_ins: str, _idx: str, _current: str) -> bool:
+        def _validate_key_action(action: str, proposed: str, char_ins: str, _idx: str, current: str) -> bool:
             if _programmatic_update[0]:
                 return True
             try:
@@ -1355,16 +1299,21 @@ def bind_euro_amount_entry_validation(
             except (TypeError, ValueError):
                 return True
             prop = (proposed or "").replace("\u2212", "-").replace("\u2013", "-").replace(" ", "")
+            cur = (current or "").replace("\u2212", "-").replace("\u2013", "-").replace(" ", "")
             if act == 1:
                 ch = str(char_ins or "")
                 if ch and ord(ch) >= 32:
+                    if ch.isalpha():
+                        return False
                     if not (ch.isdigit() or ch in "+-,." or _euro_typed_char_is_sign(ch)):
                         return False
+            if require_leading_sign and allow_leading_sign:
+                prop = _ensure_require_leading_sign_on_edit(prop, cur)
             return _is_partial_valid(prop)
 
         vcmd = (entry.register(_validate_key_action), "%d", "%P", "%S", "%i", "%s")
         entry.configure(validate="key", validatecommand=vcmd)
-        entry.bind("<KeyPress>", _keypress, add="+")
+        entry.bind("<KeyPress>", _keypress)
         entry.bind("<<Paste>>", _paste)
         entry.bind("<Control-v>", _paste)
         entry.bind("<Control-V>", _paste)
@@ -1376,8 +1325,13 @@ def bind_euro_amount_entry_validation(
                 setattr(entry, "_cdc_euro_amount_bindtag", bind_tag)
                 tags = list(entry.bindtags())
                 if bind_tag not in tags:
-                    ins_at = 1 if len(tags) > 1 else 0
-                    tags.insert(ins_at, bind_tag)
+                    if "Entry" in tags:
+                        tags.insert(tags.index("Entry"), bind_tag)
+                    elif "TEntry" in tags:
+                        tags.insert(tags.index("TEntry"), bind_tag)
+                    else:
+                        ins_at = 1 if len(tags) > 1 else 0
+                        tags.insert(ins_at, bind_tag)
                     entry.bindtags(tuple(tags))
             root = entry.winfo_toplevel()
             root.bind_class(bind_tag, "<KeyPress>", _keypress)
@@ -21894,14 +21848,10 @@ th {{ background:#efefef; text-align:left; }}
     ver_unver_tree_frame = tk.Frame(ver_results_frame, bg=_VER_BG, highlightthickness=0)
     ver_unver_tree_frame.configure(height=254)
     ver_unver_tree_frame.pack_propagate(False)
-    ver_unver_tree_frame.columnconfigure(0, weight=1)
-    ver_unver_tree_frame.columnconfigure(1, weight=0)
-    ver_unver_tree_frame.rowconfigure(0, weight=1)
-    # Due Treeview: i tag colore in ttk valgono per riga intera (come in Movimenti); l'importo è in colonna dedicata.
-    _ver_unv_main_cols = ("reg", "date", "category", "account", "cheque", "note", "period")
+    _ver_unv_cols = ("reg", "date", "category", "account", "amount", "cheque", "note", "period")
     ver_unver_tree = ttk.Treeview(
         ver_unver_tree_frame,
-        columns=_ver_unv_main_cols,
+        columns=_ver_unv_cols,
         show="headings",
         height=8,
         style="VerRes.Treeview",
@@ -21910,6 +21860,7 @@ th {{ background:#efefef; text-align:left; }}
     ver_unver_tree.heading("date", text="Data", anchor="w")
     ver_unver_tree.heading("category", text="Categoria", anchor="w")
     ver_unver_tree.heading("account", text="Conto", anchor="w")
+    ver_unver_tree.heading("amount", text="Importo", anchor="e")
     ver_unver_tree.heading("cheque", text="Assegno", anchor="w")
     ver_unver_tree.heading("note", text="Nota", anchor="w")
     ver_unver_tree.heading("period", text="Entro il periodo", anchor="center")
@@ -21917,100 +21868,23 @@ th {{ background:#efefef; text-align:left; }}
     ver_unver_tree.column("date", width=78, anchor="w", stretch=False, minwidth=64)
     ver_unver_tree.column("category", width=88, anchor="w", stretch=False, minwidth=64)
     ver_unver_tree.column("account", width=78, anchor="w", stretch=False, minwidth=56)
+    ver_unver_tree.column("amount", width=118, anchor="e", stretch=False, minwidth=92)
     ver_unver_tree.column("cheque", width=48, anchor="w", stretch=False, minwidth=40)
-    ver_unver_tree.column("note", width=220, anchor="w", stretch=False, minwidth=100)
+    ver_unver_tree.column("note", width=180, anchor="w", stretch=True, minwidth=100)
     ver_unver_tree.column("period", width=120, anchor="center", stretch=False, minwidth=96)
 
-    ver_unver_amt_tree = ttk.Treeview(
-        ver_unver_tree_frame,
-        columns=("amount_eur",),
-        show="headings",
-        height=8,
-        style="VerRes.Treeview",
-    )
-    ver_unver_amt_tree.heading("amount_eur", text="Importo", anchor="e")
-    ver_unver_amt_tree.column("amount_eur", width=118, anchor="e", stretch=False, minwidth=92)
+    ver_unv_scroll = ttk.Scrollbar(ver_unver_tree_frame, orient="vertical", command=ver_unver_tree.yview)
+    ver_unver_tree.configure(yscrollcommand=ver_unv_scroll.set)
+    ver_unver_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    ver_unv_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-    _ver_unv_yscroll_lock: list[bool] = [False]
-
-    def _ver_unv_scroll_command(*args: object) -> None:
-        ver_unver_tree.yview(*args)
-        ver_unver_amt_tree.yview(*args)
-
-    ver_unv_scroll = ttk.Scrollbar(ver_unver_tree_frame, orient="vertical", command=_ver_unv_scroll_command)
-
-    def _ver_unv_main_yscroll(first: str, last: str) -> None:
-        if _ver_unv_yscroll_lock[0]:
-            return
-        _ver_unv_yscroll_lock[0] = True
-        try:
-            ver_unv_scroll.set(first, last)
-            ver_unver_amt_tree.yview_moveto(float(first))
-        finally:
-            _ver_unv_yscroll_lock[0] = False
-
-    def _ver_unv_amt_yscroll(first: str, last: str) -> None:
-        if _ver_unv_yscroll_lock[0]:
-            return
-        _ver_unv_yscroll_lock[0] = True
-        try:
-            ver_unv_scroll.set(first, last)
-            ver_unver_tree.yview_moveto(float(first))
-        finally:
-            _ver_unv_yscroll_lock[0] = False
-
-    ver_unver_tree.configure(yscrollcommand=_ver_unv_main_yscroll)
-    ver_unver_amt_tree.configure(yscrollcommand=_ver_unv_amt_yscroll)
-
-    ver_unver_tree.grid(row=0, column=0, sticky="nsew")
-    ver_unver_amt_tree.grid(row=0, column=1, sticky="ns")
-    ver_unv_scroll.grid(row=0, column=2, sticky="ns")
-
-    _ver_configure_ver_tree_amount_tags(ver_unver_amt_tree)
+    _ver_configure_ver_tree_amount_tags(ver_unver_tree)
     try:
         ver_unver_tree.tag_configure("stripe0", background=CDC_GRID_STRIPE0_BG)
         ver_unver_tree.tag_configure("stripe1", background=CDC_GRID_STRIPE1_BG)
-        ver_unver_amt_tree.tag_configure("stripe0", background=CDC_GRID_STRIPE0_BG)
-        ver_unver_amt_tree.tag_configure("stripe1", background=CDC_GRID_STRIPE1_BG)
     except tk.TclError:
         pass
-    _ver_configure_results_grids_neutral_amount_fg(ver_unver_amt_tree)
-
-    _ver_unv_sel_lock: list[bool] = [False]
-
-    def _ver_unv_clear_sel(tv: ttk.Treeview) -> None:
-        for iid in tv.selection():
-            tv.selection_remove(iid)
-
-    def _ver_unv_sync_sel_from_main(_event: tk.Event | None = None) -> None:
-        if _ver_unv_sel_lock[0]:
-            return
-        _ver_unv_sel_lock[0] = True
-        try:
-            sel = ver_unver_tree.selection()
-            if sel:
-                if tuple(ver_unver_amt_tree.selection()) != sel:
-                    ver_unver_amt_tree.selection_set(*sel)
-            else:
-                if ver_unver_amt_tree.selection():
-                    _ver_unv_clear_sel(ver_unver_amt_tree)
-        finally:
-            _ver_unv_sel_lock[0] = False
-
-    def _ver_unv_sync_sel_from_amt(_event: tk.Event | None = None) -> None:
-        if _ver_unv_sel_lock[0]:
-            return
-        _ver_unv_sel_lock[0] = True
-        try:
-            sel = ver_unver_amt_tree.selection()
-            if sel:
-                if tuple(ver_unver_tree.selection()) != sel:
-                    ver_unver_tree.selection_set(*sel)
-            else:
-                if ver_unver_tree.selection():
-                    _ver_unv_clear_sel(ver_unver_tree)
-        finally:
-            _ver_unv_sel_lock[0] = False
+    _ver_configure_results_grids_neutral_amount_fg(ver_unver_tree)
 
     def _ver_unv_on_mousewheel(event: tk.Event) -> str:
         delta = 0
@@ -22020,11 +21894,10 @@ th {{ background:#efefef; text-align:left; }}
             ver_unver_tree.yview("scroll", str(delta), "units")
         return "break"
 
-    for _ver_uv_tv in (ver_unver_tree, ver_unver_amt_tree):
-        _ver_uv_tv.bind("<MouseWheel>", _ver_unv_on_mousewheel)
+    ver_unver_tree.bind("<MouseWheel>", _ver_unv_on_mousewheel)
 
     def _ver_unver_autofit_key_columns() -> None:
-        """Larghezze #, Data, periodo, Importo in base a intestazioni e righe inserite."""
+        """Larghezze #, Data, Importo, periodo in base a intestazioni e righe inserite."""
         try:
             f_txt = tkfont.Font(root, font=("TkDefaultFont", 10))
         except Exception:
@@ -22047,18 +21920,16 @@ th {{ background:#efefef; text-align:left; }}
                 continue
             reg_w = max(reg_w, int(f_txt.measure(str(vals[0]))) + 26)
             date_w = max(date_w, int(f_txt.measure(str(vals[1]))) + 26)
-            if len(vals) > 6:
-                pcell = str(vals[6])
+            if len(vals) > 4 and vals[4]:
+                amt_w = max(amt_w, int(f_txt.measure(str(vals[4]))) + 28)
+            if len(vals) > 7:
+                pcell = str(vals[7])
                 if pcell.strip():
                     period_w = max(period_w, int(f_txt.measure(pcell)) + 28)
-        for iid in ver_unver_amt_tree.get_children():
-            av = ver_unver_amt_tree.item(iid, "values")
-            if av and av[0]:
-                amt_w = max(amt_w, int(f_txt.measure(str(av[0]))) + 28)
         ver_unver_tree.column("reg", width=min(reg_w, 140), minwidth=40)
         ver_unver_tree.column("date", width=min(date_w, 120), minwidth=64)
+        ver_unver_tree.column("amount", width=min(amt_w, 200), minwidth=92)
         ver_unver_tree.column("period", width=min(period_w, 220), minwidth=96)
-        ver_unver_amt_tree.column("amount_eur", width=min(amt_w, 200), minwidth=92)
 
     # Barra correzione registrazioni non verificate (stesse regole della pagina Movimenti).
     _VER_CORR_BLUE = "#1565c0"
@@ -22225,15 +22096,9 @@ th {{ background:#efefef; text-align:left; }}
             ver_unver_btn_elimina_reg.grid_remove()
 
     def _on_ver_unver_tree_select(_e: tk.Event | None = None) -> None:
-        _ver_unv_sync_sel_from_main()
-        _ver_refresh_ver_unver_correction_bar()
-
-    def _on_ver_unver_amt_select(_e: tk.Event | None = None) -> None:
-        _ver_unv_sync_sel_from_amt()
         _ver_refresh_ver_unver_correction_bar()
 
     ver_unver_tree.bind("<<TreeviewSelect>>", _on_ver_unver_tree_select)
-    ver_unver_amt_tree.bind("<<TreeviewSelect>>", _on_ver_unver_amt_select)
 
     def _on_ver_unver_modifica_click(event: tk.Event) -> None:
         on_modifica_reg_click_generic(
@@ -25485,7 +25350,6 @@ th {{ background:#efefef; text-align:left; }}
                 )
             )
         ver_unver_tree.delete(*ver_unver_tree.get_children())
-        ver_unver_amt_tree.delete(*ver_unver_amt_tree.get_children())
 
         uvi = 0
         for reg_n, rec, side in unverified_before:
@@ -25494,8 +25358,7 @@ th {{ background:#efefef; text-align:left; }}
             y_cat = cat_by_year.get(rec.get("year"), [])
             cat_name = category_name_for_record(rec, y_cat)
             acc_name = account_name_for_record(rec, y_acc, side)
-            amount_text, tone_uv = format_amount_for_verification_account(d, rec, side=side)
-            uv_tag = "ver_amt_neg" if tone_uv == "neg" else "ver_amt_pos"
+            amount_text, _tone_uv = format_amount_for_verification_account(d, rec, side=side)
             iid = record_legacy_stable_key(rec)
             ver_unver_tree.insert(
                 "",
@@ -25506,13 +25369,13 @@ th {{ background:#efefef; text-align:left; }}
                     to_italian_date(str(rec.get("date_iso", ""))),
                     _ver_trunc_ver_result_cell(cat_name, 32),
                     _ver_trunc_ver_result_cell(acc_name, 28),
+                    amount_text,
                     _ver_trunc_ver_result_cell(str(rec.get("cheque") or ""), 16),
                     _ver_trunc_ver_result_cell(str(rec.get("note") or ""), 140),
                     "✖",
                 ),
                 tags=(stripe,),
             )
-            ver_unver_amt_tree.insert("", "end", iid=iid, values=(amount_text,), tags=(uv_tag, stripe))
             uvi += 1
 
         for reg_n, rec, side in unverified_after:
@@ -25521,8 +25384,7 @@ th {{ background:#efefef; text-align:left; }}
             y_cat = cat_by_year.get(rec.get("year"), [])
             cat_name = category_name_for_record(rec, y_cat)
             acc_name = account_name_for_record(rec, y_acc, side)
-            amount_text, tone_uv2 = format_amount_for_verification_account(d, rec, side=side)
-            uv_tag2 = "ver_amt_neg" if tone_uv2 == "neg" else "ver_amt_pos"
+            amount_text, _tone_uv2 = format_amount_for_verification_account(d, rec, side=side)
             iid = record_legacy_stable_key(rec)
             ver_unver_tree.insert(
                 "",
@@ -25533,13 +25395,13 @@ th {{ background:#efefef; text-align:left; }}
                     to_italian_date(str(rec.get("date_iso", ""))),
                     _ver_trunc_ver_result_cell(cat_name, 32),
                     _ver_trunc_ver_result_cell(acc_name, 28),
+                    amount_text,
                     _ver_trunc_ver_result_cell(str(rec.get("cheque") or ""), 16),
                     _ver_trunc_ver_result_cell(str(rec.get("note") or ""), 140),
                     "",
                 ),
                 tags=(stripe,),
             )
-            ver_unver_amt_tree.insert("", "end", iid=iid, values=(amount_text,), tags=(uv_tag2, stripe))
             uvi += 1
 
         try:
@@ -25601,9 +25463,8 @@ th {{ background:#efefef; text-align:left; }}
                 ver_unver_correzione_row.pack_forget()
             except tk.TclError:
                 pass
-            for _ver_uv_clear in (ver_unver_tree, ver_unver_amt_tree):
-                for _iid in _ver_uv_clear.selection():
-                    _ver_uv_clear.selection_remove(_iid)
+            for _iid in ver_unver_tree.selection():
+                ver_unver_tree.selection_remove(_iid)
             ver_unver_correzione_forza_revealed[0] = False
             ver_unver_correzione_prev_key[0] = None
             if count_total_touching == 0:
@@ -25695,12 +25556,7 @@ th {{ background:#efefef; text-align:left; }}
         unver_pdf: list[tuple[str, ...]] = []
         for iid in ver_unver_tree.get_children():
             lv = ver_unver_tree.item(iid, "values")
-            amt_cell = ""
-            if ver_unver_amt_tree.exists(iid):
-                av = ver_unver_amt_tree.item(iid, "values")
-                amt_cell = str(av[0]) if av else ""
-            full_vals = lv[:4] + (amt_cell,) + lv[4:]
-            unver_pdf.append(tuple(str(v) for v in full_vals))
+            unver_pdf.append(tuple(str(v) for v in lv))
 
         d = cur_db()
         uh = print_user_header_text(d, session_holder[0])
@@ -32540,7 +32396,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 old = _palette_runtime_attr("CDC_GRID_STRIPE0_BG")
                 _mirror_palette_runtime_global("CDC_GRID_STRIPE0_BG", h)
                 for tv in (mov_tree, amt_tree, note_tree, tree_per_amt, tree_per, tree_per_note,
-                          ver_pending_tree, ver_unver_tree, ver_unver_amt_tree):
+                          ver_pending_tree, ver_unver_tree):
                     try:
                         tv.tag_configure("stripe0", background=h)
                     except tk.TclError:
@@ -32553,7 +32409,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 old = _palette_runtime_attr("CDC_GRID_STRIPE1_BG")
                 _mirror_palette_runtime_global("CDC_GRID_STRIPE1_BG", h)
                 for tv in (mov_tree, amt_tree, note_tree, tree_per_amt, tree_per, tree_per_note,
-                          ver_pending_tree, ver_unver_tree, ver_unver_amt_tree):
+                          ver_pending_tree, ver_unver_tree):
                     try:
                         tv.tag_configure("stripe1", background=h)
                     except tk.TclError:
@@ -32612,7 +32468,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 except tk.TclError:
                     pass
                 try:
-                    _ver_configure_results_grids_neutral_amount_fg(ver_pending_tree, ver_unver_amt_tree)
+                    _ver_configure_results_grids_neutral_amount_fg(ver_pending_tree, ver_unver_tree)
                 except Exception:
                     pass
                 _patch_tk_fg_subtree(mov_records_header_row, old, h)
@@ -32810,7 +32666,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 except tk.TclError:
                     pass
                 try:
-                    _ver_configure_results_grids_neutral_amount_fg(ver_pending_tree, ver_unver_amt_tree)
+                    _ver_configure_results_grids_neutral_amount_fg(ver_pending_tree, ver_unver_tree)
                 except Exception:
                     pass
             elif token == "ver_grid_amount_neg_fg":
@@ -32820,7 +32676,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 except tk.TclError:
                     pass
                 try:
-                    _ver_configure_results_grids_neutral_amount_fg(ver_pending_tree, ver_unver_amt_tree)
+                    _ver_configure_results_grids_neutral_amount_fg(ver_pending_tree, ver_unver_tree)
                 except Exception:
                     pass
             elif token == "ver_grid_amount_zero_fg":
@@ -32830,7 +32686,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 except tk.TclError:
                     pass
                 try:
-                    _ver_configure_results_grids_neutral_amount_fg(ver_pending_tree, ver_unver_amt_tree)
+                    _ver_configure_results_grids_neutral_amount_fg(ver_pending_tree, ver_unver_tree)
                 except Exception:
                     pass
             elif token == "ver_btn_pending_new_bg":
