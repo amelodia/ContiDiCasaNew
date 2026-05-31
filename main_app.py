@@ -1074,6 +1074,27 @@ def bind_euro_amount_entry_validation(
             return "." if keysym == "period" else ","
         return None
 
+    def _partial_it_int_part_ok(int_part: str) -> bool:
+        """Parte intera italiana: cifre con punti migliaia (es. ``1.234``), anche parziale in digitazione."""
+        if not int_part:
+            return True
+        if not re.fullmatch(r"[0-9.]+", int_part):
+            return False
+        if int_part.startswith(".") or int_part.endswith(".") or ".." in int_part:
+            return False
+        parts = int_part.split(".")
+        if any(not p.isdigit() for p in parts):
+            return False
+        if len(parts) == 1:
+            return True
+        for i, p in enumerate(parts[:-1]):
+            if i == 0:
+                if not (1 <= len(p) <= 3):
+                    return False
+            elif len(p) != 3:
+                return False
+        return True
+
     def _is_partial_valid(text: str) -> bool:
         t = (text or "").replace(" ", "")
         if t == "":
@@ -1089,25 +1110,27 @@ def bind_euro_amount_entry_validation(
             body = t[1:]
         if "+" in body or "-" in body:
             return False
-        if body.count(".") + body.count(",") > 1:
+        if body.count(",") > 1:
             return False
+        if "," in body:
+            int_part, dec_part = body.split(",", 1)
+            if dec_part and (not dec_part.isdigit() or len(dec_part) > max_decimals_int):
+                return False
+            return _partial_it_int_part_ok(int_part)
         if "." in body:
+            if body.count(".") > 1:
+                return _partial_it_int_part_ok(body)
             left, right = body.split(".", 1)
             if left and not left.isdigit():
                 return False
             if right and not right.isdigit():
                 return False
-            if len(right) > max_decimals_int:
+            if right and len(right) > 3:
                 return False
-        if "," in body:
-            left, right = body.split(",", 1)
-            if left and not left.isdigit():
+            if right and len(right) > max_decimals_int and len(right) != 3:
                 return False
-            if right and not right.isdigit():
-                return False
-            if len(right) > max_decimals_int:
-                return False
-        if "." not in body and "," not in body and body and not body.isdigit():
+            return True
+        if body and not body.isdigit():
             return False
         return True
 
@@ -1187,6 +1210,21 @@ def bind_euro_amount_entry_validation(
                 or ch0 == "'"
             ):
                 _flip_sign_in_entry()
+                return "break"
+            sign_char: str | None = None
+            if ch0 == "+" or ks in ("plus", "KP_Add"):
+                sign_char = "+"
+            elif ch0 in _EURO_TYPABLE_MINUS_CHARS or ks in ("minus", "KP_Subtract"):
+                sign_char = "-"
+            elif ks == "equal" and (int(getattr(event, "state", 0) or 0) & 0x0001):
+                sign_char = "+"
+            if sign_char is not None:
+                s0 = _live_amount_text(event.widget)
+                body0 = _euro_strip_leading_signs(s0)
+                if not body0:
+                    _set_amount_text_and_cursor(sign_char, cursor=1)
+                else:
+                    _set_amount_text_and_cursor(sign_char + body0)
                 return "break"
 
         if keysym in ("BackSpace", "Delete"):
@@ -1349,6 +1387,14 @@ def bind_euro_amount_entry_validation(
 
     vcmd = (entry.register(_validate_key_action), "%d", "%P", "%S", "%i", "%s")
     entry.configure(validate="key", validatecommand=vcmd)
+
+    def _sync_from_var(_cursor: int | None = None) -> None:
+        _set_amount_text_and_cursor(var.get() or "", cursor=_cursor)
+
+    try:
+        setattr(entry, "_cdc_euro_sync_from_var", _sync_from_var)
+    except Exception:
+        pass
 
     entry.bind("<KeyPress>", _keypress)
     entry.bind("<<Paste>>", _paste)
@@ -16653,11 +16699,17 @@ th {{ background:#efefef; text-align:left; }}
             amt = normalize_euro_input(raw)
             txt = format_euro_it(abs(amt))
             if amt < 0:
-                newreg_amount_var.set("-" + txt)
+                formatted = "-" + txt
             elif omit_plus_for_positive_unless_typed and not raw.startswith("+"):
-                newreg_amount_var.set(txt)
+                formatted = txt
             else:
-                newreg_amount_var.set("+" + txt)
+                formatted = "+" + txt
+            newreg_amount_var.set(formatted)
+            sync = getattr(ent_amt, "_cdc_euro_sync_from_var", None)
+            if callable(sync):
+                sync()
+            else:
+                _sync_tk_entry_from_stringvar(ent_amt, newreg_amount_var)
             newreg_sign_var.set("-" if amt < 0 else "+")
         except Exception:
             pass
