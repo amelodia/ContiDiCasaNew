@@ -707,6 +707,24 @@ def _euro_strip_leading_signs(s: str) -> str:
     return t
 
 
+def _euro_amount_entry(
+    parent: tk.Misc,
+    textvariable: tk.StringVar,
+    *,
+    width: int,
+    font=None,
+    style: str = "NewReg.TEntry",
+    **kwargs,
+) -> tk.Misc:
+    """Campo importo: ``tk.Entry`` su Windows (``ttk.Entry`` + ``StringVar`` non gestisce bene i filtri tasti)."""
+    if platform.system() == "Windows":
+        kw: dict[str, object] = {"width": width, **kwargs}
+        if font is not None:
+            kw["font"] = font
+        return tk.Entry(parent, textvariable=textvariable, **kw)
+    return ttk.Entry(parent, textvariable=textvariable, width=width, style=style, **kwargs)
+
+
 def bind_euro_amount_entry_validation(
     entry: tk.Misc,
     var: tk.StringVar,
@@ -772,13 +790,12 @@ def bind_euro_amount_entry_validation(
     _programmatic_update: list[bool] = [False]
 
     def _live_amount_text(w: tk.Misc | None = None) -> str:
-        """Testo corrente del campo: su Windows ``StringVar`` può restare indietro rispetto al widget."""
+        """Testo corrente del campo (preferisce ``Entry.get()``: ``StringVar`` può restare indietro)."""
         widget = w if w is not None else entry
-        if platform.system() == "Windows":
-            try:
-                return str(widget.get() or "")
-            except tk.TclError:
-                pass
+        try:
+            return str(widget.get() or "")
+        except tk.TclError:
+            pass
         return var.get() or ""
 
     def _sync_var_from_entry_if_windows() -> None:
@@ -931,7 +948,7 @@ def bind_euro_amount_entry_validation(
 
     def _on_double_click_select(event: tk.Event) -> str | None:
         w = event.widget
-        s = str(var.get() or "")
+        s = str(_live_amount_text(w) or "")
         if not s:
             return None
         if _formatted_it_re.fullmatch(s):
@@ -1283,27 +1300,32 @@ def bind_euro_amount_entry_validation(
         _set_amount_text_and_cursor(merged, cursor=cur)
         return "break"
 
-    # Tag dedicato in testa ai bindtag (su Windows prima del widget/TEntry) così return "break"
-    # blocca l'inserimento predefinito di tk.Entry e ttk.Entry.
-    try:
-        bind_tag = getattr(entry, "_cdc_euro_amount_bindtag", None)
-        if not bind_tag:
-            bind_tag = f"_cdc_euro_amt_{id(entry)}"
-            setattr(entry, "_cdc_euro_amount_bindtag", bind_tag)
-            tags = list(entry.bindtags())
-            if bind_tag not in tags:
-                if platform.system() == "Windows":
-                    tags.insert(0, bind_tag)
-                else:
-                    ins_at = 1 if len(tags) > 1 else 0
-                    tags.insert(ins_at, bind_tag)
-                entry.bindtags(tuple(tags))
-        root = entry.winfo_toplevel()
-        root.bind_class(bind_tag, "<KeyPress>", _keypress)
-        root.bind_class(bind_tag, "<<Paste>>", _paste)
-    except Exception:
+    # Su Windows i binding di classe Entry/TEntry ignorano spesso return "break": rimuoverli e
+    # gestire tutto dal binding sul widget (come su macOS con tag dedicato prima della classe).
+    if platform.system() == "Windows":
+        tags = [t for t in entry.bindtags() if t not in ("Entry", "TEntry")]
+        entry.bindtags(tuple(tags))
         entry.bind("<KeyPress>", _keypress)
         entry.bind("<<Paste>>", _paste)
+        entry.bind("<Control-v>", _paste)
+        entry.bind("<Control-V>", _paste)
+    else:
+        try:
+            bind_tag = getattr(entry, "_cdc_euro_amount_bindtag", None)
+            if not bind_tag:
+                bind_tag = f"_cdc_euro_amt_{id(entry)}"
+                setattr(entry, "_cdc_euro_amount_bindtag", bind_tag)
+                tags = list(entry.bindtags())
+                if bind_tag not in tags:
+                    ins_at = 1 if len(tags) > 1 else 0
+                    tags.insert(ins_at, bind_tag)
+                    entry.bindtags(tuple(tags))
+            root = entry.winfo_toplevel()
+            root.bind_class(bind_tag, "<KeyPress>", _keypress)
+            root.bind_class(bind_tag, "<<Paste>>", _paste)
+        except Exception:
+            entry.bind("<KeyPress>", _keypress)
+            entry.bind("<<Paste>>", _paste)
     entry.bind("<Double-Button-1>", _on_double_click_select, add="+")
     if not external_focusout:
         entry.bind("<FocusOut>", _format_on_focus_out, add="+")
@@ -1311,7 +1333,8 @@ def bind_euro_amount_entry_validation(
         def _focus_set_cursor(_e: tk.Event | None = None) -> None:
             if getattr(entry, "_cdc_euro_after_modal_refocus", False):
                 return
-            raw = (var.get() or "").strip()
+            _sync_var_from_entry_if_windows()
+            raw = (_live_amount_text() or "").strip()
             if require_leading_sign and allow_leading_sign and raw == "":
                 try:
                     var.set("-")
@@ -3108,17 +3131,40 @@ def is_giroconto_record(rec: dict) -> bool:
     return _category_code_int(rec) == 1
 
 
-def giro_record_secondary_amount_flip(rec: dict, side: str) -> bool:
-    """True se l'importo sul lato secondary va mostrato/calcolato come opposto di ``amount_eur`` (convenzione girata).
+def verification_account_amount_flip(db: dict, rec: dict, side: str) -> bool:
+    """True se ``amount_eur`` va negato per importo/verifica dal punto di vista del conto in ``side``.
 
-    Le girate di chiusura verifica carta (``is_credit_card_settlement``) usano lo stesso movimento contabile
-    della girata ma **senza** inversione di segno sul secondo conto in verifica/stampa riepilogo.
+    Girata conto/conto sul secondo conto: convenzione contabile opposta al primo conto.
+    Conto carta sul secondo conto (anche registrazioni legacy non Girata): stesso criterio in verifica.
+    Le girate ``is_credit_card_settlement`` (carta primo conto) non invertono il secondo conto.
     """
+    if side != "secondary":
+        return False
+    if rec.get("is_credit_card_settlement"):
+        return False
+    if is_giroconto_record(rec):
+        return True
+    c2 = str(rec.get("account_secondary_code") or "").strip()
+    return bool(c2 and account_is_credit_card_by_code(db, c2))
+
+
+def giro_record_secondary_amount_flip(rec: dict, side: str, db: dict | None = None) -> bool:
+    """Compatibilità: preferire ``verification_account_amount_flip`` quando ``db`` è disponibile."""
+    if db is not None:
+        return verification_account_amount_flip(db, rec, side)
     if side != "secondary" or not is_giroconto_record(rec):
         return False
     if rec.get("is_credit_card_settlement"):
         return False
     return True
+
+
+def verification_account_amount_eur(db: dict, rec: dict, *, side: str) -> Decimal:
+    """Importo con segno per verifica / riepilogo dal punto di vista del conto in ``side``."""
+    amt = to_decimal(rec.get("amount_eur", "0"))
+    if verification_account_amount_flip(db, rec, side):
+        return -amt
+    return amt
 
 
 def is_dotazione_record(rec: dict) -> bool:
@@ -3147,9 +3193,11 @@ def record_skip_for_category_statistics_budget(rec: dict, twin_keys: frozenset) 
     return False
 
 
-def format_amount_for_verification_account(rec: dict, *, side: str) -> tuple[str, str]:
+def format_amount_for_verification_account(
+    db: dict, rec: dict, *, side: str
+) -> tuple[str, str]:
     """Importo mostrato dal punto di vista del conto in verifica (girata sul conto 2: stesso segno usato nei totali)."""
-    flip = giro_record_secondary_amount_flip(rec, side)
+    flip = verification_account_amount_flip(db, rec, side)
     year = int(rec.get("year", 0))
     if year <= 2001 and rec.get("amount_lire_original") is not None:
         value = to_decimal(rec["amount_lire_original"])
@@ -9866,9 +9914,9 @@ def build_ui(
 
     ttk.Label(filters_text_inner, text="Importo", style="MovCdc.TLabel").pack(side=tk.LEFT, padx=(0, 6))
     amount_filter_row = ttk.Frame(filters_text_inner)
-    amount_filter_entry = ttk.Entry(
+    amount_filter_entry = _euro_amount_entry(
         amount_filter_row,
-        textvariable=text_amount_preview_var,
+        text_amount_preview_var,
         width=12,
         style="MovCdc.TEntry",
     )
@@ -11544,7 +11592,7 @@ def build_ui(
         else:
             row_amt_edit = tk.Frame(frm)
             row_amt_edit.grid(row=0, column=1, sticky="w", padx=(8, 0))
-            ent_edit_amt = ttk.Entry(row_amt_edit, textvariable=v, width=18)
+            ent_edit_amt = _euro_amount_entry(row_amt_edit, v, width=18)
             ent_edit_amt.pack(side=tk.LEFT)
             bind_euro_amount_entry_validation(
                 ent_edit_amt,
@@ -15771,13 +15819,14 @@ th {{ background:#efefef; text-align:left; }}
     lbl_importo = tk.Label(nuova_form, text="Importo (€)", **_newreg_plain_lbl_kw)
     lbl_importo.grid(row=3, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
     row_amt = tk.Frame(nuova_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    if platform.system() == "Windows":
-        ent_amt = tk.Entry(row_amt, textvariable=newreg_amount_var, width=_NR_W_AMT, font=newreg_ui_font)
-    else:
-        ent_amt = ttk.Entry(row_amt, textvariable=newreg_amount_var, width=_NR_W_AMT, style="NewReg.TEntry")
+    ent_amt = _euro_amount_entry(
+        row_amt, newreg_amount_var, width=_NR_W_AMT, font=newreg_ui_font, style="NewReg.TEntry"
+    )
     ent_amt.pack(side=tk.LEFT)
     newreg_saldo_cassa_var = tk.StringVar(value="")
-    ent_saldo = ttk.Entry(row_amt, textvariable=newreg_saldo_cassa_var, width=_NR_W_AMT, style="NewReg.TEntry")
+    ent_saldo = _euro_amount_entry(
+        row_amt, newreg_saldo_cassa_var, width=_NR_W_AMT, font=newreg_ui_font, style="NewReg.TEntry"
+    )
     lbl_saldo_inline = tk.Label(row_amt, text="Nuovo saldo di cassa (€)", **_newreg_plain_lbl_kw)
     row_amt.grid(row=3, column=1, sticky="w", pady=_newreg_py)
 
@@ -17597,10 +17646,9 @@ th {{ background:#efefef; text-align:left; }}
     row_per_acc2.grid(row=5, column=1, columnspan=2, sticky="w", pady=_per_py)
     tk.Label(per_form, text="Importo (€)", **_newreg_plain_lbl_kw).grid(row=6, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
     row_per_amt = tk.Frame(per_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    if platform.system() == "Windows":
-        ent_per_amt = tk.Entry(row_per_amt, textvariable=per_amount_var, width=_NR_W_AMT, font=newreg_ui_font)
-    else:
-        ent_per_amt = ttk.Entry(row_per_amt, textvariable=per_amount_var, width=_NR_W_AMT, style="NewReg.TEntry")
+    ent_per_amt = _euro_amount_entry(
+        row_per_amt, per_amount_var, width=_NR_W_AMT, font=newreg_ui_font, style="NewReg.TEntry"
+    )
     ent_per_amt.pack(side=tk.LEFT)
     row_per_amt.grid(row=6, column=1, sticky="w", pady=_per_py)
     tk.Label(per_form, text="Nota", **_newreg_plain_lbl_kw).grid(row=7, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
@@ -18499,7 +18547,7 @@ th {{ background:#efefef; text-align:left; }}
             except Exception:
                 amt_dec = Decimal("0")
             v = tk.StringVar(value=("-" if amt_dec < 0 else "+") + format_euro_it(abs(amt_dec)))
-            ent = ttk.Entry(frm, textvariable=v, width=_NR_W_AMT)
+            ent = _euro_amount_entry(frm, v, width=_NR_W_AMT)
             ttk.Label(frm, text="Importo (€)").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
             ent.grid(row=1, column=1, sticky="w", pady=4)
             bind_euro_amount_entry_validation(
@@ -20730,10 +20778,10 @@ th {{ background:#efefef; text-align:left; }}
     tk.Label(ver_input_frame, text="Importo (€)", font=_ver_ui_font, bg=_VER_BG).grid(
         row=0, column=0, sticky="w", padx=(0, 6), pady=2
     )
-    if platform.system() == "Windows":
-        ver_ent_amt = tk.Entry(ver_input_frame, textvariable=ver_inp_amt_var, width=16, font=_ver_ui_font)
-    else:
-        ver_ent_amt = ttk.Entry(ver_input_frame, textvariable=ver_inp_amt_var, width=14, style="NewReg.TEntry")
+    ver_ent_amt = _euro_amount_entry(
+        ver_input_frame, ver_inp_amt_var, width=16 if platform.system() == "Windows" else 14,
+        font=_ver_ui_font, style="NewReg.TEntry",
+    )
     ver_ent_amt.grid(row=0, column=1, sticky="w", padx=(0, 4), pady=2)
     bind_euro_amount_entry_validation(
         ver_ent_amt,
@@ -21412,7 +21460,7 @@ th {{ background:#efefef; text-align:left; }}
             cat_name = category_name_for_record(rec, y_cat)
             _tc, side_c = _ver_record_touches_account(rec, acc_code_c)
             side_disp = side_c if _tc else "primary"
-            amount_text, tone = format_amount_for_verification_account(rec, side=side_disp)
+            amount_text, tone = format_amount_for_verification_account(d, rec, side=side_disp)
             amt_tag = "ver_amt_neg" if tone == "neg" else "ver_amt_pos"
             note_cell = _ver_trunc_ver_result_cell(str(rec.get("note") or ""), 220)
             ver_cand_tree.insert(
@@ -22310,7 +22358,7 @@ th {{ background:#efefef; text-align:left; }}
             justify=tk.LEFT,
         ).pack(anchor=tk.W)
         v_amt = tk.StringVar(value=str(item.get("amount") or ""))
-        ent_amt = ttk.Entry(fr_amt, textvariable=v_amt, width=22, style="NewReg.TEntry")
+        ent_amt = _euro_amount_entry(fr_amt, v_amt, width=22, style="NewReg.TEntry")
         ent_amt.pack(anchor=tk.W, pady=(8, 0))
         bind_euro_amount_entry_validation(
             ent_amt,
@@ -23096,11 +23144,28 @@ th {{ background:#efefef; text-align:left; }}
         return verification_flag_star_equivalent_count(str(rec.get(fk) or ""))
 
     def _ver_record_amount_for_account(rec: dict, side: str) -> Decimal:
-        """Importo con segno dal punto di vista del conto; sul secondary della girata: ``amount_eur`` invertito."""
-        amt = to_decimal(rec.get("amount_eur", "0"))
-        if giro_record_secondary_amount_flip(rec, side):
-            return -amt
-        return amt
+        """Importo con segno dal punto di vista del conto; girata / carta sul secondo conto: ``amount_eur`` invertito."""
+        return verification_account_amount_eur(cur_db(), rec, side=side)
+
+    def _ver_amounts_match_for_account(
+        rec_amt: Decimal,
+        target_norm: Decimal,
+        rec: dict,
+        side: str,
+        acc_code: str,
+    ) -> bool:
+        if rec_amt == target_norm:
+            return True
+        # Carta sul secondo conto in Girata: estratto spesso positivo, contabile negata (o viceversa).
+        if (
+            side == "secondary"
+            and is_giroconto_record(rec)
+            and not rec.get("is_credit_card_settlement")
+            and account_is_credit_card_by_code(cur_db(), acc_code)
+            and rec_amt == -target_norm
+        ):
+            return True
+        return False
 
     def _ver_norm(s: str) -> str:
         """Normalizza testo per confronto verifica: Unicode NFC, spazi collassati, lowercase."""
@@ -23333,7 +23398,7 @@ th {{ background:#efefef; text-align:left; }}
             if stars >= 1:
                 continue
             rec_amt = _ver_record_amount_for_account(rec, side).quantize(_Q)
-            if rec_amt != target_norm:
+            if not _ver_amounts_match_for_account(rec_amt, target_norm, rec, side, ac):
                 continue
             rec_chq = _ver_norm(str(rec.get("cheque") or ""))
             rec_note = _ver_norm(str(rec.get("note") or ""))
@@ -24706,12 +24771,13 @@ th {{ background:#efefef; text-align:left; }}
             bal_var.set(text)
             _sync_tk_entry_from_stringvar(bal_entry, bal_var)
 
-        if _stmt_bal_win:
-            bal_entry = tk.Entry(dlg, textvariable=bal_var, width=20, font=("TkDefaultFont", 13))
-        else:
-            bal_entry = ttk.Entry(
-                dlg, textvariable=bal_var, width=18, style="NewReg.TEntry", font=("TkDefaultFont", 13)
-            )
+        bal_entry = _euro_amount_entry(
+            dlg,
+            bal_var,
+            width=20 if _stmt_bal_win else 18,
+            font=("TkDefaultFont", 13),
+            style="NewReg.TEntry",
+        )
         bal_entry.pack(padx=16, pady=(0, 4))
         bind_euro_amount_entry_validation(
             bal_entry,
@@ -25369,7 +25435,7 @@ th {{ background:#efefef; text-align:left; }}
             y_cat = cat_by_year.get(rec.get("year"), [])
             cat_name = category_name_for_record(rec, y_cat)
             acc_name = account_name_for_record(rec, y_acc, side)
-            amount_text, tone_uv = format_amount_for_verification_account(rec, side=side)
+            amount_text, tone_uv = format_amount_for_verification_account(d, rec, side=side)
             uv_tag = "ver_amt_neg" if tone_uv == "neg" else "ver_amt_pos"
             iid = record_legacy_stable_key(rec)
             ver_unver_tree.insert(
@@ -25396,7 +25462,7 @@ th {{ background:#efefef; text-align:left; }}
             y_cat = cat_by_year.get(rec.get("year"), [])
             cat_name = category_name_for_record(rec, y_cat)
             acc_name = account_name_for_record(rec, y_acc, side)
-            amount_text, tone_uv2 = format_amount_for_verification_account(rec, side=side)
+            amount_text, tone_uv2 = format_amount_for_verification_account(d, rec, side=side)
             uv_tag2 = "ver_amt_neg" if tone_uv2 == "neg" else "ver_amt_pos"
             iid = record_legacy_stable_key(rec)
             ver_unver_tree.insert(
@@ -31654,178 +31720,10 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 wraplength=440,
             ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
             amt_var = tk.StringVar(value="-")
-            ent_am = ttk.Entry(fr, textvariable=amt_var, width=24)
+            ent_am = _euro_amount_entry(fr, amt_var, width=24)
             ent_am.grid(row=1, column=0, sticky="w", pady=4)
             err = ttk.Label(fr, text="", foreground="#b00020", wraplength=440)
             err.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 6))
-
-            def _amount_validate_on_focus_out(_e: tk.Event | None = None) -> None:
-                raw_live = (amt_var.get() or "").strip()
-                if raw_live in ("+", "-"):
-                    return
-                try:
-                    normalized = normalize_euro_input(raw_live)
-                except Exception:
-                    err.configure(text="Importo non valido: usa formato euro (es. -1.234,56).")
-                    return
-                err.configure(text="")
-                amt_var.set(format_euro_it(normalized))
-
-            ent_am.bind("<FocusOut>", _amount_validate_on_focus_out, add="+")
-
-            _amt_partial_re = re.compile(r"^[+-](?:\d+)?(?:[.,]\d{0,2})?$")
-
-            def _amt_next_text_for_keypress(event: tk.Event) -> str | None:
-                w = event.widget
-                cur = amt_var.get() or ""
-                try:
-                    a = int(w.index("sel.first"))
-                    b = int(w.index("sel.last"))
-                except tk.TclError:
-                    a = b = -1
-                keysym = str(getattr(event, "keysym", "") or "")
-                ch = str(getattr(event, "char", "") or "")
-                try:
-                    pos = int(w.index(tk.INSERT))
-                except tk.TclError:
-                    pos = len(cur)
-
-                if keysym == "BackSpace":
-                    if a >= 0 and b >= 0:
-                        return cur[:a] + cur[b:]
-                    if pos <= 0:
-                        return cur
-                    return cur[: pos - 1] + cur[pos:]
-                if keysym == "Delete":
-                    if a >= 0 and b >= 0:
-                        return cur[:a] + cur[b:]
-                    if pos >= len(cur):
-                        return cur
-                    return cur[:pos] + cur[pos + 1 :]
-                if ch and ord(ch) >= 32:
-                    if a >= 0 and b >= 0:
-                        return cur[:a] + ch + cur[b:]
-                    return cur[:pos] + ch + cur[pos:]
-                return None
-
-            def _strict_amt_keypress(event: tk.Event) -> str | None:
-                keysym = str(getattr(event, "keysym", "") or "")
-                if keysym in ("Return", "KP_Enter"):
-                    _am_ok()
-                    return "break"
-                if keysym in (
-                    "Left",
-                    "Right",
-                    "Up",
-                    "Down",
-                    "Home",
-                    "End",
-                    "Tab",
-                    "ISO_Left_Tab",
-                    "Escape",
-                ):
-                    return None
-                st = int(getattr(event, "state", 0) or 0)
-                if st & (0x0004 | 0x0008 | 0x20000 | 0x100000):
-                    return None
-                ch = str(getattr(event, "char", "") or "")
-                cur = amt_var.get() or ""
-                w = event.widget
-
-                if keysym in ("BackSpace", "Delete"):
-                    nxt = _amt_next_text_for_keypress(event) or cur
-                    if not nxt or nxt[0] not in "+-":
-                        return "break"
-                    if nxt in ("+", "-"):
-                        amt_var.set(nxt)
-                        try:
-                            w.icursor(1)
-                        except Exception:
-                            pass
-                        err.configure(text="")
-                        return "break"
-                    if not _amt_partial_re.fullmatch(nxt):
-                        return "break"
-                    return None
-
-                if not ch or ord(ch) < 32:
-                    return None
-
-                if _euro_typed_char_is_sign(ch):
-                    sig = _euro_sign_char_to_ascii(ch)
-                    body = cur[1:] if cur.startswith(("+", "-")) else cur
-                    amt_var.set(sig + body)
-                    try:
-                        w.icursor(1)
-                    except Exception:
-                        pass
-                    err.configure(text="")
-                    return "break"
-
-                if ch not in "0123456789.,":
-                    return "break"
-                nxt = _amt_next_text_for_keypress(event)
-                if nxt is None:
-                    return "break"
-                if not nxt or nxt[0] not in "+-":
-                    return "break"
-                if nxt in ("+", "-"):
-                    return "break"
-                if not _amt_partial_re.fullmatch(nxt):
-                    return "break"
-                body = nxt[1:]
-                if body.count(".") + body.count(",") > 1:
-                    return "break"
-                if "." in body:
-                    dec = body.split(".", 1)[1]
-                    if len(dec) > 2:
-                        return "break"
-                if "," in body:
-                    dec = body.split(",", 1)[1]
-                    if len(dec) > 2:
-                        return "break"
-                err.configure(text="")
-                return None
-
-            def _strict_amt_paste(event: tk.Event) -> str:
-                try:
-                    clip = str(event.widget.clipboard_get() or "").strip().replace(" ", "")
-                except tk.TclError:
-                    return "break"
-                clip = clip.replace("\u2212", "-").replace("\u2013", "-")
-                if not clip:
-                    return "break"
-                w = event.widget
-                cur = amt_var.get() or ""
-                try:
-                    a = int(w.index("sel.first"))
-                    b = int(w.index("sel.last"))
-                except tk.TclError:
-                    try:
-                        p = int(w.index(tk.INSERT))
-                    except tk.TclError:
-                        return "break"
-                    a = b = p
-                merged = cur[:a] + clip + cur[b:]
-                if not _amt_partial_re.fullmatch(merged):
-                    return "break"
-                body = merged[1:]
-                if body.count(".") + body.count(",") > 1:
-                    return "break"
-                if "." in body and len(body.split(".", 1)[1]) > 2:
-                    return "break"
-                if "," in body and len(body.split(",", 1)[1]) > 2:
-                    return "break"
-                amt_var.set(merged)
-                try:
-                    w.icursor(min(a + len(clip), len(merged)))
-                except tk.TclError:
-                    pass
-                err.configure(text="")
-                return "break"
-
-            ent_am.bind("<KeyPress>", _strict_amt_keypress, add="+")
-            ent_am.bind("<<Paste>>", _strict_amt_paste, add="+")
 
             def _am_close() -> None:
                 try:
@@ -31860,6 +31758,16 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                     return
                 _am_close()
                 _open_cat_note_step(name_stored, amt)
+
+            bind_euro_amount_entry_validation(
+                ent_am,
+                amt_var,
+                allow_leading_sign=True,
+                require_leading_sign=True,
+                reject_zero=False,
+                on_enter=_am_ok,
+                cursor_after_sign_on_focus=True,
+            )
 
             bf = ttk.Frame(fr)
             bf.grid(row=3, column=0, columnspan=2, sticky="e", pady=(8, 0))
