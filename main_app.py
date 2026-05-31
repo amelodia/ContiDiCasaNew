@@ -24497,6 +24497,7 @@ th {{ background:#efefef; text-align:left; }}
                 return
             ver_pending_items[0].pop(idx)
             _ver_refresh_pending_tree()
+            _ver_try_close_results_if_all_session_data_deleted()
 
     def _ver_edit_pending() -> None:
         sel = ver_pending_tree.selection()
@@ -25819,10 +25820,61 @@ th {{ background:#efefef; text-align:left; }}
         ver_inp_chq_var.set("")
         ver_inp_note_var.set("")
         ver_setup_saved_var.set("")
+        ver_results_new_data_visible[0] = False
         ver_setup_frame.pack(fill=tk.X, anchor=tk.W, pady=(0, 4), in_=ver_body)
         _ver_set_mode_chips_locked(False)
         _ver_populate_account_combo()
         _ver_refresh_setup_saved_banner_global()
+
+    def _ver_try_close_results_if_all_session_data_deleted() -> None:
+        """Pagina risultati: eliminati tutti i dati immessi in sospeso → chiede se chiudere la sessione."""
+        if not _ver_ui_on_results_page():
+            return
+        if ver_pending_items[0]:
+            return
+        try:
+            close_now = messagebox.askyesno(
+                "Verifica",
+                "Eliminati tutti i dati di verifica immessi in sospeso.\n\n"
+                "Chiudere la sessione di verifica?\n\n"
+                "Scegli «No» per restare sui risultati e immettere un nuovo dato.",
+                parent=verifica_frame,
+            )
+        except Exception:
+            return
+        if not close_now:
+            try:
+                _ver_save_pending_to_db()
+            except Exception:
+                pass
+            try:
+                _ver_refresh_pending_tree()
+            except Exception:
+                pass
+            try:
+                _ver_update_pending_action_buttons_visibility()
+            except Exception:
+                pass
+            try:
+                _ver_update_results_session_ui_visibility()
+            except Exception:
+                pass
+            return
+        ver_results_new_data_visible[0] = False
+        acc_code = str(ver_account_code_var.get() or "").strip() or str(
+            ver_session_account_code[0] or ""
+        ).strip()
+        if acc_code:
+            try:
+                _ver_clear_pending_from_db(acc_code)
+                persist_db_after_edit(None)
+            except Exception:
+                pass
+        _ver_apply_full_verification_teardown()
+        try:
+            _ver_update_pending_action_buttons_visibility()
+        except Exception:
+            pass
 
     def _ver_on_close() -> None:
         ver_amt_focusout_suppress_once[0] = True
