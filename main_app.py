@@ -707,41 +707,6 @@ def _euro_strip_leading_signs(s: str) -> str:
     return t
 
 
-def _cdc_restore_tk_entry_pointer_bindings(entry: tk.Misc) -> None:
-    """Click, trascinamento e Shift+click dopo rimozione bindtag Entry (solo Windows)."""
-
-    def _btn1(e: tk.Event) -> None:
-        w = e.widget
-        try:
-            w.focus_set()
-            w.tk.call("tk::EntryButton1", w._w, e.x)
-        except tk.TclError:
-            try:
-                w.focus_set()
-                w.icursor(w.index(f"@{e.x}"))
-                w.selection_clear()
-            except tk.TclError:
-                pass
-
-    def _b1motion(e: tk.Event) -> None:
-        w = e.widget
-        try:
-            w.tk.call("tk::EntryMouseSelect", w._w, e.x)
-        except tk.TclError:
-            pass
-
-    def _shift_btn1(e: tk.Event) -> None:
-        w = e.widget
-        try:
-            w.tk.call("tk::EntryShift1", w._w, e.x)
-        except tk.TclError:
-            pass
-
-    entry.bind("<Button-1>", _btn1, add="+")
-    entry.bind("<B1-Motion>", _b1motion, add="+")
-    entry.bind("<Shift-Button-1>", _shift_btn1, add="+")
-
-
 def _euro_amount_entry(
     parent: tk.Misc,
     textvariable: tk.StringVar,
@@ -1214,6 +1179,44 @@ def bind_euro_amount_entry_validation(
 
         if keysym in ("BackSpace", "Delete"):
             w = event.widget
+            if platform.system() == "Windows":
+                if not (require_leading_sign and allow_leading_sign):
+                    return None
+                nxt = _merged_after_edit(event)
+                if nxt is None:
+                    return "break"
+                if nxt == "":
+                    cur = _live_amount_text(w)
+                    keep = "+"
+                    if cur.startswith("-"):
+                        keep = "-"
+                    elif cur.startswith("+"):
+                        keep = "+"
+                    _set_amount_text_and_cursor(keep, cursor=1)
+                    return "break"
+                if not _is_partial_valid(nxt):
+                    return "break"
+                if not nxt.startswith(("+", "-")):
+                    cur = _live_amount_text(w)
+                    lead = "-"
+                    if cur.startswith("+"):
+                        lead = "+"
+                    elif cur.startswith("-"):
+                        lead = "-"
+                    nxt = lead + nxt.lstrip("+-")
+                    try:
+                        if not int(w.selection_present()):
+                            raise tk.TclError("no selection")
+                        a = int(w.index("sel.first"))
+                    except tk.TclError:
+                        try:
+                            a = int(w.index(tk.INSERT))
+                        except tk.TclError:
+                            a = len(nxt)
+                    new_pos = min(a, len(nxt))
+                    _set_amount_text_and_cursor(nxt, cursor=new_pos)
+                    return "break"
+                return None
             nxt = _merged_after_edit(event)
             if nxt is None or not _is_partial_valid(nxt):
                 return "break"
@@ -1282,6 +1285,11 @@ def bind_euro_amount_entry_validation(
             return "break"
 
         if sym.isdigit() or sym in ",.":
+            if platform.system() == "Windows" and not require_leading_sign:
+                ch = str(getattr(event, "char", "") or "")
+                ks = str(getattr(event, "keysym", "") or "")
+                if (ch and ord(ch) >= 32) or (len(ks) == 1 and ks.isdigit()) or ks in ("period", "comma"):
+                    return None
             merged_raw = _merged_after_edit(event, ins_ch=sym)
             if merged_raw is None:
                 return "break"
@@ -1335,16 +1343,31 @@ def bind_euro_amount_entry_validation(
         _set_amount_text_and_cursor(merged, cursor=cur)
         return "break"
 
-    # Windows: i binding di classe Entry ignorano return "break" dal tag custom — rimuoverli e
-    # gestire KeyPress sul widget; ripristinare click/selezione con le procedure Tcl dell'Entry.
+    # Windows: validate='key' blocca caratteri invalidi; KeyPress con add='+' gestisce solo casi speciali
+    # (segno, Backspace con segno obbligatorio, numpad) lasciando Entry attivo per mouse/focus/digitazione.
     if platform.system() == "Windows":
-        tags = [t for t in entry.bindtags() if t not in ("Entry", "TEntry")]
-        entry.bindtags(tuple(tags))
-        entry.bind("<KeyPress>", _keypress)
+
+        def _validate_key_action(action: str, proposed: str, char_ins: str, _idx: str, _current: str) -> bool:
+            if _programmatic_update[0]:
+                return True
+            try:
+                act = int(action)
+            except (TypeError, ValueError):
+                return True
+            prop = (proposed or "").replace("\u2212", "-").replace("\u2013", "-").replace(" ", "")
+            if act == 1:
+                ch = str(char_ins or "")
+                if ch and ord(ch) >= 32:
+                    if not (ch.isdigit() or ch in "+-,." or _euro_typed_char_is_sign(ch)):
+                        return False
+            return _is_partial_valid(prop)
+
+        vcmd = (entry.register(_validate_key_action), "%d", "%P", "%S", "%i", "%s")
+        entry.configure(validate="key", validatecommand=vcmd)
+        entry.bind("<KeyPress>", _keypress, add="+")
         entry.bind("<<Paste>>", _paste)
         entry.bind("<Control-v>", _paste)
         entry.bind("<Control-V>", _paste)
-        _cdc_restore_tk_entry_pointer_bindings(entry)
     else:
         try:
             bind_tag = getattr(entry, "_cdc_euro_amount_bindtag", None)
