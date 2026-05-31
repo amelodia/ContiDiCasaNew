@@ -741,6 +741,9 @@ def bind_euro_amount_entry_validation(
     """
     Limita immissione e incolla a importi euro: cifre e separatori . e ,; + e − solo come primo carattere
     (sostituisce il segno esistente). Con allow_leading_sign=False (es. saldo cassa) non ammette segno.
+    Durante digitazione si accettano stati parziali sulla parte intera (anche importi già formattati
+    in correzione); le cifre dopo la virgola sono al massimo ``max_decimals`` in inserimento, non in
+    cancellazione. Formato completo e normalizzazione su Enter e FocusOut (salvo external_focusout=True).
     """
 
     max_decimals_int = max(0, int(max_decimals))
@@ -1074,34 +1077,12 @@ def bind_euro_amount_entry_validation(
             return "." if keysym == "period" else ","
         return None
 
-    def _partial_it_int_part_ok(int_part: str) -> bool:
-        """Parte intera italiana: cifre con punti migliaia (es. ``1.234``), anche parziale in digitazione."""
-        if not int_part:
-            return True
-        if not re.fullmatch(r"[0-9.]+", int_part):
-            return False
-        if int_part.startswith(".") or int_part.endswith(".") or ".." in int_part:
-            return False
-        parts = int_part.split(".")
-        if any(not p.isdigit() for p in parts):
-            return False
-        if len(parts) == 1:
-            return True
-        for i, p in enumerate(parts[:-1]):
-            if i == 0:
-                if not (1 <= len(p) <= 3):
-                    return False
-            elif len(p) != 3:
-                return False
-        return True
-
-    def _is_partial_valid(text: str) -> bool:
+    def _is_allowed_typing_text(text: str, *, enforce_decimal_limit: bool = True) -> bool:
+        """Caratteri ammessi in digitazione; opzionalmente max cifre decimali (solo in inserimento, non in cancellazione)."""
         t = (text or "").replace(" ", "")
         if t == "":
             return True
         if not allow_leading_sign and (t.startswith("+") or t.startswith("-")):
-            return False
-        if require_leading_sign and allow_leading_sign and not t.startswith(("+", "-")):
             return False
         if not re.fullmatch(r"[0-9+\-.,]*", t):
             return False
@@ -1113,25 +1094,11 @@ def bind_euro_amount_entry_validation(
         if body.count(",") > 1:
             return False
         if "," in body:
-            int_part, dec_part = body.split(",", 1)
-            if dec_part and (not dec_part.isdigit() or len(dec_part) > max_decimals_int):
+            _, dec_part = body.split(",", 1)
+            if dec_part and not dec_part.isdigit():
                 return False
-            return _partial_it_int_part_ok(int_part)
-        if "." in body:
-            if body.count(".") > 1:
-                return _partial_it_int_part_ok(body)
-            left, right = body.split(".", 1)
-            if left and not left.isdigit():
+            if enforce_decimal_limit and dec_part and len(dec_part) > max_decimals_int:
                 return False
-            if right and not right.isdigit():
-                return False
-            if right and len(right) > 3:
-                return False
-            if right and len(right) > max_decimals_int and len(right) != 3:
-                return False
-            return True
-        if body and not body.isdigit():
-            return False
         return True
 
     def _ensure_require_leading_sign_on_edit(nxt: str, prev_s: str) -> str:
@@ -1257,7 +1224,7 @@ def bind_euro_amount_entry_validation(
                     _set_amount_text_and_cursor(keep, cursor=1)
                     return "break"
                 nxt = _ensure_require_leading_sign_on_edit(nxt, s)
-            if not _is_partial_valid(nxt):
+            if not _is_allowed_typing_text(nxt, enforce_decimal_limit=False):
                 return "break"
             if nxt == s:
                 return "break"
@@ -1316,7 +1283,7 @@ def bind_euro_amount_entry_validation(
             if merged_raw is None:
                 return "break"
             nxt = _ensure_require_leading_sign_on_edit(merged_raw, s)
-            if not _is_partial_valid(nxt):
+            if not _is_allowed_typing_text(nxt):
                 return "break"
             # Se _ensure_require_leading_sign_on_edit antepone +/-, il testo si allunga in testa:
             # il cursore va spostato in avanti di altrettanti caratteri, altrimenti la prossima cifra
@@ -1358,14 +1325,14 @@ def bind_euro_amount_entry_validation(
             a = b = p
         merged_raw = (s[:a] + t + s[b:]).replace("\u2212", "-").replace("\u2013", "-").replace(" ", "")
         merged = _ensure_require_leading_sign_on_edit(merged_raw, s)
-        if not _is_partial_valid(merged):
+        if not _is_allowed_typing_text(merged):
             return "break"
         sign_extra = len(merged) - len(merged_raw)
         cur = min(a + len(t) + sign_extra, len(merged))
         _set_amount_text_and_cursor(merged, cursor=cur)
         return "break"
 
-    def _validate_key_action(action: str, proposed: str, char_ins: str, _idx: str, current: str) -> bool:
+    def _validate_key_action(action: str, proposed: str, char_ins: str, _idx: str, _current: str) -> bool:
         if _programmatic_update[0]:
             return True
         try:
@@ -1373,7 +1340,6 @@ def bind_euro_amount_entry_validation(
         except (TypeError, ValueError):
             return True
         prop = (proposed or "").replace("\u2212", "-").replace("\u2013", "-").replace(" ", "")
-        cur = (current or "").replace("\u2212", "-").replace("\u2013", "-").replace(" ", "")
         if act == 1:
             ch = str(char_ins or "")
             if ch and ord(ch) >= 32:
@@ -1381,9 +1347,7 @@ def bind_euro_amount_entry_validation(
                     return False
                 if not (ch.isdigit() or ch in "+-,." or _euro_typed_char_is_sign(ch)):
                     return False
-        if require_leading_sign and allow_leading_sign:
-            prop = _ensure_require_leading_sign_on_edit(prop, cur)
-        return _is_partial_valid(prop)
+        return _is_allowed_typing_text(prop, enforce_decimal_limit=(act != 0))
 
     vcmd = (entry.register(_validate_key_action), "%d", "%P", "%S", "%i", "%s")
     entry.configure(validate="key", validatecommand=vcmd)
