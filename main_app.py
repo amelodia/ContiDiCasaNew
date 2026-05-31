@@ -34848,4 +34848,33 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        if getattr(sys, "frozen", False) and platform.system() == "Windows":
+            import traceback
+
+            tb = traceback.format_exc()
+            try:
+                log_path = _user_library_conti_support_dir() / "startup_error.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_path.write_text(tb, encoding="utf-8")
+            except Exception:
+                log_path = None
+            try:
+                _err_root = tk.Tk()
+                _err_root.withdraw()
+                detail = tb.strip()
+                if len(detail) > 1800:
+                    detail = "…\n" + detail[-1800:]
+                extra = f"\n\nLog completo:\n{log_path}" if log_path else ""
+                messagebox.showerror(
+                    "Conti di casa",
+                    "Errore all'avvio dell'applicazione.\n\n" + detail + extra,
+                    parent=None,
+                )
+                _err_root.destroy()
+            except Exception:
+                pass
+        else:
+            raise

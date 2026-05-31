@@ -81,3 +81,5 @@ Write-Host "Pacchetto Windows: $ZipPath"
 if (Test-Path $InstallerPath) {
     Write-Host "Installer Windows: $InstallerPath"
 }
+Write-Host ""
+Write-Host "Distribuire l'intera cartella dist\ContiDiCasa (o l'installer), non il solo ContiDiCasa.exe." -ForegroundColor Yellow

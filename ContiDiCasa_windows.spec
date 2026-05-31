@@ -1,7 +1,12 @@
 # PyInstaller — bundle Windows onedir. Uso: pyinstaller ContiDiCasa_windows.spec
+#
+# Runtime accanto all'exe (contents_directory=".") e senza UPX sulle DLL: evita
+# "Failed to load Python DLL" su installazioni Windows pulite / antivirus.
 
 import importlib.util
 import os
+
+from PyInstaller.utils.hooks import collect_all
 
 _vpath = os.path.join(SPECPATH, "app_version.py")
 _vspec = importlib.util.spec_from_file_location("cdc_app_version", _vpath)
@@ -35,21 +40,26 @@ hidden = [
     "import_legacy",
     "estratto_conto_pdf",
     "light_enc_sidecar",
-    # Matplotlib PDF backend e moduli Windows caricati dinamicamente.
     "matplotlib.backends.backend_pdf",
     "win32com.client",
     "webview",
     "webview.platforms.edgechromium",
 ]
 
+_sv_ttk_collect = collect_all("sv_ttk")
+_sv_ttk_datas = list(_sv_ttk_collect[0])
+_sv_ttk_binaries = list(_sv_ttk_collect[1])
+_sv_ttk_hidden = list(_sv_ttk_collect[2])
+
 a = Analysis(
     ["main_app.py"],
     pathex=[],
-    binaries=[],
+    binaries=_sv_ttk_binaries,
     datas=[
         ("webview_print_worker.py", "."),
+        *_sv_ttk_datas,
     ],
-    hiddenimports=hidden,
+    hiddenimports=hidden + _sv_ttk_hidden,
     hookspath=[],
     hooksconfig={},
     excludes=[],
@@ -70,7 +80,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     icon=_EXE_ICON,
@@ -85,7 +95,8 @@ coll = COLLECT(
     a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name="ContiDiCasa",
+    contents_directory=".",
 )
