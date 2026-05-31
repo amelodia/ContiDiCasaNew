@@ -21902,12 +21902,12 @@ th {{ background:#efefef; text-align:left; }}
     ver_unver_tree.column("account", width=78, anchor="w", stretch=False, minwidth=56)
     ver_unver_tree.column("amount", width=118, anchor="e", stretch=False, minwidth=92)
     ver_unver_tree.column("cheque", width=48, anchor="w", stretch=False, minwidth=40)
-    ver_unver_tree.column("note", width=180, anchor="w", stretch=True, minwidth=100)
+    ver_unver_tree.column("note", width=180, anchor="w", stretch=False, minwidth=100)
     ver_unver_tree.column("period", width=120, anchor="center", stretch=False, minwidth=96)
 
     ver_unv_scroll = ttk.Scrollbar(ver_unver_tree_frame, orient="vertical", command=ver_unver_tree.yview)
     ver_unver_tree.configure(yscrollcommand=ver_unv_scroll.set)
-    ver_unver_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    ver_unver_tree.pack(side=tk.LEFT, fill=tk.Y, expand=False)
     ver_unv_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
     _ver_configure_ver_tree_amount_tags(ver_unver_tree)
@@ -21929,39 +21929,54 @@ th {{ background:#efefef; text-align:left; }}
     ver_unver_tree.bind("<MouseWheel>", _ver_unv_on_mousewheel)
 
     def _ver_unver_autofit_key_columns() -> None:
-        """Larghezze #, Data, Importo, periodo in base a intestazioni e righe inserite."""
+        """Larghezze colonne e cornice tabella in base a intestazioni e righe inserite."""
         try:
-            f_txt = tkfont.Font(root, font=("TkDefaultFont", 10))
+            f_body = tkfont.Font(root, font=("TkDefaultFont", 12, "bold"))
+            f_head = tkfont.Font(root, font=("TkDefaultFont", 11, "bold"))
         except Exception:
-            f_txt = None
-        if f_txt is None:
             return
-        try:
-            period_hdr = str(ver_unver_tree.heading("period", "text") or "")
-        except Exception:
-            period_hdr = ""
-        if not period_hdr.strip():
-            period_hdr = "Entro il periodo"
-        reg_w = max(48, int(f_txt.measure("888888")) + 22)
-        date_w = max(78, int(f_txt.measure("88/88/8888")) + 22)
-        period_w = max(120, int(f_txt.measure(period_hdr)) + 32)
-        amt_w = max(118, int(f_txt.measure("+9.999.999,99 €")) + 24)
+        _col_spec: dict[str, tuple[int, int, int, str]] = {
+            "reg": (0, 40, 140, "w"),
+            "date": (1, 64, 120, "w"),
+            "category": (2, 64, 280, "w"),
+            "account": (3, 56, 240, "w"),
+            "amount": (4, 92, 220, "e"),
+            "cheque": (5, 40, 120, "w"),
+            "note": (6, 100, 520, "w"),
+            "period": (7, 56, 160, "center"),
+        }
+        widths: dict[str, int] = {}
+        for col, (_idx, min_w, _max_w, _anchor) in _col_spec.items():
+            try:
+                hdr = str(ver_unver_tree.heading(col, "text") or "")
+            except Exception:
+                hdr = ""
+            widths[col] = max(min_w, int(f_head.measure(hdr)) + 18)
         for iid in ver_unver_tree.get_children():
             vals = ver_unver_tree.item(iid, "values")
-            if not vals or len(vals) < 2:
+            if not vals:
                 continue
-            reg_w = max(reg_w, int(f_txt.measure(str(vals[0]))) + 26)
-            date_w = max(date_w, int(f_txt.measure(str(vals[1]))) + 26)
-            if len(vals) > 4 and vals[4]:
-                amt_w = max(amt_w, int(f_txt.measure(str(vals[4]))) + 28)
-            if len(vals) > 7:
-                pcell = str(vals[7])
-                if pcell.strip():
-                    period_w = max(period_w, int(f_txt.measure(pcell)) + 28)
-        ver_unver_tree.column("reg", width=min(reg_w, 140), minwidth=40)
-        ver_unver_tree.column("date", width=min(date_w, 120), minwidth=64)
-        ver_unver_tree.column("amount", width=min(amt_w, 200), minwidth=92)
-        ver_unver_tree.column("period", width=min(period_w, 220), minwidth=96)
+            for col, (idx, min_w, max_w, _anchor) in _col_spec.items():
+                if len(vals) <= idx:
+                    continue
+                cell = str(vals[idx])
+                if not cell:
+                    continue
+                pad = 24 if col == "amount" else 20
+                widths[col] = max(widths[col], int(f_body.measure(cell)) + pad)
+        for col, (_idx, min_w, max_w, anchor) in _col_spec.items():
+            ver_unver_tree.column(
+                col,
+                width=min(max(widths.get(col, min_w), min_w), max_w),
+                anchor=anchor,
+                stretch=False,
+                minwidth=min_w,
+            )
+        try:
+            total_w = sum(int(ver_unver_tree.column(c, "width") or 0) for c in _ver_unv_cols) + 22
+            ver_unver_tree_frame.configure(width=max(total_w, 320))
+        except tk.TclError:
+            pass
 
     # Barra correzione registrazioni non verificate (stesse regole della pagina Movimenti).
     _VER_CORR_BLUE = "#1565c0"
@@ -25528,7 +25543,8 @@ th {{ background:#efefef; text-align:left; }}
                 pass
             ver_unver_tree_frame.pack(
                 side=tk.TOP,
-                fill=tk.X,
+                anchor=tk.W,
+                fill=tk.NONE,
                 expand=False,
                 pady=(0, 4),
                 in_=ver_results_frame,
