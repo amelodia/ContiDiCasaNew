@@ -8668,6 +8668,9 @@ def _assert_no_dropbox_conflicted_enc_files(primary_output_path: Path) -> None:
 
 _DATA_FOLDER_IN_USE_MARKER = "conti_di_casa_folder_in_use.txt"
 _LEGACY_DATA_LOCK_JSON = "conti_di_casa_app.lock.json"
+# Segnaposto «vivo»: aggiornato periodicamente mentre l'app è aperta; oltre soglia = sessione abbandonata.
+_WORKSPACE_LOCK_STALE_SECONDS = 180.0
+_WORKSPACE_LOCK_HEARTBEAT_MS = 60_000
 
 
 def _data_folder_in_use_marker_path(data_dir: Path) -> Path:
@@ -8697,11 +8700,74 @@ def _remove_legacy_json_data_lock_if_present(data_dir: Path) -> None:
         pass
 
 
+def _materialized_workspace_lock_marker(path: Path) -> bool:
+    """File segnaposto reale e leggibile (non voce fantasma del provider cloud in elenco directory)."""
+    try:
+        if not path.is_file():
+            return False
+        if path.stat().st_size <= 0:
+            return False
+        with path.open("rb") as f:
+            return bool(f.read(1))
+    except OSError:
+        return False
+
+
+def _workspace_lock_marker_age_seconds(path: Path) -> float | None:
+    try:
+        return max(0.0, time.time() - path.stat().st_mtime)
+    except OSError:
+        return None
+
+
+def _is_stale_workspace_lock_marker(path: Path) -> bool:
+    age = _workspace_lock_marker_age_seconds(path)
+    if age is None:
+        return True
+    return age > _WORKSPACE_LOCK_STALE_SECONDS
+
+
+def _active_workspace_lock_markers(data_dir: Path) -> list[Path]:
+    return [
+        p
+        for p in _data_folder_in_use_marker_paths(data_dir)
+        if _materialized_workspace_lock_marker(p) and not _is_stale_workspace_lock_marker(p)
+    ]
+
+
+def _purge_stale_workspace_lock_markers(data_dir: Path) -> None:
+    for p in _data_folder_in_use_marker_paths(data_dir):
+        if not _materialized_workspace_lock_marker(p):
+            continue
+        if not _is_stale_workspace_lock_marker(p):
+            continue
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def touch_data_workspace_lock(data_dir: Path | None = None) -> None:
+    """Aggiorna mtime del segnaposto di questa sessione (heartbeat cross-device)."""
+    try:
+        d = data_dir if data_dir is not None else data_workspace.data_dir()
+    except Exception:
+        return
+    p = _data_folder_in_use_marker_path(d)
+    if not p.is_file():
+        return
+    try:
+        os.utime(p, None)
+    except OSError:
+        pass
+
+
 def acquire_data_workspace_lock(data_dir: Path, *, app_kind: str = "desktop") -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     _remove_legacy_json_data_lock_if_present(data_dir)
+    _purge_stale_workspace_lock_markers(data_dir)
     marker = _data_folder_in_use_marker_path(data_dir)
-    existing_markers = _data_folder_in_use_marker_paths(data_dir)
+    existing_markers = _active_workspace_lock_markers(data_dir)
     if existing_markers:
         shown = "\n".join(f"- {p.name}" for p in existing_markers[:8])
         raise RuntimeError(
@@ -34594,6 +34660,18 @@ def main() -> None:
         except Exception:
             pass
         return
+
+    def _workspace_lock_heartbeat_tick() -> None:
+        try:
+            touch_data_workspace_lock(data_dir)
+        except Exception:
+            pass
+        try:
+            root.after(_WORKSPACE_LOCK_HEARTBEAT_MS, _workspace_lock_heartbeat_tick)
+        except tk.TclError:
+            pass
+
+    root.after(_WORKSPACE_LOCK_HEARTBEAT_MS, _workspace_lock_heartbeat_tick)
 
     atexit.register(release_data_workspace_lock, data_dir)
     try:

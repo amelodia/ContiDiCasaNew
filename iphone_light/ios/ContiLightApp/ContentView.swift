@@ -120,6 +120,7 @@ struct ContentView: View {
     @State private var postLoginHydrationRefreshTask: Task<Void, Never>?
     /// Sequenza attiva del tasto Aggiorna (doppio passaggio), per evitare sovrapposizioni.
     @State private var isManualRefreshSequenceRunning = false
+    @State private var sessionLockHeartbeatTask: Task<Void, Never>?
 
     private enum MovimentiFiltriPick: Hashable {
         case category
@@ -180,12 +181,16 @@ struct ContentView: View {
         .background(Color(uiColor: .systemGroupedBackground))
         .onChange(of: loggedInSessionDb == nil) { _, noSession in
             if noSession {
+                sessionLockHeartbeatTask?.cancel()
+                sessionLockHeartbeatTask = nil
                 postLoginHydrationRefreshTask?.cancel()
                 postLoginHydrationRefreshTask = nil
                 movimentiPath = NavigationPath()
                 sessionKeyURL = nil
                 sessionLightEncURL = nil
                 applySavedLoginEmailIfNeeded()
+            } else {
+                startSessionLockHeartbeatIfNeeded()
             }
         }
         .onAppear {
@@ -1061,9 +1066,35 @@ struct ContentView: View {
         }
     }
 
+    private func startSessionLockHeartbeatIfNeeded() {
+        sessionLockHeartbeatTask?.cancel()
+        guard loggedInSessionDb != nil, let folder = dataFolderURL else { return }
+        let scope = securityScopedBookmarkURL ?? folder
+        let intervalNs = UInt64(ContiDatabase.workspaceLockHeartbeatIntervalSeconds * 1_000_000_000)
+        sessionLockHeartbeatTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: intervalNs)
+                guard !Task.isCancelled else { break }
+                await MainActor.run {
+                    guard loggedInSessionDb != nil, let folderNow = dataFolderURL else { return }
+                    let scopeNow = securityScopedBookmarkURL ?? folderNow
+                    let access = scopeNow.startAccessingSecurityScopedResource()
+                    defer {
+                        if access { scopeNow.stopAccessingSecurityScopedResource() }
+                    }
+                    if access {
+                        ContiDatabase.touchSessionWorkspaceLockIfHeld(in: folderNow)
+                    }
+                }
+            }
+        }
+    }
+
     private func closeCurrentSessionAndReleaseLock() {
         postLoginHydrationRefreshTask?.cancel()
         postLoginHydrationRefreshTask = nil
+        sessionLockHeartbeatTask?.cancel()
+        sessionLockHeartbeatTask = nil
         releaseSessionLockIfOwned()
         loggedInSessionDb = nil
         loggedInRecords = []

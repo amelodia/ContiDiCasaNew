@@ -407,6 +407,9 @@ public enum ContiDatabase {
 
     /// Stesso nome del desktop: se il file esiste, la cartella dati è considerata in uso.
     private static let dataFolderInUseMarkerFilename = "conti_di_casa_folder_in_use.txt"
+    /// Segnaposto aggiornato periodicamente; oltre soglia = sessione abbandonata (crash / chiusura senza cleanup).
+    private static let workspaceLockStaleAgeSeconds: TimeInterval = 180
+    static let workspaceLockHeartbeatIntervalSeconds: TimeInterval = 60
     private static let localInstanceMutex = NSLock()
     /// Vero solo dopo creazione con successo di `conti_di_casa_folder_in_use.txt` in questa sessione: non va mai cancellato un segnaposto altrui.
     private static var sessionHoldsDataFolderMarkerOnDisk = false
@@ -415,20 +418,71 @@ public enum ContiDatabase {
         folder.standardizedFileURL.appendingPathComponent(dataFolderInUseMarkerFilename, isDirectory: false)
     }
 
-    private static func dataFolderInUseMarkerIsPresent(in folder: URL) -> Bool {
+    private static func isDataFolderInUseMarkerFilename(_ lastPathComponent: String) -> Bool {
+        let n = lastPathComponent.lowercased()
+        return n.hasPrefix("conti_di_casa_folder_in_use") && n.hasSuffix(".txt")
+    }
+
+    private static func dataFolderInUseMarkerCandidateURLs(in folder: URL) -> [URL] {
         let fm = FileManager.default
         let folderURL = folder.standardizedFileURL
-        guard let urls = try? fm.contentsOfDirectory(
+        var out: [URL] = [dataFolderInUseMarkerURL(in: folderURL)]
+        if let urls = try? fm.contentsOfDirectory(
             at: folderURL,
             includingPropertiesForKeys: nil,
             options: []
-        ) else { return false }
-        guard let markerURL = urls.first(where: { $0.lastPathComponent == dataFolderInUseMarkerFilename }) else {
-            return false
+        ) {
+            for u in urls where isDataFolderInUseMarkerFilename(u.lastPathComponent) {
+                let std = u.standardizedFileURL
+                if !out.contains(where: { $0.path == std.path }) {
+                    out.append(std)
+                }
+            }
         }
-        var isDirectory: ObjCBool = false
-        guard fm.fileExists(atPath: markerURL.path, isDirectory: &isDirectory) else { return false }
-        return !isDirectory.boolValue
+        return out
+    }
+
+    /// File regolare non vuoto e leggibile (esclude voci fantasma del provider cloud in elenco directory).
+    private static func materializedRegularFileExists(at url: URL) -> Bool {
+        let path = url.path
+        guard FileManager.default.fileExists(atPath: path) else { return false }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path) else { return false }
+        guard let typ = attrs[.type] as? FileAttributeType, typ == .typeRegular else { return false }
+        let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+        guard size > 0 else { return false }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let chunk = try? handle.read(upToCount: 1), !chunk.isEmpty else { return false }
+        return true
+    }
+
+    private static func workspaceLockMarkerAgeSeconds(at url: URL) -> TimeInterval? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let mtime = attrs[.modificationDate] as? Date else { return nil }
+        return max(0, Date().timeIntervalSince(mtime))
+    }
+
+    private static func workspaceLockMarkerIsStale(at url: URL) -> Bool {
+        guard let age = workspaceLockMarkerAgeSeconds(at: url) else { return true }
+        return age > workspaceLockStaleAgeSeconds
+    }
+
+    private static func activeDataFolderInUseMarkerURLs(in folder: URL) -> [URL] {
+        dataFolderInUseMarkerCandidateURLs(in: folder).filter {
+            materializedRegularFileExists(at: $0) && !workspaceLockMarkerIsStale(at: $0)
+        }
+    }
+
+    private static func purgeStaleDataFolderInUseMarkers(in folder: URL) {
+        for url in dataFolderInUseMarkerCandidateURLs(in: folder) {
+            guard materializedRegularFileExists(at: url) else { continue }
+            guard workspaceLockMarkerIsStale(at: url) else { continue }
+            removeDataFolderInUseMarkerFileIfSafe(url, in: folder)
+        }
+    }
+
+    private static func dataFolderInUseMarkerIsPresent(in folder: URL) -> Bool {
+        !activeDataFolderInUseMarkerURLs(in: folder).isEmpty
     }
 
     private static func removeDataFolderInUseMarkerFileIfSafe(_ markerURL: URL, in folder: URL) {
@@ -444,9 +498,11 @@ public enum ContiDatabase {
     }
 
     public static func assertNoSessionWorkspaceLockBeforeOpen(in dataFolder: URL) throws {
-        if dataFolderInUseMarkerIsPresent(in: dataFolder.standardizedFileURL) {
+        let folder = dataFolder.standardizedFileURL
+        purgeStaleDataFolderInUseMarkers(in: folder)
+        if dataFolderInUseMarkerIsPresent(in: folder) {
             throw ContiLightImmissioneError.message(
-                "Avvio bloccato: la cartella dati risulta già in uso (file segnaposto presente nella cartella).\n\n"
+                "Avvio bloccato: la cartella dati risulta già in uso (altra istanza attiva sul desktop o su iPhone/iPad).\n\n"
                     + "Chiudi l’altra app o attendi la sincronizzazione Dropbox."
             )
         }
@@ -540,6 +596,7 @@ public enum ContiDatabase {
     /// Non cancella nulla in apertura: il segnaposto viene rimosso solo in ``releaseSessionWorkspaceLockOnClose``.
     public static func acquireSessionWorkspaceLockForOpen(in dataFolder: URL, appKind: String = "") throws {
         let folder = dataFolder.standardizedFileURL
+        purgeStaleDataFolderInUseMarkers(in: folder)
         let p = dataFolderInUseMarkerURL(in: folder)
         try assertNoSessionWorkspaceLockBeforeOpen(in: folder)
         let kindTrim = appKind.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -550,7 +607,7 @@ public enum ContiDatabase {
         guard FileManager.default.createFile(atPath: p.path, contents: data, attributes: nil) else {
             if dataFolderInUseMarkerIsPresent(in: folder) {
                 throw ContiLightImmissioneError.message(
-                    "Avvio bloccato: la cartella dati risulta già in uso (file segnaposto presente nella cartella).\n\n"
+                    "Avvio bloccato: la cartella dati risulta già in uso (altra istanza attiva sul desktop o su iPhone/iPad).\n\n"
                         + "Chiudi l’altra app o attendi la sincronizzazione Dropbox."
                 )
             }
@@ -559,6 +616,21 @@ public enum ContiDatabase {
         localInstanceMutex.lock()
         sessionHoldsDataFolderMarkerOnDisk = true
         localInstanceMutex.unlock()
+    }
+
+    /// Heartbeat cross-device: aggiorna mtime del segnaposto creato da questa sessione light.
+    public static func touchSessionWorkspaceLockIfHeld(in dataFolder: URL) {
+        localInstanceMutex.lock()
+        let shouldTouch = sessionHoldsDataFolderMarkerOnDisk
+        localInstanceMutex.unlock()
+        guard shouldTouch else { return }
+        let url = dataFolderInUseMarkerURL(in: dataFolder.standardizedFileURL)
+        guard materializedRegularFileExists(at: url) else { return }
+        do {
+            try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
+        } catch {
+            // Ignora: provider cloud può rifiutare utime intermittente.
+        }
     }
 
     /// Solo stato in RAM, senza toccare il segnaposto su disco.
