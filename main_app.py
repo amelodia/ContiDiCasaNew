@@ -707,6 +707,41 @@ def _euro_strip_leading_signs(s: str) -> str:
     return t
 
 
+def _cdc_restore_tk_entry_pointer_bindings(entry: tk.Misc) -> None:
+    """Click, trascinamento e Shift+click dopo rimozione bindtag Entry (solo Windows)."""
+
+    def _btn1(e: tk.Event) -> None:
+        w = e.widget
+        try:
+            w.focus_set()
+            w.tk.call("tk::EntryButton1", w._w, e.x)
+        except tk.TclError:
+            try:
+                w.focus_set()
+                w.icursor(w.index(f"@{e.x}"))
+                w.selection_clear()
+            except tk.TclError:
+                pass
+
+    def _b1motion(e: tk.Event) -> None:
+        w = e.widget
+        try:
+            w.tk.call("tk::EntryMouseSelect", w._w, e.x)
+        except tk.TclError:
+            pass
+
+    def _shift_btn1(e: tk.Event) -> None:
+        w = e.widget
+        try:
+            w.tk.call("tk::EntryShift1", w._w, e.x)
+        except tk.TclError:
+            pass
+
+    entry.bind("<Button-1>", _btn1, add="+")
+    entry.bind("<B1-Motion>", _b1motion, add="+")
+    entry.bind("<Shift-Button-1>", _shift_btn1, add="+")
+
+
 def _euro_amount_entry(
     parent: tk.Misc,
     textvariable: tk.StringVar,
@@ -1218,12 +1253,12 @@ def bind_euro_amount_entry_validation(
                 new_pos = a
             _set_amount_text_and_cursor(nxt, cursor=min(new_pos, len(nxt)))
             return "break"
-        sym = _typed_symbol_from_key_event(event)
-        if not sym:
-            return None
         st = int(getattr(event, "state", 0) or 0)
         if st & (0x0004 | 0x0008 | 0x20000 | 0x100000):
             return None
+        sym = _typed_symbol_from_key_event(event)
+        if not sym:
+            return "break"
 
         w = event.widget
         s = _live_amount_text(w)
@@ -1300,33 +1335,33 @@ def bind_euro_amount_entry_validation(
         _set_amount_text_and_cursor(merged, cursor=cur)
         return "break"
 
-    # Tag dedicato prima dei binding di classe Entry/TEntry: KeyPress/Paste intercettati con
-    # return "break" senza togliere Entry/TEntry (mouse, focus e selezione restano attivi).
-    try:
-        bind_tag = getattr(entry, "_cdc_euro_amount_bindtag", None)
-        if not bind_tag:
-            bind_tag = f"_cdc_euro_amt_{id(entry)}"
-            setattr(entry, "_cdc_euro_amount_bindtag", bind_tag)
-            tags = list(entry.bindtags())
-            if bind_tag not in tags:
-                if platform.system() == "Windows":
-                    tags.insert(0, bind_tag)
-                else:
-                    ins_at = 1 if len(tags) > 1 else 0
-                    tags.insert(ins_at, bind_tag)
-                entry.bindtags(tuple(tags))
-        root = entry.winfo_toplevel()
-        root.bind_class(bind_tag, "<KeyPress>", _keypress)
-        root.bind_class(bind_tag, "<<Paste>>", _paste)
-        if platform.system() == "Windows":
-            entry.bind("<Control-v>", _paste, add="+")
-            entry.bind("<Control-V>", _paste, add="+")
-    except Exception:
+    # Windows: i binding di classe Entry ignorano return "break" dal tag custom — rimuoverli e
+    # gestire KeyPress sul widget; ripristinare click/selezione con le procedure Tcl dell'Entry.
+    if platform.system() == "Windows":
+        tags = [t for t in entry.bindtags() if t not in ("Entry", "TEntry")]
+        entry.bindtags(tuple(tags))
         entry.bind("<KeyPress>", _keypress)
         entry.bind("<<Paste>>", _paste)
-        if platform.system() == "Windows":
-            entry.bind("<Control-v>", _paste, add="+")
-            entry.bind("<Control-V>", _paste, add="+")
+        entry.bind("<Control-v>", _paste)
+        entry.bind("<Control-V>", _paste)
+        _cdc_restore_tk_entry_pointer_bindings(entry)
+    else:
+        try:
+            bind_tag = getattr(entry, "_cdc_euro_amount_bindtag", None)
+            if not bind_tag:
+                bind_tag = f"_cdc_euro_amt_{id(entry)}"
+                setattr(entry, "_cdc_euro_amount_bindtag", bind_tag)
+                tags = list(entry.bindtags())
+                if bind_tag not in tags:
+                    ins_at = 1 if len(tags) > 1 else 0
+                    tags.insert(ins_at, bind_tag)
+                    entry.bindtags(tuple(tags))
+            root = entry.winfo_toplevel()
+            root.bind_class(bind_tag, "<KeyPress>", _keypress)
+            root.bind_class(bind_tag, "<<Paste>>", _paste)
+        except Exception:
+            entry.bind("<KeyPress>", _keypress)
+            entry.bind("<<Paste>>", _paste)
     entry.bind("<Double-Button-1>", _on_double_click_select, add="+")
     if not external_focusout:
         entry.bind("<FocusOut>", _format_on_focus_out, add="+")
