@@ -790,13 +790,14 @@ def bind_euro_amount_entry_validation(
     _programmatic_update: list[bool] = [False]
 
     def _live_amount_text(w: tk.Misc | None = None) -> str:
-        """Testo corrente del campo (preferisce ``Entry.get()``: ``StringVar`` può restare indietro)."""
+        """Testo corrente del campo: ``StringVar`` fa fede se diverge da ``Entry.get()``."""
         widget = w if w is not None else entry
         try:
-            return str(widget.get() or "")
+            live = str(widget.get() or "")
         except tk.TclError:
-            pass
-        return var.get() or ""
+            live = ""
+        stored = var.get() or ""
+        return stored if live != stored else live
 
     def _sync_var_from_entry_if_windows() -> None:
         if platform.system() != "Windows":
@@ -816,15 +817,21 @@ def bind_euro_amount_entry_validation(
         if _programmatic_update[0]:
             return
         _programmatic_update[0] = True
+        prev_validate = None
         try:
-            if platform.system() == "Windows":
-                try:
-                    entry.delete(0, tk.END)
-                    if text:
-                        entry.insert(0, text)
-                except tk.TclError:
-                    pass
+            try:
+                prev_validate = str(entry.cget("validate") or "none")
+                if prev_validate != "none":
+                    entry.configure(validate="none")
+            except tk.TclError:
+                prev_validate = None
             var.set(text)
+            try:
+                entry.delete(0, tk.END)
+                if text:
+                    entry.insert(0, text)
+            except tk.TclError:
+                pass
             try:
                 if select_all:
                     entry.selection_range(0, tk.END)
@@ -837,6 +844,11 @@ def bind_euro_amount_entry_validation(
             except Exception:
                 pass
         finally:
+            if prev_validate is not None and prev_validate != "none":
+                try:
+                    entry.configure(validate=prev_validate)
+                except tk.TclError:
+                    pass
             _programmatic_update[0] = False
 
     def _msg_importo_non_valido() -> None:
@@ -1180,6 +1192,20 @@ def bind_euro_amount_entry_validation(
         if keysym in ("BackSpace", "Delete"):
             w = event.widget
             s = _live_amount_text(w)
+            try:
+                p_ins = int(w.index(tk.INSERT))
+            except tk.TclError:
+                p_ins = len(s)
+            if (
+                keysym == "BackSpace"
+                and require_leading_sign
+                and allow_leading_sign
+                and p_ins <= 1
+                and len(s) > 1
+            ):
+                nxt = s[0] + s[2:]
+                _set_amount_text_and_cursor(nxt, cursor=1)
+                return "break"
             nxt = _merged_after_edit(event)
             if nxt is None:
                 return "break"
@@ -1194,6 +1220,8 @@ def bind_euro_amount_entry_validation(
                     return "break"
                 nxt = _ensure_require_leading_sign_on_edit(nxt, s)
             if not _is_partial_valid(nxt):
+                return "break"
+            if nxt == s:
                 return "break"
             try:
                 if not int(w.selection_present()):
@@ -1216,7 +1244,18 @@ def bind_euro_amount_entry_validation(
         st = int(getattr(event, "state", 0) or 0)
         if st & (0x0004 | 0x0008 | 0x20000 | 0x100000):
             return None
-        sym = _typed_symbol_from_key_event(event)
+        if keysym in ("minus", "plus", "equal"):
+            ch0 = str(getattr(event, "char", "") or "")
+            if keysym == "minus" or ch0 in _EURO_TYPABLE_MINUS_CHARS:
+                sym = "-"
+            elif keysym == "plus" or ch0 == "+":
+                sym = "+"
+            elif keysym == "equal" and (int(getattr(event, "state", 0) or 0) & 0x0001):
+                sym = "+"
+            else:
+                sym = _typed_symbol_from_key_event(event)
+        else:
+            sym = _typed_symbol_from_key_event(event)
         if not sym:
             return "break"
 
@@ -1288,57 +1327,34 @@ def bind_euro_amount_entry_validation(
         _set_amount_text_and_cursor(merged, cursor=cur)
         return "break"
 
-    # Windows: validate='key' come rete di sicurezza; KeyPress diretto sul widget (prima del bindtag Entry).
+    def _validate_key_action(action: str, proposed: str, char_ins: str, _idx: str, current: str) -> bool:
+        if _programmatic_update[0]:
+            return True
+        try:
+            act = int(action)
+        except (TypeError, ValueError):
+            return True
+        prop = (proposed or "").replace("\u2212", "-").replace("\u2013", "-").replace(" ", "")
+        cur = (current or "").replace("\u2212", "-").replace("\u2013", "-").replace(" ", "")
+        if act == 1:
+            ch = str(char_ins or "")
+            if ch and ord(ch) >= 32:
+                if ch.isalpha():
+                    return False
+                if not (ch.isdigit() or ch in "+-,." or _euro_typed_char_is_sign(ch)):
+                    return False
+        if require_leading_sign and allow_leading_sign:
+            prop = _ensure_require_leading_sign_on_edit(prop, cur)
+        return _is_partial_valid(prop)
+
+    vcmd = (entry.register(_validate_key_action), "%d", "%P", "%S", "%i", "%s")
+    entry.configure(validate="key", validatecommand=vcmd)
+
+    entry.bind("<KeyPress>", _keypress)
+    entry.bind("<<Paste>>", _paste)
     if platform.system() == "Windows":
-
-        def _validate_key_action(action: str, proposed: str, char_ins: str, _idx: str, current: str) -> bool:
-            if _programmatic_update[0]:
-                return True
-            try:
-                act = int(action)
-            except (TypeError, ValueError):
-                return True
-            prop = (proposed or "").replace("\u2212", "-").replace("\u2013", "-").replace(" ", "")
-            cur = (current or "").replace("\u2212", "-").replace("\u2013", "-").replace(" ", "")
-            if act == 1:
-                ch = str(char_ins or "")
-                if ch and ord(ch) >= 32:
-                    if ch.isalpha():
-                        return False
-                    if not (ch.isdigit() or ch in "+-,." or _euro_typed_char_is_sign(ch)):
-                        return False
-            if require_leading_sign and allow_leading_sign:
-                prop = _ensure_require_leading_sign_on_edit(prop, cur)
-            return _is_partial_valid(prop)
-
-        vcmd = (entry.register(_validate_key_action), "%d", "%P", "%S", "%i", "%s")
-        entry.configure(validate="key", validatecommand=vcmd)
-        entry.bind("<KeyPress>", _keypress)
-        entry.bind("<<Paste>>", _paste)
         entry.bind("<Control-v>", _paste)
         entry.bind("<Control-V>", _paste)
-    else:
-        try:
-            bind_tag = getattr(entry, "_cdc_euro_amount_bindtag", None)
-            if not bind_tag:
-                bind_tag = f"_cdc_euro_amt_{id(entry)}"
-                setattr(entry, "_cdc_euro_amount_bindtag", bind_tag)
-                tags = list(entry.bindtags())
-                if bind_tag not in tags:
-                    if "Entry" in tags:
-                        tags.insert(tags.index("Entry"), bind_tag)
-                    elif "TEntry" in tags:
-                        tags.insert(tags.index("TEntry"), bind_tag)
-                    else:
-                        ins_at = 1 if len(tags) > 1 else 0
-                        tags.insert(ins_at, bind_tag)
-                    entry.bindtags(tuple(tags))
-            root = entry.winfo_toplevel()
-            root.bind_class(bind_tag, "<KeyPress>", _keypress)
-            root.bind_class(bind_tag, "<<Paste>>", _paste)
-        except Exception:
-            entry.bind("<KeyPress>", _keypress)
-            entry.bind("<<Paste>>", _paste)
     entry.bind("<Double-Button-1>", _on_double_click_select, add="+")
     if not external_focusout:
         entry.bind("<FocusOut>", _format_on_focus_out, add="+")
