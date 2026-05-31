@@ -1300,32 +1300,33 @@ def bind_euro_amount_entry_validation(
         _set_amount_text_and_cursor(merged, cursor=cur)
         return "break"
 
-    # Su Windows i binding di classe Entry/TEntry ignorano spesso return "break": rimuoverli e
-    # gestire tutto dal binding sul widget (come su macOS con tag dedicato prima della classe).
-    if platform.system() == "Windows":
-        tags = [t for t in entry.bindtags() if t not in ("Entry", "TEntry")]
-        entry.bindtags(tuple(tags))
-        entry.bind("<KeyPress>", _keypress)
-        entry.bind("<<Paste>>", _paste)
-        entry.bind("<Control-v>", _paste)
-        entry.bind("<Control-V>", _paste)
-    else:
-        try:
-            bind_tag = getattr(entry, "_cdc_euro_amount_bindtag", None)
-            if not bind_tag:
-                bind_tag = f"_cdc_euro_amt_{id(entry)}"
-                setattr(entry, "_cdc_euro_amount_bindtag", bind_tag)
-                tags = list(entry.bindtags())
-                if bind_tag not in tags:
+    # Tag dedicato prima dei binding di classe Entry/TEntry: KeyPress/Paste intercettati con
+    # return "break" senza togliere Entry/TEntry (mouse, focus e selezione restano attivi).
+    try:
+        bind_tag = getattr(entry, "_cdc_euro_amount_bindtag", None)
+        if not bind_tag:
+            bind_tag = f"_cdc_euro_amt_{id(entry)}"
+            setattr(entry, "_cdc_euro_amount_bindtag", bind_tag)
+            tags = list(entry.bindtags())
+            if bind_tag not in tags:
+                if platform.system() == "Windows":
+                    tags.insert(0, bind_tag)
+                else:
                     ins_at = 1 if len(tags) > 1 else 0
                     tags.insert(ins_at, bind_tag)
-                    entry.bindtags(tuple(tags))
-            root = entry.winfo_toplevel()
-            root.bind_class(bind_tag, "<KeyPress>", _keypress)
-            root.bind_class(bind_tag, "<<Paste>>", _paste)
-        except Exception:
-            entry.bind("<KeyPress>", _keypress)
-            entry.bind("<<Paste>>", _paste)
+                entry.bindtags(tuple(tags))
+        root = entry.winfo_toplevel()
+        root.bind_class(bind_tag, "<KeyPress>", _keypress)
+        root.bind_class(bind_tag, "<<Paste>>", _paste)
+        if platform.system() == "Windows":
+            entry.bind("<Control-v>", _paste, add="+")
+            entry.bind("<Control-V>", _paste, add="+")
+    except Exception:
+        entry.bind("<KeyPress>", _keypress)
+        entry.bind("<<Paste>>", _paste)
+        if platform.system() == "Windows":
+            entry.bind("<Control-v>", _paste, add="+")
+            entry.bind("<Control-V>", _paste, add="+")
     entry.bind("<Double-Button-1>", _on_double_click_select, add="+")
     if not external_focusout:
         entry.bind("<FocusOut>", _format_on_focus_out, add="+")
