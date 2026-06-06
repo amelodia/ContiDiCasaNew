@@ -8583,7 +8583,7 @@ def _try_restore_database_from_library_at_startup(
     periodiche.ensure_periodic_registrations(db)
     email_client.ensure_email_settings(db)
     security_auth.ensure_security(db)
-        _finalize_startup_db_with_light_sidecar(db, primary_target, ui_parent=parent)
+    _finalize_startup_db_with_light_sidecar(db, primary_target, ui_parent=parent)
     return db, primary_target
 
 
