@@ -4,9 +4,12 @@ Sidecar cifrato per l'app iOS light: ``*_light.enc`` nella stessa cartella del f
 - Il desktop, dopo ogni salvataggio del DB completo, rigenera il file light con solo le
   registrazioni nella finestra mobile (ultimi 365 giorni + date future), più metadati
   completi (profilo, categorie/conti per anno incluso).
-- All'avvio il desktop legge ``*_light.enc``, fonde le sole righe nuove (``conti_light_record_id``) nel DB
-  completo e, se qualcosa è stato importato, salva completo + sidecar. Se il merge è vuoto e il file light
-  esiste già, **non** riscrive il sidecar (meno versioni Dropbox). Se ``*_light.enc`` manca, lo crea all'avvio.
+- All'avvio il desktop legge ``*_light.enc``, fonde **nuove righe** (``conti_light_record_id``) e **modifiche**
+  (upsert / sospensioni) nel DB completo e, se qualcosa è stato importato, salva completo + sidecar avvisando
+  l'utente. Se il merge è vuoto e il file light esiste già, **non** riscrive il sidecar (meno versioni Dropbox).
+  Se ``*_light.enc`` manca, lo crea all'avvio.
+- L'app iOS **non** riscrive il file ``.enc`` completo: aggiorna solo ``*_light.enc`` (con backup locale prima
+  della scrittura); l'integrazione nel completo avviene sul desktop.
 - Il JSON light include ``light_saldi`` (saldi allineati al **footer Saldi** del desktop: assoluti, alla data,
   di cui spese future, spese per carte di credito sulle colonne di riferimento, disponibilità (assoluti+CC, senza spese future); conti congelati esclusi)
   calcolati sul **DB completo**, così l'app iOS non ricostruisce i saldi dai soli movimenti nella finestra mobile.
@@ -31,6 +34,15 @@ except ImportError:  # pragma: no cover
 
 # Chiave record creata dall'app light (non usata dal desktop per inserimenti normali)
 LIGHT_RECORD_ID_KEY = "conti_light_record_id"
+LIGHT_EDIT_SUPERSEDES_YEAR = "conti_light_edit_supersedes_year"
+LIGHT_EDIT_SUPERSEDES_LEGACY = "conti_light_edit_supersedes_legacy_key"
+LIGHT_EDIT_SUPERSEDES_SI = "conti_light_edit_supersedes_source_index"
+_ACCOUNT_VERIFICATION_FIELD_KEYS = (
+    "account_primary_flags",
+    "account_primary_with_flags",
+    "account_secondary_flags",
+    "account_secondary_with_flags",
+)
 
 
 def light_enc_path_for_primary(primary_enc: Path) -> Path:
@@ -224,6 +236,194 @@ def merge_light_new_records_into_main(main: dict, light: dict) -> int:
     return added
 
 
+def _record_without_ios_supersedes_for_main_write(rec: dict) -> dict:
+    out = copy.deepcopy(rec)
+    for k in (
+        LIGHT_EDIT_SUPERSEDES_YEAR,
+        LIGHT_EDIT_SUPERSEDES_LEGACY,
+        LIGHT_EDIT_SUPERSEDES_SI,
+    ):
+        out.pop(k, None)
+    return out
+
+
+def _copy_account_verification_fields(existing: dict, merged: dict) -> None:
+    for k in _ACCOUNT_VERIFICATION_FIELD_KEYS:
+        if k in existing:
+            merged[k] = existing[k]
+
+
+def _light_incoming_record_merged_with_main_verification(existing_in_main: dict, incoming: dict) -> dict:
+    merged = copy.deepcopy(incoming)
+    _copy_account_verification_fields(existing_in_main, merged)
+    return merged
+
+
+def _find_in_main_index_by_conti_light_id(main: dict, conti_id: str) -> tuple[int, int] | None:
+    cid = str(conti_id or "").strip()
+    if not cid:
+        return None
+    for yi, yd in enumerate(main.get("years") or []):
+        for ri, r in enumerate(yd.get("records") or []):
+            if str(r.get(LIGHT_RECORD_ID_KEY) or "").strip() == cid:
+                return yi, ri
+    return None
+
+
+def _find_in_main_index_by_year_and_legacy(main: dict, year: int, legacy_key: str) -> tuple[int, int] | None:
+    lk = str(legacy_key or "").strip()
+    if not lk:
+        return None
+    for yi, yd in enumerate(main.get("years") or []):
+        if int(yd.get("year", 0)) != int(year):
+            continue
+        for ri, r in enumerate(yd.get("records") or []):
+            if str(r.get("legacy_registration_key") or "").strip() == lk:
+                return yi, ri
+    return None
+
+
+def _remove_main_record_for_ios_supersede(
+    main: dict,
+    *,
+    year: int,
+    legacy_key: str,
+    source_index: int,
+) -> bool:
+    lk = str(legacy_key or "").strip()
+    years = main.get("years") or []
+    yi = next((i for i, yd in enumerate(years) if int(yd.get("year", 0)) == int(year)), None)
+    if yi is None:
+        return False
+    yd = years[yi]
+    recs = list(yd.get("records") or [])
+    if not recs:
+        return False
+    rj: int | None = None
+    if lk:
+        rj = next(
+            (i for i, r in enumerate(recs) if str(r.get("legacy_registration_key") or "").strip() == lk),
+            None,
+        )
+    if rj is None and source_index:
+        rj = next(
+            (i for i, r in enumerate(recs) if int(r.get("source_index", 0) or 0) == int(source_index)),
+            None,
+        )
+    if rj is None:
+        return False
+    recs.pop(rj)
+    yd = dict(yd)
+    yd["records"] = recs
+    years = list(years)
+    years[yi] = yd
+    main["years"] = years
+    return True
+
+
+def upsert_light_session_records_in_main(main: dict, light: dict) -> int:
+    """
+    Sostituisce o sposta in ``main`` le righe del light (per ``conti_light_record_id`` e/o
+    ``legacy_registration_key`` nello stesso anno). Preserva i campi verifica conto già presenti sul main.
+    """
+    flat: list[dict] = []
+    for yl in light.get("years") or []:
+        for rec in yl.get("records") or []:
+            if isinstance(rec, dict):
+                flat.append(rec)
+    updated = 0
+    for rec0 in flat:
+        if rec0.get(LIGHT_EDIT_SUPERSEDES_YEAR) is None:
+            continue
+        try:
+            y_s = int(rec0.get(LIGHT_EDIT_SUPERSEDES_YEAR, 0) or 0)
+        except (TypeError, ValueError):
+            y_s = 0
+        k_s = str(rec0.get(LIGHT_EDIT_SUPERSEDES_LEGACY) or "").strip()
+        try:
+            si_s = int(rec0.get(LIGHT_EDIT_SUPERSEDES_SI, 0) or 0)
+        except (TypeError, ValueError):
+            si_s = 0
+        if y_s and _remove_main_record_for_ios_supersede(
+            main, year=y_s, legacy_key=k_s, source_index=si_s
+        ):
+            updated += 1
+    for rec0 in flat:
+        rec_l = _record_without_ios_supersedes_for_main_write(rec0)
+        try:
+            y_new = int(rec_l.get("year", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if y_new <= 0:
+            continue
+        rid = str(rec_l.get(LIGHT_RECORD_ID_KEY) or "").strip()
+        legacy = str(rec_l.get("legacy_registration_key") or "").strip()
+        if not rid and not legacy:
+            continue
+        found: tuple[int, int] | None = None
+        if rid:
+            found = _find_in_main_index_by_conti_light_id(main, rid)
+        if found is None and legacy:
+            found = _find_in_main_index_by_year_and_legacy(main, y_new, legacy)
+        years = main.get("years") or []
+        if found is not None:
+            fyi, fri = found
+            y_old = int(years[fyi].get("year", 0))
+            if y_old == y_new:
+                yd = dict(years[fyi])
+                recs = list(yd.get("records") or [])
+                prev_main = recs[fri]
+                recs[fri] = _light_incoming_record_merged_with_main_verification(prev_main, rec_l)
+                yd["records"] = recs
+                years = list(years)
+                years[fyi] = yd
+                main["years"] = years
+                updated += 1
+            else:
+                yd_old = dict(years[fyi])
+                recs_old = list(yd_old.get("records") or [])
+                removed = recs_old[fri]
+                recs_old.pop(fri)
+                yd_old["records"] = recs_old
+                years = list(years)
+                years[fyi] = yd_old
+                main["years"] = years
+                ensure_year_bucket_for_merge(main, y_new)
+                years = main.get("years") or []
+                yi_n = next(i for i, yd in enumerate(years) if int(yd.get("year", 0)) == y_new)
+                yd_n = dict(years[yi_n])
+                recs_n = list(yd_n.get("records") or [])
+                if rid:
+                    j = next(
+                        (
+                            i
+                            for i, r in enumerate(recs_n)
+                            if str(r.get(LIGHT_RECORD_ID_KEY) or "").strip() == rid
+                        ),
+                        None,
+                    )
+                    if j is not None:
+                        prev_nj = recs_n[j]
+                        recs_n[j] = _light_incoming_record_merged_with_main_verification(prev_nj, rec_l)
+                    else:
+                        recs_n.append(_light_incoming_record_merged_with_main_verification(removed, rec_l))
+                else:
+                    recs_n.append(_light_incoming_record_merged_with_main_verification(removed, rec_l))
+                yd_n["records"] = recs_n
+                years = list(years)
+                years[yi_n] = yd_n
+                main["years"] = years
+                updated += 1
+    return updated
+
+
+def merge_light_sidecar_into_main(main: dict, light: dict) -> tuple[int, int]:
+    """Fonde sidecar light in ``main``. Ritorna ``(nuove_righe, righe_aggiornate)``."""
+    n_up = upsert_light_session_records_in_main(main, light)
+    n_new = merge_light_new_records_into_main(main, light)
+    return n_new, n_up
+
+
 def write_light_enc_sidecar(db: dict, primary_enc: Path, key_path: Path) -> None:
     """Scrive ``<stem>_light.enc`` nella stessa cartella di ``primary_enc``."""
     if Fernet is None:
@@ -260,9 +460,12 @@ def merge_light_sidecar_at_startup(
     db: dict,
     primary_enc: Path,
     key_path: Path,
-) -> int:
-    """Se esiste il sidecar, fonde le registrazioni light nel DB già caricato. Ritorna il numero di righe aggiunte."""
+) -> tuple[int, int]:
+    """Se esiste il sidecar, fonde le registrazioni light nel DB già caricato.
+
+    Ritorna ``(nuove_righe, righe_aggiornate)``.
+    """
     light = load_light_enc_if_present(primary_enc, key_path)
     if not light:
-        return 0
-    return merge_light_new_records_into_main(db, light)
+        return 0, 0
+    return merge_light_sidecar_into_main(db, light)

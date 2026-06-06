@@ -8583,7 +8583,7 @@ def _try_restore_database_from_library_at_startup(
     periodiche.ensure_periodic_registrations(db)
     email_client.ensure_email_settings(db)
     security_auth.ensure_security(db)
-    _finalize_startup_db_with_light_sidecar(db, primary_target)
+        _finalize_startup_db_with_light_sidecar(db, primary_target, ui_parent=parent)
     return db, primary_target
 
 
@@ -8912,31 +8912,53 @@ def save_encrypted_db_dual(
         pass
 
 
-def _finalize_startup_db_with_light_sidecar(db: dict, primary_path: Path) -> None:
+def _finalize_startup_db_with_light_sidecar(
+    db: dict,
+    primary_path: Path,
+    *,
+    ui_parent: tk.Misc | None = None,
+) -> tuple[int, int]:
     """Fonde ``*_light.enc`` nel DB; salva completo+light solo se il merge ha importato righe.
 
     Non rigenera il sidecar a ogni avvio se il file esiste già: evita versioni Dropbox ravvicinate
     inutili (il completo non viene riscritto). ``save_encrypted_db_dual`` aggiorna sempre il light
     dopo ogni salvataggio dati. Se il sidecar manca, viene creato una tantum all'avvio.
+
+    Ritorna ``(nuove_righe, righe_aggiornate)`` importate dal sidecar.
     """
     try:
         import light_enc_sidecar
 
-        n = light_enc_sidecar.merge_light_sidecar_at_startup(
+        n_new, n_up = light_enc_sidecar.merge_light_sidecar_at_startup(
             db, primary_path, data_workspace.default_key_file()
         )
-        if n > 0:
+        if n_new + n_up > 0:
             save_encrypted_db_dual(
                 db,
                 primary_path,
                 data_workspace.default_key_file(),
             )
-        else:
-            lp = light_enc_sidecar.light_enc_path_for_primary(primary_path)
-            if not lp.is_file():
-                light_enc_sidecar.write_light_enc_sidecar(db, primary_path, data_workspace.default_key_file())
+            parts: list[str] = []
+            if n_new > 0:
+                parts.append(
+                    f"Importate {n_new} nuova/e registrazione/i dall'app Conti light."
+                )
+            if n_up > 0:
+                parts.append(
+                    f"Aggiornate {n_up} registrazione/i (modifiche o sospensioni) da Conti light."
+                )
+            msg = "\n".join(parts) + "\n\nSalvati database completo e file light nella cartella dati."
+            if ui_parent is not None:
+                messagebox.showinfo("Sincronizzazione Conti light", msg, parent=ui_parent)
+            return n_new, n_up
+        lp = light_enc_sidecar.light_enc_path_for_primary(primary_path)
+        if not lp.is_file():
+            light_enc_sidecar.write_light_enc_sidecar(
+                db, primary_path, data_workspace.default_key_file()
+            )
+        return 0, 0
     except Exception:
-        pass
+        return 0, 0
 
 
 def reset_contabili_for_nuova_utenza(db: dict) -> None:
@@ -9081,7 +9103,7 @@ def _try_load_first_valid_user_db(
         periodiche.ensure_periodic_registrations(db)
         email_client.ensure_email_settings(db)
         security_auth.ensure_security(db)
-        _finalize_startup_db_with_light_sidecar(db, p)
+        _finalize_startup_db_with_light_sidecar(db, p, ui_parent=sync_ui_parent)
         return db, p
     return None
 
@@ -9089,7 +9111,17 @@ def _try_load_first_valid_user_db(
 def _startup_paths_for_cloud_wait() -> list[Path]:
     """File da considerare per l’attesa «stabile» in Dropbox all’avvio."""
     out: list[Path] = [data_workspace.default_key_file()]
-    out.extend(_discover_existing_user_db_candidates())
+    cands = _discover_existing_user_db_candidates()
+    out.extend(cands)
+    try:
+        import light_enc_sidecar as _lec
+
+        for p in cands:
+            lp = _lec.light_enc_path_for_primary(p)
+            if lp.is_file():
+                out.append(lp)
+    except ImportError:
+        pass
     boot = data_workspace.session_bootstrap_enc_path()
     if boot.exists():
         out.append(boot)
@@ -9138,7 +9170,7 @@ def load_database_at_startup(*, sync_ui_parent: tk.Misc | None = None) -> tuple[
             periodiche.ensure_periodic_registrations(db)
             email_client.ensure_email_settings(db)
             security_auth.ensure_security(db)
-            _finalize_startup_db_with_light_sidecar(db, boot_enc)
+            _finalize_startup_db_with_light_sidecar(db, boot_enc, ui_parent=sync_ui_parent)
             return db, boot_enc
 
     if not LEGACY_IMPORT_ENABLED:
@@ -9156,7 +9188,7 @@ def load_database_at_startup(*, sync_ui_parent: tk.Misc | None = None) -> tuple[
     email_client.ensure_email_settings(db)
     security_auth.ensure_security(db)
     # Nessun .enc per-utente finché non salvi (post wizard: percorso aggiornato al login).
-    _finalize_startup_db_with_light_sidecar(db, boot_enc)
+    _finalize_startup_db_with_light_sidecar(db, boot_enc, ui_parent=sync_ui_parent)
     return db, boot_enc
 
 
@@ -9164,6 +9196,8 @@ def migrate_data_path_after_login(
     db: dict,
     session: security_auth.AppSession,
     current_path: Path,
+    *,
+    ui_parent: tk.Misc | None = None,
 ) -> Path:
     """Dopo login con account registrato, usa un file .enc dedicato per quell'email.
 
@@ -9188,7 +9222,7 @@ def migrate_data_path_after_login(
         email_client.ensure_email_settings(db)
         security_auth.ensure_security(db)
         try:
-            _finalize_startup_db_with_light_sidecar(db, primary)
+            _finalize_startup_db_with_light_sidecar(db, primary, ui_parent=ui_parent)
         except Exception:
             pass
         return True
@@ -33758,7 +33792,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         security_auth.ensure_security(loaded)
         db_holder[0] = loaded
         try:
-            _finalize_startup_db_with_light_sidecar(db_holder[0], primary)
+            _finalize_startup_db_with_light_sidecar(db_holder[0], primary, ui_parent=root)
         except Exception:
             pass
         try:
@@ -34811,7 +34845,9 @@ def main() -> None:
             pass
 
     security_auth.pulse_login_loading_window(login_window_holder[0])
-    path_holder[0] = migrate_data_path_after_login(db_holder[0], session, path_holder[0])
+    path_holder[0] = migrate_data_path_after_login(
+        db_holder[0], session, path_holder[0], ui_parent=root
+    )
     security_auth.pulse_login_loading_window(login_window_holder[0])
     if session.entered_via_backdoor:
         security_auth.ensure_security(db_holder[0])

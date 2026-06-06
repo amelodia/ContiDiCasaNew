@@ -67,7 +67,8 @@ struct ContiLightSaldiSchedaView: View {
             Stessi importi della pagina Saldi del desktop (incluse colonne legate alle carte di credito). \
             Nessuna funzione di verifica su iPhone. \
             Riferimento \(meta.dateIso), anno piano \(meta.yearBasis). \
-            Dopo immissioni su iOS, al salvataggio si aggiornano in locale; salva sul desktop per rigenerare il light.
+            Dopo immissioni su iOS, al salvataggio si aggiorna solo il file light; \
+            all’apertura sul desktop le registrazioni vengono integrate nel database completo.
             """
         }
         return "Dati mancanti: nel file non c’è il blocco «light_saldi». Rigenera il file *_light.enc dal desktop (salvataggio app desktop)."
@@ -488,6 +489,8 @@ struct ContiLightNuovoMovimentoSchedaView: View {
     let email: String
     let password: String
     let onPersisted: ([String: Any], [ContiRecordRow], String) -> Void
+    var onPersistWillStart: (() -> Void)? = nil
+    var onDropboxPersistIncomplete: (() -> Void)? = nil
     /// Se valorizzata, stessa form in modalità modifica (solo righe inserite da Conti light).
     var editingLegacyKey: String? = nil
 
@@ -506,6 +509,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
     @State private var pendingLightRecordId = ""
     @State private var showErrorAlert = false
     @State private var errorAlertMessage = ""
+    @State private var lastFailedSessionDb: [String: Any]?
     @State private var showSuccessAlert = false
     @State private var successAlertMessage = ""
     @State private var showDeleteRecordConfirm = false
@@ -914,6 +918,48 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         return err.localizedDescription
     }
 
+    private func handlePersistFailure(_ err: Error, workingDb: [String: Any]?) {
+        lastFailedSessionDb = workingDb
+        var msg = errorMessage(from: err)
+        if let folder = dataFolderURL, let k = keyURL, let e = lightEncURL,
+           ContiDatabase.localLightRecoveryState(forLightEncURL: e).hasPendingWrite {
+            let pushAttempt = runWithDataFolderAccess(folder: folder) { () -> Result<[String: Any], Error> in
+                do {
+                    try ContiDatabase.pushPendingLightBackupToDropbox(lightEncURL: e, keyURL: k)
+                    let data = try ContiDatabase.coordinatedDataContents(of: e)
+                    let keyString = try ContiDatabase.coordinatedStringContents(of: k, encoding: .utf8)
+                    let (db, _) = try ContiDatabase.loadDBForEmail(
+                        primaryEncData: data,
+                        keyString: keyString,
+                        primaryEncURL: e
+                    )
+                    return .success(db)
+                } catch {
+                    return .failure(error)
+                }
+            }
+            switch pushAttempt {
+            case .success(let db):
+                lastFailedSessionDb = nil
+                let rows = ContiDatabase.displayRecords(from: db)
+                onPersisted(db, rows, "Salvato su Dropbox (recupero automatico della bozza).")
+                successAlertMessage = "Salvato su Dropbox (recupero automatico della bozza)."
+                showSuccessAlert = true
+                return
+            case .failure:
+                break
+            }
+        }
+        if let working = workingDb {
+            let rows = ContiDatabase.displayRecords(from: working)
+            onPersisted(working, rows, "Modifiche in app; file su Dropbox non aggiornato.")
+        }
+        onDropboxPersistIncomplete?()
+        msg += "\n\nLe modifiche restano in app; la bozza locale verrà reinviata automaticamente al prossimo accesso."
+        errorAlertMessage = msg
+        showErrorAlert = true
+    }
+
     private func runWithDataFolderAccess<T>(
         folder: URL,
         _ body: () -> Result<T, Error>
@@ -1011,7 +1057,9 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         let optEdit = editingLegacyKey
         let isNewForm = (optEdit == nil)
         isSaving = true
+        onPersistWillStart?()
         DispatchQueue.global(qos: .userInitiated).async {
+            var failedWorking: [String: Any]?
             let result = runWithDataFolderAccess(folder: folder) {
                 do {
                     let tpl = try ContiDatabase.buildNewLightRecordTemplate(
@@ -1035,6 +1083,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                     } else {
                         _ = try ContiDatabase.appendLightSessionRecord(db: &working, recordTemplate: tpl)
                     }
+                    failedWorking = working
                     let out = try ContiDatabase.persistSessionDbToEncryptedFiles(
                         sessionDb: working,
                         recordForSaldi: tpl,
@@ -1052,6 +1101,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                 isSaving = false
                 switch result {
                 case .success(let pair):
+                    lastFailedSessionDb = nil
                     let rows = ContiDatabase.displayRecords(from: pair.sessionLight)
                     onPersisted(pair.sessionLight, rows, pair.note)
                     successAlertMessage = pair.note
@@ -1060,8 +1110,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                         clearForm()
                     }
                 case .failure(let err):
-                    errorAlertMessage = errorMessage(from: err)
-                    showErrorAlert = true
+                    handlePersistFailure(err, workingDb: failedWorking)
                 }
             }
         }
@@ -1076,11 +1125,14 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         let emailTrim = email.trimmingCharacters(in: .whitespacesAndNewlines)
         let passwordTrim = password.trimmingCharacters(in: .whitespacesAndNewlines)
         isSaving = true
+        onPersistWillStart?()
         DispatchQueue.global(qos: .userInitiated).async {
+            var failedWorking: [String: Any]?
             let result = runWithDataFolderAccess(folder: folder) {
                 do {
                     var working = try ContiDatabase.deepCopyDb(db)
                     try ContiDatabase.setSessionRecordCancelled(db: &working, legacyKey: lk, isCancelled: true)
+                    failedWorking = working
                     let saldiPlaceholder: [String: Any] = ["is_cancelled": true]
                     let out = try ContiDatabase.persistSessionDbToEncryptedFiles(
                         sessionDb: working,
@@ -1099,12 +1151,12 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                 isSaving = false
                 switch result {
                 case .success(let pair):
+                    lastFailedSessionDb = nil
                     let rows = ContiDatabase.displayRecords(from: pair.sessionLight)
                     onPersisted(pair.sessionLight, rows, pair.note)
                     dismiss()
                 case .failure(let err):
-                    errorAlertMessage = errorMessage(from: err)
-                    showErrorAlert = true
+                    handlePersistFailure(err, workingDb: failedWorking)
                 }
             }
         }

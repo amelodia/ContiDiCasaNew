@@ -121,6 +121,8 @@ struct ContentView: View {
     /// Sequenza attiva del tasto Aggiorna (doppio passaggio), per evitare sovrapposizioni.
     @State private var isManualRefreshSequenceRunning = false
     @State private var sessionLockHeartbeatTask: Task<Void, Never>?
+    /// True finché un salvataggio light su Dropbox non è completato (flush in background se necessario).
+    @State private var sessionPendingLightWrite = false
 
     private enum MovimentiFiltriPick: Hashable {
         case category
@@ -149,7 +151,10 @@ struct ContentView: View {
                         lightEncURL: sessionLightEncURL,
                         email: email,
                         password: password,
+                        onPersistWillStart: { sessionPendingLightWrite = true },
+                        onDropboxPersistIncomplete: { sessionPendingLightWrite = true },
                         onPersisted: { updatedDb, _, note in
+                            sessionPendingLightWrite = false
                             loggedInSessionDb = updatedDb as NSDictionary
                             if let d = updatedDb as? [String: Any] {
                                 loggedInRecords = ContiDatabase.displayRecords(from: d, sort: movimentiListSort)
@@ -166,7 +171,10 @@ struct ContentView: View {
                         lightEncURL: sessionLightEncURL,
                         email: email,
                         password: password,
+                        onPersistWillStart: { sessionPendingLightWrite = true },
+                        onDropboxPersistIncomplete: { sessionPendingLightWrite = true },
                         onPersisted: { updatedDb, _, note in
+                            sessionPendingLightWrite = false
                             loggedInSessionDb = updatedDb as NSDictionary
                             if let d = updatedDb as? [String: Any] {
                                 loggedInRecords = ContiDatabase.displayRecords(from: d, sort: movimentiListSort)
@@ -214,6 +222,7 @@ struct ContentView: View {
             } else if phase == .background {
                 postLoginHydrationRefreshTask?.cancel()
                 postLoginHydrationRefreshTask = nil
+                flushPendingLightSessionBeforeBackground()
                 closeCurrentSessionAndReleaseLock()
             }
         }
@@ -1096,12 +1105,61 @@ struct ContentView: View {
         sessionLockHeartbeatTask?.cancel()
         sessionLockHeartbeatTask = nil
         releaseSessionLockIfOwned()
+        sessionPendingLightWrite = false
         loggedInSessionDb = nil
         loggedInRecords = []
         movimentiDisplayName = ""
         sessionKeyURL = nil
         sessionLightEncURL = nil
         movimentiPath = NavigationPath()
+    }
+
+    /// Se un salvataggio light era in corso o non riuscito, tenta un flush sincrono prima di uscire.
+    private func flushPendingLightSessionBeforeBackground() {
+        guard sessionPendingLightWrite,
+              let db = loggedInSessionDb as? [String: Any],
+              let folder = dataFolderURL,
+              let k = sessionKeyURL,
+              let e = sessionLightEncURL
+        else { return }
+        let scoped = securityScopedBookmarkURL ?? folder
+        let emailTrim = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let passwordTrim = password.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !emailTrim.isEmpty, !passwordTrim.isEmpty else { return }
+
+        var bgTask: UIBackgroundTaskIdentifier = .invalid
+        bgTask = UIApplication.shared.beginBackgroundTask {
+            if bgTask != .invalid {
+                UIApplication.shared.endBackgroundTask(bgTask)
+                bgTask = .invalid
+            }
+        }
+        defer {
+            if bgTask != .invalid {
+                UIApplication.shared.endBackgroundTask(bgTask)
+            }
+        }
+
+        let folderAccess = scoped.startAccessingSecurityScopedResource()
+        defer {
+            if folderAccess {
+                ContiLightFolderBookmark.renew(from: scoped)
+                scoped.stopAccessingSecurityScopedResource()
+            }
+        }
+        guard folderAccess else { return }
+        do {
+            try ContiDatabase.flushSessionLightToEncryptedFile(
+                sessionDb: db,
+                lightEncURL: e,
+                keyURL: k,
+                email: emailTrim,
+                password: passwordTrim
+            )
+            sessionPendingLightWrite = false
+        } catch {
+            // Resta pending: al prossimo avvio l'utente può usare il backup locale se la scrittura Dropbox fallisce.
+        }
     }
 
     /// Carica e decifra il DB in background (come `loginWithPassword`).
@@ -1228,9 +1286,14 @@ struct ContentView: View {
                                 return
                             }
                         }
-                        // Login/refresh in sola lettura: nessuna riscrittura dei `.enc` in questa fase.
-                        // Le scritture restano solo nelle azioni esplicite utente (nuova immissione/modifica/annullamento).
-                        let sessionDb: [String: Any] = db
+                        // Login in sola lettura, salvo recupero automatico bozza pending (salvataggio Dropbox incompleto).
+                        var sessionDb: [String: Any] = db
+                        let recovered = ContiDatabase.applyAutomaticPendingLightRecoveryIfNeeded(
+                            lightEncURL: encRef,
+                            keyURL: keyRef,
+                            dropboxLoadedDb: db
+                        )
+                        sessionDb = recovered.sessionDb
                         let periodicStartupMessage: String? = nil
                         let rows = ContiDatabase.displayRecords(from: sessionDb)
                         let baseMsg = rows.isEmpty
@@ -1238,6 +1301,9 @@ struct ContentView: View {
                             : "Accesso effettuato."
                         var notes: [String] = []
                         if !syncWaitNote.isEmpty { notes.append(syncWaitNote) }
+                        if let rn = recovered.recoveryNote?.trimmingCharacters(in: .whitespacesAndNewlines), !rn.isEmpty {
+                            notes.append(rn)
+                        }
                         let msgOut = notes.isEmpty ? baseMsg : baseMsg + "\n\n" + notes.joined(separator: "\n")
                         packet = LoginResultPacket(
                             message: msgOut,
@@ -1315,6 +1381,10 @@ struct ContentView: View {
             if let pm = packet.periodicStartupMessage?.trimmingCharacters(in: .whitespacesAndNewlines), !pm.isEmpty {
                 periodicStartupAlertText = pm
                 periodicStartupAlertPresented = true
+            }
+            if let enc = packet.lightEncURL,
+               ContiDatabase.localLightRecoveryState(forLightEncURL: enc).hasPendingWrite {
+                sessionPendingLightWrite = true
             }
             schedulePostLoginHydrationRefreshes()
         } else {

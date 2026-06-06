@@ -959,8 +959,8 @@ public enum ContiDatabase {
         return (dateD, catCode, a1, a2, amountText, chq, noteR, clid)
     }
 
-    /// Imposta ``is_cancelled`` (stesso significato dell’«annulla registrazione» sul desktop). Dopo ``persistSessionDbToEncryptedFiles``,
-    /// ``upsertLightSessionRecordsInMain`` copia il record aggiornato nel ``.enc`` completo, quindi il programma per PC vede l’annullamento.
+    /// Imposta ``is_cancelled`` (stesso significato dell’«annulla registrazione» sul desktop). Dopo ``persistSessionDbToEncryptedFiles``
+    /// il light su Dropbox è aggiornato; l’integrazione nel file completo avviene all’avvio sul desktop.
     public static func setSessionRecordCancelled(
         db: inout [String: Any],
         legacyKey: String,
@@ -2178,13 +2178,6 @@ public enum ContiDatabase {
                     main["years"] = allY2
                     updated += 1
                 }
-            } else if !rid.isEmpty {
-                do {
-                    try appendRecordToMainYear(main: &main, year: yNew, rec: recL)
-                    updated += 1
-                } catch {
-                    continue
-                }
             }
         }
         return updated
@@ -2539,10 +2532,10 @@ public enum ContiDatabase {
     }
 
     /**
-     Scrive su disco ``*_light.enc`` e, se presente e autenticabile, anche ``conti_utente_*.enc`` completo.
-     ``recordForSaldi`` è usato in sola lettura come documentazione legata a ``appendLightSessionRecord``; i saldi sul file light vengono ricalcolati interamente da movimenti; sul completo: merge + upsert + ricalcolo.
-
-     **Flusso:** si carica il completo da disco, si applica ``sessionDb`` con ``upsertLightSessionRecordsInMain`` (che **preserva** sul main i campi verifica conto già presenti), poi le sole righe light nuove con ``mergeLightNewRecordsIntoMain``. Infine saldi e riscrittura doppia file.
+     Scrive su disco **solo** ``*_light.enc`` (mai il file ``conti_utente_*.enc`` completo).
+     Se il completo è presente, viene letto in sola lettura per ricalcolare ``light_saldi`` come sul desktop.
+     Prima della scrittura su Dropbox viene salvato un backup locale in Application Support.
+     L'integrazione nel database completo avviene all'avvio sul desktop.
      */
     public static func persistSessionDbToEncryptedFiles(
         sessionDb: [String: Any],
@@ -2553,6 +2546,34 @@ public enum ContiDatabase {
         password: String
     ) throws -> (sessionLight: [String: Any], mergedIntoFull: Int, note: String) {
         _ = recordForSaldi
+        let lightExport = try prepareLightExportForDiskWrite(
+            sessionDb: sessionDb,
+            lightEncURL: lightEncURL,
+            keyURL: keyURL,
+            email: email,
+            password: password
+        )
+        let keyString = try coordinatedStringContents(of: keyURL, encoding: .utf8)
+        try saveLightEncToDropboxWithLocalBackup(
+            lightDb: lightExport,
+            lightEncURL: lightEncURL,
+            keyString: keyString
+        )
+        let msg = """
+        Salvato il file light nella cartella dati. \
+        Al prossimo avvio sul desktop le registrazioni verranno integrate nel database completo.
+        """
+        return (lightExport, 0, msg)
+    }
+
+    /// Ricalcola l'export light da salvare (saldi allineati al desktop se esiste il file completo).
+    private static func prepareLightExportForDiskWrite(
+        sessionDb: [String: Any],
+        lightEncURL: URL,
+        keyURL: URL,
+        email: String,
+        password: String
+    ) throws -> [String: Any] {
         let em = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let fullURL = perUserEncURL(primaryEnc: lightEncURL, email: em)
         var waitPaths = [keyURL, lightEncURL]
@@ -2560,7 +2581,6 @@ public enum ContiDatabase {
             waitPaths.append(fullURL)
         }
         _ = waitForPathsStableIfDropbox(waitPaths)
-        let keyString = try coordinatedStringContents(of: keyURL, encoding: .utf8)
         if FileManager.default.fileExists(atPath: fullURL.path) {
             var main = try loadEncryptedDBFull(encURL: fullURL, keyURL: keyURL)
             guard tryLogin(db: main, email: em, password: password) != nil else {
@@ -2568,26 +2588,10 @@ public enum ContiDatabase {
                     "Il file database completo è presente ma l’accesso è fallito. Verifica la password o apri prima sul desktop."
                 )
             }
-            let nUp = upsertLightSessionRecordsInMain(main: &main, light: sessionDb)
-            let nNew = mergeLightNewRecordsIntoMain(main: &main, light: sessionDb)
+            _ = upsertLightSessionRecordsInMain(main: &main, light: sessionDb)
+            _ = mergeLightNewRecordsIntoMain(main: &main, light: sessionDb)
             recomputeLightSaldiFromFullDb(&main)
-            let lightExport = try buildLightDatabaseForExport(from: main)
-            try saveEncryptedDbPairUnderSingleWorkspaceLock(
-                keyString: keyString,
-                fullURL: fullURL,
-                fullDb: main,
-                lightURL: lightEncURL,
-                lightDb: lightExport
-            )
-            var msg = "Salvati file completo e light nella cartella dati; saldi ricalcolati come sul desktop."
-            if nNew > 0, nUp > 0 {
-                msg = "Importate \(nNew) nuove registrazione/i, aggiornate \(nUp) esistenti nel database completo. " + msg
-            } else if nNew > 0 {
-                msg = "Importate \(nNew) nuove registrazione/i nel database completo. " + msg
-            } else if nUp > 0 {
-                msg = "Aggiornate \(nUp) registrazione/i (modifica/sospensione) nel database completo. " + msg
-            }
-            return (lightExport, nNew + nUp, msg)
+            return try buildLightDatabaseForExport(from: main)
         }
         var lightOnly = try deepCopyDb(sessionDb)
         guard dictionaryFromAnyRoot(lightOnly["light_saldi"]) != nil else {
@@ -2596,12 +2600,182 @@ public enum ContiDatabase {
             )
         }
         recomputeLightSaldiFromFullDb(&lightOnly)
-        try saveEncryptedDbToDisk(db: lightOnly, encURL: lightEncURL, keyString: keyString)
-        let msg = """
-        Salvato solo il file light (nessun database completo trovato accanto). \
-        I saldi sono stati ricalcolati a partire dai movimenti; per l’allineamento completo con la contabilità desktop copia il file .enc completo e salva o apri sul desktop.
-        """
-        return (lightOnly, 0, msg)
+        return lightOnly
+    }
+
+    /// Backup locale del light operativo prima di ogni riscrittura su Dropbox (Application Support, non sincronizzato).
+    public static func localLightBackupURL(forLightEncURL lightURL: URL) -> URL {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ContiDiCasa", isDirectory: true)
+        let stem = lightURL.deletingPathExtension().lastPathComponent
+        return support.appendingPathComponent("\(stem)_backup.enc")
+    }
+
+    /// Bozza locale dell'ultimo salvataggio non completato su Dropbox (non sincronizzato).
+    public static func pendingLightBackupURL(forLightEncURL lightURL: URL) -> URL {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ContiDiCasa", isDirectory: true)
+        let stem = lightURL.deletingPathExtension().lastPathComponent
+        return support.appendingPathComponent("\(stem)_pending.enc")
+    }
+
+    public struct LocalLightRecoveryState {
+        public let hasOperationalBackup: Bool
+        public let hasPendingWrite: Bool
+    }
+
+    public static func localLightRecoveryState(forLightEncURL lightURL: URL) -> LocalLightRecoveryState {
+        LocalLightRecoveryState(
+            hasOperationalBackup: FileManager.default.fileExists(
+                atPath: localLightBackupURL(forLightEncURL: lightURL).path
+            ),
+            hasPendingWrite: FileManager.default.fileExists(
+                atPath: pendingLightBackupURL(forLightEncURL: lightURL).path
+            )
+        )
+    }
+
+    private static func writePendingLightBackup(
+        lightDb: [String: Any],
+        lightEncURL: URL,
+        keyString: String
+    ) throws {
+        let pendingURL = pendingLightBackupURL(forLightEncURL: lightEncURL)
+        try FileManager.default.createDirectory(
+            at: pendingURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try writeFernetEncryptedDb(db: lightDb, encURL: pendingURL, keyString: keyString)
+    }
+
+    private static func removePendingLightBackupIfPresent(lightEncURL: URL) {
+        let pendingURL = pendingLightBackupURL(forLightEncURL: lightEncURL)
+        guard FileManager.default.fileExists(atPath: pendingURL.path) else { return }
+        try? FileManager.default.removeItem(at: pendingURL)
+    }
+
+    /// Carica la bozza locale (ultimo tentativo di salvataggio non arrivato su Dropbox).
+    public static func loadPendingLightSessionDb(lightEncURL: URL, keyURL: URL) throws -> [String: Any] {
+        let pendingURL = pendingLightBackupURL(forLightEncURL: lightEncURL)
+        guard FileManager.default.fileExists(atPath: pendingURL.path) else {
+            throw ContiLightImmissioneError.message("Nessuna bozza locale da recuperare.")
+        }
+        return try loadEncryptedDBFull(encURL: pendingURL, keyURL: keyURL)
+    }
+
+    /// Reinvia su Dropbox la bozza locale (`*_pending.enc`).
+    public static func pushPendingLightBackupToDropbox(lightEncURL: URL, keyURL: URL) throws {
+        let pendingURL = pendingLightBackupURL(forLightEncURL: lightEncURL)
+        guard FileManager.default.fileExists(atPath: pendingURL.path) else {
+            throw ContiLightImmissioneError.message("Nessuna bozza locale da inviare.")
+        }
+        let keyString = try coordinatedStringContents(of: keyURL, encoding: .utf8)
+        let db = try loadEncryptedDBFull(encURL: pendingURL, keyURL: keyURL)
+        try backupExistingLightEncBeforeWrite(lightEncURL: lightEncURL)
+        try assertSafeToSave(lightEncURL)
+        try writeFernetEncryptedDb(db: db, encURL: lightEncURL, keyString: keyString)
+        removePendingLightBackupIfPresent(lightEncURL: lightEncURL)
+    }
+
+    /**
+     Se esiste ``*_pending.enc`` (salvataggio su Dropbox non completato), tenta l'invio automatico
+     e ritorna il DB da usare in sessione. Criterio oggettivo: presenza del file pending.
+     """
+    public static func applyAutomaticPendingLightRecoveryIfNeeded(
+        lightEncURL: URL,
+        keyURL: URL,
+        dropboxLoadedDb: [String: Any]
+    ) -> (sessionDb: [String: Any], recoveryNote: String?) {
+        guard localLightRecoveryState(forLightEncURL: lightEncURL).hasPendingWrite else {
+            return (dropboxLoadedDb, nil)
+        }
+        do {
+            try pushPendingLightBackupToDropbox(lightEncURL: lightEncURL, keyURL: keyURL)
+            let data = try coordinatedDataContents(of: lightEncURL)
+            let keyString = try coordinatedStringContents(of: keyURL, encoding: .utf8)
+            let (db, _) = try loadDBForEmail(
+                primaryEncData: data,
+                keyString: keyString,
+                primaryEncURL: lightEncURL
+            )
+            return (db, "Recuperata e sincronizzata bozza di un salvataggio non completato.")
+        } catch {
+            do {
+                let pending = try loadPendingLightSessionDb(lightEncURL: lightEncURL, keyURL: keyURL)
+                return (
+                    pending,
+                    "Recuperata bozza locale; invio su Dropbox non ancora riuscito (verrà ritentato automaticamente)."
+                )
+            } catch {
+                return (dropboxLoadedDb, nil)
+            }
+        }
+    }
+
+    /// Ripristina su Dropbox l'ultimo backup operativo (`*_backup.enc`), sovrascrivendo il file light corrente.
+    public static func restoreOperationalLightBackupToDropbox(lightEncURL: URL, keyURL: URL) throws {
+        let backupURL = localLightBackupURL(forLightEncURL: lightEncURL)
+        guard FileManager.default.fileExists(atPath: backupURL.path) else {
+            throw ContiLightImmissioneError.message("Nessun backup locale precedente trovato.")
+        }
+        let keyString = try coordinatedStringContents(of: keyURL, encoding: .utf8)
+        let db = try loadEncryptedDBFull(encURL: backupURL, keyURL: keyURL)
+        try assertSafeToSave(lightEncURL)
+        try writeFernetEncryptedDb(db: db, encURL: lightEncURL, keyString: keyString)
+        removePendingLightBackupIfPresent(lightEncURL: lightEncURL)
+    }
+
+    /// Elimina la bozza locale senza toccare Dropbox (es. bozza obsoleta).
+    public static func discardPendingLightBackup(forLightEncURL lightURL: URL) {
+        removePendingLightBackupIfPresent(lightEncURL: lightURL)
+    }
+
+    private static func backupExistingLightEncBeforeWrite(lightEncURL: URL) throws {
+        guard FileManager.default.fileExists(atPath: lightEncURL.path) else { return }
+        let backupURL = localLightBackupURL(forLightEncURL: lightEncURL)
+        try FileManager.default.createDirectory(
+            at: backupURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        if FileManager.default.fileExists(atPath: backupURL.path) {
+            try FileManager.default.removeItem(at: backupURL)
+        }
+        try FileManager.default.copyItem(at: lightEncURL, to: backupURL)
+    }
+
+    private static func saveLightEncToDropboxWithLocalBackup(
+        lightDb: [String: Any],
+        lightEncURL: URL,
+        keyString: String
+    ) throws {
+        try writePendingLightBackup(lightDb: lightDb, lightEncURL: lightEncURL, keyString: keyString)
+        try backupExistingLightEncBeforeWrite(lightEncURL: lightEncURL)
+        try assertSafeToSave(lightEncURL)
+        try writeFernetEncryptedDb(db: lightDb, encURL: lightEncURL, keyString: keyString)
+        removePendingLightBackupIfPresent(lightEncURL: lightEncURL)
+    }
+
+    /// Flush di sicurezza (es. passaggio in background): riscrive il light se la sessione è valida.
+    public static func flushSessionLightToEncryptedFile(
+        sessionDb: [String: Any],
+        lightEncURL: URL,
+        keyURL: URL,
+        email: String,
+        password: String
+    ) throws {
+        let lightExport = try prepareLightExportForDiskWrite(
+            sessionDb: sessionDb,
+            lightEncURL: lightEncURL,
+            keyURL: keyURL,
+            email: email,
+            password: password
+        )
+        let keyString = try coordinatedStringContents(of: keyURL, encoding: .utf8)
+        try saveLightEncToDropboxWithLocalBackup(
+            lightDb: lightExport,
+            lightEncURL: lightEncURL,
+            keyString: keyString
+        )
     }
 
     /// Cifratura Fernet + scrittura atomica (senza controlli cartella: uso interno dopo ``assertSafeToSave``).
@@ -2647,8 +2821,8 @@ public enum ContiDatabase {
     }
 
     /**
-     All’accesso: fonde il light in memoria nel ``conti_utente_*.enc`` completo (se presente), ricalcola saldi,
-     riscrive **entrambi** i file. Ritorna il DB light da usare in sessione (lista Movimenti / Saldi).
+     All’accesso (legacy): allinea in memoria il light con il completo **senza scrivere** file su disco.
+     Preferire il login in sola lettura in ``ContentView``; mantenuto per compatibilità interna.
      */
     public static func syncDualEncAtStartup(
         lightDb: [String: Any],
@@ -2663,7 +2837,6 @@ public enum ContiDatabase {
             return (lightDb, 0, "Nessun file completo \(fullURL.lastPathComponent); uso solo il light.")
         }
         _ = waitForPathsStableIfDropbox([keyURL, fullURL, lightEncURL])
-        let keyString = try coordinatedStringContents(of: keyURL, encoding: .utf8)
         var fullDb = try loadEncryptedDBFull(encURL: fullURL, keyURL: keyURL)
         guard tryLogin(db: fullDb, email: em, password: password) != nil else {
             return (lightDb, 0, "File completo presente ma accesso non riuscito; uso solo il light.")
@@ -2672,28 +2845,19 @@ public enum ContiDatabase {
         let n2 = upsertLightSessionRecordsInMain(main: &main, light: lightDb)
         let n1 = mergeLightNewRecordsIntoMain(main: &main, light: lightDb)
         let n = n1 + n2
-        // Evita riscritture inutili su refresh/login: se non c'e' nulla da importare/aggiornare dal light,
-        // il passaggio resta read-only e riduce i conflicted copies Dropbox.
         if n == 0 {
             let alignedLight = try buildLightDatabaseForExport(from: fullDb)
-            return (alignedLight, 0, "Database gia' allineato: nessuna modifica da salvare.")
+            return (alignedLight, 0, "Database già allineato in memoria: nessuna scrittura su disco.")
         }
         recomputeLightSaldiFromFullDb(&main)
         let lightExport = try buildLightDatabaseForExport(from: main)
-        try saveEncryptedDbPairUnderSingleWorkspaceLock(
-            keyString: keyString,
-            fullURL: fullURL,
-            fullDb: main,
-            lightURL: lightEncURL,
-            lightDb: lightExport
-        )
-        var msg = "Database allineato: saldi ricalcolati; salvati file completo e light."
+        var msg = "Allineamento in memoria (nessuna scrittura): saldi ricalcolati dal file completo."
         if n1 > 0, n2 > 0 {
-            msg = "Sincronizzate \(n1) nuove e \(n2) modificate dell’app light con il file completo. " + msg
+            msg = "In memoria: \(n1) nuove e \(n2) modificate da integrare sul desktop. " + msg
         } else if n1 > 0 {
-            msg = "Importate \(n1) registrazioni dall’app light nel file completo. " + msg
+            msg = "In memoria: \(n1) registrazioni da integrare sul desktop. " + msg
         } else if n2 > 0 {
-            msg = "Aggiornate \(n2) registrazioni (modifiche o sospensioni) da Conti light nel file completo. " + msg
+            msg = "In memoria: \(n2) modifiche da integrare sul desktop. " + msg
         }
         return (lightExport, n, msg)
     }

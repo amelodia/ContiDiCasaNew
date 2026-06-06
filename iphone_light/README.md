@@ -34,10 +34,10 @@ Se servono comportamenti diversi tra desktop e mobile, si implementano **nel cli
 - Modulo: `light_enc_sidecar.py` nella root del repo (usato da `main_app.save_encrypted_db_dual` e all’avvio).
 - Il file light ha nome `{stem}_light.enc` dove `{stem}` è il nome del `.enc` completo senza estensione (es. `conti_utente_abc…` → `conti_utente_abc…_light.enc`), **nella stessa cartella** del completo.
 - Ogni nuova registrazione inserita dall’app iOS deve avere **`conti_light_record_id`**: stringa UUID univoca, così il desktop non duplica le righe al merge.
-- L’app iOS **scrive** le nuove registrazioni sul `*_light.enc` e, se il file `conti_utente_<hash>.enc` completo è nella stessa cartella, lo **aggiorna** con merge (`conti_light_record_id`) e **ricalcola** `light_saldi` come all’avvio desktop. Senza file completo: solo sidecar light e aggiornamento **approssimativo** dei saldi (`applyNewRecordToLightSaldi`).
+- L’app iOS **scrive solo** il `*_light.enc` (backup locale in Application Support prima di ogni riscrittura); **non** modifica il file completo. All’avvio il desktop importa nuove righe e modifiche e avvisa l’utente. Senza file completo accanto: solo sidecar light e saldi approssimativi.
 
-5. **Nessun backup locale aggiuntivo su iPhone**  
-   Sul desktop `save_encrypted_db_dual` scrive anche una copia in **`~/Library/Application Support/ContiDiCasa/<stem>_backup.enc`** (Library dell’utente sul Mac, nome legato al file `.enc` principale). Su iPhone: **solo** riscrittura del file `.enc` operativo (come in `iphone_light/crypto_db.save_encrypted_db_single`).
+5. **Backup locale**  
+   Desktop: `~/Library/Application Support/ContiDiCasa/`. iPhone: `Application Support/ContiDiCasa/<stem>_backup.enc` (non sincronizzato), prima di ogni riscrittura del light su Dropbox.
 
 ## Dove sta il DB nell’«albero» dell’iPhone
 
