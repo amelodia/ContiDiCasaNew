@@ -60,10 +60,11 @@ function Repair-ContiDiCasaOnedirLayout {
         return
     }
     $dllAtRoot = Get-ChildItem -Path $AppRoot -Filter "python*.dll" -File -ErrorAction SilentlyContinue
-    if ($dllAtRoot) {
-        return
+    if (-not $dllAtRoot) {
+        Write-Host "Correzione layout: sposto il contenuto di _internal accanto a ContiDiCasa.exe" -ForegroundColor Yellow
+    } else {
+        Write-Host "Correzione layout: rimuovo cartella _internal residua" -ForegroundColor Yellow
     }
-    Write-Host "Correzione layout: sposto il contenuto di _internal accanto a ContiDiCasa.exe" -ForegroundColor Yellow
     Get-ChildItem -Path $internal -Force | ForEach-Object {
         $dest = Join-Path $AppRoot $_.Name
         if (Test-Path $dest) {
@@ -71,7 +72,7 @@ function Repair-ContiDiCasaOnedirLayout {
         }
         Move-Item -LiteralPath $_.FullName -Destination $AppRoot -Force
     }
-    Remove-Item -Recurse -Force $internal
+    Remove-Item -Recurse -Force $internal -ErrorAction Stop
 }
 
 Repair-ContiDiCasaOnedirLayout -AppRoot $AppDir
@@ -84,14 +85,6 @@ Build Windows non valida: python*.dll non trovato accanto a ContiDiCasa.exe in:
 
 L'exe PyInstaller 6 con layout flat richiede le DLL nella stessa cartella dell'exe (non solo in _internal).
 Aggiornare PyInstaller (>=6.11) e ricompilare.
-"@
-}
-if (Test-Path (Join-Path $AppDir "_internal")) {
-    throw @"
-Build Windows non valida: cartella _internal ancora presente in:
-  $AppDir
-
-Ricompilare dopo aggiornamento di ContiDiCasa_windows.spec e build_windows_app.ps1.
 "@
 }
 
