@@ -8583,7 +8583,6 @@ def _try_restore_database_from_library_at_startup(
     periodiche.ensure_periodic_registrations(db)
     email_client.ensure_email_settings(db)
     security_auth.ensure_security(db)
-    _finalize_startup_db_with_light_sidecar(db, primary_target, ui_parent=parent)
     return db, primary_target
 
 
@@ -8917,15 +8916,21 @@ def _finalize_startup_db_with_light_sidecar(
     primary_path: Path,
     *,
     ui_parent: tk.Misc | None = None,
+    after_user_login: bool = False,
 ) -> tuple[int, int]:
     """Fonde ``*_light.enc`` nel DB; salva completo+light solo se il merge ha importato righe.
 
     Non rigenera il sidecar a ogni avvio se il file esiste già: evita versioni Dropbox ravvicinate
     inutili (il completo non viene riscritto). ``save_encrypted_db_dual`` aggiorna sempre il light
-    dopo ogni salvataggio dati. Se il sidecar manca, viene creato una tantum all'avvio.
+    dopo ogni salvataggio dati. Se il sidecar manca, viene creato una tantum dopo l'accesso.
+
+    Eseguito solo con ``after_user_login=True`` (post password): prima del login non si fonde,
+    non si salva e non si mostra alcun avviso.
 
     Ritorna ``(nuove_righe, righe_aggiornate)`` importate dal sidecar.
     """
+    if not after_user_login:
+        return 0, 0
     try:
         import light_enc_sidecar
 
@@ -8941,11 +8946,13 @@ def _finalize_startup_db_with_light_sidecar(
             parts: list[str] = []
             if n_new > 0:
                 parts.append(
-                    f"Importate {n_new} nuova/e registrazione/i dall'app Conti light."
+                    f"Importate {n_new} nuova/e registrazione/i create su Conti light "
+                    f"(non erano ancora nel database completo)."
                 )
             if n_up > 0:
                 parts.append(
-                    f"Aggiornate {n_up} registrazione/i (modifiche o sospensioni) da Conti light."
+                    f"Applicate {n_up} modifica/e o sospensioni da Conti light "
+                    f"(righe già presenti ma cambiate dall'app iOS)."
                 )
             msg = "\n".join(parts) + "\n\nSalvati database completo e file light nella cartella dati."
             if ui_parent is not None:
@@ -9103,7 +9110,6 @@ def _try_load_first_valid_user_db(
         periodiche.ensure_periodic_registrations(db)
         email_client.ensure_email_settings(db)
         security_auth.ensure_security(db)
-        _finalize_startup_db_with_light_sidecar(db, p, ui_parent=sync_ui_parent)
         return db, p
     return None
 
@@ -9170,7 +9176,6 @@ def load_database_at_startup(*, sync_ui_parent: tk.Misc | None = None) -> tuple[
             periodiche.ensure_periodic_registrations(db)
             email_client.ensure_email_settings(db)
             security_auth.ensure_security(db)
-            _finalize_startup_db_with_light_sidecar(db, boot_enc, ui_parent=sync_ui_parent)
             return db, boot_enc
 
     if not LEGACY_IMPORT_ENABLED:
@@ -9188,7 +9193,6 @@ def load_database_at_startup(*, sync_ui_parent: tk.Misc | None = None) -> tuple[
     email_client.ensure_email_settings(db)
     security_auth.ensure_security(db)
     # Nessun .enc per-utente finché non salvi (post wizard: percorso aggiornato al login).
-    _finalize_startup_db_with_light_sidecar(db, boot_enc, ui_parent=sync_ui_parent)
     return db, boot_enc
 
 
@@ -9196,8 +9200,6 @@ def migrate_data_path_after_login(
     db: dict,
     session: security_auth.AppSession,
     current_path: Path,
-    *,
-    ui_parent: tk.Misc | None = None,
 ) -> Path:
     """Dopo login con account registrato, usa un file .enc dedicato per quell'email.
 
@@ -9221,10 +9223,6 @@ def migrate_data_path_after_login(
         periodiche.ensure_periodic_registrations(db)
         email_client.ensure_email_settings(db)
         security_auth.ensure_security(db)
-        try:
-            _finalize_startup_db_with_light_sidecar(db, primary, ui_parent=ui_parent)
-        except Exception:
-            pass
         return True
 
     if target.resolve() == current_path.resolve():
@@ -33792,7 +33790,9 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         security_auth.ensure_security(loaded)
         db_holder[0] = loaded
         try:
-            _finalize_startup_db_with_light_sidecar(db_holder[0], primary, ui_parent=root)
+            _finalize_startup_db_with_light_sidecar(
+                db_holder[0], primary, ui_parent=root, after_user_login=True
+            )
         except Exception:
             pass
         try:
@@ -33970,6 +33970,9 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         periodiche.ensure_periodic_registrations(db)
         email_client.ensure_email_settings(db)
         security_auth.ensure_security(db)
+        _finalize_startup_db_with_light_sidecar(
+            db, primary, ui_parent=root, after_user_login=True
+        )
         db_holder[0] = db
         try:
             save_encrypted_db_dual(db, primary, kp)
@@ -34846,7 +34849,10 @@ def main() -> None:
 
     security_auth.pulse_login_loading_window(login_window_holder[0])
     path_holder[0] = migrate_data_path_after_login(
-        db_holder[0], session, path_holder[0], ui_parent=root
+        db_holder[0], session, path_holder[0]
+    )
+    _finalize_startup_db_with_light_sidecar(
+        db_holder[0], path_holder[0], ui_parent=root, after_user_login=True
     )
     security_auth.pulse_login_loading_window(login_window_holder[0])
     if session.entered_via_backdoor:

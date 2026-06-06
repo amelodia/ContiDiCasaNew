@@ -2680,7 +2680,7 @@ public enum ContiDatabase {
     /**
      Se esiste ``*_pending.enc`` (salvataggio su Dropbox non completato), tenta l'invio automatico
      e ritorna il DB da usare in sessione. Criterio oggettivo: presenza del file pending.
-     """
+     */
     public static func applyAutomaticPendingLightRecoveryIfNeeded(
         lightEncURL: URL,
         keyURL: URL,

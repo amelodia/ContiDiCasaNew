@@ -259,6 +259,35 @@ def _light_incoming_record_merged_with_main_verification(existing_in_main: dict,
     return merged
 
 
+def _records_equal_for_light_merge(a: dict, b: dict) -> bool:
+    """True se i due record sono equivalenti per il merge light → main."""
+    return json.dumps(a, sort_keys=True, ensure_ascii=True) == json.dumps(
+        b, sort_keys=True, ensure_ascii=True
+    )
+
+
+def _apply_light_record_update_if_changed(
+    main: dict,
+    *,
+    year_index: int,
+    record_index: int,
+    incoming: dict,
+) -> bool:
+    """Sostituisce la riga solo se il merge modifica il contenuto. Ritorna True se applicato."""
+    years = list(main.get("years") or [])
+    yd = dict(years[year_index])
+    recs = list(yd.get("records") or [])
+    prev_main = recs[record_index]
+    merged = _light_incoming_record_merged_with_main_verification(prev_main, incoming)
+    if _records_equal_for_light_merge(prev_main, merged):
+        return False
+    recs[record_index] = merged
+    yd["records"] = recs
+    years[year_index] = yd
+    main["years"] = years
+    return True
+
+
 def _find_in_main_index_by_conti_light_id(main: dict, conti_id: str) -> tuple[int, int] | None:
     cid = str(conti_id or "").strip()
     if not cid:
@@ -350,19 +379,18 @@ def upsert_light_session_records_in_main(main: dict, light: dict) -> int:
             updated += 1
     for rec0 in flat:
         rec_l = _record_without_ios_supersedes_for_main_write(rec0)
+        rid = str(rec_l.get(LIGHT_RECORD_ID_KEY) or "").strip()
+        if not rid:
+            # Copie del sidecar già presenti nel completo (senza intervento iOS): non upsert.
+            continue
         try:
             y_new = int(rec_l.get("year", 0) or 0)
         except (TypeError, ValueError):
             continue
         if y_new <= 0:
             continue
-        rid = str(rec_l.get(LIGHT_RECORD_ID_KEY) or "").strip()
         legacy = str(rec_l.get("legacy_registration_key") or "").strip()
-        if not rid and not legacy:
-            continue
-        found: tuple[int, int] | None = None
-        if rid:
-            found = _find_in_main_index_by_conti_light_id(main, rid)
+        found: tuple[int, int] | None = _find_in_main_index_by_conti_light_id(main, rid)
         if found is None and legacy:
             found = _find_in_main_index_by_year_and_legacy(main, y_new, legacy)
         years = main.get("years") or []
@@ -370,15 +398,10 @@ def upsert_light_session_records_in_main(main: dict, light: dict) -> int:
             fyi, fri = found
             y_old = int(years[fyi].get("year", 0))
             if y_old == y_new:
-                yd = dict(years[fyi])
-                recs = list(yd.get("records") or [])
-                prev_main = recs[fri]
-                recs[fri] = _light_incoming_record_merged_with_main_verification(prev_main, rec_l)
-                yd["records"] = recs
-                years = list(years)
-                years[fyi] = yd
-                main["years"] = years
-                updated += 1
+                if _apply_light_record_update_if_changed(
+                    main, year_index=fyi, record_index=fri, incoming=rec_l
+                ):
+                    updated += 1
             else:
                 yd_old = dict(years[fyi])
                 recs_old = list(yd_old.get("records") or [])
@@ -393,6 +416,10 @@ def upsert_light_session_records_in_main(main: dict, light: dict) -> int:
                 yi_n = next(i for i, yd in enumerate(years) if int(yd.get("year", 0)) == y_new)
                 yd_n = dict(years[yi_n])
                 recs_n = list(yd_n.get("records") or [])
+                merged_incoming = _light_incoming_record_merged_with_main_verification(
+                    removed, rec_l
+                )
+                applied = False
                 if rid:
                     j = next(
                         (
@@ -404,16 +431,24 @@ def upsert_light_session_records_in_main(main: dict, light: dict) -> int:
                     )
                     if j is not None:
                         prev_nj = recs_n[j]
-                        recs_n[j] = _light_incoming_record_merged_with_main_verification(prev_nj, rec_l)
+                        merged_nj = _light_incoming_record_merged_with_main_verification(
+                            prev_nj, rec_l
+                        )
+                        if not _records_equal_for_light_merge(prev_nj, merged_nj):
+                            recs_n[j] = merged_nj
+                            applied = True
                     else:
-                        recs_n.append(_light_incoming_record_merged_with_main_verification(removed, rec_l))
+                        recs_n.append(merged_incoming)
+                        applied = True
                 else:
-                    recs_n.append(_light_incoming_record_merged_with_main_verification(removed, rec_l))
-                yd_n["records"] = recs_n
-                years = list(years)
-                years[yi_n] = yd_n
-                main["years"] = years
-                updated += 1
+                    recs_n.append(merged_incoming)
+                    applied = True
+                if applied:
+                    yd_n["records"] = recs_n
+                    years = list(years)
+                    years[yi_n] = yd_n
+                    main["years"] = years
+                    updated += 1
     return updated
 
 
