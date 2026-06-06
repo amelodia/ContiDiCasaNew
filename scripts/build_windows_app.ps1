@@ -47,7 +47,10 @@ New-Item -ItemType Directory -Force -Path $env:PYINSTALLER_CONFIG_DIR, $env:MPLC
 
 python (Join-Path $Root "scripts\build_euro_ico.py") (Join-Path $BuildDir "ContiDiCasa.ico")
 
-python -m PyInstaller --noconfirm --contents-directory . (Join-Path $Root "ContiDiCasa_windows.spec")
+python -m PyInstaller --noconfirm (Join-Path $Root "ContiDiCasa_windows.spec")
+if ($LASTEXITCODE -ne 0) {
+    throw "PyInstaller fallito con codice $LASTEXITCODE"
+}
 
 if (-not (Test-Path $AppDir)) {
     throw "Build PyInstaller non trovato: $AppDir"

@@ -99,5 +99,4 @@ coll = COLLECT(
     upx=False,
     upx_exclude=[],
     name="ContiDiCasa",
-    contents_directory=".",
 )
