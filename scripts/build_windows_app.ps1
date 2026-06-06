@@ -22,10 +22,11 @@ if (Test-Path $VenvActivate) {
 python -c "import PyInstaller" 2>$null
 if ($LASTEXITCODE -ne 0) {
     python -m pip install --upgrade pip
-    python -m pip install "pyinstaller>=6.0"
+    python -m pip install "pyinstaller>=6.11"
 }
 
 python -m pip install -r (Join-Path $Root "requirements.txt")
+python -m pip install "pyinstaller>=6.11"
 
 if (-not $NoVersionBump) {
     python (Join-Path $Root "scripts\bump_version_build.py")
@@ -46,11 +47,55 @@ New-Item -ItemType Directory -Force -Path $env:PYINSTALLER_CONFIG_DIR, $env:MPLC
 
 python (Join-Path $Root "scripts\build_euro_ico.py") (Join-Path $BuildDir "ContiDiCasa.ico")
 
-python -m PyInstaller --noconfirm (Join-Path $Root "ContiDiCasa_windows.spec")
+python -m PyInstaller --noconfirm --contents-directory . (Join-Path $Root "ContiDiCasa_windows.spec")
 
 if (-not (Test-Path $AppDir)) {
     throw "Build PyInstaller non trovato: $AppDir"
 }
+
+function Repair-ContiDiCasaOnedirLayout {
+    param([string]$AppRoot)
+    $internal = Join-Path $AppRoot "_internal"
+    if (-not (Test-Path $internal)) {
+        return
+    }
+    $dllAtRoot = Get-ChildItem -Path $AppRoot -Filter "python*.dll" -File -ErrorAction SilentlyContinue
+    if ($dllAtRoot) {
+        return
+    }
+    Write-Host "Correzione layout: sposto il contenuto di _internal accanto a ContiDiCasa.exe" -ForegroundColor Yellow
+    Get-ChildItem -Path $internal -Force | ForEach-Object {
+        $dest = Join-Path $AppRoot $_.Name
+        if (Test-Path $dest) {
+            Remove-Item -Recurse -Force $dest
+        }
+        Move-Item -LiteralPath $_.FullName -Destination $AppRoot -Force
+    }
+    Remove-Item -Recurse -Force $internal
+}
+
+Repair-ContiDiCasaOnedirLayout -AppRoot $AppDir
+
+$pythonDll = Get-ChildItem -Path $AppDir -Filter "python*.dll" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $pythonDll) {
+    throw @"
+Build Windows non valida: python*.dll non trovato accanto a ContiDiCasa.exe in:
+  $AppDir
+
+L'exe PyInstaller 6 con layout flat richiede le DLL nella stessa cartella dell'exe (non solo in _internal).
+Aggiornare PyInstaller (>=6.11) e ricompilare.
+"@
+}
+if (Test-Path (Join-Path $AppDir "_internal")) {
+    throw @"
+Build Windows non valida: cartella _internal ancora presente in:
+  $AppDir
+
+Ricompilare dopo aggiornamento di ContiDiCasa_windows.spec e build_windows_app.ps1.
+"@
+}
+
+Write-Host "Layout OK: $($pythonDll.Name) accanto a ContiDiCasa.exe" -ForegroundColor Green
 
 Compress-Archive -Path (Join-Path $AppDir "*") -DestinationPath $ZipPath -Force
 
