@@ -8956,7 +8956,7 @@ def _finalize_startup_db_with_light_sidecar(
                 )
             msg = "\n".join(parts) + "\n\nSalvati database completo e file light nella cartella dati."
             if ui_parent is not None:
-                messagebox.showinfo("Sincronizzazione Conti light", msg, parent=ui_parent)
+                _show_centered_info_dialog(ui_parent, "Sincronizzazione Conti light", msg)
             return n_new, n_up
         lp = light_enc_sidecar.light_enc_path_for_primary(primary_path)
         if not lp.is_file():
@@ -34560,6 +34560,65 @@ def _apply_sun_valley_ttk_theme(root: tk.Tk) -> None:
             sty.configure("Accent.TButton", padding=pad)
     except tk.TclError:
         pass
+
+
+def _show_centered_info_dialog(parent: tk.Misc, title: str, message: str) -> None:
+    """Dialogo informativo modale centrato sullo schermo (non ancorato al bordo della finestra parent)."""
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.resizable(False, False)
+    try:
+        win.transient(parent)
+    except Exception:
+        pass
+
+    frm = tk.Frame(win, padx=22, pady=18)
+    frm.pack(fill=tk.BOTH, expand=True)
+    tk.Label(
+        frm,
+        text=message,
+        justify=tk.LEFT,
+        wraplength=480,
+    ).pack(anchor=tk.W)
+    btn_row = tk.Frame(frm)
+    btn_row.pack(anchor=tk.E, pady=(18, 0))
+
+    def _close() -> None:
+        win.destroy()
+
+    tk.Button(btn_row, text="OK", width=12, command=_close).pack(side=tk.LEFT)
+    win.protocol("WM_DELETE_WINDOW", _close)
+
+    try:
+        win.update_idletasks()
+        ww = max(win.winfo_reqwidth(), 360)
+        wh = max(win.winfo_reqheight(), 1)
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        win.geometry(f"{ww}x{wh}+{max(0, (sw - ww) // 2)}+{max(0, (sh - wh) // 2)}")
+        win.lift()
+        win.attributes("-topmost", True)
+
+        def _topmost_off() -> None:
+            try:
+                if win.winfo_exists():
+                    win.attributes("-topmost", False)
+            except Exception:
+                pass
+
+        win.after(800, _topmost_off)
+        win.focus_force()
+        win.grab_set()
+    except Exception:
+        pass
+
+    try:
+        parent.wait_window(win)
+    except Exception:
+        try:
+            win.wait_window()
+        except Exception:
+            pass
 
 
 def _confirm_dropbox_ready_after_recent_boot(root: tk.Tk) -> bool:

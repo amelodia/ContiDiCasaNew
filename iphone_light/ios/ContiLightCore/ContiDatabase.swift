@@ -2467,7 +2467,7 @@ public enum ContiDatabase {
             acc2Name = ""
             acc2CodeOut = ""
         }
-        var rec: [String: Any] = [
+        let rec: [String: Any] = [
             "year": targetYear,
             "source_folder": "APP",
             "source_file": "conti_light",
@@ -2837,7 +2837,7 @@ public enum ContiDatabase {
             return (lightDb, 0, "Nessun file completo \(fullURL.lastPathComponent); uso solo il light.")
         }
         _ = waitForPathsStableIfDropbox([keyURL, fullURL, lightEncURL])
-        var fullDb = try loadEncryptedDBFull(encURL: fullURL, keyURL: keyURL)
+        let fullDb = try loadEncryptedDBFull(encURL: fullURL, keyURL: keyURL)
         guard tryLogin(db: fullDb, email: em, password: password) != nil else {
             return (lightDb, 0, "File completo presente ma accesso non riuscito; uso solo il light.")
         }

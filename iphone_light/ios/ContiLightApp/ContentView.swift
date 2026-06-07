@@ -130,6 +130,73 @@ struct ContentView: View {
     }
 
     var body: some View {
+        contentWithPeriodicAlert
+    }
+
+    private var contentWithPeriodicAlert: some View {
+        contentWithSecondaryOnChange
+            .alert("Registrazioni periodiche", isPresented: $periodicStartupAlertPresented) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(periodicStartupAlertText)
+            }
+    }
+
+    private var contentWithSecondaryOnChange: some View {
+        contentWithPrimaryLifecycle
+            .onChange(of: email) { _, _ in
+                if dataFolderURL != nil {
+                    refreshKeyStatus()
+                }
+            }
+            .onChange(of: savePasswordForBiometrics) { _, enabled in
+                if !enabled {
+                    ContiLightBiometricLogin.deleteAllBiometricCredentials()
+                }
+            }
+            .onChange(of: showFiltriSheet) { _, open in
+                if !open {
+                    filtriNavigationPath = NavigationPath()
+                }
+            }
+            .onChange(of: movimentiListSort) { _, _ in
+                guard let d = loggedInSessionDb as? [String: Any] else { return }
+                loggedInRecords = ContiDatabase.displayRecords(from: d, sort: movimentiListSort)
+            }
+    }
+
+    private var contentWithPrimaryLifecycle: some View {
+        navigationStackRoot
+            .background(Color(uiColor: .systemGroupedBackground))
+            .onChange(of: loggedInSessionDb == nil) { _, noSession in
+                if noSession {
+                    sessionLockHeartbeatTask?.cancel()
+                    sessionLockHeartbeatTask = nil
+                    postLoginHydrationRefreshTask?.cancel()
+                    postLoginHydrationRefreshTask = nil
+                    movimentiPath = NavigationPath()
+                    sessionKeyURL = nil
+                    sessionLightEncURL = nil
+                    applySavedLoginEmailIfNeeded()
+                } else {
+                    startSessionLockHeartbeatIfNeeded()
+                }
+            }
+            .onAppear {
+                if dataFolderURL == nil, securityScopedBookmarkURL == nil, let restored = ContiLightFolderBookmark.restore() {
+                    securityScopedBookmarkURL = restored
+                    let isDir = (try? restored.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+                    dataFolderURL = isDir ? restored : restored.deletingLastPathComponent()
+                }
+                applySavedLoginEmailIfNeeded()
+                refreshKeyStatus()
+            }
+            .onChange(of: scenePhase) { _, phase in
+                handleScenePhaseChange(phase)
+            }
+    }
+
+    private var navigationStackRoot: some View {
         NavigationStack(path: $movimentiPath) {
             Group {
                 if loggedInSessionDb == nil {
@@ -139,116 +206,62 @@ struct ContentView: View {
                 }
             }
             .navigationDestination(for: MovimentiSchedaRoute.self) { route in
-                switch route {
-                case .saldi:
-                    ContiLightSaldiSchedaView(sessionDb: loggedInSessionDb)
-                case .nuoviDati:
-                    ContiLightNuovoMovimentoSchedaView(
-                        sessionDb: loggedInSessionDb as? [String: Any],
-                        dataFolderURL: dataFolderURL,
-                        securityScopedBookmarkURL: securityScopedBookmarkURL,
-                        keyURL: sessionKeyURL,
-                        lightEncURL: sessionLightEncURL,
-                        email: email,
-                        password: password,
-                        onPersistWillStart: { sessionPendingLightWrite = true },
-                        onDropboxPersistIncomplete: { sessionPendingLightWrite = true },
-                        onPersisted: { updatedDb, _, note in
-                            sessionPendingLightWrite = false
-                            loggedInSessionDb = updatedDb as NSDictionary
-                            if let d = updatedDb as? [String: Any] {
-                                loggedInRecords = ContiDatabase.displayRecords(from: d, sort: movimentiListSort)
-                            }
-                            message = note
-                        }
-                    )
-                case .modifica(let legacyKey):
-                    ContiLightNuovoMovimentoSchedaView(
-                        sessionDb: loggedInSessionDb as? [String: Any],
-                        dataFolderURL: dataFolderURL,
-                        securityScopedBookmarkURL: securityScopedBookmarkURL,
-                        keyURL: sessionKeyURL,
-                        lightEncURL: sessionLightEncURL,
-                        email: email,
-                        password: password,
-                        onPersistWillStart: { sessionPendingLightWrite = true },
-                        onDropboxPersistIncomplete: { sessionPendingLightWrite = true },
-                        onPersisted: { updatedDb, _, note in
-                            sessionPendingLightWrite = false
-                            loggedInSessionDb = updatedDb as NSDictionary
-                            if let d = updatedDb as? [String: Any] {
-                                loggedInRecords = ContiDatabase.displayRecords(from: d, sort: movimentiListSort)
-                            }
-                            message = note
-                        },
-                        editingLegacyKey: legacyKey
-                    )
-                }
+                movimentiSchedaDestination(for: route)
             }
         }
-        .background(Color(uiColor: .systemGroupedBackground))
-        .onChange(of: loggedInSessionDb == nil) { _, noSession in
-            if noSession {
-                sessionLockHeartbeatTask?.cancel()
-                sessionLockHeartbeatTask = nil
-                postLoginHydrationRefreshTask?.cancel()
-                postLoginHydrationRefreshTask = nil
-                movimentiPath = NavigationPath()
-                sessionKeyURL = nil
-                sessionLightEncURL = nil
-                applySavedLoginEmailIfNeeded()
-            } else {
-                startSessionLockHeartbeatIfNeeded()
-            }
+    }
+
+    @ViewBuilder
+    private func movimentiSchedaDestination(for route: MovimentiSchedaRoute) -> some View {
+        switch route {
+        case .saldi:
+            ContiLightSaldiSchedaView(sessionDb: loggedInSessionDb)
+        case .nuoviDati:
+            nuovoMovimentoSchedaView(editingLegacyKey: nil)
+        case .modifica(let legacyKey):
+            nuovoMovimentoSchedaView(editingLegacyKey: legacyKey)
         }
-        .onAppear {
-            if dataFolderURL == nil, securityScopedBookmarkURL == nil, let restored = ContiLightFolderBookmark.restore() {
-                securityScopedBookmarkURL = restored
-                let isDir = (try? restored.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
-                dataFolderURL = isDir ? restored : restored.deletingLastPathComponent()
-            }
-            applySavedLoginEmailIfNeeded()
+    }
+
+    private func nuovoMovimentoSchedaView(editingLegacyKey: String?) -> ContiLightNuovoMovimentoSchedaView {
+        ContiLightNuovoMovimentoSchedaView(
+            sessionDb: loggedInSessionDb as? [String: Any],
+            dataFolderURL: dataFolderURL,
+            securityScopedBookmarkURL: securityScopedBookmarkURL,
+            keyURL: sessionKeyURL,
+            lightEncURL: sessionLightEncURL,
+            email: email,
+            password: password,
+            onPersisted: { updatedDb, _, note in
+                applyMovimentoPersisted(updatedDb: updatedDb, note: note)
+            },
+            onPersistWillStart: { sessionPendingLightWrite = true },
+            onDropboxPersistIncomplete: { sessionPendingLightWrite = true },
+            editingLegacyKey: editingLegacyKey
+        )
+    }
+
+    private func applyMovimentoPersisted(updatedDb: [String: Any], note: String) {
+        sessionPendingLightWrite = false
+        loggedInSessionDb = updatedDb as NSDictionary
+        loggedInRecords = ContiDatabase.displayRecords(from: updatedDb, sort: movimentiListSort)
+        message = note
+    }
+
+    private func handleScenePhaseChange(_ phase: ScenePhase) {
+        if phase == .active, dataFolderURL != nil {
             refreshKeyStatus()
-        }
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active, dataFolderURL != nil {
-                refreshKeyStatus()
-                // Rilegge il `*_light.enc` con path risolto di nuovo e attesa Dropbox (come «Aggiorna»), così dopo sync non resta la copia precedente in memoria.
-                Task { @MainActor in
-                    if Date().timeIntervalSince(lastScenePhaseRefreshAt) >= 3 {
-                        await refreshLightSessionIfLoggedIn()
-                    }
+            // Rilegge il `*_light.enc` con path risolto di nuovo e attesa Dropbox (come «Aggiorna»), così dopo sync non resta la copia precedente in memoria.
+            Task { @MainActor in
+                if Date().timeIntervalSince(lastScenePhaseRefreshAt) >= 3 {
+                    await refreshLightSessionIfLoggedIn()
                 }
-            } else if phase == .background {
-                postLoginHydrationRefreshTask?.cancel()
-                postLoginHydrationRefreshTask = nil
-                flushPendingLightSessionBeforeBackground()
-                closeCurrentSessionAndReleaseLock()
             }
-        }
-        .onChange(of: email) { _, _ in
-            if dataFolderURL != nil {
-                refreshKeyStatus()
-            }
-        }
-        .onChange(of: savePasswordForBiometrics) { _, enabled in
-            if !enabled {
-                ContiLightBiometricLogin.deleteAllBiometricCredentials()
-            }
-        }
-        .onChange(of: showFiltriSheet) { _, open in
-            if !open {
-                filtriNavigationPath = NavigationPath()
-            }
-        }
-        .onChange(of: movimentiListSort) { _, _ in
-            guard let d = loggedInSessionDb as? [String: Any] else { return }
-            loggedInRecords = ContiDatabase.displayRecords(from: d, sort: movimentiListSort)
-        }
-        .alert("Registrazioni periodiche", isPresented: $periodicStartupAlertPresented) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(periodicStartupAlertText)
+        } else if phase == .background {
+            postLoginHydrationRefreshTask?.cancel()
+            postLoginHydrationRefreshTask = nil
+            flushPendingLightSessionBeforeBackground()
+            closeCurrentSessionAndReleaseLock()
         }
     }
 
@@ -1077,8 +1090,7 @@ struct ContentView: View {
 
     private func startSessionLockHeartbeatIfNeeded() {
         sessionLockHeartbeatTask?.cancel()
-        guard loggedInSessionDb != nil, let folder = dataFolderURL else { return }
-        let scope = securityScopedBookmarkURL ?? folder
+        guard loggedInSessionDb != nil, dataFolderURL != nil else { return }
         let intervalNs = UInt64(ContiDatabase.workspaceLockHeartbeatIntervalSeconds * 1_000_000_000)
         sessionLockHeartbeatTask = Task {
             while !Task.isCancelled {

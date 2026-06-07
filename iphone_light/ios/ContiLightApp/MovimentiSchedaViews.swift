@@ -432,7 +432,7 @@ private struct ContiLightEuroAmountField: UIViewRepresentable {
                 placeCaretAfterLeadingSign(textField)
                 return false
             }
-            var new = rawNew
+            let new = rawNew
             var norm = ContiDatabase.normalizedEuroImmissioneAmountFieldText(new)
             if norm.isEmpty { norm = ContiDatabase.lightImmissioneDefaultAmountText }
             if norm != new {
