@@ -184,7 +184,8 @@ def test_email_configuration(db: dict) -> tuple[bool, str]:
 
     if errs:
         cert_hint = (
-            "\n\nSuggerimenti (certificati): «python3 -m pip install certifi» e riavvio; "
+            "\n\nSuggerimenti (certificati): «python -m pip install certifi» "
+            "(su Windows: «py -3 -m pip install certifi») e riavvio; "
             "oppure disattiva «Verifica certificati SSL» in Opzioni solo se necessario."
         )
         blob = "\n".join(errs)

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 ()
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import copy
@@ -5028,7 +5028,8 @@ def save_verifica_results_pdf(
     except ImportError:
         messagebox.showerror(
             "Stampa verifica",
-            "Modulo fpdf2 assente: installare da requirements.txt (`python3 -m pip install -r requirements.txt`).",
+            "Modulo fpdf2 assente: installare da requirements.txt "
+            "(`python -m pip install -r requirements.txt`; su Windows anche `py -3 -m pip ...`).",
             parent=parent,
         )
         return False

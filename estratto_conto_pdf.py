@@ -1750,8 +1750,9 @@ def extract_estratto_conto_movements_from_pdf(path: Path, *, max_note_len: int =
         from pypdf import PdfReader
     except ImportError as exc:
         raise ImportError(
-            "Per leggere gli estratti PDF installa le dipendenze: python3 -m pip install -r requirements.txt "
-            "(pacchetto pypdf)."
+            "Per leggere gli estratti PDF installa le dipendenze: "
+            "python -m pip install -r requirements.txt "
+            "(su Windows: py -3 -m pip install -r requirements.txt; pacchetto pypdf)."
         ) from exc
 
     path = Path(path)

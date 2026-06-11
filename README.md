@@ -22,6 +22,18 @@ Da sorgente:
 python3 main_app.py
 ```
 
+Su Windows, evitare `python3` e avviare con:
+
+```bat
+scripts\start_windows.cmd
+```
+
+oppure:
+
+```bat
+py -3 main_app.py
+```
+
 Creazione dell'app macOS:
 
 ```bash
@@ -127,6 +139,8 @@ Esecuzione:
 python3 -m unittest discover
 python3 -m compileall -q .
 ```
+
+Su Windows usare `py -3 -m unittest discover` e `py -3 -m compileall -q .`.
 
 I test coprono le parti piu delicate: importi euro, saldi consolidati, regole storiche, carte di credito e sidecar light.
 
