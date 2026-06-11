@@ -119,14 +119,7 @@ def primary_user_enc_files_sorted(workspace: Path) -> list[Path]:
         if p.name.endswith("_light.enc"):
             continue
         out.append(p)
-
-    def _mtime_or_zero(path: Path) -> float:
-        try:
-            return path.stat().st_mtime
-        except OSError:
-            return 0.0
-
-    return sorted(out, key=_mtime_or_zero, reverse=True)
+    return sorted(out, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
 def legacy_import_dir() -> Path:

@@ -12,7 +12,6 @@ import shutil
 import calendar
 from bisect import bisect_left
 import platform
-import socket
 import subprocess
 import sys
 import time
@@ -7646,13 +7645,6 @@ _DATA_FOLDER_IN_USE_MARKER = "conti_di_casa_folder_in_use.txt"
 _LEGACY_DATA_LOCK_JSON = "conti_di_casa_app.lock.json"
 
 
-class DataWorkspaceLockError(RuntimeError):
-    def __init__(self, message: str, *, markers: list[Path], recoverable: bool = True) -> None:
-        super().__init__(message)
-        self.markers = markers
-        self.recoverable = recoverable
-
-
 def _data_folder_in_use_marker_path(data_dir: Path) -> Path:
     return data_dir / _DATA_FOLDER_IN_USE_MARKER
 
@@ -7680,125 +7672,31 @@ def _remove_legacy_json_data_lock_if_present(data_dir: Path) -> None:
         pass
 
 
-def _lock_hostname() -> str:
-    return (socket.gethostname() or platform.node() or "").strip()
-
-
-def _read_data_folder_lock_info(path: Path) -> dict:
-    try:
-        raw = path.read_text(encoding="utf-8", errors="replace").strip()
-    except OSError:
-        raw = ""
-    try:
-        obj = json.loads(raw) if raw else {}
-        if isinstance(obj, dict):
-            return obj
-    except json.JSONDecodeError:
-        pass
-    return {"legacy_text": raw.splitlines()[0] if raw else ""}
-
-
-def _process_id_is_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if pid == os.getpid():
-        return True
-    if platform.system() == "Windows":
-        try:
-            import ctypes
-
-            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-            handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
-            if handle:
-                kernel32.CloseHandle(handle)
-                return True
-            # ERROR_ACCESS_DENIED indica in genere un processo vivo ma non interrogabile.
-            if kernel32.GetLastError() == 5:
-                return True
-            return False
-        except Exception:
-            return True
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return True
-
-
-def _data_lock_marker_is_dead_local_process(path: Path) -> bool:
-    info = _read_data_folder_lock_info(path)
-    try:
-        pid = int(info.get("pid", 0))
-    except (TypeError, ValueError):
-        return False
-    host = str(info.get("host") or "").strip().lower()
-    if not pid or not host:
-        return False
-    if host not in {_lock_hostname().lower(), platform.node().strip().lower()}:
-        return False
-    return not _process_id_is_running(pid)
-
-
-def _remove_dead_local_data_lock_markers(data_dir: Path) -> None:
-    for p in _data_folder_in_use_marker_paths(data_dir):
-        if not _data_lock_marker_is_dead_local_process(p):
-            continue
-        try:
-            p.unlink()
-        except OSError:
-            pass
-
-
-def _data_lock_error_message(markers: list[Path]) -> str:
-    shown = "\n".join(f"- {p.name}" for p in markers[:8])
-    extra = f"\n... altri {len(markers) - 8} file" if len(markers) > 8 else ""
-    return (
-        "Un'altra copia di Conti di casa risulta aperta sulla stessa cartella dati "
-        "(è presente il file segnaposto nella cartella).\n\n"
-        f"{shown}{extra}\n\n"
-        "Se Windows Update o uno spegnimento forzato hanno chiuso l'applicazione, "
-        "il segnaposto può essere rimasto nella cartella. Prima di rimuoverlo verifica "
-        "che Conti di casa non sia aperto su questo o altri computer collegati alla stessa Dropbox."
-    )
-
-
 def acquire_data_workspace_lock(data_dir: Path, *, app_kind: str = "desktop") -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     _remove_legacy_json_data_lock_if_present(data_dir)
-    _remove_dead_local_data_lock_markers(data_dir)
     marker = _data_folder_in_use_marker_path(data_dir)
     existing_markers = _data_folder_in_use_marker_paths(data_dir)
     if existing_markers:
-        raise DataWorkspaceLockError(
-            _data_lock_error_message(existing_markers),
-            markers=existing_markers,
-            recoverable=True,
+        shown = "\n".join(f"- {p.name}" for p in existing_markers[:8])
+        raise RuntimeError(
+            "Un'altra copia di Conti di casa risulta aperta sulla stessa cartella dati "
+            "(è presente il file segnaposto nella cartella).\n\n"
+            f"{shown}\n\n"
+            "Chiudi l'altra app e attendi la sincronizzazione Dropbox prima di continuare."
         )
-    payload = {
-        "app": "Conti di casa",
-        "kind": app_kind,
-        "pid": os.getpid(),
-        "host": _lock_hostname(),
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "created_ts": time.time(),
-        "platform": platform.platform(),
-    }
-    data = (json.dumps(payload, ensure_ascii=True, indent=2) + "\n").encode("utf-8")
+    line = f"{app_kind}\n".encode("utf-8")
     try:
         fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     except FileExistsError:
-        raise DataWorkspaceLockError(
-            _data_lock_error_message([marker]),
-            markers=[marker],
-            recoverable=True,
+        raise RuntimeError(
+            "Un'altra copia di Conti di casa risulta aperta sulla stessa cartella dati "
+            "(è presente il file segnaposto nella cartella).\n\n"
+            "Chiudi l'altra app e attendi la sincronizzazione Dropbox prima di continuare."
         ) from None
     try:
         with os.fdopen(fd, "wb") as f:
-            f.write(data)
+            f.write(line)
             f.flush()
             os.fsync(f.fileno())
     except Exception:
@@ -8052,7 +7950,13 @@ def _discover_existing_user_db_candidates() -> list[Path]:
     data_dir = data_workspace.data_dir()
     if not data_dir.is_dir():
         return []
-    return data_workspace.primary_user_enc_files_sorted(data_dir)
+    out: list[Path] = []
+    for p in data_dir.glob("conti_utente_*.enc"):
+        if not p.is_file():
+            continue
+        out.append(p)
+    out.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0.0, reverse=True)
+    return out
 
 
 def _try_load_first_valid_user_db(
@@ -8086,18 +7990,7 @@ def _try_load_first_valid_user_db(
 def _startup_paths_for_cloud_wait() -> list[Path]:
     """File da considerare per l’attesa «stabile» in Dropbox all’avvio."""
     out: list[Path] = [data_workspace.default_key_file()]
-    primaries = _discover_existing_user_db_candidates()
-    out.extend(primaries)
-    try:
-        import light_enc_sidecar
-
-        out.extend(
-            lp
-            for primary in primaries
-            if (lp := light_enc_sidecar.light_enc_path_for_primary(primary)).exists()
-        )
-    except Exception:
-        pass
+    out.extend(_discover_existing_user_db_candidates())
     boot = data_workspace.session_bootstrap_enc_path()
     if boot.exists():
         out.append(boot)
@@ -30690,8 +30583,10 @@ def main() -> None:
             pass
         return
     data_dir = data_workspace.data_dir()
-
-    def _abort_startup_for_lock_error(exc: Exception) -> None:
+    try:
+        acquire_data_workspace_lock(data_dir, app_kind="desktop")
+    except Exception as exc:
+        # Non abbiamo creato il segnaposto: non va cancellato un file altrui ancora valido.
         try:
             messagebox.showerror("Cartella dati in uso", str(exc), parent=None)
         except Exception:
@@ -30700,35 +30595,6 @@ def main() -> None:
             root.destroy()
         except Exception:
             pass
-
-    try:
-        acquire_data_workspace_lock(data_dir, app_kind="desktop")
-    except DataWorkspaceLockError as exc:
-        remove_marker = False
-        if exc.recoverable:
-            try:
-                remove_marker = messagebox.askyesno(
-                    "Cartella dati in uso",
-                    f"{exc}\n\n"
-                    "Rimuovere il segnaposto e riprovare l'apertura?\n\n"
-                    "Scegli Sì solo se hai verificato che nessun'altra copia dell'app sia aperta.",
-                    parent=None,
-                )
-            except Exception:
-                remove_marker = False
-        if remove_marker:
-            release_data_workspace_lock(data_dir)
-            try:
-                acquire_data_workspace_lock(data_dir, app_kind="desktop")
-            except Exception as retry_exc:
-                _abort_startup_for_lock_error(retry_exc)
-                return
-        else:
-            _abort_startup_for_lock_error(exc)
-            return
-    except Exception as exc:
-        # Non abbiamo creato il segnaposto: non va cancellato un file altrui ancora valido.
-        _abort_startup_for_lock_error(exc)
         return
 
     atexit.register(release_data_workspace_lock, data_dir)
