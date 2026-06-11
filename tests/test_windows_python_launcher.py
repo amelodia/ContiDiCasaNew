@@ -15,6 +15,16 @@ class WindowsPythonLauncherTests(unittest.TestCase):
         self.assertIn("python \"%app%\"", script)
         self.assertNotIn("python3", script)
 
+    def test_windows_build_uploads_setup_artifact(self) -> None:
+        workflow = Path(".github/workflows/windows-build.yml").read_text(encoding="utf-8")
+        build_script = Path("scripts/build_windows_app.ps1").read_text(encoding="utf-8")
+        installer_script = Path("installer/ContiDiCasa.iss").read_text(encoding="utf-8")
+
+        self.assertIn("windows-latest", workflow)
+        self.assertIn("dist/ContiDiCasa-Windows-Setup.exe", workflow)
+        self.assertIn("ContiDiCasa-Windows-Setup.exe", build_script)
+        self.assertIn("OutputBaseFilename=ContiDiCasa-Windows-Setup", installer_script)
+
 
 if __name__ == "__main__":
     unittest.main()

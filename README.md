@@ -34,6 +34,19 @@ oppure:
 py -3 main_app.py
 ```
 
+## Installer Windows
+
+Il file `setup.exe` viene prodotto da GitHub Actions, non è committato nel repository.
+
+Per scaricarlo:
+
+1. Apri la scheda **Actions** su GitHub.
+2. Seleziona il workflow **Windows build**.
+3. Apri l'ultima esecuzione riuscita.
+4. Scarica l'artifact **ContiDiCasa-Windows-Setup-...**: contiene `ContiDiCasa-Windows-Setup.exe`.
+
+Lo stesso workflow carica anche **ContiDiCasa-Windows-...**, lo zip della cartella completa dell'app.
+
 Creazione dell'app macOS:
 
 ```bash
