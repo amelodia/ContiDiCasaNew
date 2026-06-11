@@ -7711,6 +7711,9 @@ def _process_id_is_running(pid: int) -> bool:
             if handle:
                 kernel32.CloseHandle(handle)
                 return True
+            # ERROR_ACCESS_DENIED indica in genere un processo vivo ma non interrogabile.
+            if kernel32.GetLastError() == 5:
+                return True
             return False
         except Exception:
             return True
