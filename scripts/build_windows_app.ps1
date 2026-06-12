@@ -63,11 +63,12 @@ function Repair-ContiDiCasaOnedirLayout {
         return
     }
     $dllAtRoot = Get-ChildItem -Path $AppRoot -Filter "python*.dll" -File -ErrorAction SilentlyContinue
-    if (-not $dllAtRoot) {
-        Write-Host "Correzione layout: sposto il contenuto di _internal accanto a ContiDiCasa.exe" -ForegroundColor Yellow
-    } else {
-        Write-Host "Correzione layout: rimuovo cartella _internal residua" -ForegroundColor Yellow
+    if ($dllAtRoot) {
+        Write-Host "Layout flat gia' valido: rimuovo solo _internal residua" -ForegroundColor Yellow
+        Remove-Item -Recurse -Force $internal -ErrorAction SilentlyContinue
+        return
     }
+    Write-Host "Correzione layout: sposto il contenuto di _internal accanto a ContiDiCasa.exe" -ForegroundColor Yellow
     Get-ChildItem -Path $internal -Force | ForEach-Object {
         $dest = Join-Path $AppRoot $_.Name
         if (Test-Path $dest) {
@@ -112,15 +113,24 @@ if (-not $IsccPath) {
         $IsccPath = $CommonIscc
     }
 }
+if (-not (Test-Path $ZipPath)) {
+    throw "Pacchetto zip non creato: $ZipPath"
+}
+
 if ($IsccPath) {
     Write-Host "Inno Setup: versione $($env:CDC_APP_VERSION)" -ForegroundColor Cyan
-    & $IsccPath (Join-Path $Root "installer\ContiDiCasa.iss")
+  try {
+    & $IsccPath "/DMyAppVersion=$($env:CDC_APP_VERSION)" (Join-Path $Root "installer\ContiDiCasa.iss")
     if ($LASTEXITCODE -ne 0) {
-        throw "Inno Setup fallito con codice $LASTEXITCODE"
+      throw "Inno Setup fallito con codice $LASTEXITCODE"
     }
     if (-not (Test-Path $InstallerPath)) {
-        throw "Installer Inno Setup non trovato: $InstallerPath"
+      throw "Installer Inno Setup non trovato: $InstallerPath"
     }
+  } catch {
+    Write-Warning $_.Exception.Message
+    Write-Warning "Installer non creato; lo zip resta disponibile in dist."
+  }
 } else {
     Write-Warning "ISCC.exe non trovato: salto generazione installer .exe."
 }
