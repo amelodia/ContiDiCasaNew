@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 ()
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import copy
@@ -29,11 +29,29 @@ from tkinter import filedialog, font as tkfont, messagebox, ttk
 from dataclasses import asdict
 from datetime import date, datetime, timedelta
 
-try:
-    from cryptography.fernet import Fernet, InvalidToken
-except Exception:  # pragma: no cover - runtime optional dependency check
-    Fernet = None
-    InvalidToken = Exception
+def _import_fernet():
+    try:
+        from cryptography.fernet import Fernet as _Fernet, InvalidToken as _InvalidToken
+    except ImportError as exc:
+        print(
+            "cryptography non importabile. Usa lo stesso Python con cui avvii l'app:\n"
+            f"  {sys.executable} -m pip install -r requirements.txt\n"
+            f"Dettaglio: {exc}",
+            file=sys.stderr,
+        )
+        return None, Exception
+    except Exception as exc:  # pragma: no cover - DLL/_cffi_backend mancante nel bundle
+        print(
+            "cryptography presente ma non caricabile.\n"
+            f"  {sys.executable} -m pip install --force-reinstall cryptography cffi\n"
+            f"Dettaglio: {exc}",
+            file=sys.stderr,
+        )
+        return None, Exception
+    return _Fernet, _InvalidToken
+
+
+Fernet, InvalidToken = _import_fernet()
 
 import app_help_text
 import cloud_sync_wait
@@ -115,6 +133,41 @@ _BOOT_DROPBOX_CONFIRM_WITHIN_SECONDS = 5 * 60
 # Stessa regola della colonna Importo nella griglia movimenti.
 COLOR_AMOUNT_POS = "#006400"
 COLOR_AMOUNT_NEG = "#b22222"
+
+
+def _startup_root_stays_visible() -> bool:
+    """Su Windows le finestre Toplevel/messagebox con parent withdrawn spesso non compaiono."""
+    return platform.system() == "Windows"
+
+
+def _startup_log_path() -> Path:
+    try:
+        return data_workspace.app_support_dir() / "startup.log"
+    except Exception:
+        return Path.home() / "ContiDiCasa_startup.log"
+
+
+def _log_startup(message: str) -> None:
+    try:
+        p = _startup_log_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")
+    except Exception:
+        pass
+
+
+def _log_startup_exception(context: str) -> None:
+    try:
+        import traceback
+
+        p = _startup_log_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')} ERRORE {context}\n")
+            traceback.print_exc(file=f)
+    except Exception:
+        pass
 
 
 def _darwin_prepare_stdin_for_tk_aqua() -> None:
@@ -7644,6 +7697,13 @@ _DATA_FOLDER_IN_USE_MARKER = "conti_di_casa_folder_in_use.txt"
 _LEGACY_DATA_LOCK_JSON = "conti_di_casa_app.lock.json"
 
 
+class DataWorkspaceLockError(RuntimeError):
+    def __init__(self, message: str, *, markers: list[Path], recoverable: bool = True) -> None:
+        super().__init__(message)
+        self.markers = markers
+        self.recoverable = recoverable
+
+
 def _data_folder_in_use_marker_path(data_dir: Path) -> Path:
     return data_dir / _DATA_FOLDER_IN_USE_MARKER
 
@@ -7678,20 +7738,25 @@ def acquire_data_workspace_lock(data_dir: Path, *, app_kind: str = "desktop") ->
     existing_markers = _data_folder_in_use_marker_paths(data_dir)
     if existing_markers:
         shown = "\n".join(f"- {p.name}" for p in existing_markers[:8])
-        raise RuntimeError(
+        raise DataWorkspaceLockError(
             "Un'altra copia di Conti di casa risulta aperta sulla stessa cartella dati "
             "(è presente il file segnaposto nella cartella).\n\n"
             f"{shown}\n\n"
-            "Chiudi l'altra app e attendi la sincronizzazione Dropbox prima di continuare."
+            "Se l'app si è chiusa in modo anomalo (crash, Windows Update), il segnaposto "
+            "può essere rimasto. Rimuovilo solo se nessun'altra copia è aperta.",
+            markers=existing_markers,
+            recoverable=True,
         )
     line = f"{app_kind}\n".encode("utf-8")
     try:
         fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     except FileExistsError:
-        raise RuntimeError(
+        raise DataWorkspaceLockError(
             "Un'altra copia di Conti di casa risulta aperta sulla stessa cartella dati "
             "(è presente il file segnaposto nella cartella).\n\n"
-            "Chiudi l'altra app e attendi la sincronizzazione Dropbox prima di continuare."
+            "Se l'app si è chiusa in modo anomalo, il segnaposto può essere rimasto.",
+            markers=[marker],
+            recoverable=True,
         ) from None
     try:
         with os.fdopen(fd, "wb") as f:
@@ -8217,15 +8282,40 @@ def build_ui(
 
     data_file_var.trace_add("write", _sync_path_holders_from_vars)
     key_file_var.trace_add("write", _sync_path_holders_from_vars)
-    # La root resta nascosta durante tutta la costruzione dell'interfaccia: così non si vede
-    # una finestra vuota in fullscreen (su macOS il -fullscreen nativo dà spesso un flash nero in alto).
-    try:
-        root.withdraw()
-    except Exception:
-        pass
+    # Su macOS nascondi la root mentre si costruisce l'UI; su Windows tenerla visibile evita
+    # che l'app sembri sparita dopo il login (fino a _present_main_window).
+    if not _startup_root_stays_visible():
+        try:
+            root.withdraw()
+        except Exception:
+            pass
     root.title(window_title_for_session(db_holder[0], session_holder[0], show_clock=True))
 
+    _build_loading_label: tk.Label | None = None
+    if _startup_root_stays_visible():
+        try:
+            _build_loading_label = tk.Label(
+                root,
+                text="Caricamento interfaccia in corso…\nAttendere qualche secondo.",
+                font=("TkDefaultFont", 14),
+                bg=MOVIMENTI_PAGE_BG,
+                fg="#333333",
+                justify="center",
+            )
+            _build_loading_label.pack(expand=True, fill=tk.BOTH, padx=24, pady=24)
+            root.update_idletasks()
+            root.deiconify()
+            root.lift()
+            root.focus_force()
+        except Exception:
+            _build_loading_label = None
+
     main_nb_shell = tk.Frame(root, bg=MOVIMENTI_PAGE_BG)
+    if _build_loading_label is not None:
+        try:
+            _build_loading_label.destroy()
+        except Exception:
+            pass
     main_nb_shell.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
     cdc_tab_bar = tk.Frame(main_nb_shell, bg=MOVIMENTI_PAGE_BG)
     cdc_tab_bar.pack(fill=tk.X, pady=(0, 6))
@@ -30460,15 +30550,25 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 sh = root.winfo_screenheight()
                 root.geometry(f"{sw}x{sh}+0+0")
             else:
-                root.geometry("1200x760")
-                try:
-                    root.state("zoomed")
-                except Exception:
-                    pass
+                sw = root.winfo_screenwidth()
+                sh = root.winfo_screenheight()
+                w = min(1200, max(800, sw - 80))
+                h = min(760, max(600, sh - 80))
+                x = max(0, (sw - w) // 2)
+                y = max(0, (sh - h) // 2)
+                root.geometry(f"{w}x{h}+{x}+{y}")
             root.deiconify()
             root.lift()
+            try:
+                root.attributes("-topmost", True)
+            except Exception:
+                pass
             root.focus_force()
             root.update_idletasks()
+            try:
+                root.after(300, lambda: root.attributes("-topmost", False))
+            except Exception:
+                pass
 
             def _dock_icon_when_safe() -> None:
                 try:
@@ -30482,8 +30582,8 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 root.after(450, _dock_icon_when_safe)
             except tk.TclError:
                 pass
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"_present_main_window: {exc}", file=sys.stderr)
 
     def _on_app_close() -> None:
         if ver_session_active[0]:
@@ -30549,21 +30649,32 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
 
 
 def main() -> None:
+    _log_startup(
+        f"avvio frozen={getattr(sys, 'frozen', False)} exe={sys.executable} version={APP_VERSION}"
+    )
     if Fernet is None:
-        print("Installa cryptography: pip install cryptography", file=sys.stderr)
+        _log_startup("cryptography non disponibile: uscita")
         sys.exit(1)
 
     _darwin_prepare_stdin_for_tk_aqua()
 
     root = tk.Tk()
     root.title("Conti di casa")
-    # La root resta nascosta fino al bisogno (evita la grande finestra vuota dietro i dialoghi).
-    try:
-        root.withdraw()
-    except Exception:
-        pass
+    # Su macOS la root resta nascosta dietro i dialoghi; su Windows tenerla visibile evita
+    # finestre di avvio (cartella dati, login, posta) che non compaiono.
+    if not _startup_root_stays_visible():
+        try:
+            root.withdraw()
+        except Exception:
+            pass
+    else:
+        try:
+            root.update_idletasks()
+            root.lift()
+        except Exception:
+            pass
 
-    if not security_auth.verify_pillow_for_login_ui(parent=None):
+    if not security_auth.verify_pillow_for_login_ui(parent=root):
         print("Avvio interrotto: Pillow non disponibile per UI login.", file=sys.stderr)
         try:
             root.destroy()
@@ -30582,18 +30693,44 @@ def main() -> None:
             pass
         return
     data_dir = data_workspace.data_dir()
-    try:
-        acquire_data_workspace_lock(data_dir, app_kind="desktop")
-    except Exception as exc:
-        # Non abbiamo creato il segnaposto: non va cancellato un file altrui ancora valido.
+
+    def _abort_startup_for_lock_error(exc: Exception) -> None:
         try:
-            messagebox.showerror("Cartella dati in uso", str(exc), parent=None)
+            messagebox.showerror("Cartella dati in uso", str(exc), parent=root)
         except Exception:
             print(f"Avvio interrotto: {exc}", file=sys.stderr)
         try:
             root.destroy()
         except Exception:
             pass
+
+    try:
+        acquire_data_workspace_lock(data_dir, app_kind="desktop")
+    except DataWorkspaceLockError as exc:
+        remove_marker = False
+        if exc.recoverable:
+            try:
+                remove_marker = messagebox.askyesno(
+                    "Cartella dati in uso",
+                    f"{exc}\n\n"
+                    "Rimuovere il segnaposto e riprovare?\n\n"
+                    "Scegli Sì solo se Conti di casa non è aperto altrove.",
+                    parent=root,
+                )
+            except Exception:
+                remove_marker = False
+        if remove_marker:
+            release_data_workspace_lock(data_dir)
+            try:
+                acquire_data_workspace_lock(data_dir, app_kind="desktop")
+            except Exception as retry_exc:
+                _abort_startup_for_lock_error(retry_exc)
+                return
+        else:
+            _abort_startup_for_lock_error(exc)
+            return
+    except Exception as exc:
+        _abort_startup_for_lock_error(exc)
         return
 
     atexit.register(release_data_workspace_lock, data_dir)
@@ -30602,7 +30739,7 @@ def main() -> None:
     except Exception as exc:
         release_data_workspace_lock(data_dir)
         try:
-            messagebox.showerror("Conti di casa", str(exc), parent=None)
+            messagebox.showerror("Conti di casa", str(exc), parent=root)
         except Exception:
             print(f"Avvio interrotto: {exc}", file=sys.stderr)
         try:
@@ -30611,10 +30748,11 @@ def main() -> None:
             pass
         return
 
-    try:
-        root.withdraw()
-    except Exception:
-        pass
+    if not _startup_root_stays_visible():
+        try:
+            root.withdraw()
+        except Exception:
+            pass
 
     up = os_boot_time.seconds_since_os_boot()
     if up is not None and up < _BOOT_DROPBOX_CONFIRM_WITHIN_SECONDS:
@@ -30625,7 +30763,7 @@ def main() -> None:
             "prima di continuare.\n\n"
             "OK = continua e carica il database\n"
             "Annulla = esci dall'applicazione",
-            parent=None,
+            parent=root,
         ):
             print("Avvio annullato: conferma Dropbox dopo boot non accettata.", file=sys.stderr)
             try:
@@ -30733,8 +30871,30 @@ def main() -> None:
         session.is_registered = bool(
             (db_holder[0].get("user_profile") or {}).get("registration_verified")
         )
-    build_ui(db_holder[0], root, session, path_holder, key_path_holder)
+    try:
+        build_ui(db_holder[0], root, session, path_holder, key_path_holder)
+    except Exception as exc:
+        release_data_workspace_lock(data_dir)
+        try:
+            import traceback
+
+            traceback.print_exc()
+            messagebox.showerror(
+                "Conti di casa",
+                f"Errore durante l'apertura dell'interfaccia:\n\n{exc}",
+                parent=root,
+            )
+        except Exception:
+            print(f"Errore build_ui: {exc}", file=sys.stderr)
+        try:
+            root.destroy()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        _log_startup_exception("main() non gestita")
+        raise

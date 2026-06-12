@@ -22,6 +22,31 @@ Da sorgente:
 python3 main_app.py
 ```
 
+Su Windows, evitare `python3` e avviare con:
+
+```bat
+scripts\start_windows.cmd
+```
+
+oppure:
+
+```bat
+py -3 main_app.py
+```
+
+## Installer Windows
+
+Il file `setup.exe` viene prodotto da GitHub Actions, non è committato nel repository.
+
+Per scaricarlo:
+
+1. Apri la scheda **Actions** su GitHub.
+2. Seleziona il workflow **Windows build**.
+3. Apri l'ultima esecuzione riuscita.
+4. Scarica l'artifact **ContiDiCasa-Windows-Setup-...**: contiene `ContiDiCasa-Windows-Setup.exe`.
+
+Lo stesso workflow carica anche **ContiDiCasa-Windows-...**, lo zip della cartella completa dell'app.
+
 Creazione dell'app macOS:
 
 ```bash
@@ -127,6 +152,8 @@ Esecuzione:
 python3 -m unittest discover
 python3 -m compileall -q .
 ```
+
+Su Windows usare `py -3 -m unittest discover` e `py -3 -m compileall -q .`.
 
 I test coprono le parti piu delicate: importi euro, saldi consolidati, regole storiche, carte di credito e sidecar light.
 

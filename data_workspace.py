@@ -2,12 +2,16 @@
 Cartella dati configurabile dall'utente: contiene ``conti_di_casa.key``, i file ``.enc``,
 la sottocartella ``legacy_import/`` (JSON unificato e bootstrap sessione).
 
-Il percorso scelto è salvato in ``~/Library/Application Support/ContiDiCasa/data_workspace.json``.
+Il percorso scelto è salvato in:
+- macOS: ``~/Library/Application Support/ContiDiCasa/data_workspace.json``
+- Windows: ``%APPDATA%\\ContiDiCasa\\data_workspace.json``
 """
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import sys
 from pathlib import Path
 
 _CONFIG_NAME = "data_workspace.json"
@@ -16,6 +20,11 @@ _workspace_root: Path | None = None
 
 
 def app_support_dir() -> Path:
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA")
+        if base:
+            return Path(base) / "ContiDiCasa"
+        return Path.home() / "AppData" / "Roaming" / "ContiDiCasa"
     return Path.home() / "Library" / "Application Support" / "ContiDiCasa"
 
 
@@ -256,9 +265,19 @@ def configure_data_workspace_interactive(parent) -> bool:
     win.grab_set()
     try:
         win.update_idletasks()
-        px = parent.winfo_rootx() + (parent.winfo_width() - win.winfo_reqwidth()) // 2
-        py = parent.winfo_rooty() + (parent.winfo_height() - win.winfo_reqheight()) // 2
-        win.geometry(f"+{max(0, px)}+{max(0, py)}")
+        ww = win.winfo_reqwidth()
+        wh = win.winfo_reqheight()
+        if sys.platform == "win32":
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            win.geometry(f"+{max(0, (sw - ww) // 2)}+{max(0, (sh - wh) // 2)}")
+        else:
+            px = parent.winfo_rootx() + (parent.winfo_width() - ww) // 2
+            py = parent.winfo_rooty() + (parent.winfo_height() - wh) // 2
+            win.geometry(f"+{max(0, px)}+{max(0, py)}")
+        win.deiconify()
+        win.lift()
+        win.focus_force()
     except Exception:
         pass
     parent.wait_window(win)

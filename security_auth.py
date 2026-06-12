@@ -95,7 +95,9 @@ def verify_pillow_for_login_ui(parent: tk.Misc | None = None) -> bool:
         messagebox.showerror(
             "Dipendenza mancante — Pillow",
             "L'applicazione richiede Pillow per la finestra di accesso (immagine JPEG incorporata).\n\n"
-            "Installazione:\n  python3 -m pip install Pillow\n\n"
+            "Installazione:\n"
+            "  macOS/Linux: python3 -m pip install Pillow\n"
+            "  Windows: py -3 -m pip install Pillow\n\n"
             "Compilazione (PyInstaller/equivalenti): includere il pacchetto Pillow "
             "(verificare che risultino inclusi PIL, PIL.Image, PIL.ImageTk).",
             parent=parent,
