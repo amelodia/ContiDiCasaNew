@@ -25,7 +25,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 Name: "italian"; MessagesFile: "compiler:Languages\Italian.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "Crea un collegamento sul desktop"; GroupDescription: "Collegamenti:"; Flags: unchecked
+Name: "desktopicon"; Description: "Crea un collegamento sul desktop"; GroupDescription: "Collegamenti:"; Flags: checked
 
 [Files]
 Source: "..\dist\ContiDiCasa\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
