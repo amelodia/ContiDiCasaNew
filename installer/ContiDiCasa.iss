@@ -1,7 +1,9 @@
 #define MyAppName "Conti di casa"
 #define MyAppExeName "ContiDiCasa.exe"
 #define MyAppPublisher "Conti di casa"
+#ifndef MyAppVersion
 #define MyAppVersion GetEnv("CDC_APP_VERSION")
+#endif
 
 [Setup]
 AppId={{B2C59B64-70F6-4F09-9F8A-9B0E9C30A6D4}
@@ -25,7 +27,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 Name: "italian"; MessagesFile: "compiler:Languages\Italian.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "Crea un collegamento sul desktop"; GroupDescription: "Collegamenti:"; Flags: unchecked
+Name: "desktopicon"; Description: "Crea un collegamento sul desktop"; GroupDescription: "Collegamenti:"; Flags: checked
 
 [Files]
 Source: "..\dist\ContiDiCasa\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs

@@ -30,8 +30,29 @@ from dataclasses import asdict
 from datetime import date, datetime, timedelta
 
 try:
-    from cryptography.fernet import Fernet, InvalidToken
-except Exception:  # pragma: no cover - runtime optional dependency check
+    def _import_fernet():
+        try:
+            from cryptography.fernet import Fernet as _Fernet, InvalidToken as _InvalidToken
+        except ImportError as exc:
+            print(
+                "cryptography non importabile. Usa lo stesso Python con cui avvii l'app:\n"
+                f"  {sys.executable} -m pip install -r requirements.txt\n"
+                f"Dettaglio: {exc}",
+                file=sys.stderr,
+            )
+            return None, Exception
+        except Exception as exc:  # pragma: no cover - DLL/_cffi_backend mancante nel bundle
+            print(
+                "cryptography presente ma non caricabile.\n"
+                f"  {sys.executable} -m pip install --force-reinstall cryptography cffi\n"
+                f"Dettaglio: {exc}",
+                file=sys.stderr,
+            )
+            return None, Exception
+        return _Fernet, _InvalidToken
+
+    Fernet, InvalidToken = _import_fernet()
+except Exception:
     Fernet = None
     InvalidToken = Exception
 
@@ -346,6 +367,11 @@ def _ui_font_tuple(size: int, *modifiers: str, family: str = "TkDefaultFont") ->
     if int(size) < 0:
         scaled = -scaled
     return (family, scaled, *modifiers)
+
+
+def _startup_root_stays_visible() -> bool:
+    """Su Windows le finestre Toplevel/messagebox con parent withdrawn spesso non compaiono."""
+    return platform.system() == "Windows"
 
 
 def _darwin_prepare_stdin_for_tk_aqua() -> None:
@@ -9357,13 +9383,31 @@ def build_ui(
 
     data_file_var.trace_add("write", _sync_path_holders_from_vars)
     key_file_var.trace_add("write", _sync_path_holders_from_vars)
-    # La root resta nascosta durante tutta la costruzione dell'interfaccia: così non si vede
-    # una finestra vuota in fullscreen (su macOS il -fullscreen nativo dà spesso un flash nero in alto).
-    try:
-        root.withdraw()
-    except Exception:
-        pass
+    # Su macOS nascondi la root durante la costruzione; su Windows tenerla visibile evita che l'app sembri sparita.
+    if not _startup_root_stays_visible():
+        try:
+            root.withdraw()
+        except Exception:
+            pass
     root.title(window_title_for_session(db_holder[0], session_holder[0], show_clock=True))
+    _build_loading_label: tk.Label | None = None
+    if _startup_root_stays_visible():
+        try:
+            _build_loading_label = tk.Label(
+                root,
+                text="Caricamento interfaccia in corso…\nAttendere qualche secondo.",
+                font=("TkDefaultFont", 14),
+                bg=MOVIMENTI_PAGE_BG,
+                fg="#333333",
+                justify="center",
+            )
+            _build_loading_label.pack(expand=True, fill=tk.BOTH, padx=24, pady=24)
+            root.update_idletasks()
+            root.deiconify()
+            root.lift()
+            root.focus_force()
+        except Exception:
+            _build_loading_label = None
     _main_window_presented: list[bool] = [False]
     login_window_to_close = getattr(root, "_cdc_login_window_to_close", None)
 
@@ -9422,15 +9466,25 @@ def build_ui(
                 _apply_macos_fullscreen_window()
                 root.deiconify()
             else:
-                root.geometry("1200x760")
-                try:
-                    root.state("zoomed")
-                except Exception:
-                    pass
+                sw = root.winfo_screenwidth()
+                sh = root.winfo_screenheight()
+                w = min(1200, max(800, sw - 80))
+                h = min(760, max(600, sh - 80))
+                x = max(0, (sw - w) // 2)
+                y = max(0, (sh - h) // 2)
+                root.geometry(f"{w}x{h}+{x}+{y}")
                 root.deiconify()
             root.lift()
+            try:
+                root.attributes("-topmost", True)
+            except Exception:
+                pass
             root.focus_force()
             root.update_idletasks()
+            try:
+                root.after(300, lambda: root.attributes("-topmost", False))
+            except Exception:
+                pass
             if login_window_to_close is not None:
                 try:
                     login_window_to_close.destroy()
@@ -9452,6 +9506,11 @@ def build_ui(
 
     _is_macos_ui = platform.system() == "Darwin"
     main_nb_shell = tk.Frame(root, bg=MOVIMENTI_PAGE_BG)
+    if _build_loading_label is not None:
+        try:
+            _build_loading_label.destroy()
+        except Exception:
+            pass
     # Margine superiore più generoso su macOS fullscreen: prima riga sempre sotto menu bar/notch.
     main_nb_shell.pack(
         fill=tk.BOTH, expand=True, padx=8, pady=(18, 6) if _is_macos_ui else 8
@@ -34700,7 +34759,6 @@ def _confirm_dropbox_ready_after_recent_boot(root: tk.Tk) -> bool:
 
 def main() -> None:
     if Fernet is None:
-        print("Installa cryptography: pip install cryptography", file=sys.stderr)
         sys.exit(1)
 
     _darwin_prepare_stdin_for_tk_aqua()
@@ -34710,12 +34768,19 @@ def main() -> None:
     _apply_sun_valley_ttk_theme(root)
     root.title("Conti di casa")
     # La root resta nascosta fino al bisogno (evita la grande finestra vuota dietro i dialoghi).
-    try:
-        root.withdraw()
-    except Exception:
-        pass
+    if not _startup_root_stays_visible():
+        try:
+            root.withdraw()
+        except Exception:
+            pass
+    else:
+        try:
+            root.update_idletasks()
+            root.lift()
+        except Exception:
+            pass
 
-    if not security_auth.verify_pillow_for_login_ui(parent=None):
+    if not security_auth.verify_pillow_for_login_ui(parent=root):
         print("Avvio interrotto: Pillow non disponibile per UI login.", file=sys.stderr)
         try:
             root.destroy()
@@ -34748,7 +34813,7 @@ def main() -> None:
     except Exception as exc:
         # Non abbiamo creato il segnaposto: non va cancellato un file altrui ancora valido.
         try:
-            messagebox.showerror("Cartella dati in uso", str(exc), parent=None)
+            messagebox.showerror("Cartella dati in uso", str(exc), parent=root)
         except Exception:
             print(f"Avvio interrotto: {exc}", file=sys.stderr)
         try:
@@ -34775,7 +34840,7 @@ def main() -> None:
     except Exception as exc:
         release_data_workspace_lock(data_dir)
         try:
-            messagebox.showerror("Conti di casa", str(exc), parent=None)
+            messagebox.showerror("Conti di casa", str(exc), parent=root)
         except Exception:
             print(f"Avvio interrotto: {exc}", file=sys.stderr)
         try:
@@ -34784,10 +34849,11 @@ def main() -> None:
             pass
         return
 
-    try:
-        root.withdraw()
-    except Exception:
-        pass
+    if not _startup_root_stays_visible():
+        try:
+            root.withdraw()
+        except Exception:
+            pass
 
     # Root resta nascosta: lo splash Dropbox è un Toplevel; ``deiconify`` qui causava un flash visivo.
 

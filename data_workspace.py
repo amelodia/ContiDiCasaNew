@@ -2,12 +2,16 @@
 Cartella dati configurabile dall'utente: contiene ``conti_di_casa.key``, i file ``.enc``,
 la sottocartella ``legacy_import/`` (JSON unificato e bootstrap sessione).
 
-Il percorso scelto è salvato in ``~/Library/Application Support/ContiDiCasa/data_workspace.json``.
+Il percorso scelto è salvato in:
+- macOS: ``~/Library/Application Support/ContiDiCasa/data_workspace.json``
+- Windows: ``%APPDATA%\\ContiDiCasa\\data_workspace.json``
 """
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import sys
 from pathlib import Path
 
 _CONFIG_NAME = "data_workspace.json"
@@ -16,6 +20,11 @@ _workspace_root: Path | None = None
 
 
 def app_support_dir() -> Path:
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA")
+        if base:
+            return Path(base) / "ContiDiCasa"
+        return Path.home() / "AppData" / "Roaming" / "ContiDiCasa"
     return Path.home() / "Library" / "Application Support" / "ContiDiCasa"
 
 
