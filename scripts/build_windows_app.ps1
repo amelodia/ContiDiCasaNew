@@ -95,7 +95,12 @@ Write-Host "Layout OK: $($pythonDll.Name) accanto a ContiDiCasa.exe" -Foreground
 
 Compress-Archive -Path (Join-Path $AppDir "*") -DestinationPath $ZipPath -Force
 
-$env:CDC_APP_VERSION = python -c "import app_version; print(app_version.APP_VERSION)"
+$env:CDC_APP_VERSION = (
+    python -c "import app_version; print(app_version.APP_VERSION, end='')"
+).Trim()
+if (-not $env:CDC_APP_VERSION) {
+    $env:CDC_APP_VERSION = "0.0.0"
+}
 $Iscc = Get-Command "ISCC.exe" -ErrorAction SilentlyContinue
 $IsccPath = $null
 if ($Iscc) {
@@ -108,7 +113,11 @@ if (-not $IsccPath) {
     }
 }
 if ($IsccPath) {
+    Write-Host "Inno Setup: versione $($env:CDC_APP_VERSION)" -ForegroundColor Cyan
     & $IsccPath (Join-Path $Root "installer\ContiDiCasa.iss")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Inno Setup fallito con codice $LASTEXITCODE"
+    }
     if (-not (Test-Path $InstallerPath)) {
         throw "Installer Inno Setup non trovato: $InstallerPath"
     }
