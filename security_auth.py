@@ -150,6 +150,11 @@ def pulse_login_loading_window(win: tk.Misc | None) -> None:
 
     Utile durante operazioni lunghe (es. ricarico .enc dopo l’accesso) anche senza passare da errori su email/password.
     """
+    update_login_loading_message(win, None)
+
+
+def update_login_loading_message(win: tk.Misc | None, text: str | None) -> None:
+    """Aggiorna il testo «Caricamento…» sulla finestra login e forza un refresh UI."""
     if win is None:
         return
     try:
@@ -165,7 +170,10 @@ def pulse_login_loading_window(win: tk.Misc | None) -> None:
     lbl = getattr(win, "_cdc_login_loading_label", None)
     if lbl is not None:
         try:
-            lbl.configure(fg=CDC_TIPO_TASTI_BTN_FG)
+            if text and text.strip():
+                lbl.configure(text=text.strip(), fg=CDC_TIPO_TASTI_BTN_FG)
+            else:
+                lbl.configure(text="Caricamento in corso...", fg=CDC_TIPO_TASTI_BTN_FG)
         except Exception:
             pass
     try:

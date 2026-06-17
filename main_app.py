@@ -8943,6 +8943,7 @@ def _finalize_startup_db_with_light_sidecar(
     *,
     ui_parent: tk.Misc | None = None,
     after_user_login: bool = False,
+    progress: Callable[[str], None] | None = None,
 ) -> tuple[int, int]:
     """Fonde ``*_light.enc`` nel DB; salva completo+light solo se il merge ha importato righe.
 
@@ -8961,15 +8962,26 @@ def _finalize_startup_db_with_light_sidecar(
         import light_enc_sidecar
 
         n_new, n_up = light_enc_sidecar.merge_light_sidecar_at_startup(
-            db, primary_path, data_workspace.default_key_file()
+            db, primary_path, data_workspace.default_key_file(), progress=progress
         )
         if n_new + n_up > 0:
+            if progress is not None:
+                bits: list[str] = []
+                if n_new > 0:
+                    bits.append(f"{n_new} nuova/e")
+                if n_up > 0:
+                    bits.append(f"{n_up} modifica/e")
+                progress(
+                    "Salvataggio database completo su Dropbox ("
+                    + " e ".join(bits)
+                    + ")… può richiedere tempo."
+                )
             save_encrypted_db_dual(
                 db,
                 primary_path,
                 data_workspace.default_key_file(),
             )
-            parts: list[str] = []
+            parts: list[str] = ["Sincronizzazione con Conti light completata."]
             if n_new > 0:
                 parts.append(
                     f"Importate {n_new} nuova/e registrazione/i create su Conti light "
@@ -8980,7 +8992,7 @@ def _finalize_startup_db_with_light_sidecar(
                     f"Applicate {n_up} modifica/e o sospensioni da Conti light "
                     f"(righe già presenti ma cambiate dall'app iOS)."
                 )
-            msg = "\n".join(parts) + "\n\nSalvati database completo e file light nella cartella dati."
+            msg = "\n\n".join(parts) + "\n\nSalvati database completo e file light nella cartella dati."
             if ui_parent is not None:
                 _show_centered_info_dialog(ui_parent, "Sincronizzazione Conti light", msg)
             return n_new, n_up
@@ -9384,30 +9396,31 @@ def build_ui(
     data_file_var.trace_add("write", _sync_path_holders_from_vars)
     key_file_var.trace_add("write", _sync_path_holders_from_vars)
     # Su macOS nascondi la root durante la costruzione; su Windows tenerla visibile evita che l'app sembri sparita.
-    if not _startup_root_stays_visible():
+    if not _startup_root_stays_visible() and getattr(root, "_cdc_early_build_loading_label", None) is None:
         try:
             root.withdraw()
         except Exception:
             pass
     root.title(window_title_for_session(db_holder[0], session_holder[0], show_clock=True))
     _build_loading_label: tk.Label | None = None
-    if _startup_root_stays_visible():
-        try:
-            _build_loading_label = tk.Label(
-                root,
-                text="Caricamento interfaccia in corso…\nAttendere qualche secondo.",
-                font=("TkDefaultFont", 14),
-                bg=MOVIMENTI_PAGE_BG,
-                fg="#333333",
-                justify="center",
-            )
-            _build_loading_label.pack(expand=True, fill=tk.BOTH, padx=24, pady=24)
-            root.update_idletasks()
-            root.deiconify()
-            root.lift()
-            root.focus_force()
-        except Exception:
-            _build_loading_label = None
+    if _startup_root_stays_visible() or getattr(root, "_cdc_early_build_loading_label", None) is None:
+        if _startup_root_stays_visible():
+            try:
+                _build_loading_label = tk.Label(
+                    root,
+                    text="Caricamento interfaccia in corso…\nAttendere qualche secondo.",
+                    font=("TkDefaultFont", 14),
+                    bg=MOVIMENTI_PAGE_BG,
+                    fg="#333333",
+                    justify="center",
+                )
+                _build_loading_label.pack(expand=True, fill=tk.BOTH, padx=24, pady=24)
+                root.update_idletasks()
+                root.deiconify()
+                root.lift()
+                root.focus_force()
+            except Exception:
+                _build_loading_label = None
     _main_window_presented: list[bool] = [False]
     login_window_to_close = getattr(root, "_cdc_login_window_to_close", None)
 
@@ -9460,6 +9473,16 @@ def build_ui(
         if _main_window_presented[0]:
             return
         _main_window_presented[0] = True
+        early = getattr(root, "_cdc_early_build_loading_label", None)
+        if early is not None:
+            try:
+                early.destroy()
+            except Exception:
+                pass
+            try:
+                delattr(root, "_cdc_early_build_loading_label")
+            except Exception:
+                pass
         try:
             if platform.system() == "Darwin":
                 # Prep + fullscreen mentre non è ancora visibile il primo pixel (root ancora ``withdraw()``).
@@ -9506,6 +9529,16 @@ def build_ui(
 
     _is_macos_ui = platform.system() == "Darwin"
     main_nb_shell = tk.Frame(root, bg=MOVIMENTI_PAGE_BG)
+    early_lbl = getattr(root, "_cdc_early_build_loading_label", None)
+    if early_lbl is not None:
+        try:
+            early_lbl.destroy()
+        except Exception:
+            pass
+        try:
+            delattr(root, "_cdc_early_build_loading_label")
+        except Exception:
+            pass
     if _build_loading_label is not None:
         try:
             _build_loading_label.destroy()
@@ -34621,6 +34654,49 @@ def _apply_sun_valley_ttk_theme(root: tk.Tk) -> None:
         pass
 
 
+def _handoff_login_to_main_build(
+    login_win: tk.Misc | None,
+    root: tk.Tk,
+    *,
+    message: str = "Apertura interfaccia in corso",
+) -> None:
+    """Chiude il login e mostra subito la root con messaggio di attesa (evita freeze percepito su macOS)."""
+    security_auth.update_login_loading_message(login_win, message)
+    try:
+        if login_win is not None and login_win.winfo_exists():
+            login_win.destroy()
+    except Exception:
+        pass
+    try:
+        setattr(root, "_cdc_login_window_to_close", None)
+    except Exception:
+        pass
+    prev = getattr(root, "_cdc_early_build_loading_label", None)
+    if prev is not None:
+        try:
+            prev.destroy()
+        except Exception:
+            pass
+    try:
+        lbl = tk.Label(
+            root,
+            text=f"{message}…\nAttendere.",
+            font=("TkDefaultFont", 14),
+            bg=MOVIMENTI_PAGE_BG,
+            fg="#333333",
+            justify="center",
+        )
+        lbl.pack(expand=True, fill=tk.BOTH, padx=24, pady=24)
+        setattr(root, "_cdc_early_build_loading_label", lbl)
+        root.deiconify()
+        root.lift()
+        root.focus_force()
+        root.update_idletasks()
+        root.update()
+    except Exception:
+        pass
+
+
 def _show_centered_info_dialog(parent: tk.Misc, title: str, message: str) -> None:
     """Dialogo informativo modale centrato sullo schermo (non ancorato al bordo della finestra parent)."""
     win = tk.Toplevel(parent)
@@ -34972,20 +35048,34 @@ def main() -> None:
         except Exception:
             pass
 
-    security_auth.pulse_login_loading_window(login_window_holder[0])
+    security_auth.update_login_loading_message(
+        login_window_holder[0], "Allineamento file dati utente…"
+    )
     path_holder[0] = migrate_data_path_after_login(
         db_holder[0], session, path_holder[0]
     )
+
+    def _post_login_progress(msg: str) -> None:
+        security_auth.update_login_loading_message(login_window_holder[0], msg)
+
     _finalize_startup_db_with_light_sidecar(
-        db_holder[0], path_holder[0], ui_parent=root, after_user_login=True
+        db_holder[0],
+        path_holder[0],
+        ui_parent=root,
+        after_user_login=True,
+        progress=_post_login_progress,
     )
-    security_auth.pulse_login_loading_window(login_window_holder[0])
+    _handoff_login_to_main_build(
+        login_window_holder[0],
+        root,
+        message="Costruzione interfaccia",
+    )
+    login_window_holder[0] = None
     if session.entered_via_backdoor:
         security_auth.ensure_security(db_holder[0])
         session.is_registered = bool(
             (db_holder[0].get("user_profile") or {}).get("registration_verified")
         )
-    security_auth.pulse_login_loading_window(login_window_holder[0])
     try:
         build_ui(db_holder[0], root, session, path_holder, key_path_holder)
     except Exception:

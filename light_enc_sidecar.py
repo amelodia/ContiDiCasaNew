@@ -495,11 +495,26 @@ def merge_light_sidecar_at_startup(
     db: dict,
     primary_enc: Path,
     key_path: Path,
+    *,
+    progress: Callable[[str], None] | None = None,
 ) -> tuple[int, int]:
     """Se esiste il sidecar, fonde le registrazioni light nel DB già caricato.
 
     Ritorna ``(nuove_righe, righe_aggiornate)``.
     """
+    p = light_enc_path_for_primary(primary_enc)
+    if not p.is_file():
+        return 0, 0
+    if progress is not None:
+        progress("Attesa aggiornamento file Conti light (Dropbox)…")
+    try:
+        import cloud_sync_wait
+
+        cloud_sync_wait.wait_for_paths_stable_if_cloud([p, key_path], ui_parent=None)
+    except Exception:
+        pass
+    if progress is not None:
+        progress("Integrazione dati da Conti light…")
     light = load_light_enc_if_present(primary_enc, key_path)
     if not light:
         return 0, 0

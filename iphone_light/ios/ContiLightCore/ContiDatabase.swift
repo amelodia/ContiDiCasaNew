@@ -318,6 +318,26 @@ public enum ContiDatabase {
         firstExistingURL(in: userDatabaseEncURLCandidates(inFolder: folder, email: email))
     }
 
+    /// Path canonico del sidecar light per la scrittura (nome fisso nella cartella dati).
+    /// Evita duplicati Dropbox quando in sessione resta un URL alias diverso da quello del file «ufficiale».
+    public static func canonicalLightEncURLForWrite(
+        inFolder folder: URL,
+        email: String,
+        fallback: URL
+    ) -> URL {
+        let folderStd = folder.standardizedFileURL
+        if let existing = resolvePrimaryEncURL(inFolder: folderStd, email: email) {
+            return existing
+        }
+        let expected = userDatabaseEncURLCandidates(inFolder: folderStd, email: email).first
+            ?? fallback
+        if fallback.deletingLastPathComponent().standardizedFileURL.path == folderStd.path,
+           fallback.lastPathComponent == expected.lastPathComponent {
+            return expected
+        }
+        return expected
+    }
+
     /// Un file `.key` nella cartella (preferenza `conti_di_casa.key`).
     public static func preferredKeyFileURL(inFolder folder: URL) -> URL? {
         let fm = FileManager.default
@@ -663,6 +683,27 @@ public enum ContiDatabase {
         data = try Data(contentsOf: readURL, options: [.uncached])
         Thread.sleep(forTimeInterval: 2.0)
         data = try Data(contentsOf: readURL, options: [.uncached])
+        return data
+    }
+
+    /// Lettura `.enc` su Dropbox con più passaggi finché il blob non smette di cambiare (cache File Provider).
+    /// Mitiga l’apertura con file «vecchio» al primo avvio; il secondo avvio spesso funzionava perché la cache era già idratata.
+    public static func coordinatedDataContentsPreferringHydratedDropbox(_ url: URL) throws -> Data {
+        if !pathLooksUnderDropbox(url) {
+            return try coordinatedDataContents(of: url)
+        }
+        var data = try coordinatedDataContents(of: url)
+        for pass in 0 ..< 3 {
+            let pause = pass == 0 ? 1.0 : 1.35
+            Thread.sleep(forTimeInterval: pause)
+            _ = waitForFileStableIfDropbox(url, stableSeconds: 0.85, maxWaitSeconds: 10)
+            let again = try coordinatedDataContents(of: url)
+            if again == data {
+                if pass >= 1 { break }
+            } else {
+                data = again
+            }
+        }
         return data
     }
 
@@ -2557,7 +2598,8 @@ public enum ContiDatabase {
         try saveLightEncToDropboxWithLocalBackup(
             lightDb: lightExport,
             lightEncURL: lightEncURL,
-            keyString: keyString
+            keyString: keyString,
+            email: email
         )
         let msg = """
         Salvato il file light nella cartella dati. \
@@ -2664,16 +2706,26 @@ public enum ContiDatabase {
     }
 
     /// Reinvia su Dropbox la bozza locale (`*_pending.enc`).
-    public static func pushPendingLightBackupToDropbox(lightEncURL: URL, keyURL: URL) throws {
+    public static func pushPendingLightBackupToDropbox(
+        lightEncURL: URL,
+        keyURL: URL,
+        email: String
+    ) throws {
         let pendingURL = pendingLightBackupURL(forLightEncURL: lightEncURL)
         guard FileManager.default.fileExists(atPath: pendingURL.path) else {
             throw ContiLightImmissioneError.message("Nessuna bozza locale da inviare.")
         }
+        let folder = lightEncURL.deletingLastPathComponent()
+        let writeURL = canonicalLightEncURLForWrite(
+            inFolder: folder,
+            email: email,
+            fallback: lightEncURL
+        )
         let keyString = try coordinatedStringContents(of: keyURL, encoding: .utf8)
         let db = try loadEncryptedDBFull(encURL: pendingURL, keyURL: keyURL)
-        try backupExistingLightEncBeforeWrite(lightEncURL: lightEncURL)
-        try assertSafeToSave(lightEncURL)
-        try writeFernetEncryptedDb(db: db, encURL: lightEncURL, keyString: keyString)
+        try backupExistingLightEncBeforeWrite(lightEncURL: writeURL)
+        try assertSafeToSave(writeURL)
+        try writeFernetEncryptedDb(db: db, encURL: writeURL, keyString: keyString)
         removePendingLightBackupIfPresent(lightEncURL: lightEncURL)
     }
 
@@ -2684,19 +2736,26 @@ public enum ContiDatabase {
     public static func applyAutomaticPendingLightRecoveryIfNeeded(
         lightEncURL: URL,
         keyURL: URL,
+        email: String,
         dropboxLoadedDb: [String: Any]
     ) -> (sessionDb: [String: Any], recoveryNote: String?) {
         guard localLightRecoveryState(forLightEncURL: lightEncURL).hasPendingWrite else {
             return (dropboxLoadedDb, nil)
         }
+        let folder = lightEncURL.deletingLastPathComponent()
+        let writeURL = canonicalLightEncURLForWrite(
+            inFolder: folder,
+            email: email,
+            fallback: lightEncURL
+        )
         do {
-            try pushPendingLightBackupToDropbox(lightEncURL: lightEncURL, keyURL: keyURL)
-            let data = try coordinatedDataContents(of: lightEncURL)
+            try pushPendingLightBackupToDropbox(lightEncURL: writeURL, keyURL: keyURL, email: email)
+            let data = try coordinatedDataContents(of: writeURL)
             let keyString = try coordinatedStringContents(of: keyURL, encoding: .utf8)
             let (db, _) = try loadDBForEmail(
                 primaryEncData: data,
                 keyString: keyString,
-                primaryEncURL: lightEncURL
+                primaryEncURL: writeURL
             )
             return (db, "Recuperata e sincronizzata bozza di un salvataggio non completato.")
         } catch {
@@ -2746,13 +2805,20 @@ public enum ContiDatabase {
     private static func saveLightEncToDropboxWithLocalBackup(
         lightDb: [String: Any],
         lightEncURL: URL,
-        keyString: String
+        keyString: String,
+        email: String
     ) throws {
-        try writePendingLightBackup(lightDb: lightDb, lightEncURL: lightEncURL, keyString: keyString)
-        try backupExistingLightEncBeforeWrite(lightEncURL: lightEncURL)
-        try assertSafeToSave(lightEncURL)
-        try writeFernetEncryptedDb(db: lightDb, encURL: lightEncURL, keyString: keyString)
-        removePendingLightBackupIfPresent(lightEncURL: lightEncURL)
+        let folder = lightEncURL.deletingLastPathComponent()
+        let writeURL = canonicalLightEncURLForWrite(
+            inFolder: folder,
+            email: email,
+            fallback: lightEncURL
+        )
+        try writePendingLightBackup(lightDb: lightDb, lightEncURL: writeURL, keyString: keyString)
+        try backupExistingLightEncBeforeWrite(lightEncURL: writeURL)
+        try assertSafeToSave(writeURL)
+        try writeFernetEncryptedDb(db: lightDb, encURL: writeURL, keyString: keyString)
+        removePendingLightBackupIfPresent(lightEncURL: writeURL)
     }
 
     /// Flush di sicurezza (es. passaggio in background): riscrive il light se la sessione è valida.
@@ -2774,11 +2840,43 @@ public enum ContiDatabase {
         try saveLightEncToDropboxWithLocalBackup(
             lightDb: lightExport,
             lightEncURL: lightEncURL,
-            keyString: keyString
+            keyString: keyString,
+            email: email
         )
     }
 
-    /// Cifratura Fernet + scrittura atomica (senza controlli cartella: uso interno dopo ``assertSafeToSave``).
+    /// Scrittura su provider cloud (Dropbox/File): ``NSFileCoordinator`` e **no** ``.atomic``
+    /// (su iOS ``.atomic`` crea spesso un secondo file / copia in conflitto invece di sostituire).
+    private static func writeDataToEncURL(_ data: Data, encURL: URL) throws {
+        try FileManager.default.createDirectory(
+            at: encURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        if pathLooksUnderDropbox(encURL) {
+            let coordinator = NSFileCoordinator(filePresenter: nil)
+            var coordinatorError: NSError?
+            var writeError: Error?
+            let writeOptions: NSFileCoordinator.WritingOptions =
+                FileManager.default.fileExists(atPath: encURL.path) ? [.forReplacing] : []
+            coordinator.coordinate(
+                writingItemAt: encURL,
+                options: writeOptions,
+                error: &coordinatorError
+            ) { writeURL in
+                do {
+                    try data.write(to: writeURL, options: [])
+                } catch {
+                    writeError = error
+                }
+            }
+            if let coordinatorError { throw coordinatorError }
+            if let writeError { throw writeError }
+            return
+        }
+        try data.write(to: encURL, options: .atomic)
+    }
+
+    /// Cifratura Fernet + scrittura (senza controlli cartella: uso interno dopo ``assertSafeToSave``).
     private static func writeFernetEncryptedDb(db: [String: Any], encURL: URL, keyString: String) throws {
         guard let enc = FernetEncryptor(keyFileContents: keyString) else {
             throw ContiDBError.cannotEncrypt
@@ -2786,12 +2884,8 @@ public enum ContiDatabase {
         let opts: JSONSerialization.WritingOptions = [.prettyPrinted]
         let jsonData = try JSONSerialization.data(withJSONObject: db, options: opts)
         let tokenUtf8 = try enc.encryptToUTF8String(plaintext: jsonData)
-        try FileManager.default.createDirectory(
-            at: encURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
         guard let outData = tokenUtf8.data(using: .utf8) else { throw ContiDBError.cannotEncrypt }
-        try outData.write(to: encURL, options: .atomic)
+        try writeDataToEncURL(outData, encURL: encURL)
     }
 
     /// Scrive ``conti_utente_*.enc`` e ``*_light.enc`` in successione (stessa cartella), dopo i controlli conflitti ``.enc``.

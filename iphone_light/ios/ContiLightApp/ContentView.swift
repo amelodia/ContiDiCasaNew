@@ -253,7 +253,7 @@ struct ContentView: View {
             refreshKeyStatus()
             // Rilegge il `*_light.enc` con path risolto di nuovo e attesa Dropbox (come «Aggiorna»), così dopo sync non resta la copia precedente in memoria.
             Task { @MainActor in
-                if Date().timeIntervalSince(lastScenePhaseRefreshAt) >= 3 {
+                if Date().timeIntervalSince(lastScenePhaseRefreshAt) >= 1.5 {
                     await refreshLightSessionIfLoggedIn()
                 }
             }
@@ -491,9 +491,17 @@ struct ContentView: View {
                             return
                         }
                         url.stopAccessingSecurityScopedResource()
-                        ContiLightFolderBookmark.save(url)
-                        securityScopedBookmarkURL = url
-                        dataFolderURL = url.deletingLastPathComponent()
+                        let folderURL = url.deletingLastPathComponent()
+                        // Bookmark sulla cartella dati (serve scrittura su *_light.enc, non solo sul .key scelto).
+                        if folderURL.startAccessingSecurityScopedResource() {
+                            ContiLightFolderBookmark.save(folderURL)
+                            securityScopedBookmarkURL = folderURL
+                            folderURL.stopAccessingSecurityScopedResource()
+                        } else {
+                            ContiLightFolderBookmark.save(url)
+                            securityScopedBookmarkURL = url
+                        }
+                        dataFolderURL = folderURL
                         refreshKeyStatus()
                         message = "Punto ai file dalla scelta sopra (accesso sicuro solo a questo file). Per .key e *_light.enc insieme preferisci Scegli cartella dati. Inserisci email e password, poi Accedi."
                     }
@@ -1064,6 +1072,9 @@ struct ContentView: View {
         }
         sessionKeyURL = packet.keyURL
         sessionLightEncURL = packet.lightEncURL
+        if let enc = packet.lightEncURL {
+            ensureWriteBookmarkForLightEnc(enc)
+        }
         if let pm = packet.periodicStartupMessage?.trimmingCharacters(in: .whitespacesAndNewlines), !pm.isEmpty {
             periodicStartupAlertText = pm
             periodicStartupAlertPresented = true
@@ -1273,7 +1284,7 @@ struct ContentView: View {
                     : ""
 
                 do {
-                    let encData = try ContiDatabase.coordinatedDataContents(of: encRef)
+                    let encData = try ContiDatabase.coordinatedDataContentsPreferringHydratedDropbox(encRef)
                     let keyString = try ContiDatabase.coordinatedStringContents(of: keyRef, encoding: .utf8)
                     let (db, _) = try ContiDatabase.loadDBForEmail(
                         primaryEncData: encData,
@@ -1303,6 +1314,7 @@ struct ContentView: View {
                         let recovered = ContiDatabase.applyAutomaticPendingLightRecoveryIfNeeded(
                             lightEncURL: encRef,
                             keyURL: keyRef,
+                            email: emailTrim,
                             dropboxLoadedDb: db
                         )
                         sessionDb = recovered.sessionDb
@@ -1360,6 +1372,8 @@ struct ContentView: View {
         var msg = packet.message
         if packet.sessionDb != nil {
             ContiLightLastLoginEmail.save(emailTrim)
+            // Non bloccare il refresh al ritorno in primo piano subito dopo il login.
+            lastScenePhaseRefreshAt = Date().addingTimeInterval(-30)
             if savePasswordForBiometrics, ContiLightBiometricLogin.biometricsAvailable() {
                 do {
                     try ContiLightBiometricLogin.savePasswordForBiometricUnlock(
@@ -1376,13 +1390,16 @@ struct ContentView: View {
         message = msg
         if let dbObj = packet.sessionDb {
             // Evita che `.active` immediato dopo il login lanci una seconda lettura in concorrenza col Task ritardato sotto.
-            lastScenePhaseRefreshAt = Date()
+            lastScenePhaseRefreshAt = Date().addingTimeInterval(-30)
             movimentiPath = NavigationPath()
             filterCategoryKey = ""
             filterAccountKey = ""
             loggedInSessionDb = dbObj
             sessionKeyURL = packet.keyURL
             sessionLightEncURL = packet.lightEncURL
+            if let enc = packet.lightEncURL {
+                ensureWriteBookmarkForLightEnc(enc)
+            }
             if let d = dbObj as? [String: Any] {
                 loggedInRecords = ContiDatabase.displayRecords(from: d, sort: movimentiListSort)
                 movimentiDisplayName = ContiDatabase.displayNameForHeader(db: d, email: emailTrim)
@@ -1399,9 +1416,38 @@ struct ContentView: View {
                 sessionPendingLightWrite = true
             }
             schedulePostLoginHydrationRefreshes()
+            Task { @MainActor in
+                await runPostLoginDropboxHydrationRefresh()
+            }
         } else {
             closeCurrentSessionAndReleaseLock()
         }
+    }
+
+    /// Dopo il login, il bookmark deve coprire il file light che verrà riscritto (non solo un .key scelto al picker).
+    private func ensureWriteBookmarkForLightEnc(_ enc: URL) {
+        let folder = enc.deletingLastPathComponent()
+        if let scoped = securityScopedBookmarkURL {
+            if scoped.standardizedFileURL.path == folder.standardizedFileURL.path {
+                return
+            }
+            if scoped.lastPathComponent == enc.lastPathComponent {
+                return
+            }
+        }
+        guard enc.startAccessingSecurityScopedResource() else { return }
+        defer { enc.stopAccessingSecurityScopedResource() }
+        ContiLightFolderBookmark.save(enc)
+        securityScopedBookmarkURL = enc
+        dataFolderURL = folder
+    }
+
+    /// Subito dopo il login: doppio refresh come il tasto Aggiorna (prima che l’utente veda dati obsoleti).
+    private func runPostLoginDropboxHydrationRefresh() async {
+        try? await Task.sleep(nanoseconds: 600_000_000)
+        await refreshLightSessionIfLoggedIn(forceReResolveEnc: true)
+        try? await Task.sleep(nanoseconds: 1_400_000_000)
+        await refreshLightSessionIfLoggedIn(forceReResolveEnc: true)
     }
 
     /// Alcuni provider (Dropbox/Files) consegnano inizialmente una copia locale non ancora aggiornata.
@@ -1410,9 +1456,10 @@ struct ContentView: View {
         postLoginHydrationRefreshTask?.cancel()
         postLoginHydrationRefreshTask = Task { @MainActor in
             let delaysNs: [UInt64] = [
-                4_000_000_000,   // conferma rapida
-                10_000_000_000,  // coda tipica provider
-                20_000_000_000,  // casi lenti
+                2_500_000_000,
+                6_000_000_000,
+                12_000_000_000,
+                22_000_000_000,
             ]
             for delay in delaysNs {
                 if Task.isCancelled { return }

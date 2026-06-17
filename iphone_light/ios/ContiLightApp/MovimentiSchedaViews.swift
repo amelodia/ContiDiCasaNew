@@ -923,15 +923,25 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         var msg = errorMessage(from: err)
         if let folder = dataFolderURL, let k = keyURL, let e = lightEncURL,
            ContiDatabase.localLightRecoveryState(forLightEncURL: e).hasPendingWrite {
+            let emailTrim = email.trimmingCharacters(in: .whitespacesAndNewlines)
             let pushAttempt = runWithDataFolderAccess(folder: folder) { () -> Result<[String: Any], Error> in
                 do {
-                    try ContiDatabase.pushPendingLightBackupToDropbox(lightEncURL: e, keyURL: k)
-                    let data = try ContiDatabase.coordinatedDataContents(of: e)
+                    try ContiDatabase.pushPendingLightBackupToDropbox(
+                        lightEncURL: e,
+                        keyURL: k,
+                        email: emailTrim
+                    )
+                    let writeURL = ContiDatabase.canonicalLightEncURLForWrite(
+                        inFolder: folder,
+                        email: emailTrim,
+                        fallback: e
+                    )
+                    let data = try ContiDatabase.coordinatedDataContents(of: writeURL)
                     let keyString = try ContiDatabase.coordinatedStringContents(of: k, encoding: .utf8)
                     let (db, _) = try ContiDatabase.loadDBForEmail(
                         primaryEncData: data,
                         keyString: keyString,
-                        primaryEncURL: e
+                        primaryEncURL: writeURL
                     )
                     return .success(db)
                 } catch {
