@@ -19,6 +19,106 @@ _CONFIG_NAME = "data_workspace.json"
 _workspace_root: Path | None = None
 
 
+def app_install_dir() -> Path:
+    """Directory dell'eseguibile (PyInstaller) o cwd in sviluppo."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path.cwd().resolve()
+
+
+def _visible_dialog_parent(parent) -> object | None:
+    """Parent per dialoghi Tk: None se la root principale non è ancora mappata."""
+    if parent is None:
+        return None
+    try:
+        if bool(int(str(parent.winfo_viewable()))):
+            return parent
+    except Exception:
+        pass
+    return None
+
+
+def _center_toplevel_on_screen(win) -> None:
+    try:
+        win.update_idletasks()
+        ww = max(win.winfo_reqwidth(), 320)
+        wh = max(win.winfo_reqheight(), 1)
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        win.geometry(f"{ww}x{wh}+{max(0, (sw - ww) // 2)}+{max(0, (sh - wh) // 2)}")
+    except Exception:
+        pass
+
+
+def _iter_workspace_config_paths() -> list[Path]:
+    """Percorsi noti del file di configurazione (Roaming, Local, accanto all'exe)."""
+    paths: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(p: Path) -> None:
+        try:
+            key = str(p.expanduser().resolve())
+        except OSError:
+            key = str(p)
+        if key in seen:
+            return
+        seen.add(key)
+        paths.append(p)
+
+    _add(workspace_config_path())
+    if sys.platform == "win32":
+        local = (os.environ.get("LOCALAPPDATA") or "").strip()
+        if local:
+            _add(Path(local) / "ContiDiCasa" / _CONFIG_NAME)
+        _add(app_install_dir() / _CONFIG_NAME)
+    return paths
+
+
+def _load_best_workspace_config() -> tuple[dict, Path | None]:
+    best: dict = {}
+    best_path: Path | None = None
+    for p in _iter_workspace_config_paths():
+        if not p.is_file():
+            continue
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(obj, dict):
+                continue
+        except Exception:
+            continue
+        if obj.get("workspace_path") or obj.get("path"):
+            return obj, p
+        if not best:
+            best = obj
+            best_path = p
+    return best, best_path
+
+
+def _canonicalize_workspace_config(obj: dict, source: Path | None) -> None:
+    """Copia in Roaming/Application Support la config trovata altrove (upgrade Windows)."""
+    canonical = workspace_config_path()
+    if source is not None:
+        try:
+            if source.resolve() == canonical.resolve():
+                return
+        except OSError:
+            pass
+    merged = {}
+    try:
+        cp = workspace_config_path()
+        if cp.is_file():
+            raw = json.loads(cp.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                merged.update(raw)
+    except Exception:
+        pass
+    merged.update(obj)
+    try:
+        _write_workspace_config(merged)
+    except Exception:
+        pass
+
+
 def app_support_dir() -> Path:
     if sys.platform == "win32":
         base = os.environ.get("APPDATA")
@@ -33,14 +133,8 @@ def workspace_config_path() -> Path:
 
 
 def _read_workspace_config() -> dict:
-    p = workspace_config_path()
-    if not p.is_file():
-        return {}
-    try:
-        obj = json.loads(p.read_text(encoding="utf-8"))
-        return obj if isinstance(obj, dict) else {}
-    except Exception:
-        return {}
+    obj, _src = _load_best_workspace_config()
+    return obj if isinstance(obj, dict) else {}
 
 
 def _write_workspace_config(obj: dict) -> None:
@@ -52,18 +146,62 @@ def _write_workspace_config(obj: dict) -> None:
 
 
 def load_saved_workspace_path() -> Path | None:
-    """Restituisce il percorso assoluto se il file di configurazione indica una directory esistente."""
-    try:
-        obj = _read_workspace_config()
-        raw = obj.get("workspace_path") or obj.get("path")
-        if not raw:
-            return None
-        path = Path(str(raw)).expanduser().resolve()
-        if path.is_dir():
-            return path
-    except Exception:
-        pass
+    """Restituisce il percorso assoluto se la config indica una directory esistente."""
+    obj, src = _load_best_workspace_config()
+    raw = obj.get("workspace_path") or obj.get("path")
+    if raw:
+        try:
+            path = Path(str(raw)).expanduser().resolve()
+            if path.is_dir():
+                _canonicalize_workspace_config(obj, src)
+                return path
+        except Exception:
+            pass
+    rediscovered = try_migrate_from_legacy_relative_data()
+    if rediscovered is not None:
+        save_workspace_path(rediscovered)
+        _canonicalize_workspace_config({**obj, "workspace_path": str(rediscovered)}, src)
+        return rediscovered
     return None
+
+
+def _is_valid_data_dir(d: Path) -> bool:
+    if not d.is_dir():
+        return False
+    if (d / "conti_di_casa.key").is_file():
+        return True
+    return any(is_workspace_primary_enc_file(p) for p in d.glob("*.enc"))
+
+
+def candidate_legacy_data_dirs() -> list[Path]:
+    """Cartelle ``data`` / Dropbox tipiche da versioni precedenti (portable, installer, dev)."""
+    seen: set[str] = set()
+    out: list[Path] = []
+
+    def _add(raw: Path) -> None:
+        try:
+            p = raw.expanduser().resolve()
+        except OSError:
+            return
+        key = str(p)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(p)
+
+    _add(app_install_dir() / "data")
+    _add(Path.cwd() / "data")
+    if sys.platform == "win32":
+        _add(app_support_dir())
+        local = (os.environ.get("LOCALAPPDATA") or "").strip()
+        if local:
+            _add(Path(local) / "ContiDiCasa")
+        _add(Path.home() / "Documents" / "ContiDiCasa")
+        dropbox = Path.home() / "Dropbox"
+        if dropbox.is_dir():
+            _add(dropbox / "ContiDiCasa")
+            _add(dropbox / "Conti di casa")
+    return out
 
 
 def save_workspace_path(path: Path) -> None:
@@ -163,22 +301,17 @@ def session_bootstrap_enc_path() -> Path:
 
 
 def legacy_project_data_dir() -> Path:
-    """Vecchia convenzione: cartella ``data`` sotto la directory di lavoro corrente."""
-    return (Path.cwd() / "data").resolve()
+    """Vecchia convenzione: cartella ``data`` accanto all'eseguibile o al cwd."""
+    return (app_install_dir() / "data").resolve()
 
 
 def try_migrate_from_legacy_relative_data() -> Path | None:
     """
-    Se esiste ``./data`` (cwd) con ``conti_di_casa.key`` o almeno un file ``*.enc`` di database completo,
-    restituisce quel percorso per proporre la migrazione.
+    Cerca una cartella dati legacy (``data`` accanto all'exe, Documenti, Dropbox, cwd).
     """
-    d = legacy_project_data_dir()
-    if not d.is_dir():
-        return None
-    if (d / "conti_di_casa.key").is_file():
-        return d
-    if any(is_workspace_primary_enc_file(p) for p in d.glob("*.enc")):
-        return d
+    for d in candidate_legacy_data_dirs():
+        if _is_valid_data_dir(d):
+            return d
     return None
 
 
@@ -195,7 +328,7 @@ def _prompt_copy_key_if_missing(parent) -> bool:
         "Nella cartella dati non c'è il file conti_di_casa.key.\n\n"
         "Per aprire un database esistente o ripristinare da backup serve quella chiave.\n\n"
         "Vuoi selezionare un file .key da copiare nella cartella dati?",
-        parent=parent,
+        parent=_visible_dialog_parent(parent),
     ):
         return False
     picked = filedialog.askopenfilename(
@@ -224,6 +357,8 @@ def configure_data_workspace_interactive(parent) -> bool:
 
     import security_auth
 
+    dlg_parent = _visible_dialog_parent(parent)
+
     saved = load_saved_workspace_path()
     if saved is not None:
         set_data_workspace_root(saved)
@@ -231,22 +366,19 @@ def configure_data_workspace_interactive(parent) -> bool:
 
     mig = try_migrate_from_legacy_relative_data()
     if mig is not None:
-        if messagebox.askyesno(
-            "Cartella dati",
-            f"È stata trovata una cartella dati locale del progetto:\n{mig}\n\n"
-            "Vuoi usarla come cartella dati dell'applicazione?\n\n"
-            "(Consigliato se prima usavi la cartella «data» accanto al progetto.)",
-            parent=parent,
-        ):
-            save_workspace_path(mig)
-            set_data_workspace_root(mig)
-            return True
+        save_workspace_path(mig)
+        set_data_workspace_root(mig)
+        return True
 
     choice: list[str | None] = [None]
 
     win = tk.Toplevel(parent)
     win.title("Cartella dati")
-    win.transient(parent)
+    if dlg_parent is not None:
+        try:
+            win.transient(dlg_parent)
+        except Exception:
+            pass
     win.resizable(False, False)
     frm = tk.Frame(win, padx=20, pady=16)
     frm.pack(fill=tk.BOTH, expand=True)
@@ -300,14 +432,20 @@ def configure_data_workspace_interactive(parent) -> bool:
     tk.Button(btn_row, text="Esci", command=on_exit, width=10, **_cw_btn).pack(side=tk.LEFT)
 
     win.grab_set()
-    try:
-        win.update_idletasks()
-        px = parent.winfo_rootx() + (parent.winfo_width() - win.winfo_reqwidth()) // 2
-        py = parent.winfo_rooty() + (parent.winfo_height() - win.winfo_reqheight()) // 2
-        win.geometry(f"+{max(0, px)}+{max(0, py)}")
-    except Exception:
-        pass
-    parent.wait_window(win)
+    if dlg_parent is not None:
+        try:
+            win.update_idletasks()
+            px = dlg_parent.winfo_rootx() + (dlg_parent.winfo_width() - win.winfo_reqwidth()) // 2
+            py = dlg_parent.winfo_rooty() + (dlg_parent.winfo_height() - win.winfo_reqheight()) // 2
+            win.geometry(f"+{max(0, px)}+{max(0, py)}")
+        except Exception:
+            _center_toplevel_on_screen(win)
+    else:
+        _center_toplevel_on_screen(win)
+    if dlg_parent is not None:
+        dlg_parent.wait_window(win)
+    else:
+        win.wait_window()
 
     ch = choice[0]
     if ch is None:
@@ -323,7 +461,7 @@ def configure_data_workspace_interactive(parent) -> bool:
             return False
         path = Path(folder).expanduser().resolve()
         if not path.is_dir():
-            messagebox.showerror("Cartella dati", "Percorso non valido.", parent=parent)
+            messagebox.showerror("Cartella dati", "Percorso non valido.", parent=dlg_parent)
             return False
         save_workspace_path(path)
         set_data_workspace_root(path)
@@ -339,7 +477,7 @@ def configure_data_workspace_interactive(parent) -> bool:
         return False
     path = Path(folder).expanduser().resolve()
     if not path.is_dir():
-        messagebox.showerror("Cartella dati", "Percorso non valido.", parent=parent)
+        messagebox.showerror("Cartella dati", "Percorso non valido.", parent=dlg_parent)
         return False
     save_workspace_path(path)
     set_data_workspace_root(path)
@@ -348,7 +486,7 @@ def configure_data_workspace_interactive(parent) -> bool:
             "Cartella dati",
             "Senza conti_di_casa.key nella cartella non è possibile ripristinare.\n"
             "Copia la chiave e riavvia l'applicazione.",
-            parent=parent,
+            parent=dlg_parent,
         )
         clear_workspace_configuration()
         return False

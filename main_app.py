@@ -369,9 +369,16 @@ def _ui_font_tuple(size: int, *modifiers: str, family: str = "TkDefaultFont") ->
     return (family, scaled, *modifiers)
 
 
-def _startup_root_stays_visible() -> bool:
-    """Su Windows le finestre Toplevel/messagebox con parent withdrawn spesso non compaiono."""
-    return platform.system() == "Windows"
+def _startup_dialog_parent(root: tk.Misc | None) -> tk.Misc | None:
+    """Parent per dialoghi pre-mappa della finestra principale (root withdrawn su tutte le piattaforme)."""
+    if root is None:
+        return None
+    try:
+        if bool(int(str(root.winfo_viewable()))):
+            return root
+    except Exception:
+        pass
+    return None
 
 
 def _darwin_prepare_stdin_for_tk_aqua() -> None:
@@ -9425,34 +9432,36 @@ def build_ui(
 
     data_file_var.trace_add("write", _sync_path_holders_from_vars)
     key_file_var.trace_add("write", _sync_path_holders_from_vars)
-    # Su macOS nascondi la root durante la costruzione; su Windows tenerla visibile evita che l'app sembri sparita.
-    if not _startup_root_stays_visible() and getattr(root, "_cdc_early_build_loading_label", None) is None:
+    # Root nascosta fino a UI pronta: login e dialoghi usano Toplevel indipendenti.
+    if getattr(root, "_cdc_early_build_loading_label", None) is None:
         try:
             root.withdraw()
         except Exception:
             pass
     root.title(window_title_for_session(db_holder[0], session_holder[0], show_clock=True))
     _build_loading_label: tk.Label | None = None
-    if _startup_root_stays_visible() or getattr(root, "_cdc_early_build_loading_label", None) is None:
-        if _startup_root_stays_visible():
-            try:
-                _build_loading_label = tk.Label(
-                    root,
-                    text="Caricamento interfaccia in corso…\nAttendere qualche secondo.",
-                    font=("TkDefaultFont", 14),
-                    bg=MOVIMENTI_PAGE_BG,
-                    fg="#333333",
-                    justify="center",
-                )
-                _build_loading_label.pack(expand=True, fill=tk.BOTH, padx=24, pady=24)
-                root.update_idletasks()
-                root.deiconify()
-                root.lift()
-                root.focus_force()
-            except Exception:
-                _build_loading_label = None
     _main_window_presented: list[bool] = [False]
     login_window_to_close = getattr(root, "_cdc_login_window_to_close", None)
+
+    def _apply_windows_maximized_window() -> None:
+        """Massimizza la finestra principale su Windows prima del primo ``deiconify()``."""
+        if platform.system() != "Windows":
+            return
+        for _try in (
+            lambda: root.state("zoomed"),
+            lambda: root.attributes("-zoomed", True),
+        ):
+            try:
+                _try()
+                return
+            except Exception:
+                pass
+        try:
+            sw = max(1, int(root.winfo_screenwidth()))
+            sh = max(1, int(root.winfo_screenheight()))
+            root.geometry(f"{sw}x{sh}+0+0")
+        except Exception:
+            pass
 
     def _apply_macos_fullscreen_window() -> None:
         """Tk/Aqua: geometria grande + fullscreen prima del primo ``deiconify()``.
@@ -9517,6 +9526,9 @@ def build_ui(
             if platform.system() == "Darwin":
                 # Prep + fullscreen mentre non è ancora visibile il primo pixel (root ancora ``withdraw()``).
                 _apply_macos_fullscreen_window()
+                root.deiconify()
+            elif platform.system() == "Windows":
+                _apply_windows_maximized_window()
                 root.deiconify()
             else:
                 sw = root.winfo_screenwidth()
@@ -15631,8 +15643,6 @@ th {{ background:#efefef; text-align:left; }}
             pass
 
     refresh_balance_footer()
-    if platform.system() == "Windows":
-        _present_main_window_once()
 
     root.bind_all("<FocusIn>", _saldi_footer_on_app_focus_in, add="+")
 
@@ -34799,13 +34809,15 @@ def _confirm_dropbox_ready_after_recent_boot(root: tk.Tk) -> bool:
         return True
 
     result: list[bool] = [False]
+    dlg_parent = _startup_dialog_parent(root)
     win = tk.Toplevel(root)
     win.title("Conti di casa")
     win.resizable(False, False)
-    try:
-        win.transient(root)
-    except Exception:
-        pass
+    if dlg_parent is not None:
+        try:
+            win.transient(dlg_parent)
+        except Exception:
+            pass
 
     frm = tk.Frame(win, padx=22, pady=18)
     frm.pack(fill=tk.BOTH, expand=True)
@@ -34860,13 +34872,22 @@ def _confirm_dropbox_ready_after_recent_boot(root: tk.Tk) -> bool:
             except Exception:
                 pass
 
-        win.after(800, _topmost_off)
+        win.after(400, _topmost_off)
         win.focus_force()
         win.grab_set()
     except Exception:
         pass
 
-    root.wait_window(win)
+    try:
+        if dlg_parent is not None:
+            dlg_parent.wait_window(win)
+        else:
+            win.wait_window()
+    except Exception:
+        try:
+            win.wait_window()
+        except Exception:
+            pass
     return result[0]
 
 
@@ -34885,17 +34906,10 @@ def main() -> None:
     except Exception:
         pass
     # La root resta nascosta fino al bisogno (evita la grande finestra vuota dietro i dialoghi).
-    if not _startup_root_stays_visible():
-        try:
-            root.withdraw()
-        except Exception:
-            pass
-    else:
-        try:
-            root.update_idletasks()
-            root.lift()
-        except Exception:
-            pass
+    try:
+        root.withdraw()
+    except Exception:
+        pass
 
     if not security_auth.verify_pillow_for_login_ui(parent=root):
         print("Avvio interrotto: Pillow non disponibile per UI login.", file=sys.stderr)
@@ -34930,7 +34944,7 @@ def main() -> None:
     except Exception as exc:
         # Non abbiamo creato il segnaposto: non va cancellato un file altrui ancora valido.
         try:
-            messagebox.showerror("Cartella dati in uso", str(exc), parent=root)
+            messagebox.showerror("Cartella dati in uso", str(exc), parent=_startup_dialog_parent(root))
         except Exception:
             print(f"Avvio interrotto: {exc}", file=sys.stderr)
         try:
@@ -34957,7 +34971,7 @@ def main() -> None:
     except Exception as exc:
         release_data_workspace_lock(data_dir)
         try:
-            messagebox.showerror("Conti di casa", str(exc), parent=root)
+            messagebox.showerror("Conti di casa", str(exc), parent=_startup_dialog_parent(root))
         except Exception:
             print(f"Avvio interrotto: {exc}", file=sys.stderr)
         try:
@@ -34966,15 +34980,7 @@ def main() -> None:
             pass
         return
 
-    if not _startup_root_stays_visible():
-        try:
-            root.withdraw()
-        except Exception:
-            pass
-
-    # Root resta nascosta: lo splash Dropbox è un Toplevel; ``deiconify`` qui causava un flash visivo.
-
-    db, resolved_path = load_database_at_startup(sync_ui_parent=root)
+    db, resolved_path = load_database_at_startup(sync_ui_parent=None)
     try:
         _apply_tk_ui_scale(root, db)
     except Exception:
