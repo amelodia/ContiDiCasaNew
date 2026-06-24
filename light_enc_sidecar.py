@@ -24,6 +24,7 @@ import copy
 import json
 import os
 import tempfile
+from collections.abc import Callable
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -497,6 +498,7 @@ def merge_light_sidecar_at_startup(
     key_path: Path,
     *,
     progress: Callable[[str], None] | None = None,
+    ui_pump: Callable[[], object] | None = None,
 ) -> tuple[int, int]:
     """Se esiste il sidecar, fonde le registrazioni light nel DB già caricato.
 
@@ -510,7 +512,12 @@ def merge_light_sidecar_at_startup(
     try:
         import cloud_sync_wait
 
-        cloud_sync_wait.wait_for_paths_stable_if_cloud([p, key_path], ui_parent=None)
+        cloud_sync_wait.wait_for_paths_stable_if_cloud(
+            [p, key_path],
+            ui_parent=None,
+            ui_pump=ui_pump,
+            light_sidecar=True,
+        )
     except Exception:
         pass
     if progress is not None:

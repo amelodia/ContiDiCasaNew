@@ -178,7 +178,6 @@ def update_login_loading_message(win: tk.Misc | None, text: str | None) -> None:
             pass
     try:
         win.update_idletasks()
-        win.update()
     except Exception:
         pass
 

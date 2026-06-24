@@ -10,11 +10,14 @@ from __future__ import annotations
 import os
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 # Durata minima in cui size+mtime devono restare invariati (secondi).
 _DEFAULT_STABLE_SECONDS = 1.6
+# Sidecar light post-login: file piccolo, .enc completo già caricato all'avvio.
+_LIGHT_SIDECAR_STABLE_SECONDS = 0.85
+_LIGHT_SIDECAR_MAX_WAIT_SECONDS = 75.0
 # Intervallo tra due controlli (secondi).
 _DEFAULT_POLL_SECONDS = 0.25
 # Limite massimo di attesa totale per file (secondi) dopo che il file esiste (stabilità size/mtime).
@@ -116,6 +119,7 @@ def _wait_file_stable(
     max_wait_seconds: float,
     max_wait_for_existence_seconds: float,
     ui_parent: object | None,
+    ui_pump: Callable[[], object] | None = None,
     label: str,
     batch_splash_holder: list[object | None] | None = None,
 ) -> float:
@@ -130,6 +134,15 @@ def _wait_file_stable(
     splash = None
     last_log = t_start
     batch_mode = batch_splash_holder is not None
+
+    def _pump_wait_ui() -> None:
+        if ui_parent is not None:
+            _pump_ui(ui_parent)
+        elif ui_pump is not None:
+            try:
+                ui_pump()
+            except Exception:
+                pass
 
     def _ensure_splash() -> None:
         nonlocal splash
@@ -156,8 +169,7 @@ def _wait_file_stable(
             return time.monotonic() - t_start
         if ui_parent is not None:
             _ensure_splash()
-        if ui_parent is not None:
-            _pump_ui(ui_parent)
+        _pump_wait_ui()
         time.sleep(poll_seconds)
 
     fp0 = _stat_fingerprint(path)
@@ -185,8 +197,7 @@ def _wait_file_stable(
             _ensure_splash()
 
         time.sleep(poll_seconds)
-        if ui_parent is not None:
-            _pump_ui(ui_parent)
+        _pump_wait_ui()
 
         fp1 = _stat_fingerprint(path)
         if fp1 is None:
@@ -286,9 +297,11 @@ def wait_for_paths_stable_if_cloud(
     paths: Sequence[Path],
     *,
     ui_parent: object | None = None,
-    stable_seconds: float = _DEFAULT_STABLE_SECONDS,
+    ui_pump: Callable[[], object] | None = None,
+    stable_seconds: float | None = None,
     poll_seconds: float = _DEFAULT_POLL_SECONDS,
-    max_wait_seconds: float = _DEFAULT_MAX_WAIT_SECONDS,
+    max_wait_seconds: float | None = None,
+    light_sidecar: bool = False,
 ) -> None:
     """
     Per ogni percorso sotto Dropbox (euristica), attende che il file sia stabile prima che l'app lo legga.
@@ -308,6 +321,20 @@ def wait_for_paths_stable_if_cloud(
     """
     if os.environ.get("CONTI_SKIP_CLOUD_SYNC_WAIT", "").strip().lower() in ("1", "true", "yes", "on"):
         return
+    if light_sidecar:
+        stable = (
+            stable_seconds
+            if stable_seconds is not None
+            else _LIGHT_SIDECAR_STABLE_SECONDS
+        )
+        max_wait = (
+            max_wait_seconds
+            if max_wait_seconds is not None
+            else _LIGHT_SIDECAR_MAX_WAIT_SECONDS
+        )
+    else:
+        stable = stable_seconds if stable_seconds is not None else _DEFAULT_STABLE_SECONDS
+        max_wait = max_wait_seconds if max_wait_seconds is not None else _DEFAULT_MAX_WAIT_SECONDS
     verbose = os.environ.get("CONTI_VERBOSE_CLOUD_WAIT", "").strip().lower() in ("1", "true", "yes", "on")
     existence_cap = _max_wait_existence_seconds()
     seen: set[Path] = set()
@@ -335,11 +362,12 @@ def wait_for_paths_stable_if_cloud(
                 )
             waited = _wait_file_stable(
                 p,
-                stable_seconds=stable_seconds,
+                stable_seconds=stable,
                 poll_seconds=poll_seconds,
-                max_wait_seconds=max_wait_seconds,
+                max_wait_seconds=max_wait,
                 max_wait_for_existence_seconds=existence_cap,
                 ui_parent=ui_parent,
+                ui_pump=ui_pump,
                 label=label,
                 batch_splash_holder=batch_splash if len(drop_paths) > 1 else None,
             )

@@ -760,6 +760,7 @@ def bind_euro_amount_entry_validation(
     reject_zero: bool = False,
     max_decimals: int = 2,
     on_enter: Callable[[], object] | None = None,
+    on_after_format: Callable[[], object] | None = None,
     cursor_after_sign_on_focus: bool = False,
     external_focusout: bool = False,
     format_zero: bool = True,
@@ -935,6 +936,11 @@ def bind_euro_amount_entry_validation(
                 _set_amount_text_and_cursor(txt_abs)
         else:
             _set_amount_text_and_cursor(txt_abs)
+        if on_after_format is not None:
+            try:
+                on_after_format()
+            except Exception:
+                pass
         return True
 
     def _format_on_focus_out(_e: tk.Event | None = None) -> None:
@@ -986,6 +992,11 @@ def bind_euro_amount_entry_validation(
                 _set_amount_text_and_cursor(txt_abs)
         else:
             _set_amount_text_and_cursor(txt_abs)
+        if on_after_format is not None:
+            try:
+                on_after_format()
+            except Exception:
+                pass
 
     def _on_double_click_select(event: tk.Event) -> str | None:
         w = event.widget
@@ -8944,6 +8955,8 @@ def _finalize_startup_db_with_light_sidecar(
     ui_parent: tk.Misc | None = None,
     after_user_login: bool = False,
     progress: Callable[[str], None] | None = None,
+    ui_pump: Callable[[], object] | None = None,
+    defer_result_dialog: bool = False,
 ) -> tuple[int, int]:
     """Fonde ``*_light.enc`` nel DB; salva completo+light solo se il merge ha importato righe.
 
@@ -8962,7 +8975,11 @@ def _finalize_startup_db_with_light_sidecar(
         import light_enc_sidecar
 
         n_new, n_up = light_enc_sidecar.merge_light_sidecar_at_startup(
-            db, primary_path, data_workspace.default_key_file(), progress=progress
+            db,
+            primary_path,
+            data_workspace.default_key_file(),
+            progress=progress,
+            ui_pump=ui_pump,
         )
         if n_new + n_up > 0:
             if progress is not None:
@@ -8976,11 +8993,21 @@ def _finalize_startup_db_with_light_sidecar(
                     + " e ".join(bits)
                     + ")… può richiedere tempo."
                 )
+            if ui_pump is not None:
+                try:
+                    ui_pump()
+                except Exception:
+                    pass
             save_encrypted_db_dual(
                 db,
                 primary_path,
                 data_workspace.default_key_file(),
             )
+            if ui_pump is not None:
+                try:
+                    ui_pump()
+                except Exception:
+                    pass
             parts: list[str] = ["Sincronizzazione con Conti light completata."]
             if n_new > 0:
                 parts.append(
@@ -8994,7 +9021,10 @@ def _finalize_startup_db_with_light_sidecar(
                 )
             msg = "\n\n".join(parts) + "\n\nSalvati database completo e file light nella cartella dati."
             if ui_parent is not None:
-                _show_centered_info_dialog(ui_parent, "Sincronizzazione Conti light", msg)
+                if defer_result_dialog:
+                    _queue_light_sync_result_dialog(ui_parent, "Sincronizzazione Conti light", msg)
+                else:
+                    _show_centered_info_dialog(ui_parent, "Sincronizzazione Conti light", msg)
             return n_new, n_up
         lp = light_enc_sidecar.light_enc_path_for_primary(primary_path)
         if not lp.is_file():
@@ -16552,6 +16582,11 @@ th {{ background:#efefef; text-align:left; }}
         return _is_virtuale_account(newreg_acc1_var.get()) or _is_virtuale_account(newreg_acc2_var.get())
 
     _AUT_NOTE_RE = re.compile(r"^Aut \d{2}/\d{2}$")
+    _NEWREG_FORMATTED_AMT_RE = re.compile(r"^[+-](?:\d{1,3}(?:\.\d{3})+|\d+),\d{2}$")
+
+    def _newreg_amount_is_formatted() -> bool:
+        raw = (newreg_amount_var.get() or "").strip()
+        return bool(_NEWREG_FORMATTED_AMT_RE.fullmatch(raw))
 
     def _note_is_aut_replaceable(cur: str) -> bool:
         t = (cur or "").strip()
@@ -16602,6 +16637,8 @@ th {{ background:#efefef; text-align:left; }}
     ent_note.bind("<FocusIn>", _on_newreg_note_focus_in, add="+")
 
     def _apply_giro_default_note() -> None:
+        if not _newreg_amount_is_formatted():
+            return
         if not _is_giro_label(newreg_cat_var.get()):
             return
         if _has_virtuale_in_girata():
@@ -16754,7 +16791,6 @@ th {{ background:#efefef; text-align:left; }}
                         break
                 if newreg_acc1_var.get().strip() == newreg_acc2_var.get().strip():
                     nuovi_status_var.set("Attenzione: i due conti del giroconto devono essere diversi.")
-            _apply_giro_default_note()
         else:
             lbl_acc2.grid_remove()
             row_acc2_outer.grid_remove()
@@ -16805,6 +16841,8 @@ th {{ background:#efefef; text-align:left; }}
                 pass
 
         _refresh_virtuale_ui()
+        if _newreg_amount_is_formatted():
+            _apply_giro_default_note()
 
     def _selected_category_code() -> str:
         cat_name = (newreg_cat_var.get() or "").strip()
@@ -16865,6 +16903,7 @@ th {{ background:#efefef; text-align:left; }}
             else:
                 _sync_tk_entry_from_stringvar(ent_amt, newreg_amount_var)
             newreg_sign_var.set("-" if amt < 0 else "+")
+            _apply_giro_default_note()
         except Exception:
             pass
 
@@ -17022,6 +17061,7 @@ th {{ background:#efefef; text-align:left; }}
         newreg_note_var.set("")
         _cancel_saldo_procedure()
         _sync_cat_note_and_second_account()
+        newreg_note_var.set("")
         newreg_baseline_snapshot[0] = _newreg_form_snapshot()
         newreg_last_account_touched[0] = "acc1"
         try:
@@ -19480,6 +19520,7 @@ th {{ background:#efefef; text-align:left; }}
         require_leading_sign=True,
         reject_zero=False,
         on_enter=lambda: _on_amt_enter(None),
+        on_after_format=_apply_giro_default_note,
         cursor_after_sign_on_focus=True,
         format_zero=False,
     )
@@ -34561,6 +34602,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     def _present_main_window() -> None:
         """Mostra la finestra principale solo a UI pronta; evita flash nero (fullscreen Cocoa) su macOS."""
         _present_main_window_once()
+        _flush_pending_light_sync_dialog(root)
 
     def _on_app_close() -> None:
         if ver_session_active[0]:
@@ -34654,47 +34696,37 @@ def _apply_sun_valley_ttk_theme(root: tk.Tk) -> None:
         pass
 
 
-def _handoff_login_to_main_build(
-    login_win: tk.Misc | None,
-    root: tk.Tk,
-    *,
-    message: str = "Apertura interfaccia in corso",
-) -> None:
-    """Chiude il login e mostra subito la root con messaggio di attesa (evita freeze percepito su macOS)."""
-    security_auth.update_login_loading_message(login_win, message)
+def _queue_light_sync_result_dialog(parent: tk.Misc, title: str, message: str) -> None:
+    """Accoda il riepilogo sync light da mostrare quando la finestra principale è pronta."""
     try:
-        if login_win is not None and login_win.winfo_exists():
-            login_win.destroy()
+        setattr(parent, "_cdc_pending_light_sync_dialog", (title, message))
     except Exception:
         pass
+
+
+def _flush_pending_light_sync_dialog(parent: tk.Misc, *, delay_ms: int = 450) -> None:
+    """Mostra il dialogo sync accodato dopo il primo paint della finestra principale."""
+    pending = getattr(parent, "_cdc_pending_light_sync_dialog", None)
+    if not pending:
+        return
     try:
-        setattr(root, "_cdc_login_window_to_close", None)
+        delattr(parent, "_cdc_pending_light_sync_dialog")
     except Exception:
         pass
-    prev = getattr(root, "_cdc_early_build_loading_label", None)
-    if prev is not None:
+    title, message = pending
+
+    def _show() -> None:
         try:
-            prev.destroy()
+            if not parent.winfo_exists():
+                return
+            _show_centered_info_dialog(parent, title, message)
         except Exception:
             pass
+
     try:
-        lbl = tk.Label(
-            root,
-            text=f"{message}…\nAttendere.",
-            font=("TkDefaultFont", 14),
-            bg=MOVIMENTI_PAGE_BG,
-            fg="#333333",
-            justify="center",
-        )
-        lbl.pack(expand=True, fill=tk.BOTH, padx=24, pady=24)
-        setattr(root, "_cdc_early_build_loading_label", lbl)
-        root.deiconify()
-        root.lift()
-        root.focus_force()
-        root.update_idletasks()
-        root.update()
+        parent.after(max(0, int(delay_ms)), _show)
     except Exception:
-        pass
+        _show()
 
 
 def _show_centered_info_dialog(parent: tk.Misc, title: str, message: str) -> None:
@@ -34741,9 +34773,14 @@ def _show_centered_info_dialog(parent: tk.Misc, title: str, message: str) -> Non
             except Exception:
                 pass
 
-        win.after(800, _topmost_off)
+        win.after(400, _topmost_off)
         win.focus_force()
         win.grab_set()
+    except Exception:
+        pass
+
+    try:
+        parent.update_idletasks()
     except Exception:
         pass
 
@@ -34843,6 +34880,10 @@ def main() -> None:
     _apply_tk_ui_scale(root)
     _apply_sun_valley_ttk_theme(root)
     root.title("Conti di casa")
+    try:
+        root.configure(bg=MOVIMENTI_PAGE_BG)
+    except Exception:
+        pass
     # La root resta nascosta fino al bisogno (evita la grande finestra vuota dietro i dialoghi).
     if not _startup_root_stays_visible():
         try:
@@ -35055,8 +35096,19 @@ def main() -> None:
         db_holder[0], session, path_holder[0]
     )
 
+    def _post_login_pump_ui() -> None:
+        w = login_window_holder[0]
+        if w is None:
+            return
+        try:
+            if w.winfo_exists():
+                w.update_idletasks()
+        except Exception:
+            pass
+
     def _post_login_progress(msg: str) -> None:
         security_auth.update_login_loading_message(login_window_holder[0], msg)
+        _post_login_pump_ui()
 
     _finalize_startup_db_with_light_sidecar(
         db_holder[0],
@@ -35064,13 +35116,12 @@ def main() -> None:
         ui_parent=root,
         after_user_login=True,
         progress=_post_login_progress,
+        ui_pump=_post_login_pump_ui,
+        defer_result_dialog=True,
     )
-    _handoff_login_to_main_build(
-        login_window_holder[0],
-        root,
-        message="Costruzione interfaccia",
+    security_auth.update_login_loading_message(
+        login_window_holder[0], "Costruzione interfaccia"
     )
-    login_window_holder[0] = None
     if session.entered_via_backdoor:
         security_auth.ensure_security(db_holder[0])
         session.is_registered = bool(
