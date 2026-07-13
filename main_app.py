@@ -8856,14 +8856,39 @@ def release_data_workspace_lock(data_dir: Path | None = None) -> None:
         pass
 
 
+_PRESAVE_BACKUP_RETENTION_DAYS = 7
+
+
+def _presave_backups_dir() -> Path:
+    return _user_library_conti_support_dir() / "pre_save_backups"
+
+
+def _prune_old_presave_backups(bdir: Path | None = None) -> None:
+    """Elimina in ``pre_save_backups`` i file più vecchi di ``_PRESAVE_BACKUP_RETENTION_DAYS``."""
+    target = bdir if bdir is not None else _presave_backups_dir()
+    if not target.is_dir():
+        return
+    cutoff = datetime.now() - timedelta(days=_PRESAVE_BACKUP_RETENTION_DAYS)
+    cutoff_ts = cutoff.timestamp()
+    for p in target.iterdir():
+        if not p.is_file():
+            continue
+        try:
+            if p.stat().st_mtime < cutoff_ts:
+                p.unlink()
+        except OSError:
+            pass
+
+
 def _write_timestamped_presave_backup(path: Path) -> None:
     if not path.is_file():
         return
     try:
-        bdir = _user_library_conti_support_dir() / "pre_save_backups"
+        bdir = _presave_backups_dir()
         bdir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         shutil.copy2(path, bdir / f"{path.stem}_{ts}{path.suffix}")
+        _prune_old_presave_backups(bdir)
     except Exception:
         pass
 
@@ -34684,6 +34709,17 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         root.after(1200, _apply_theme_tokens_after_first_paint)
     except Exception:
         _apply_theme_tokens_after_first_paint()
+
+    def _deferred_prune_presave_backups() -> None:
+        try:
+            _prune_old_presave_backups()
+        except Exception:
+            pass
+
+    try:
+        root.after(2500, _deferred_prune_presave_backups)
+    except Exception:
+        pass
     root.mainloop()
 
 
