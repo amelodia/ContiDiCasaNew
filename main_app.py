@@ -8543,6 +8543,28 @@ def primary_enc_path_from_library_backup_filename(backup_path: Path) -> Path | N
     return data_workspace.data_dir() / f"{primary_stem}.enc"
 
 
+def _enc_file_has_payload(path: Path, *, min_bytes: int = 256) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size >= min_bytes
+    except OSError:
+        return False
+
+
+def _presave_backup_candidates_for_primary(primary: Path) -> list[Path]:
+    """Backup pre-salvataggio in Library, più recente per primo."""
+    bdir = _presave_backups_dir()
+    if not bdir.is_dir():
+        return []
+    stems = {primary.stem, f"{primary.stem}_backup"}
+    out: list[Path] = []
+    for stem in stems:
+        for p in bdir.glob(f"{stem}_*.enc"):
+            if _enc_file_has_payload(p):
+                out.append(p)
+    out.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return out
+
+
 def restore_enc_from_library_backup_file(
     *,
     backup_path: Path,
@@ -8580,14 +8602,15 @@ def _try_restore_database_from_library_at_startup(
     *,
     sync_ui_parent: tk.Misc | None,
 ) -> tuple[dict, Path] | None:
-    """Se nella cartella dati non c’è un ``conti_utente_*.enc`` ma esiste un backup in Library, propone il ripristino."""
+    """Se nella cartella dati non c’è un ``conti_utente_*.enc`` valido ma esiste un backup in Library, propone il ripristino."""
     if Fernet is None:
         return None
-    if not data_workspace.default_key_file().is_file():
+    key_path = data_workspace.default_key_file()
+    if not key_path.is_file():
         return None
-    if _discover_existing_user_db_candidates():
+    if _try_load_first_valid_user_db(key_path=key_path) is not None:
         return None
-    backups = _discover_library_backup_enc_files()
+    backups = [p for p in _discover_library_backup_enc_files() if _enc_file_has_payload(p)]
     if not backups:
         return None
     chosen = backups[0]
@@ -8630,6 +8653,83 @@ def _try_restore_database_from_library_at_startup(
     return db, primary_target
 
 
+def _try_autorecover_corrupted_database_at_startup(
+    *,
+    sync_ui_parent: tk.Misc | None = None,
+) -> tuple[dict, Path] | None:
+    """Ripristina automaticamente un ``.enc`` corrotto/vuoto da backup Library o ``pre_save_backups``."""
+    if Fernet is None:
+        return None
+    key_path = data_workspace.default_key_file()
+    if not key_path.is_file():
+        return None
+
+    primaries = _discover_existing_user_db_candidates()
+    if not primaries:
+        return None
+
+    parent = sync_ui_parent
+
+    for primary in primaries:
+        if _enc_file_has_payload(primary):
+            try:
+                db = load_encrypted_db(primary, key_path)
+            except (InvalidToken, OSError, json.JSONDecodeError, ValueError):
+                db = None
+            if db:
+                continue
+
+        sources: list[Path] = []
+        lib = user_local_backup_enc_path(primary)
+        if _enc_file_has_payload(lib):
+            sources.append(lib)
+        for p in _presave_backup_candidates_for_primary(primary):
+            if p not in sources:
+                sources.append(p)
+
+        for src in sources:
+            try:
+                db = load_encrypted_db(src, key_path)
+            except (InvalidToken, OSError, json.JSONDecodeError, ValueError):
+                db = None
+            if not db:
+                continue
+            try:
+                primary.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, primary)
+                lib_target = user_local_backup_enc_path(primary)
+                try:
+                    if lib_target.resolve() != primary.resolve():
+                        shutil.copy2(src, lib_target)
+                except OSError:
+                    shutil.copy2(src, lib_target)
+            except OSError as exc:
+                try:
+                    messagebox.showerror(
+                        "Ripristino database",
+                        f"Impossibile ripristinare il file dati:\n{primary}\n\n{exc}",
+                        parent=parent,
+                    )
+                except Exception:
+                    pass
+                return None
+            periodiche.ensure_periodic_registrations(db)
+            email_client.ensure_email_settings(db)
+            security_auth.ensure_security(db)
+            try:
+                messagebox.showinfo(
+                    "Database ripristinato",
+                    "Il file dati operativo era vuoto o corrotto (spesso per disco pieno durante un salvataggio).\n\n"
+                    f"Ripristinato da:\n{src}\n\n"
+                    f"File operativo:\n{primary}",
+                    parent=parent,
+                )
+            except Exception:
+                pass
+            return db, primary
+    return None
+
+
 def get_or_create_key(key_path: Path) -> bytes:
     if Fernet is None:
         raise RuntimeError("Pacchetto 'cryptography' non disponibile. Installa con: pip install cryptography")
@@ -8669,15 +8769,9 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
                 time.sleep(0.12 * (attempt + 1))
                 continue
             break
-    try:
-        with open(path, "wb") as f:
-            f.write(data)
-            f.flush()
-        return
-    except Exception:
-        if last_exc is not None:
-            raise last_exc
-        raise
+    if last_exc is not None:
+        raise last_exc
+    raise OSError(f"Scrittura non riuscita: {path}")
 
 
 def _is_dropbox_conflicted_file(path: Path) -> bool:
@@ -9164,6 +9258,8 @@ def load_encrypted_db(output_path: Path, key_path: Path) -> dict | None:
         return None
     if not output_path.exists() or not key_path.exists():
         return None
+    if not _enc_file_has_payload(output_path):
+        return None
     key = key_path.read_bytes()
     token = output_path.read_bytes()
     raw = Fernet(key).decrypt(token)
@@ -9260,6 +9356,10 @@ def load_database_at_startup(*, sync_ui_parent: tk.Misc | None = None) -> tuple[
     )
     if fallback is not None:
         return fallback
+
+    recovered = _try_autorecover_corrupted_database_at_startup(sync_ui_parent=sync_ui_parent)
+    if recovered is not None:
+        return recovered
 
     restored = _try_restore_database_from_library_at_startup(sync_ui_parent=sync_ui_parent)
     if restored is not None:
