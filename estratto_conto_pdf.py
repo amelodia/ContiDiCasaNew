@@ -28,6 +28,9 @@ Alcuni PDF (es. estratti a colonne) espongono il testo con **uno spazio tra ogni
 si collassano gli spazi sulla riga prima del riconoscimento. Le date possono comparire **attaccate**
 (``05/01/202605/01/2026``); l'importo in colonna entrate può avere il simbolo **€** subito dopo le cifre.
 
+**Estratti BancoPosta / Poste (conto corrente):** se in testata compare «BancoPosta» / «Poste Italiane» con colonne
+**DARE** / **AVERE**, si usa lo stesso parser a due colonne degli estratti BCC (seconda colonna → importi **positivi**).
+
 **Estratti BCC (Roma):** se nella **parte iniziale** del testo (primi ~120.000 caratteri) compare l'intestazione
 «BCC ROMA» (anche **senza spazio** tra BCC e ROMA, o con ROMA attaccata a «Banca» come ``BCC ROMABanca`` nel PDF),
 si applica il parser dedicato: dopo «DOTAZIONE INIZIALE» o «SALDO INIZIALE» due date ``gg/mm/aa`` (anche **attaccate**
@@ -607,6 +610,49 @@ def _looks_like_bcc_estratto(text: str) -> bool:
     return "BCCROMA" in _compact_for_keyword(head)
 
 
+def _looks_like_bancoposta_estratto(text: str) -> bool:
+    """
+    True se l'estratto è BancoPosta / Poste Italiane (conto corrente a colonne DARE/AVERE).
+
+    Il layout è analogo a BCC Roma: importi in uscita in prima colonna, entrate (AVERE) in seconda colonna.
+    """
+    head = (text or "")[:_BCC_HEADER_SCAN_CHARS]
+    u = head.upper()
+    c = _compact_for_keyword(head)
+    if "BANCOPOSTA" in c:
+        return True
+    if "BANCO POSTA" in u or "BANCOPOSTA" in u.replace(" ", ""):
+        return True
+    if "POSTEITALIANE" in c or "POSTE ITALIANE" in u:
+        if "DARE" in u and "AVERE" in u:
+            return True
+        if "ESTRATTOCONTO" in c or "CONTOCORRENTE" in c or "ELENCOMOVIMENTI" in c:
+            return True
+    return False
+
+
+def _looks_like_dare_avere_column_estratto(text: str) -> bool:
+    """Fallback: tabella movimenti con intestazioni DARE e AVERE (senza marchio BCC/Poste esplicito)."""
+    head = (text or "")[:_BCC_HEADER_SCAN_CHARS]
+    u = " ".join(head.split()).upper()
+    ck = _compact_for_keyword(head)
+    if "DARE" not in u and "DARE" not in ck:
+        return False
+    if "AVERE" not in u and "AVERE" not in ck:
+        return False
+    hints = ("DATA", "OPERAZ", "VALUT", "DESCR", "CAUSAL", "MOVIM", "IMPORT")
+    return sum(1 for h in hints if h in u or h in ck) >= 2
+
+
+def _looks_like_two_column_dare_avere_estratto(text: str) -> bool:
+    """Estratto con colonne DARE/AVERE (BCC, BancoPosta o layout analogo)."""
+    return (
+        _looks_like_bcc_estratto(text)
+        or _looks_like_bancoposta_estratto(text)
+        or _looks_like_dare_avere_column_estratto(text)
+    )
+
+
 def _bcc_line_starts_informazioni_clientela(line: str) -> bool:
     """Blocco informativo a fine estratto (non parte della nota dell'ultimo movimento)."""
     c = _compact_for_keyword((line or "").strip())
@@ -827,7 +873,7 @@ def _parse_statement_text_bcc(
     prepared: list[str], *, max_note_len: int
 ) -> tuple[list[dict[str, object]], Decimal | None]:
     """
-    Parser estratti BCC Roma («BCC ROMA» in testata).
+    Parser estratti a colonne DARE/AVERE (BCC Roma, BancoPosta/Poste e layout analoghi).
 
     Ogni movimento inizia in riga con la doppia data; la nota continua sulle righe seguenti fino al prossimo movimento
     (stessa riga che ricomincia con doppia data, event. dopo prefisso SALDO/DOTAZIONE INIZIALE sulla prima riga).
@@ -1161,21 +1207,55 @@ def _looks_like_amex_estratto(text: str) -> bool:
     return False
 
 
+def _amex_line_has_trailing_amount(line: str) -> bool:
+    c0 = _normalize_pdf_line((line or "").replace("\n", " "))
+    return bool(re.search(rf"(?:{_AMT_CORE}){_AMT_LINE_SUFFIX}$", c0, re.I))
+
+
 def _amex_merge_cr_line_pairs(lines: list[str]) -> list[str]:
     """
-    Unisce ``… 18,70 €`` sulla riga successiva isolata ``CR`` (credito su estratto Amex tutto in positivo).
+    Unisce crediti Amex marcati da ``CR`` sulla riga sotto l'importo.
+
+    Casi gestiti:
+    - ``… 18,70 €`` + riga ``CR``;
+    - ``data data descrizione`` + riga solo importo + riga ``CR``;
+    - riga solo importo + riga ``CR`` accodata al movimento precedente (senza importo in coda).
     """
     out: list[str] = []
     i = 0
     n = len(lines)
     while i < n:
         cur = lines[i]
+        cstrip = (cur or "").strip()
+        if not cstrip:
+            out.append(cur)
+            i += 1
+            continue
+
+        if i + 2 < n:
+            amt_mid = _normalize_pdf_line(lines[i + 1].replace("\n", " "))
+            cr_third = lines[i + 2].strip()
+            if _RE_ORPHAN_AMOUNT_LINE.match(amt_mid) and _RE_STANDALONE_CR_LINE.match(cr_third):
+                if not _amex_line_has_trailing_amount(cstrip):
+                    out.append(_normalize_pdf_line(cstrip + " " + amt_mid + " CR"))
+                    i += 3
+                    continue
+
         if i + 1 < n and _RE_STANDALONE_CR_LINE.match(lines[i + 1].strip()):
             c0 = _normalize_pdf_line(cur.replace("\n", " "))
-            if re.search(rf"(?:{_AMT_CORE}){_AMT_LINE_SUFFIX}$", c0, re.I):
+            if _amex_line_has_trailing_amount(c0):
                 out.append(_normalize_pdf_line(c0 + " CR"))
                 i += 2
                 continue
+            if _RE_ORPHAN_AMOUNT_LINE.match(c0) and out:
+                prev = out[-1]
+                prev_norm = _normalize_pdf_line(prev.replace("\n", " "))
+                if not _amex_line_has_trailing_amount(prev_norm):
+                    out.pop()
+                    out.append(_normalize_pdf_line(prev_norm + " " + c0 + " CR"))
+                    i += 2
+                    continue
+
         out.append(cur)
         i += 1
     return out
@@ -1356,11 +1436,11 @@ def _parse_statement_text(text: str, *, max_note_len: int) -> tuple[list[dict[st
     is_amex = _looks_like_amex_estratto(text)
     prepared = _prepare_statement_lines(text)
     if is_amex:
-        prepared = _amex_merge_cr_line_pairs(prepared)
         prepared = _amex_merge_wrapped_statement_lines(prepared, max_note_len=max_note_len)
         prepared = _amex_rejoin_split_movement_lines(prepared, max_note_len=max_note_len)
+        prepared = _amex_merge_cr_line_pairs(prepared)
     joined = "\n".join(prepared)
-    if _looks_like_bcc_estratto(joined):
+    if _looks_like_two_column_dare_avere_estratto(joined):
         rows_bcc, cl_bcc = _parse_statement_text_bcc(prepared, max_note_len=max_note_len)
         if rows_bcc or cl_bcc is not None:
             return rows_bcc, cl_bcc

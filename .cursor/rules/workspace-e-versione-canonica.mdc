@@ -1,0 +1,25 @@
+---
+description: Workspace Dropbox canonico e linea versione 11.2.x (no copie Documents)
+alwaysApply: true
+---
+
+# Workspace e versione — vincoli obbligatori
+
+## Unica radice di lavoro (desktop)
+
+- Lavorare **solo** in `/Users/macand/Library/CloudStorage/Dropbox/CursorAppMacCdc`.
+- **Non** implementare né compilare da `/Users/macand/Documents/ContiDiCasaNew` (copia non canonica / archivio).
+- Le chat/transcript di questo progetto devono restare legate a questa cartella Dropbox.
+
+## Conti Light
+
+- Codice/app Light: `/Users/macand/Library/CloudStorage/Dropbox/ContiLight` e, nel repo desktop, `iphone_light/` allineato a quella radice.
+- Commit Light e desktop sono **due repository distinti**.
+
+## Versione applicazione desktop
+
+- Linea obbligatoria: **11.2.x** (`APP_VERSION_MAJOR=11`, `APP_VERSION_MINOR=2` in `app_version.py`).
+- Non abbassare il build sotto la baseline unificata; non riportare major/minor a 1.0.x / 11.1.x.
+- Il terzo numero sale **solo** con `python3 scripts/bump_version_build.py` o `scripts/build_macos_app.sh`.
+- Conti Light: `MARKETING_VERSION` Xcode separata (non è `APP_VERSION` desktop).
+---

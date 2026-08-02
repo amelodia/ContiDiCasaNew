@@ -10,11 +10,14 @@ from __future__ import annotations
 import os
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 # Durata minima in cui size+mtime devono restare invariati (secondi).
 _DEFAULT_STABLE_SECONDS = 1.6
+# Sidecar light post-login: file piccolo, .enc completo già caricato all'avvio.
+_LIGHT_SIDECAR_STABLE_SECONDS = 0.85
+_LIGHT_SIDECAR_MAX_WAIT_SECONDS = 75.0
 # Intervallo tra due controlli (secondi).
 _DEFAULT_POLL_SECONDS = 0.25
 # Limite massimo di attesa totale per file (secondi) dopo che il file esiste (stabilità size/mtime).
@@ -116,6 +119,7 @@ def _wait_file_stable(
     max_wait_seconds: float,
     max_wait_for_existence_seconds: float,
     ui_parent: object | None,
+    ui_pump: Callable[[], object] | None = None,
     label: str,
     batch_splash_holder: list[object | None] | None = None,
 ) -> float:
@@ -130,6 +134,15 @@ def _wait_file_stable(
     splash = None
     last_log = t_start
     batch_mode = batch_splash_holder is not None
+
+    def _pump_wait_ui() -> None:
+        if ui_parent is not None:
+            _pump_ui(ui_parent)
+        elif ui_pump is not None:
+            try:
+                ui_pump()
+            except Exception:
+                pass
 
     def _ensure_splash() -> None:
         nonlocal splash
@@ -148,12 +161,6 @@ def _wait_file_stable(
             if splash is None:
                 splash = _open_splash(ui_parent, label)
 
-    def _pump() -> None:
-        live = splash
-        if batch_mode and batch_splash_holder is not None:
-            live = batch_splash_holder[0]
-        _pump_ui(ui_parent, live if ui_parent is not None else None)
-
     # Fase 1: comparsa file (Dropbox in download, ecc.) — timeout breve se il path non è più valido.
     while not path.exists():
         if time.monotonic() >= existence_deadline:
@@ -162,7 +169,7 @@ def _wait_file_stable(
             return time.monotonic() - t_start
         if ui_parent is not None:
             _ensure_splash()
-            _pump()
+        _pump_wait_ui()
         time.sleep(poll_seconds)
 
     fp0 = _stat_fingerprint(path)
@@ -190,8 +197,7 @@ def _wait_file_stable(
             _ensure_splash()
 
         time.sleep(poll_seconds)
-        if ui_parent is not None:
-            _pump()
+        _pump_wait_ui()
 
         fp1 = _stat_fingerprint(path)
         if fp1 is None:
@@ -215,33 +221,6 @@ def _wait_file_stable(
     return time.monotonic() - t_start
 
 
-def _is_windows() -> bool:
-    return sys.platform.startswith("win")
-
-
-def _size_splash_window(w: object, *, min_w: int = 360, pad_w: int = 28, pad_h: int = 40) -> None:
-    """Geometria dopo pack/map: su Windows/DPI ``winfo_reqheight`` da soli taglia spesso l’ultima riga."""
-    import tkinter as tk
-
-    try:
-        w.update_idletasks()  # type: ignore[attr-defined]
-        ww = max(int(w.winfo_reqwidth()), min_w) + pad_w  # type: ignore[attr-defined]
-        wh = max(int(w.winfo_reqheight()), 1) + pad_h  # type: ignore[attr-defined]
-        if _is_windows():
-            # Margine extra: scaling DPI / font metrics non ancora stabili a withdraw.
-            ww += 16
-            wh += 28
-        sw = int(w.winfo_screenwidth())  # type: ignore[attr-defined]
-        sh = int(w.winfo_screenheight())  # type: ignore[attr-defined]
-        ww = min(ww, max(320, sw - 40))
-        wh = min(wh, max(120, sh - 80))
-        x = max(0, (sw - ww) // 2)
-        y = max(0, (sh - wh) // 2)
-        w.geometry(f"{ww}x{wh}+{x}+{y}")  # type: ignore[attr-defined]
-    except Exception:
-        pass
-
-
 def _open_splash(parent: object, subtitle: str) -> object:
     import tkinter as tk
 
@@ -254,7 +233,7 @@ def _open_splash(parent: object, subtitle: str) -> object:
         pass
     w.resizable(False, False)
     frm = tk.Frame(w, padx=22, pady=18)
-    frm.pack(fill="both", expand=True)
+    frm.pack()
     tk.Label(
         frm,
         text="Sincronizzazione dati in corso…",
@@ -265,41 +244,39 @@ def _open_splash(parent: object, subtitle: str) -> object:
         text=subtitle,
         font=("TkDefaultFont", 11),
         fg="#444444",
-        wraplength=380,
+        wraplength=360,
         justify="left",
     ).pack(anchor="w", pady=(8, 0))
     tk.Label(
         frm,
-        text="Attendere: Dropbox sta aggiornando i file in questa cartella.\n"
-        "Non chiudere questa finestra finché non scompare.",
+        text="Attendere: Dropbox sta aggiornando i file in questa cartella.",
         font=("TkDefaultFont", 10),
         fg="#666666",
-        wraplength=380,
+        wraplength=360,
         justify="left",
     ).pack(anchor="w", pady=(10, 0))
     try:
-        _size_splash_window(w)
+        w.update_idletasks()
+        ww = max(w.winfo_reqwidth(), 320)
+        wh = max(w.winfo_reqheight(), 1)
+        sw = w.winfo_screenwidth()
+        sh = w.winfo_screenheight()
+        x = max(0, (sw - ww) // 2)
+        y = max(0, (sh - wh) // 2)
+        w.geometry(f"{ww}x{wh}+{x}+{y}")
         w.deiconify()
         w.lift()
         w.attributes("-topmost", True)
-        # Secondo passaggio dopo la map: su Windows le metriche testo cambiano al primo paint.
-        w.update_idletasks()
-        _size_splash_window(w)
-        w.lift()
 
         def _topmost_off() -> None:
             try:
                 if not w.winfo_exists():
-                    return
-                # Su Windows lasciare topmost evita che altri dialoghi/explorer “superino” lo splash.
-                if _is_windows():
                     return
                 w.attributes("-topmost", False)
             except Exception:
                 pass
 
         w._conti_dropbox_splash_after = w.after(400, _topmost_off)  # type: ignore[attr-defined]
-        w._conti_dropbox_keep_topmost = _is_windows()  # type: ignore[attr-defined]
     except Exception:
         try:
             w.destroy()
@@ -308,19 +285,10 @@ def _open_splash(parent: object, subtitle: str) -> object:
     return w
 
 
-def _pump_ui(parent: object, splash: object | None = None) -> None:
-    """Aggiorna la UI senza far competere la root withdrawn con lo splash (problema tipico Windows)."""
+def _pump_ui(parent: object) -> None:
     try:
-        target = splash if splash is not None else parent
-        target.update_idletasks()  # type: ignore[attr-defined]
-        # ``update()`` pieno sulla root nascosta su Windows può ridisegnare a metà i Toplevel.
-        if splash is not None or not _is_windows():
-            target.update()  # type: ignore[attr-defined]
-        elif _is_windows():
-            try:
-                parent.update_idletasks()  # type: ignore[attr-defined]
-            except Exception:
-                pass
+        parent.update_idletasks()  # type: ignore[attr-defined]
+        parent.update()  # type: ignore[attr-defined]
     except Exception:
         pass
 
@@ -329,9 +297,11 @@ def wait_for_paths_stable_if_cloud(
     paths: Sequence[Path],
     *,
     ui_parent: object | None = None,
-    stable_seconds: float = _DEFAULT_STABLE_SECONDS,
+    ui_pump: Callable[[], object] | None = None,
+    stable_seconds: float | None = None,
     poll_seconds: float = _DEFAULT_POLL_SECONDS,
-    max_wait_seconds: float = _DEFAULT_MAX_WAIT_SECONDS,
+    max_wait_seconds: float | None = None,
+    light_sidecar: bool = False,
 ) -> None:
     """
     Per ogni percorso sotto Dropbox (euristica), attende che il file sia stabile prima che l'app lo legga.
@@ -351,6 +321,20 @@ def wait_for_paths_stable_if_cloud(
     """
     if os.environ.get("CONTI_SKIP_CLOUD_SYNC_WAIT", "").strip().lower() in ("1", "true", "yes", "on"):
         return
+    if light_sidecar:
+        stable = (
+            stable_seconds
+            if stable_seconds is not None
+            else _LIGHT_SIDECAR_STABLE_SECONDS
+        )
+        max_wait = (
+            max_wait_seconds
+            if max_wait_seconds is not None
+            else _LIGHT_SIDECAR_MAX_WAIT_SECONDS
+        )
+    else:
+        stable = stable_seconds if stable_seconds is not None else _DEFAULT_STABLE_SECONDS
+        max_wait = max_wait_seconds if max_wait_seconds is not None else _DEFAULT_MAX_WAIT_SECONDS
     verbose = os.environ.get("CONTI_VERBOSE_CLOUD_WAIT", "").strip().lower() in ("1", "true", "yes", "on")
     existence_cap = _max_wait_existence_seconds()
     seen: set[Path] = set()
@@ -378,11 +362,12 @@ def wait_for_paths_stable_if_cloud(
                 )
             waited = _wait_file_stable(
                 p,
-                stable_seconds=stable_seconds,
+                stable_seconds=stable,
                 poll_seconds=poll_seconds,
-                max_wait_seconds=max_wait_seconds,
+                max_wait_seconds=max_wait,
                 max_wait_for_existence_seconds=existence_cap,
                 ui_parent=ui_parent,
+                ui_pump=ui_pump,
                 label=label,
                 batch_splash_holder=batch_splash if len(drop_paths) > 1 else None,
             )

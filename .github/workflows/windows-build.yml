@@ -1,0 +1,63 @@
+name: Windows build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - "cursor/**"
+  pull_request:
+    branches: ["main"]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $innoDir = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6"
+          if (Test-Path $innoDir) {
+            echo "$innoDir" >> $env:GITHUB_PATH
+          }
+          $iscc = Join-Path $innoDir "ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Error "ISCC.exe non trovato dopo choco install innosetup"
+          }
+          Write-Host "ISCC OK: $iscc"
+
+      - name: Build Windows package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\scripts\build_windows_app.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload Windows zip package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ContiDiCasa-Windows-${{ github.sha }}
+          path: dist/ContiDiCasa-Windows.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ContiDiCasa-Windows-Setup-${{ github.sha }}
+          path: dist/ContiDiCasa-Windows-Setup.exe
+          if-no-files-found: error
+          retention-days: 14

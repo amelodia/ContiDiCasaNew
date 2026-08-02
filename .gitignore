@@ -26,6 +26,10 @@ legacy_import/*.enc
 # Cursor / log di debug locale
 .cursor/debug*.log
 
+# GoodSync / Dropbox metadata (non versionare)
+_gsdata_/
+**/_gsdata_/
+
 # PyInstaller (scripts/build_macos_app.sh)
 build/
 dist/

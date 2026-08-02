@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Incrementa APP_VERSION_BUILD (terzo numero) in app_version.py.
 
-Esegui prima di PyInstaller o manualmente dopo modifiche sostanziali.
-``scripts/build_macos_app.sh`` invoca questo script automaticamente.
+Esegui manualmente quando serve. Durante la compilazione PyInstaller
+(``ContiDiCasa.spec``) viene invocato automaticamente.
 """
 from __future__ import annotations
 
@@ -11,16 +11,35 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
 PATH = ROOT / "app_version.py"
 
 
 def main() -> int:
     text = PATH.read_text(encoding="utf-8")
+    maj = re.search(r"^APP_VERSION_MAJOR\s*=\s*(\d+)\s*$", text, re.MULTILINE)
+    minor = re.search(r"^APP_VERSION_MINOR\s*=\s*(\d+)\s*$", text, re.MULTILINE)
+    if not maj or not minor:
+        print("APP_VERSION_MAJOR/MINOR non trovati in app_version.py", file=sys.stderr)
+        return 1
+    if int(maj.group(1)) != 11 or int(minor.group(1)) != 2:
+        print(
+            f"Linea versione non ammessa: {maj.group(1)}.{minor.group(1)}.x "
+            "(obbligatoria 11.2.x).",
+            file=sys.stderr,
+        )
+        return 1
     m = re.search(r"^APP_VERSION_BUILD\s*=\s*(\d+)\s*$", text, re.MULTILINE)
     if not m:
         print("APP_VERSION_BUILD non trovato in app_version.py", file=sys.stderr)
         return 1
     n = int(m.group(1)) + 1
+    if n < 22:
+        print(
+            f"APP_VERSION_BUILD risultante {n} sotto baseline unificata 22.",
+            file=sys.stderr,
+        )
+        return 1
     text2, k = re.subn(
         r"^APP_VERSION_BUILD\s*=\s*\d+\s*$",
         f"APP_VERSION_BUILD = {n}",

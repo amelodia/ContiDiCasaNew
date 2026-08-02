@@ -1,25 +1,19 @@
-# PyInstaller — bundle macOS (.app). Uso: pyinstaller ContiDiCasa.spec
-# Dipendenze build: pip install pyinstaller (vedi scripts/build_macos_app.sh)
+# PyInstaller — bundle Windows onedir. Uso: pyinstaller ContiDiCasa_windows.spec
+#
+# Runtime accanto all'exe (contents_directory=".") e senza UPX sulle DLL: evita
+# "Failed to load Python DLL" su installazioni Windows pulite / antivirus.
 
 import importlib.util
 import os
-import subprocess
-import sys
 
 from PyInstaller.utils.hooks import collect_all
-
-_AUTO_BUMP = os.environ.get("CDC_AUTO_BUMP_VERSION", "1").strip().lower() not in ("0", "false", "no", "off")
-_BUMP_SCRIPT = os.path.join(SPECPATH, "scripts", "bump_version_build.py")
-if _AUTO_BUMP and os.path.isfile(_BUMP_SCRIPT):
-    subprocess.run([sys.executable, _BUMP_SCRIPT], cwd=SPECPATH, check=True)
 
 _vpath = os.path.join(SPECPATH, "app_version.py")
 _vspec = importlib.util.spec_from_file_location("cdc_app_version", _vpath)
 _vmod = importlib.util.module_from_spec(_vspec)
 _vspec.loader.exec_module(_vmod)
-_APP_VERSION = _vmod.APP_VERSION
-_ICNS_PATH = os.path.join(SPECPATH, "build", "ContiDiCasa.icns")
-_BUNDLE_ICON = _ICNS_PATH if os.path.isfile(_ICNS_PATH) else None
+_ICO_PATH = os.path.join(SPECPATH, "build", "ContiDiCasa.ico")
+_EXE_ICON = _ICO_PATH if os.path.isfile(_ICO_PATH) else None
 
 block_cipher = None
 
@@ -30,24 +24,34 @@ hidden = [
     "pypdf.generic",
     "pypdf._text_extraction",
     "cryptography.hazmat.backends.openssl",
+    "_cffi_backend",
+    "cffi",
+    "cryptography",
+    "cryptography.fernet",
+    "PIL",
+    "PIL.Image",
+    "PIL.ImageTk",
+    "PIL._imaging",
     "PIL._imagingtk",
     "certifi",
     "cloud_sync_wait",
+    "cdc_round_color_wheel",
+    "cdc_ui_palette",
+    "cdc_ui_theme",
     "email_client",
     "os_boot_time",
     "data_workspace",
     "mail_gate",
     "periodiche",
     "security_auth",
-    "cdc_ui_palette",
-    "cdc_ui_theme",
-    "cdc_round_color_wheel",
-    "balance_engine",
+    "tk_foreground",
     "import_legacy",
     "estratto_conto_pdf",
     "light_enc_sidecar",
-    # Matplotlib PDF backend è importato dinamicamente da fig.savefig(..., format="pdf").
     "matplotlib.backends.backend_pdf",
+    "win32com.client",
+    "webview",
+    "webview.platforms.edgechromium",
 ]
 
 _sv_ttk_collect = collect_all("sv_ttk")
@@ -55,22 +59,17 @@ _sv_ttk_datas = list(_sv_ttk_collect[0])
 _sv_ttk_binaries = list(_sv_ttk_collect[1])
 _sv_ttk_hidden = list(_sv_ttk_collect[2])
 
-if sys.platform == "darwin":
-    hidden += [
-        "AppKit",
-        "Foundation",
-        "objc",
-    ]
-
 a = Analysis(
     ["main_app.py"],
     pathex=[],
     binaries=_sv_ttk_binaries,
-    datas=_sv_ttk_datas,
+    datas=[
+        ("webview_print_worker.py", "."),
+        *_sv_ttk_datas,
+    ],
     hiddenimports=hidden + _sv_ttk_hidden,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
     excludes=[],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -89,13 +88,14 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
-    argv_emulation=(sys.platform == "darwin"),
+    icon=_EXE_ICON,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    contents_directory=".",
 )
 
 coll = COLLECT(
@@ -104,23 +104,7 @@ coll = COLLECT(
     a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name="ContiDiCasa",
-)
-
-app = BUNDLE(
-    coll,
-    name="ContiDiCasa.app",
-    icon=_BUNDLE_ICON,
-    bundle_identifier="it.contidicasa.desktop",
-    info_plist={
-        "CFBundleName": "Conti di casa",
-        "CFBundleDisplayName": "Conti di casa",
-        "CFBundleShortVersionString": _APP_VERSION,
-        "CFBundleVersion": _APP_VERSION,
-        "LSMinimumSystemVersion": "11.0",
-        "LSApplicationCategoryType": "public.app-category.finance",
-        "NSHighResolutionCapable": True,
-    },
 )
