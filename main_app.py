@@ -8163,6 +8163,8 @@ def build_ui(
     session: security_auth.AppSession,
     path_holder: list[Path],
     key_path_holder: list[Path],
+    *,
+    post_login_loading_win: tk.Toplevel | None = None,
 ) -> None:
     # Riferimento mutabile: dopo import legacy da Opzioni, griglia e saldi devono usare il nuovo DB.
     _BANNER_CLOCK_LABELS.clear()
@@ -8219,10 +8221,24 @@ def build_ui(
     key_file_var.trace_add("write", _sync_path_holders_from_vars)
     # La root resta nascosta durante tutta la costruzione dell'interfaccia: così non si vede
     # una finestra vuota in fullscreen (su macOS il -fullscreen nativo dà spesso un flash nero in alto).
+    # La finestra «Caricamento…» post-login resta visibile (Toplevel già mappato); su Windows va
+    # rilanciata in primo piano dopo withdraw della root, altrimenti sparisce o si ridisegna a metà.
     try:
         root.withdraw()
     except Exception:
         pass
+    if post_login_loading_win is not None:
+        try:
+            if post_login_loading_win.winfo_exists():
+                post_login_loading_win.lift()
+                if platform.system() == "Windows":
+                    try:
+                        post_login_loading_win.attributes("-topmost", True)
+                    except Exception:
+                        pass
+                post_login_loading_win.update_idletasks()
+        except Exception:
+            pass
     root.title(window_title_for_session(db_holder[0], session_holder[0], show_clock=True))
 
     main_nb_shell = tk.Frame(root, bg=MOVIMENTI_PAGE_BG)
@@ -8277,6 +8293,7 @@ def build_ui(
     movimenti_body = ttk.Frame(movimenti_main_stack, style="MovCdc.TFrame")
     movimenti_body.grid(row=0, column=0, sticky="nsew")
     nuovi_dati_frame = tk.Frame(cdc_content, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
+    periodiche_dati_frame = tk.Frame(cdc_content, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     verifica_frame = ttk.Frame(cdc_content, padding=8, style="MovCdc.TFrame")
     statistiche_frame = ttk.Frame(cdc_content, padding=8, style="MovCdc.TFrame")
     budget_frame = ttk.Frame(cdc_content, padding=8, style="MovCdc.TFrame")
@@ -8288,6 +8305,7 @@ def build_ui(
     _pages_all: list[tk.Widget] = [
         movimenti_frame,
         nuovi_dati_frame,
+        periodiche_dati_frame,
         verifica_frame,
         statistiche_frame,
         budget_frame,
@@ -8297,7 +8315,7 @@ def build_ui(
         aiuto_frame,
     ]
     for _pf in _pages_all:
-        if _pf is nuovi_dati_frame:
+        if _pf in (nuovi_dati_frame, periodiche_dati_frame):
             _pf.grid(row=0, column=0, sticky="nsew", in_=cdc_content, padx=8, pady=8)
         else:
             _pf.grid(row=0, column=0, sticky="nsew", in_=cdc_content)
@@ -8314,10 +8332,14 @@ def build_ui(
     # Codice conto (solo cifre) dell'ultima sessione avviata: usato se StringVar è vuota al momento di ``**``.
     ver_session_account_code: list[str] = [""]
 
+    _nuovi_on_tab_enter_fn: list[Callable[[], None] | None] = [None]
+    _periodiche_on_tab_enter_fn: list[Callable[[], None] | None] = [None]
+
     def _cdc_ordered_tabs() -> list[tk.Widget]:
         o: list[tk.Widget] = [
             movimenti_frame,
             nuovi_dati_frame,
+            periodiche_dati_frame,
             verifica_frame,
             statistiche_frame,
             budget_frame,
@@ -8377,6 +8399,14 @@ def build_ui(
             fn_b = _budget_on_tab_enter_fn[0]
             if fn_b is not None:
                 fn_b()
+        elif _new is nuovi_dati_frame:
+            fn_n = _nuovi_on_tab_enter_fn[0]
+            if fn_n is not None:
+                fn_n()
+        elif _new is periodiche_dati_frame:
+            fn_p = _periodiche_on_tab_enter_fn[0]
+            if fn_p is not None:
+                fn_p()
 
     def _cdc_select(f: tk.Widget) -> None:
         if _cdc_current[0] is verifica_frame and f is not verifica_frame and ver_session_active[0]:
@@ -8411,7 +8441,7 @@ def build_ui(
                 pf.grid_remove()
             except tk.TclError:
                 pass
-        if f is nuovi_dati_frame:
+        if f in (nuovi_dati_frame, periodiche_dati_frame):
             f.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         else:
             f.grid(row=0, column=0, sticky="nsew")
@@ -8458,6 +8488,7 @@ def build_ui(
 
     _mk_cdc_tab("Movimenti e correzioni", movimenti_frame).pack(side=tk.LEFT, padx=(0, 6))
     _mk_cdc_tab("Nuove registrazioni", nuovi_dati_frame).pack(side=tk.LEFT, padx=(0, 6))
+    _mk_cdc_tab("Registrazioni periodiche", periodiche_dati_frame).pack(side=tk.LEFT, padx=(0, 6))
     _mk_cdc_tab("Verifica", verifica_frame).pack(side=tk.LEFT, padx=(0, 6))
     _mk_cdc_tab("Statistiche", statistiche_frame).pack(side=tk.LEFT, padx=(0, 6))
     _mk_cdc_tab("Budget", budget_frame).pack(side=tk.LEFT, padx=(0, 6))
@@ -13838,66 +13869,7 @@ th {{ background:#efefef; text-align:left; }}
 
     root.bind_all("<FocusIn>", _saldi_footer_on_app_focus_in, add="+")
 
-    # Pagina Nuove registrazioni
-    nuovi_top = tk.Frame(nuovi_dati_frame, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    nuovi_top.pack(fill=tk.X, pady=(0, 10))
-    nuovi_top_inner = tk.Frame(nuovi_top, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    nuovi_top_inner.pack(anchor=tk.CENTER)
-    btn_nuova_reg = tk.Label(
-        nuovi_top_inner,
-        text="Nuova registrazione",
-        cursor="hand2",
-        highlightthickness=0,
-        font=_TAB_BAR_FONT,
-        padx=10,
-        pady=5,
-        bg=_tipo_bg,
-        fg=_tipo_fg,
-        relief=tk.RAISED,
-        bd=1,
-    )
-    btn_reg_periodiche = tk.Label(
-        nuovi_top_inner,
-        text="Registrazioni periodiche",
-        cursor="hand2",
-        highlightthickness=0,
-        font=_TAB_BAR_FONT,
-        padx=10,
-        pady=5,
-        bg=_tipo_bg,
-        fg=_tipo_fg,
-        relief=tk.RAISED,
-        bd=1,
-    )
-    btn_nuova_reg.pack(side=tk.LEFT, padx=(0, 8))
-    btn_reg_periodiche.pack(side=tk.LEFT)
-
-    nuovi_submode: list[str] = ["new"]
-
-    def _nuovi_sync_subtab_style() -> None:
-        if nuovi_submode[0] == "new":
-            btn_nuova_reg.configure(bg=_tipo_act, fg=_tipo_fg, relief=tk.SUNKEN, bd=2, highlightthickness=0)
-            btn_reg_periodiche.configure(bg=_tipo_bg, fg=_tipo_fg, relief=tk.RAISED, bd=1, highlightthickness=0)
-        else:
-            btn_nuova_reg.configure(bg=_tipo_bg, fg=_tipo_fg, relief=tk.RAISED, bd=1, highlightthickness=0)
-            btn_reg_periodiche.configure(bg=_tipo_act, fg=_tipo_fg, relief=tk.SUNKEN, bd=2, highlightthickness=0)
-
-    def _nuovi_subtab_enter(which: str):
-        def _on_ent(_e: tk.Event) -> None:
-            if nuovi_submode[0] != which:
-                (btn_nuova_reg if which == "new" else btn_reg_periodiche).configure(bg=_tipo_act)
-
-        return _on_ent
-
-    def _nuovi_subtab_leave(_e: tk.Event) -> None:
-        _nuovi_sync_subtab_style()
-
-    btn_nuova_reg.bind("<Enter>", _nuovi_subtab_enter("new"))
-    btn_nuova_reg.bind("<Leave>", _nuovi_subtab_leave)
-    btn_reg_periodiche.bind("<Enter>", _nuovi_subtab_enter("periodiche"))
-    btn_reg_periodiche.bind("<Leave>", _nuovi_subtab_leave)
-    _nuovi_sync_subtab_style()
-
+    # Pagina Nuove registrazioni (scheda dedicata; le periodiche hanno scheda propria nella barra).
     nuovi_status_var = tk.StringVar(value="")
     tk.Label(
         nuovi_dati_frame,
@@ -13910,7 +13882,7 @@ th {{ background:#efefef; text-align:left; }}
 
     nuovi_immissione_title_var = tk.StringVar(value="")
 
-    # Come periodiche: modulo in alto (stessa quota verticale), spazio espandibile sotto (non centra il form in mezzo alla pagina).
+    # Modulo in alto (stessa quota verticale delle periodiche), spazio espandibile sotto.
     nuova_page_outer = tk.Frame(nuovi_dati_frame, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     nuova_form_strip = tk.Frame(nuova_page_outer, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     nuova_form_strip.pack(fill=tk.X)
@@ -13934,8 +13906,10 @@ th {{ background:#efefef; text-align:left; }}
     # Mantiene stabile il layout verticale: mostra/nasconde controlli saldo senza spostare le righe.
     nuova_form.rowconfigure(0, minsize=36)  # riga "Conto"
     nuova_form.rowconfigure(3, minsize=36)  # riga "Importo"
-    periodiche_panel = tk.Frame(nuovi_dati_frame, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    periodiche_panel.pack_forget()
+
+    # Pagina Registrazioni periodiche (scheda dedicata nella barra principale).
+    periodiche_panel = tk.Frame(periodiche_dati_frame, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
+    periodiche_panel.pack(fill=tk.BOTH, expand=True, padx=(0, 8))
 
     newreg_no_var = tk.StringVar(value="-")
     newreg_date_var = tk.StringVar(value=to_italian_date(date.today().isoformat()))
@@ -15030,8 +15004,7 @@ th {{ background:#efefef; text-align:left; }}
         cb_acc1.configure(values=[n for n, _c in acc_opts_cache])
         cb_acc2.configure(values=[n for n, _c in acc_opts_cache])
         newreg_no_var.set(f"Nuova registrazione n. {_next_registration_number()}")
-        if nuovi_submode[0] == "new":
-            nuovi_immissione_title_var.set(newreg_no_var.get())
+        nuovi_immissione_title_var.set(newreg_no_var.get())
         if virtuale_discharge_active[0]:
             newreg_date_var.set(to_italian_date(date.today().isoformat()))
             _set_category_by_code(
@@ -15304,9 +15277,6 @@ th {{ background:#efefef; text-align:left; }}
 
     def _nuovi_leave_guard(_dest: tk.Widget) -> bool:
         """Prima di lasciare «Nuove registrazioni»: conferma salvataggio se importo compilato; reset default."""
-        if nuovi_submode[0] != "new":
-            _populate_form_defaults(keep_last=False)
-            return True
         if not _newreg_importo_implica_conferma():
             _populate_form_defaults(keep_last=False)
             return True
@@ -15904,12 +15874,11 @@ th {{ background:#efefef; text-align:left; }}
     ).pack(fill=tk.X, anchor=tk.W, pady=(2, 0))
 
     def _per_refresh_form_title() -> None:
-        if nuovi_submode[0] == "periodiche":
-            nuovi_immissione_title_var.set(
-                "Modifica registrazione periodica"
-                if per_edit_rule_id[0]
-                else "Nuova registrazione periodica"
-            )
+        nuovi_immissione_title_var.set(
+            "Modifica registrazione periodica"
+            if per_edit_rule_id[0]
+            else "Nuova registrazione periodica"
+        )
         per_date_field_lbl_var.set(
             "Prossima creazione" if per_edit_rule_id[0] else "Prima scadenza"
         )
@@ -17176,31 +17145,36 @@ th {{ background:#efefef; text-align:left; }}
     for _per_foc_w in (tree_per, tree_per_amt, tree_per_note, tree_per_scroll_y, tree_per_scroll_x):
         _per_foc_w.bind("<FocusOut>", _per_on_list_area_focus_out, add="+")
 
+    def _enter_nuovi_page() -> None:
+        per_follow_grid_selection[0] = False
+        _populate_form_defaults(keep_last=True)
+        nuovi_immissione_title_var.set(newreg_no_var.get())
+        try:
+            ent_date.focus_set()
+        except Exception:
+            pass
+
+    def _enter_periodiche_page() -> None:
+        _per_refresh_options()
+        _per_sync_cadence_combo()
+        _per_refresh_tree()
+        _per_apply_periodic_defaults_if_unfilled()
+        _per_sync_cat_and_second()
+        _per_refresh_form_title()
+        root.after_idle(_per_schedule_tree_visible_rows)
+
     def _show_mode(mode: str) -> None:
+        """Compatibilità: seleziona la scheda Nuove o Periodiche nella barra principale."""
         if mode == "new":
-            nuovi_submode[0] = "new"
-            nuova_page_outer.pack(fill=tk.BOTH, expand=True)
-            periodiche_panel.pack_forget()
-            per_follow_grid_selection[0] = False
-            _nuovi_sync_subtab_style()
-            _populate_form_defaults(keep_last=True)
-            nuovi_immissione_title_var.set(newreg_no_var.get())
             try:
-                ent_date.focus_set()
+                notebook.select(nuovi_dati_frame)
             except Exception:
-                pass
+                _enter_nuovi_page()
         else:
-            nuovi_submode[0] = "periodiche"
-            nuova_page_outer.pack_forget()
-            _nuovi_sync_subtab_style()
-            _per_refresh_options()
-            _per_sync_cadence_combo()
-            _per_refresh_tree()
-            _per_apply_periodic_defaults_if_unfilled()
-            _per_sync_cat_and_second()
-            _per_refresh_form_title()
-            periodiche_panel.pack(fill=tk.BOTH, expand=True, padx=(0, 8))
-            root.after_idle(_per_schedule_tree_visible_rows)
+            try:
+                notebook.select(periodiche_dati_frame)
+            except Exception:
+                _enter_periodiche_page()
 
     def _on_cat_selected(_e: tk.Event | None = None) -> None:
         code = _selected_category_code()
@@ -17490,8 +17464,8 @@ th {{ background:#efefef; text-align:left; }}
     btn_finish.configure(command=lambda: _commit_new_record(finish=True))
     btn_clear.configure(command=_clear_values)
     nuovi_leave_guard_ref[0] = _nuovi_leave_guard
-    btn_nuova_reg.bind("<Button-1>", lambda _e: _show_mode("new"))
-    btn_reg_periodiche.bind("<Button-1>", lambda _e: _show_mode("periodiche"))
+    _nuovi_on_tab_enter_fn[0] = _enter_nuovi_page
+    _periodiche_on_tab_enter_fn[0] = _enter_periodiche_page
     btn_aggiorna_saldo.configure(command=_on_aggiorna_saldo_cassa_click)
     btn_scarica_virtuale.configure(command=_on_scarica_virtuale_click)
 
@@ -17507,6 +17481,10 @@ th {{ background:#efefef; text-align:left; }}
             nuovi_ix = notebook.index(nuovi_dati_frame)
         except Exception:
             nuovi_ix = 1
+        try:
+            periodiche_ix = notebook.index(periodiche_dati_frame)
+        except Exception:
+            periodiche_ix = -1
         try:
             opzioni_ix = notebook.index(opzioni_frame)
         except Exception:
@@ -17529,6 +17507,13 @@ th {{ background:#efefef; text-align:left; }}
                     _cat_and_acc_options()
                 )
                 _sync_cat_note_and_second_account()
+            except Exception:
+                pass
+        elif cur == periodiche_ix:
+            try:
+                cat_opts_cache, acc_opts_cache, cat_note_by_code_cache, cat_sign_by_code_cache, cat_raw_name_by_code_cache = (
+                    _cat_and_acc_options()
+                )
                 cb_per_cat.configure(values=[n for n, _c in cat_opts_cache])
                 cb_per_acc1.configure(values=[n for n, _c in acc_opts_cache])
                 cb_per_acc2.configure(values=[n for n, _c in acc_opts_cache])
@@ -17546,7 +17531,7 @@ th {{ background:#efefef; text-align:left; }}
         reject_zero=False,
         external_focusout=True,
     )
-    _show_mode("new")
+    _enter_nuovi_page()
 
     # ========================  PAGINA VERIFICA  ========================
     _VER_BG = MOVIMENTI_PAGE_BG
@@ -30424,15 +30409,12 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             "La sessione precedente si è interrotta prima dell'azzeramento.\n"
             "Occorre completare lo scarico del saldo virtuale.\n\n"
             "In alternativa, usa «Azzera saldo virtuale (emergenza)» nelle Opzioni.",
+            parent=root,
         )
 
     def _startup_periodic_then_virtuale() -> None:
         _startup_periodic_due_check()
         _startup_check_virtuale_pending()
-
-    root.after(200, _open_opzioni_if_mail_incomplete)
-    root.after(350, _startup_periodic_then_virtuale)
-    root.after(900, _try_open_plan_conti_pending)
 
     def _poll_registration_once() -> None:
         try:
@@ -30446,10 +30428,16 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         except Exception:
             pass
 
-    root.after(900, _poll_registration_once)
+    def _schedule_post_present_startup_dialogs() -> None:
+        """Avvisi post-apertura solo a finestra principale stabile (su Windows evita race con «zoomed»)."""
+        root.after(200, _open_opzioni_if_mail_incomplete)
+        root.after(350, _startup_periodic_then_virtuale)
+        root.after(900, _try_open_plan_conti_pending)
+        root.after(900, _poll_registration_once)
 
     def _present_main_window() -> None:
         """Mostra la finestra principale solo a UI pronta; evita flash nero (fullscreen Cocoa) su macOS."""
+        security_auth.close_post_login_loading_window(post_login_loading_win)
         try:
             if platform.system() == "Darwin":
                 try:
@@ -30459,16 +30447,32 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 sw = root.winfo_screenwidth()
                 sh = root.winfo_screenheight()
                 root.geometry(f"{sw}x{sh}+0+0")
+                root.deiconify()
+                root.lift()
+                root.focus_force()
+                root.update_idletasks()
             else:
+                # Windows: prima mappa a dimensione fissa, poi zoom — così i messagebox di avvio
+                # non vengono “superati” dall’animazione maximized / ridisegno incompleto.
                 root.geometry("1200x760")
+                root.deiconify()
+                root.lift()
+                root.focus_force()
+                try:
+                    root.update_idletasks()
+                    root.update()
+                except Exception:
+                    pass
                 try:
                     root.state("zoomed")
                 except Exception:
                     pass
-            root.deiconify()
-            root.lift()
-            root.focus_force()
-            root.update_idletasks()
+                try:
+                    root.update_idletasks()
+                    root.lift()
+                    root.focus_force()
+                except Exception:
+                    pass
 
             def _dock_icon_when_safe() -> None:
                 try:
@@ -30482,8 +30486,17 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 root.after(450, _dock_icon_when_safe)
             except tk.TclError:
                 pass
+
+            # Su Windows attendere che lo stato zoomed si assesti prima di dialoghi bloccanti.
+            if platform.system() == "Windows":
+                root.after(700, _schedule_post_present_startup_dialogs)
+            else:
+                _schedule_post_present_startup_dialogs()
         except Exception:
-            pass
+            try:
+                _schedule_post_present_startup_dialogs()
+            except Exception:
+                pass
 
     def _on_app_close() -> None:
         if ver_session_active[0]:
@@ -30587,7 +30600,7 @@ def main() -> None:
     except Exception as exc:
         # Non abbiamo creato il segnaposto: non va cancellato un file altrui ancora valido.
         try:
-            messagebox.showerror("Cartella dati in uso", str(exc), parent=None)
+            messagebox.showerror("Cartella dati in uso", str(exc), parent=root)
         except Exception:
             print(f"Avvio interrotto: {exc}", file=sys.stderr)
         try:
@@ -30625,7 +30638,7 @@ def main() -> None:
             "prima di continuare.\n\n"
             "OK = continua e carica il database\n"
             "Annulla = esci dall'applicazione",
-            parent=None,
+            parent=root,
         ):
             print("Avvio annullato: conferma Dropbox dopo boot non accettata.", file=sys.stderr)
             try:
@@ -30697,7 +30710,7 @@ def main() -> None:
         security_auth.ensure_security(d)
         save_encrypted_db_dual(d, target, key_path_holder[0])
 
-    ok, session = security_auth.run_login_dialog(
+    ok, session, post_login_loading_win = security_auth.run_login_dialog(
         root,
         db_holder[0],
         save_db,
@@ -30705,11 +30718,12 @@ def main() -> None:
         after_prepare_nuova_utenza=reset_contabili_for_nuova_utenza,
     )
     if not ok or session is None:
+        security_auth.close_post_login_loading_window(post_login_loading_win)
         try:
             messagebox.showinfo(
                 "Conti di casa",
                 "Accesso annullato.\nPer usare il programma avvia di nuovo l'applicazione.",
-                parent=None,
+                parent=root,
             )
         except Exception:
             print("Accesso annullato.", file=sys.stderr)
@@ -30727,13 +30741,30 @@ def main() -> None:
         except Exception:
             pass
 
-    path_holder[0] = migrate_data_path_after_login(db_holder[0], session, path_holder[0])
-    if session.entered_via_backdoor:
-        security_auth.ensure_security(db_holder[0])
-        session.is_registered = bool(
-            (db_holder[0].get("user_profile") or {}).get("registration_verified")
+    try:
+        if post_login_loading_win is not None and post_login_loading_win.winfo_exists():
+            post_login_loading_win.update_idletasks()
+    except Exception:
+        pass
+
+    try:
+        path_holder[0] = migrate_data_path_after_login(db_holder[0], session, path_holder[0])
+        if session.entered_via_backdoor:
+            security_auth.ensure_security(db_holder[0])
+            session.is_registered = bool(
+                (db_holder[0].get("user_profile") or {}).get("registration_verified")
+            )
+        build_ui(
+            db_holder[0],
+            root,
+            session,
+            path_holder,
+            key_path_holder,
+            post_login_loading_win=post_login_loading_win,
         )
-    build_ui(db_holder[0], root, session, path_holder, key_path_holder)
+    except Exception:
+        security_auth.close_post_login_loading_window(post_login_loading_win)
+        raise
 
 
 if __name__ == "__main__":

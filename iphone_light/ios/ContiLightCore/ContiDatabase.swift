@@ -426,6 +426,64 @@ public enum ContiDatabase {
     private static let localInstanceMutex = NSLock()
     /// Vero solo dopo creazione con successo di `conti_di_casa_folder_in_use.txt` in questa sessione: non va mai cancellato un segnaposto altrui.
     private static var sessionHoldsDataFolderMarkerOnDisk = false
+    /// Contatore persist `.enc` in corso (thread-safe). Usato per non chiudere la sessione in background a metà scrittura.
+    private static var activePersistCount = 0
+
+    /// `true` mentre Conti Light sta scrivendo il `*_light.enc` (o altro persist esplicito).
+    public static var isPersistInProgress: Bool {
+        localInstanceMutex.lock()
+        defer { localInstanceMutex.unlock() }
+        return activePersistCount > 0
+    }
+
+    private static func beginPersistGate() {
+        localInstanceMutex.lock()
+        activePersistCount += 1
+        localInstanceMutex.unlock()
+    }
+
+    private static func endPersistGate() {
+        localInstanceMutex.lock()
+        activePersistCount = max(0, activePersistCount - 1)
+        localInstanceMutex.unlock()
+    }
+
+    /// Mantiene vivo il processo iOS per il tempo della scrittura Dropbox/File Provider.
+    private static func withPersistLifetimeProtection<T>(_ body: () throws -> T) rethrows -> T {
+        beginPersistGate()
+        defer { endPersistGate() }
+        #if canImport(UIKit)
+        var bgTaskId = UIBackgroundTaskIdentifier.invalid
+        let startBg = {
+            bgTaskId = UIApplication.shared.beginBackgroundTask(withName: "ContiLightPersistEnc") {
+                let id = bgTaskId
+                bgTaskId = .invalid
+                if id != .invalid {
+                    UIApplication.shared.endBackgroundTask(id)
+                }
+            }
+        }
+        if Thread.isMainThread {
+            startBg()
+        } else {
+            DispatchQueue.main.sync(execute: startBg)
+        }
+        defer {
+            let endBg = {
+                if bgTaskId != .invalid {
+                    UIApplication.shared.endBackgroundTask(bgTaskId)
+                    bgTaskId = .invalid
+                }
+            }
+            if Thread.isMainThread {
+                endBg()
+            } else {
+                DispatchQueue.main.sync(execute: endBg)
+            }
+        }
+        #endif
+        return try body()
+    }
 
     private static func dataFolderInUseMarkerURL(in folder: URL) -> URL {
         folder.standardizedFileURL.appendingPathComponent(dataFolderInUseMarkerFilename, isDirectory: false)
@@ -2548,10 +2606,13 @@ public enum ContiDatabase {
     }
 
     /**
-     Scrive su disco ``*_light.enc`` e, se presente e autenticabile, anche ``conti_utente_*.enc`` completo.
-     ``recordForSaldi`` è usato in sola lettura come documentazione legata a ``appendLightSessionRecord``; i saldi sul file light vengono ricalcolati interamente da movimenti; sul completo: merge + upsert + ricalcolo.
+     Scrive su disco **solo** ``*_light.enc``.
 
-     **Flusso:** si carica il completo da disco, si applica ``sessionDb`` con ``upsertLightSessionRecordsInMain`` (che **preserva** sul main i campi verifica conto già presenti), poi le sole righe light nuove con ``mergeLightNewRecordsIntoMain``. Infine saldi e riscrittura doppia file.
+     Il ``conti_utente_*.enc`` completo resta di proprietà del desktop (merge delle righe light all’avvio).
+     Così si evitano overwrite ravvicinati del completo via Dropbox File Provider e si riducono le conflicted copy.
+
+     ``recordForSaldi`` resta per compatibilità con i chiamanti; i saldi sul light vengono ricalcolati dai movimenti in sessione.
+     ``password`` / ``email`` non sono usati per autenticare il completo in questo percorso (sola scrittura light).
      */
     public static func persistSessionDbToEncryptedFiles(
         sessionDb: [String: Any],
@@ -2562,55 +2623,25 @@ public enum ContiDatabase {
         password: String
     ) throws -> (sessionLight: [String: Any], mergedIntoFull: Int, note: String) {
         _ = recordForSaldi
-        let em = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let fullURL = perUserEncURL(primaryEnc: lightEncURL, email: em)
-        var waitPaths = [keyURL, lightEncURL]
-        if FileManager.default.fileExists(atPath: fullURL.path) {
-            waitPaths.append(fullURL)
-        }
-        _ = waitForPathsStableIfDropbox(waitPaths)
-        let keyString = try coordinatedStringContents(of: keyURL, encoding: .utf8)
-        if FileManager.default.fileExists(atPath: fullURL.path) {
-            var main = try loadEncryptedDBFull(encURL: fullURL, keyURL: keyURL)
-            guard tryLogin(db: main, email: em, password: password) != nil else {
+        _ = email
+        _ = password
+        return try withPersistLifetimeProtection {
+            _ = waitForPathsStableIfDropbox([keyURL, lightEncURL])
+            let keyString = try coordinatedStringContents(of: keyURL, encoding: .utf8)
+            var lightOnly = try deepCopyDb(sessionDb)
+            guard dictionaryFromAnyRoot(lightOnly["light_saldi"]) != nil else {
                 throw ContiLightImmissioneError.message(
-                    "Il file database completo è presente ma l’accesso è fallito. Verifica la password o apri prima sul desktop."
+                    "Nel file light manca il blocco «light_saldi». Rigenera il file *_light.enc salvando sul desktop, poi riprova."
                 )
             }
-            let nUp = upsertLightSessionRecordsInMain(main: &main, light: sessionDb)
-            let nNew = mergeLightNewRecordsIntoMain(main: &main, light: sessionDb)
-            recomputeLightSaldiFromFullDb(&main)
-            let lightExport = try buildLightDatabaseForExport(from: main)
-            try saveEncryptedDbPairUnderSingleWorkspaceLock(
-                keyString: keyString,
-                fullURL: fullURL,
-                fullDb: main,
-                lightURL: lightEncURL,
-                lightDb: lightExport
-            )
-            var msg = "Salvati file completo e light nella cartella dati; saldi ricalcolati come sul desktop."
-            if nNew > 0, nUp > 0 {
-                msg = "Importate \(nNew) nuove registrazione/i, aggiornate \(nUp) esistenti nel database completo. " + msg
-            } else if nNew > 0 {
-                msg = "Importate \(nNew) nuove registrazione/i nel database completo. " + msg
-            } else if nUp > 0 {
-                msg = "Aggiornate \(nUp) registrazione/i (modifica/sospensione) nel database completo. " + msg
-            }
-            return (lightExport, nNew + nUp, msg)
+            recomputeLightSaldiFromFullDb(&lightOnly)
+            try saveEncryptedDbToDisk(db: lightOnly, encURL: lightEncURL, keyString: keyString)
+            let msg = """
+            Salvato il file light nella cartella dati. \
+            Il database completo verrà aggiornato al prossimo avvio dell’app desktop (import delle registrazioni Conti light).
+            """
+            return (lightOnly, 0, msg)
         }
-        var lightOnly = try deepCopyDb(sessionDb)
-        guard dictionaryFromAnyRoot(lightOnly["light_saldi"]) != nil else {
-            throw ContiLightImmissioneError.message(
-                "Nel file light manca il blocco «light_saldi». Copia nella cartella anche il database completo .enc (consigliato) oppure rigenera il file *_light.enc salvando sul desktop, poi riprova."
-            )
-        }
-        recomputeLightSaldiFromFullDb(&lightOnly)
-        try saveEncryptedDbToDisk(db: lightOnly, encURL: lightEncURL, keyString: keyString)
-        let msg = """
-        Salvato solo il file light (nessun database completo trovato accanto). \
-        I saldi sono stati ricalcolati a partire dai movimenti; per l’allineamento completo con la contabilità desktop copia il file .enc completo e salva o apri sul desktop.
-        """
-        return (lightOnly, 0, msg)
     }
 
     /// Cifratura Fernet + scrittura atomica (senza controlli cartella: uso interno dopo ``assertSafeToSave``).
@@ -2629,35 +2660,17 @@ public enum ContiDatabase {
         try outData.write(to: encURL, options: .atomic)
     }
 
-    /// Scrive ``conti_utente_*.enc`` e ``*_light.enc`` in successione (stessa cartella), dopo i controlli conflitti ``.enc``.
-    private static func saveEncryptedDbPairUnderSingleWorkspaceLock(
-        keyString: String,
-        fullURL: URL,
-        fullDb: [String: Any],
-        lightURL: URL,
-        lightDb: [String: Any]
-    ) throws {
-        let f1 = fullURL.deletingLastPathComponent().standardizedFileURL
-        let f2 = lightURL.deletingLastPathComponent().standardizedFileURL
-        precondition(
-            f1.path == f2.path,
-            "saveEncryptedDbPairUnderSingleWorkspaceLock: full e light devono essere nella stessa cartella dati."
-        )
-        try assertSafeToSave(fullURL)
-        try assertSafeToSave(lightURL)
-        try writeFernetEncryptedDb(db: fullDb, encURL: fullURL, keyString: keyString)
-        try writeFernetEncryptedDb(db: lightDb, encURL: lightURL, keyString: keyString)
-    }
-
-    /// Scrive un database cifrato (stesso formato del desktop).
+    /// Scrive un database cifrato (stesso formato del desktop). Usato da Conti Light solo per ``*_light.enc``.
     public static func saveEncryptedDbToDisk(db: [String: Any], encURL: URL, keyString: String) throws {
         try assertSafeToSave(encURL)
         try writeFernetEncryptedDb(db: db, encURL: encURL, keyString: keyString)
     }
 
     /**
-     All’accesso: fonde il light in memoria nel ``conti_utente_*.enc`` completo (se presente), ricalcola saldi,
-     riscrive **entrambi** i file. Ritorna il DB light da usare in sessione (lista Movimenti / Saldi).
+     Allineamento opzionale in sola lettura rispetto al ``conti_utente_*.enc`` completo (se presente).
+
+     **Non scrive** né il completo né il light: le scritture restano solo in ``persistSessionDbToEncryptedFiles``
+     (solo light). Il merge nel completo è compito del desktop all’avvio.
      */
     public static func syncDualEncAtStartup(
         lightDb: [String: Any],
@@ -2672,39 +2685,13 @@ public enum ContiDatabase {
             return (lightDb, 0, "Nessun file completo \(fullURL.lastPathComponent); uso solo il light.")
         }
         _ = waitForPathsStableIfDropbox([keyURL, fullURL, lightEncURL])
-        let keyString = try coordinatedStringContents(of: keyURL, encoding: .utf8)
-        var fullDb = try loadEncryptedDBFull(encURL: fullURL, keyURL: keyURL)
+        let fullDb = try loadEncryptedDBFull(encURL: fullURL, keyURL: keyURL)
         guard tryLogin(db: fullDb, email: em, password: password) != nil else {
             return (lightDb, 0, "File completo presente ma accesso non riuscito; uso solo il light.")
         }
-        var main = fullDb
-        let n2 = upsertLightSessionRecordsInMain(main: &main, light: lightDb)
-        let n1 = mergeLightNewRecordsIntoMain(main: &main, light: lightDb)
-        let n = n1 + n2
-        // Evita riscritture inutili su refresh/login: se non c'e' nulla da importare/aggiornare dal light,
-        // il passaggio resta read-only e riduce i conflicted copies Dropbox.
-        if n == 0 {
-            let alignedLight = try buildLightDatabaseForExport(from: fullDb)
-            return (alignedLight, 0, "Database gia' allineato: nessuna modifica da salvare.")
-        }
-        recomputeLightSaldiFromFullDb(&main)
-        let lightExport = try buildLightDatabaseForExport(from: main)
-        try saveEncryptedDbPairUnderSingleWorkspaceLock(
-            keyString: keyString,
-            fullURL: fullURL,
-            fullDb: main,
-            lightURL: lightEncURL,
-            lightDb: lightExport
-        )
-        var msg = "Database allineato: saldi ricalcolati; salvati file completo e light."
-        if n1 > 0, n2 > 0 {
-            msg = "Sincronizzate \(n1) nuove e \(n2) modificate dell’app light con il file completo. " + msg
-        } else if n1 > 0 {
-            msg = "Importate \(n1) registrazioni dall’app light nel file completo. " + msg
-        } else if n2 > 0 {
-            msg = "Aggiornate \(n2) registrazioni (modifiche o sospensioni) da Conti light nel file completo. " + msg
-        }
-        return (lightExport, n, msg)
+        // Sola lettura: nessuna riscrittura Dropbox da questo percorso.
+        let alignedLight = try buildLightDatabaseForExport(from: fullDb)
+        return (alignedLight, 0, "Database completo presente: nessuna scrittura all’avvio (il merge è sul desktop).")
     }
 
     /// Solo dal blocco ``light_saldi`` scritto dal desktop sul DB completo. Nessun ricalcolo dai movimenti nel file light.

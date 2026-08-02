@@ -148,6 +148,12 @@ def _wait_file_stable(
             if splash is None:
                 splash = _open_splash(ui_parent, label)
 
+    def _pump() -> None:
+        live = splash
+        if batch_mode and batch_splash_holder is not None:
+            live = batch_splash_holder[0]
+        _pump_ui(ui_parent, live if ui_parent is not None else None)
+
     # Fase 1: comparsa file (Dropbox in download, ecc.) — timeout breve se il path non è più valido.
     while not path.exists():
         if time.monotonic() >= existence_deadline:
@@ -156,8 +162,7 @@ def _wait_file_stable(
             return time.monotonic() - t_start
         if ui_parent is not None:
             _ensure_splash()
-        if ui_parent is not None:
-            _pump_ui(ui_parent)
+            _pump()
         time.sleep(poll_seconds)
 
     fp0 = _stat_fingerprint(path)
@@ -186,7 +191,7 @@ def _wait_file_stable(
 
         time.sleep(poll_seconds)
         if ui_parent is not None:
-            _pump_ui(ui_parent)
+            _pump()
 
         fp1 = _stat_fingerprint(path)
         if fp1 is None:
@@ -210,6 +215,33 @@ def _wait_file_stable(
     return time.monotonic() - t_start
 
 
+def _is_windows() -> bool:
+    return sys.platform.startswith("win")
+
+
+def _size_splash_window(w: object, *, min_w: int = 360, pad_w: int = 28, pad_h: int = 40) -> None:
+    """Geometria dopo pack/map: su Windows/DPI ``winfo_reqheight`` da soli taglia spesso l’ultima riga."""
+    import tkinter as tk
+
+    try:
+        w.update_idletasks()  # type: ignore[attr-defined]
+        ww = max(int(w.winfo_reqwidth()), min_w) + pad_w  # type: ignore[attr-defined]
+        wh = max(int(w.winfo_reqheight()), 1) + pad_h  # type: ignore[attr-defined]
+        if _is_windows():
+            # Margine extra: scaling DPI / font metrics non ancora stabili a withdraw.
+            ww += 16
+            wh += 28
+        sw = int(w.winfo_screenwidth())  # type: ignore[attr-defined]
+        sh = int(w.winfo_screenheight())  # type: ignore[attr-defined]
+        ww = min(ww, max(320, sw - 40))
+        wh = min(wh, max(120, sh - 80))
+        x = max(0, (sw - ww) // 2)
+        y = max(0, (sh - wh) // 2)
+        w.geometry(f"{ww}x{wh}+{x}+{y}")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def _open_splash(parent: object, subtitle: str) -> object:
     import tkinter as tk
 
@@ -222,7 +254,7 @@ def _open_splash(parent: object, subtitle: str) -> object:
         pass
     w.resizable(False, False)
     frm = tk.Frame(w, padx=22, pady=18)
-    frm.pack()
+    frm.pack(fill="both", expand=True)
     tk.Label(
         frm,
         text="Sincronizzazione dati in corso…",
@@ -233,39 +265,41 @@ def _open_splash(parent: object, subtitle: str) -> object:
         text=subtitle,
         font=("TkDefaultFont", 11),
         fg="#444444",
-        wraplength=360,
+        wraplength=380,
         justify="left",
     ).pack(anchor="w", pady=(8, 0))
     tk.Label(
         frm,
-        text="Attendere: Dropbox sta aggiornando i file in questa cartella.",
+        text="Attendere: Dropbox sta aggiornando i file in questa cartella.\n"
+        "Non chiudere questa finestra finché non scompare.",
         font=("TkDefaultFont", 10),
         fg="#666666",
-        wraplength=360,
+        wraplength=380,
         justify="left",
     ).pack(anchor="w", pady=(10, 0))
     try:
-        w.update_idletasks()
-        ww = max(w.winfo_reqwidth(), 320)
-        wh = max(w.winfo_reqheight(), 1)
-        sw = w.winfo_screenwidth()
-        sh = w.winfo_screenheight()
-        x = max(0, (sw - ww) // 2)
-        y = max(0, (sh - wh) // 2)
-        w.geometry(f"{ww}x{wh}+{x}+{y}")
+        _size_splash_window(w)
         w.deiconify()
         w.lift()
         w.attributes("-topmost", True)
+        # Secondo passaggio dopo la map: su Windows le metriche testo cambiano al primo paint.
+        w.update_idletasks()
+        _size_splash_window(w)
+        w.lift()
 
         def _topmost_off() -> None:
             try:
                 if not w.winfo_exists():
+                    return
+                # Su Windows lasciare topmost evita che altri dialoghi/explorer “superino” lo splash.
+                if _is_windows():
                     return
                 w.attributes("-topmost", False)
             except Exception:
                 pass
 
         w._conti_dropbox_splash_after = w.after(400, _topmost_off)  # type: ignore[attr-defined]
+        w._conti_dropbox_keep_topmost = _is_windows()  # type: ignore[attr-defined]
     except Exception:
         try:
             w.destroy()
@@ -274,10 +308,19 @@ def _open_splash(parent: object, subtitle: str) -> object:
     return w
 
 
-def _pump_ui(parent: object) -> None:
+def _pump_ui(parent: object, splash: object | None = None) -> None:
+    """Aggiorna la UI senza far competere la root withdrawn con lo splash (problema tipico Windows)."""
     try:
-        parent.update_idletasks()  # type: ignore[attr-defined]
-        parent.update()  # type: ignore[attr-defined]
+        target = splash if splash is not None else parent
+        target.update_idletasks()  # type: ignore[attr-defined]
+        # ``update()`` pieno sulla root nascosta su Windows può ridisegnare a metà i Toplevel.
+        if splash is not None or not _is_windows():
+            target.update()  # type: ignore[attr-defined]
+        elif _is_windows():
+            try:
+                parent.update_idletasks()  # type: ignore[attr-defined]
+            except Exception:
+                pass
     except Exception:
         pass
 

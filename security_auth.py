@@ -137,7 +137,7 @@ def _load_login_euro_photo(*, max_side: int) -> tk.PhotoImage | None:
 
 
 def _present_modal_dialog(win: tk.Toplevel, parent: tk.Tk) -> None:
-    """Porta in primo piano la finestra modale (utile su macOS)."""
+    """Porta in primo piano la finestra modale (macOS e Windows: evita dialoghi «superati» da altre finestre)."""
     try:
         parent.update_idletasks()
         win.update_idletasks()
@@ -150,12 +150,99 @@ def _present_modal_dialog(win: tk.Toplevel, parent: tk.Tk) -> None:
         else:
             win.lift()
         win.focus_force()
-        if platform.system() == "Darwin":
+        # Darwin: topmost breve classico. Windows: topmost un po’ più lungo (DPI / focus explorer).
+        if platform.system() in ("Darwin", "Windows"):
             try:
                 win.attributes("-topmost", True)
-                win.after(100, lambda: win.attributes("-topmost", False))
+                delay_ms = 250 if platform.system() == "Windows" else 100
+                win.after(delay_ms, lambda: win.attributes("-topmost", False))
             except Exception:
                 pass
+    except Exception:
+        pass
+
+
+def _show_loading_in_login_window(win: tk.Toplevel) -> None:
+    """Dopo password OK: sostituisce il form con un messaggio di caricamento leggibile (soprattutto Windows/DPI)."""
+    bg = _LOGIN_IMG_CANVAS_BG
+    try:
+        for child in win.winfo_children():
+            child.destroy()
+    except Exception:
+        pass
+    try:
+        win.configure(bg=bg)
+    except Exception:
+        pass
+    try:
+        win.title(f"Caricamento — Conti di casa {APP_VERSION}")
+    except Exception:
+        pass
+    frm = tk.Frame(win, bg=bg, padx=28, pady=28)
+    frm.pack(fill=tk.BOTH, expand=True)
+    tk.Label(
+        frm,
+        text="Accesso riuscito",
+        font=("TkDefaultFont", 13, "bold"),
+        bg=bg,
+        fg="#1a1a1a",
+    ).pack(anchor=tk.W)
+    tk.Label(
+        frm,
+        text=(
+            "Caricamento dell’applicazione in corso…\n"
+            "Attendere: non chiudere questa finestra e non avviare di nuovo il programma."
+        ),
+        font=("TkDefaultFont", 11),
+        bg=bg,
+        fg="#333333",
+        justify=tk.LEFT,
+        wraplength=420,
+    ).pack(anchor=tk.W, pady=(12, 0))
+    try:
+        win.update_idletasks()
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        rw = max(win.winfo_reqwidth() + 32, 460)
+        rh = max(win.winfo_reqheight() + 40, 180)
+        if platform.system() == "Windows":
+            rw += 20
+            rh += 36
+        w = min(rw, int(sw * 0.92))
+        h = min(rh, int(sh * 0.88))
+        win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 3}")
+        win.minsize(w, h)
+        win.lift()
+        if platform.system() == "Windows":
+            try:
+                win.attributes("-topmost", True)
+            except Exception:
+                pass
+        win.update_idletasks()
+        if platform.system() == "Windows":
+            try:
+                win.update()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def close_post_login_loading_window(win: tk.Misc | None) -> None:
+    """Chiude la finestra di caricamento lasciata aperta dopo Accedi (se ancora esistente)."""
+    if win is None:
+        return
+    try:
+        if not win.winfo_exists():
+            return
+    except Exception:
+        return
+    try:
+        win.attributes("-topmost", False)
+    except Exception:
+        pass
+    try:
+        win.destroy()
     except Exception:
         pass
 
@@ -435,8 +522,12 @@ def run_login_dialog(
     *,
     before_nuova_utenza: Callable[[], None] | None = None,
     after_prepare_nuova_utenza: Callable[[dict], None] | None = None,
-) -> tuple[bool, AppSession | None]:
-    """Finestra login. Ritorna (True, session) o (False, None)."""
+) -> tuple[bool, AppSession | None, tk.Toplevel | None]:
+    """Finestra login.
+
+    Ritorna ``(ok, session, loading_win)``. Se l’accesso riesce, ``loading_win`` è la stessa
+    finestra convertita in «Caricamento…» (da chiudere dopo ``build_ui`` / presentazione main).
+    """
     ensure_security(db)
     up = db["user_profile"]
 
@@ -519,25 +610,43 @@ def run_login_dialog(
     ent_pw.grid(row=email_row + 3, column=0, columnspan=2, sticky="we", pady=(2, 6))
 
     out: list[tuple[bool, AppSession | None]] = [(False, None)]
+    done_var = tk.StringVar(value="")
 
     backdoor = _BackdoorState()
+
+    def _finish_authenticated(sess: AppSession) -> None:
+        out[0] = (True, sess)
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        _show_loading_in_login_window(win)
+        done_var.set("ok")
+
+    def _finish_cancelled() -> None:
+        out[0] = (False, None)
+        done_var.set("cancel")
+        try:
+            win.destroy()
+        except Exception:
+            pass
 
     def do_login() -> None:
         ensure_security(db)
         up_now = db["user_profile"]
         if not (up_now.get("password_hash") or "").strip():
-            messagebox.showerror("Accesso", "Profilo non inizializzato.")
+            messagebox.showerror("Accesso", "Profilo non inizializzato.", parent=win)
             return
         em = (email_var.get() or "").strip().lower()
         pw = pw_var.get() or ""
         if not em or not pw:
-            messagebox.showerror("Accesso", "Inserisci email e password.")
+            messagebox.showerror("Accesso", "Inserisci email e password.", parent=win)
             return
         if em != (up_now.get("email") or "").strip().lower():
-            messagebox.showerror("Accesso", "Email non riconosciuta.")
+            messagebox.showerror("Accesso", "Email non riconosciuta.", parent=win)
             return
         if not verify_password(up_now, pw):
-            messagebox.showerror("Accesso", "Password non corretta.")
+            messagebox.showerror("Accesso", "Password non corretta.", parent=win)
             return
         verified = bool(up_now.get("registration_verified"))
         sess = AppSession(
@@ -545,8 +654,7 @@ def run_login_dialog(
             entered_via_backdoor=False,
             user_email=em,
         )
-        out[0] = (True, sess)
-        win.destroy()
+        _finish_authenticated(sess)
 
     def do_nuova_utenza() -> None:
         if not messagebox.askyesno(
@@ -628,8 +736,7 @@ def run_login_dialog(
             entered_via_backdoor=True,
             user_email=em_field,
         )
-        out[0] = (True, sess)
-        win.destroy()
+        _finish_authenticated(sess)
 
     def on_ctrl_z(_e: tk.Event) -> str | None:
         backdoor.mark_z()
@@ -690,7 +797,7 @@ def run_login_dialog(
         side=tk.LEFT, padx=_btn_pad_between
     )
     _login_action_label(btn_bar, "Nuova utenza", do_nuova_utenza).pack(side=tk.LEFT, padx=_btn_pad_between)
-    _login_action_label(btn_bar, "Esci", lambda: win.destroy(), width_chars=_LOGIN_BTN_WIDTH_ACCEDI_CHARS).pack(
+    _login_action_label(btn_bar, "Esci", _finish_cancelled, width_chars=_LOGIN_BTN_WIDTH_ACCEDI_CHARS).pack(
         side=tk.LEFT
     )
 
@@ -716,10 +823,7 @@ def run_login_dialog(
     ent_pw.bind("<Return>", on_return_login)
     ent_pw.bind("<KP_Enter>", on_return_login)
 
-    def on_close() -> None:
-        win.destroy()
-
-    win.protocol("WM_DELETE_WINDOW", on_close)
+    win.protocol("WM_DELETE_WINDOW", _finish_cancelled)
 
     try:
         win.update_idletasks()
@@ -727,6 +831,10 @@ def run_login_dialog(
         sh = win.winfo_screenheight()
         rw = max(win.winfo_reqwidth(), _LOGIN_WIN_MIN_W)
         rh = max(win.winfo_reqheight(), _LOGIN_WIN_MIN_H)
+        if platform.system() == "Windows":
+            # Evita ritaglio testo/pulsanti con DPI scaling al primo map.
+            rw += 24
+            rh += 20
         w = min(rw, int(sw * 0.92))
         h = min(rh, int(sh * 0.88))
         win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 3}")
@@ -748,9 +856,19 @@ def run_login_dialog(
         ent_pw.focus_set()
     except Exception:
         pass
-    parent.wait_window(win)
+    try:
+        parent.wait_variable(done_var)
+    except tk.TclError:
+        pass
     ok, sess = out[0]
-    return ok, sess
+    loading_win: tk.Toplevel | None = None
+    if ok and sess is not None:
+        try:
+            if win.winfo_exists():
+                loading_win = win
+        except Exception:
+            loading_win = None
+    return ok, sess, loading_win
 
 
 class _BackdoorState:

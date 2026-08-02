@@ -107,6 +107,8 @@ struct ContentView: View {
     @State private var periodicStartupAlertPresented = false
     /// Throttle per ``refreshLightSessionIfLoggedIn`` (solo lettura + decifra; non riscrive `.enc`). Evita hammer al provider file.
     @State private var lastScenePhaseRefreshAt: Date = .distantPast
+    /// Se l’app va in background a metà salvataggio, chiudi la sessione solo a scrittura completata.
+    @State private var closeSessionWhenPersistEnds = false
 
     private enum MovimentiFiltriPick: Hashable {
         case category
@@ -180,6 +182,7 @@ struct ContentView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active, dataFolderURL != nil {
+                closeSessionWhenPersistEnds = false
                 refreshKeyStatus()
                 // Rilegge il `*_light.enc` con path risolto di nuovo e attesa Dropbox (come «Aggiorna»), così dopo sync non resta la copia precedente in memoria.
                 Task { @MainActor in
@@ -188,7 +191,22 @@ struct ContentView: View {
                     }
                 }
             } else if phase == .background {
-                closeCurrentSessionAndReleaseLock()
+                // Non interrompere la scrittura del *_light.enc: background task + chiusura sessione solo a fine persist.
+                if ContiDatabase.isPersistInProgress {
+                    closeSessionWhenPersistEnds = true
+                    Task { @MainActor in
+                        while ContiDatabase.isPersistInProgress {
+                            try? await Task.sleep(nanoseconds: 200_000_000)
+                        }
+                        if closeSessionWhenPersistEnds {
+                            closeSessionWhenPersistEnds = false
+                            closeCurrentSessionAndReleaseLock()
+                        }
+                    }
+                } else {
+                    closeSessionWhenPersistEnds = false
+                    closeCurrentSessionAndReleaseLock()
+                }
             }
         }
         .onChange(of: email) { _, _ in

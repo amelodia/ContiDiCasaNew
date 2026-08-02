@@ -744,6 +744,17 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                         }
                     }
                     Section {
+                        Label {
+                            Text("Durante il salvataggio l’app resta bloccata: non chiuderla e non bloccare lo schermo finché non compare la conferma.")
+                                .font(.footnote)
+                                .foregroundStyle(.primary)
+                        } icon: {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                        }
+                        .labelStyle(.titleAndIcon)
+                        .accessibilityLabel("Avviso: non chiudere l’app durante il salvataggio")
+
                         Button(isEditMode ? "Conferma modifiche" : "Conferma immissione") {
                             prepareCommitDialog()
                         }
@@ -769,13 +780,40 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         .overlay {
             if isSaving {
                 ZStack {
-                    Color.black.opacity(0.2).ignoresSafeArea()
-                    ProgressView("Salvataggio…")
-                        .padding(24)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                    Color.black.opacity(0.55).ignoresSafeArea()
+                    VStack(spacing: 16) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 36))
+                            .foregroundStyle(.orange)
+                        Text("NON CHIUDERE L’APP")
+                            .font(.title3.weight(.bold))
+                            .multilineTextAlignment(.center)
+                        Text("Salvataggio in corso sul file light (Dropbox).\nAttendi la conferma a video.\nNon chiudere Conti Light e non bloccare lo schermo.")
+                            .font(.subheadline)
+                            .multilineTextAlignment(.center)
+                        ProgressView()
+                            .scaleEffect(1.15)
+                            .padding(.top, 4)
+                    }
+                    .padding(28)
+                    .frame(maxWidth: 340)
+                    .background(
+                        RoundedRectangle(cornerRadius: 16)
+                            .fill(Color(uiColor: .systemBackground))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16)
+                            .stroke(Color.orange, lineWidth: 3)
+                    )
+                    .shadow(color: .black.opacity(0.35), radius: 18, y: 8)
                 }
+                .allowsHitTesting(true)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Avviso: non chiudere l’app. Salvataggio in corso.")
             }
         }
+        .interactiveDismissDisabled(isSaving)
+        .navigationBarBackButtonHidden(isSaving)
         .navigationTitle(isEditMode ? "Modifica registrazione" : "Nuove registrazioni")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
@@ -863,7 +901,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
             Text(successAlertMessage)
         }
         .confirmationDialog(
-            "Annullare questa registrazione? Verrà impostata come annullata (come sul desktop): non comparirà più in elenco né nei saldi, ma resterà nel database finché non la gestisci dal programma per PC.",
+            "Annullare questa registrazione? Verrà impostata come annullata (come sul desktop): non comparirà più in elenco né nei saldi, ma resterà nel database finché non la gestisci dal programma per PC.\n\nAVVISO: durante il salvataggio non chiudere l’app e non bloccare lo schermo finché non compare la conferma.",
             isPresented: $showDeleteRecordConfirm,
             titleVisibility: .visible
         ) {
@@ -958,8 +996,11 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         lines.append("Importo (JSON): \(amt) EUR")
         lines.append(
             isEditMode
-                ? "Le modifiche saranno scritte nei file cifrati nella cartella dati (Dropbox / File)."
-                : "La registrazione sarà scritta nei file cifrati nella cartella dati (Dropbox / File)."
+                ? "Le modifiche saranno scritte nel file light (*_light.enc) nella cartella dati. Il completo si aggiorna sul desktop."
+                : "La registrazione sarà scritta nel file light (*_light.enc) nella cartella dati. Il completo si aggiorna sul desktop."
+        )
+        lines.append(
+            "AVVISO: durante il salvataggio l’app resta bloccata — non chiuderla e non bloccare lo schermo finché non compare la conferma."
         )
         return lines.joined(separator: "\n")
     }
