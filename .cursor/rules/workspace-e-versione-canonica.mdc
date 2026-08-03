@@ -8,12 +8,15 @@ alwaysApply: true
 ## Unica radice di lavoro (desktop)
 
 - Lavorare **solo** in `/Users/macand/Library/CloudStorage/Dropbox/CursorAppMacCdc`.
-- **Non** implementare né compilare da `/Users/macand/Documents/ContiDiCasaNew` (copia non canonica / archivio).
+- **Non** aprire né compilare da `Documents/ContiDiCasaNew*` (archiviato come `ContiDiCasaNew_ARCHIVIO_2026-08-02`).
+- **Non** usare `Documents/ContiDiCasa-windows*` (archiviato come `ContiDiCasa-windows_ARCHIVIO_2026-08-02`).
 - Le chat/transcript di questo progetto devono restare legate a questa cartella Dropbox.
+- Repo GitHub desktop: `amelodia/ContiDiCasaNew` — un solo clone attivo (questa cartella Dropbox).
 
 ## Conti Light
 
-- Codice/app Light: `/Users/macand/Library/CloudStorage/Dropbox/ContiLight` e, nel repo desktop, `iphone_light/` allineato a quella radice.
+- Repo Xcode: `/Users/macand/Library/CloudStorage/Dropbox/ContiLight/ContiLight` (un solo `.git`, un solo `ContiLight.xcodeproj`).
+- Mirror nel desktop: `iphone_light/ios/` (allineare i Swift da qui verso ContiLight o viceversa).
 - Commit Light e desktop sono **due repository distinti**.
 
 ## Versione applicazione desktop
