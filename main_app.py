@@ -8331,6 +8331,121 @@ def verification_flag_star_equivalent_count(flags: str) -> int:
     return len(t)
 
 
+def verification_post_cutoff_unmarked_breaks_double_star_chain(
+    *,
+    stars: int,
+    date_iso: str,
+    cutoff_iso: str,
+    reg_n: int,
+    floor_reg: int | None,
+    in_movimenti: bool,
+) -> bool:
+    """True se una riga non verificata oltre la chiusura estratto deve interrompere l'avanzamento di ``**``.
+
+    Evita di collocare ``**`` oltre buchi Movimenti-visibili che resterebbero con ``reg_n`` inferiore al floor
+    (non più abbinabili, ma prima conteggiabili nel riepilogo via supplemento).
+    """
+    if stars >= 1 or not in_movimenti:
+        return False
+    d_gap = str(date_iso or "").strip()
+    cut = str(cutoff_iso or "").strip()
+    if not d_gap or not cut or d_gap <= cut:
+        return False
+    if floor_reg is not None and reg_n <= floor_reg:
+        return False
+    return True
+
+
+def apply_account_verification_star_count(rec: dict, which: str, stars: int) -> None:
+    """Imposta ``*``/``**`` (o zero) sul lato conto e aggiorna ``*_with_flags``."""
+    fk = "account_primary_flags" if which == "primary" else "account_secondary_flags"
+    ck = "account_primary_code" if which == "primary" else "account_secondary_code"
+    wk = "account_primary_with_flags" if which == "primary" else "account_secondary_with_flags"
+    base = str(rec.get(fk) or "").replace("*", "")
+    n = max(0, int(stars))
+    rec[fk] = f"{base}{'*' * n}" if (base or n) else ""
+    code = str(rec.get(ck) or "").strip()
+    fl = str(rec.get(fk) or "")
+    rec[wk] = f"{code}{fl}" if code else ""
+
+
+def record_sides_touching_account_code(rec: dict, account_code: str) -> list[str]:
+    """Lati ``primary``/``secondary`` della registrazione che coincidono col codice conto (verifica)."""
+    ac = str(account_code or "").strip()
+    if not ac:
+        return []
+    out: list[str] = []
+    c1 = str(rec.get("account_primary_code", "") or "").strip()
+    c2 = str(rec.get("account_secondary_code", "") or "").strip()
+    if c1 and account_codes_match_for_verification(c1, ac):
+        out.append("primary")
+    if c2 and account_codes_match_for_verification(c2, ac):
+        out.append("secondary")
+    return out
+
+
+def reanchor_double_star_before_reg_for_account(
+    ordered: list[tuple[int, dict]],
+    *,
+    account_code: str,
+    before_reg_n: int,
+) -> bool:
+    """Se il conto ha ``**`` su registrazioni con ``reg_n > before_reg_n``, li riduce a ``*`` e pone ``**``
+    sulla registrazione precedente dello stesso conto (``reg_n < before_reg_n``).
+
+    Usato quando si riassegna una registrazione a un conto già verificato più avanti nel libro:
+    il confine di ricerca non deve restare dopo la nuova riga (ancora non verificata).
+    Ritorna True se ha modificato almeno un flag.
+    """
+    ac = str(account_code or "").strip()
+    if not ac or before_reg_n <= 0:
+        return False
+    changed = False
+    found_higher_double = False
+    for reg_n, rec in ordered:
+        if rec.get("is_cancelled"):
+            continue
+        if reg_n <= before_reg_n:
+            continue
+        for side in record_sides_touching_account_code(rec, ac):
+            fk = "account_primary_flags" if side == "primary" else "account_secondary_flags"
+            st = verification_flag_star_equivalent_count(str(rec.get(fk) or ""))
+            if st >= 2:
+                apply_account_verification_star_count(rec, side, 1)
+                found_higher_double = True
+                changed = True
+    if not found_higher_double:
+        return changed
+    prev_rec: dict | None = None
+    prev_side: str | None = None
+    prev_reg = -1
+    for reg_n, rec in ordered:
+        if rec.get("is_cancelled"):
+            continue
+        if reg_n >= before_reg_n or reg_n <= prev_reg:
+            continue
+        sides = record_sides_touching_account_code(rec, ac)
+        if not sides:
+            continue
+        # Preferisci il lato con più asterischi (come in verifica); altrimenti primary.
+        best = sides[0]
+        best_st = -1
+        for side in sides:
+            fk = "account_primary_flags" if side == "primary" else "account_secondary_flags"
+            st = verification_flag_star_equivalent_count(str(rec.get(fk) or ""))
+            if st > best_st:
+                best_st = st
+                best = side
+        prev_rec, prev_side, prev_reg = rec, best, reg_n
+    if prev_rec is not None and prev_side is not None:
+        fk = "account_primary_flags" if prev_side == "primary" else "account_secondary_flags"
+        cur_st = verification_flag_star_equivalent_count(str(prev_rec.get(fk) or ""))
+        if cur_st < 2:
+            apply_account_verification_star_count(prev_rec, prev_side, 2)
+            changed = True
+    return changed
+
+
 def find_record_year_and_ref(db: dict, stable_key: str) -> tuple[dict, dict] | None:
     """Ritorna (year_dict, record) se la chiave è nel DB."""
     for yd in db.get("years", []):
@@ -11832,7 +11947,22 @@ def build_ui(
             if idx0 is None:
                 messagebox.showerror("Conto", "Selezione non valida.", parent=top)
                 return
+            old_code = str(rec.get("account_primary_code") or "").strip()
             sync_record_primary_account(rec, accounts, idx0)
+            new_code = str(rec.get("account_primary_code") or "").strip()
+            if new_code and not account_codes_match_for_verification(old_code, new_code):
+                all_records, reg_map = _build_reg_index_maps()
+                edited_n = reg_map.get(stable_key)
+                if edited_n is not None:
+                    ordered = sorted(
+                        [(reg_map[record_legacy_stable_key(r)], r) for r in all_records],
+                        key=lambda x: x[0],
+                    )
+                    reanchor_double_star_before_reg_for_account(
+                        ordered,
+                        account_code=new_code,
+                        before_reg_n=int(edited_n),
+                    )
             top.destroy()
             persist_db_after_edit(stable_key, ensure_reselected_visible=True)
 
@@ -11891,7 +12021,22 @@ def build_ui(
             if idx0 is None:
                 messagebox.showerror("Conto", "Selezione non valida.", parent=top)
                 return
+            old_code = str(rec.get("account_secondary_code") or "").strip()
             sync_record_secondary_account(rec, accounts, idx0)
+            new_code = str(rec.get("account_secondary_code") or "").strip()
+            if new_code and not account_codes_match_for_verification(old_code, new_code):
+                all_records, reg_map = _build_reg_index_maps()
+                edited_n = reg_map.get(stable_key)
+                if edited_n is not None:
+                    ordered = sorted(
+                        [(reg_map[record_legacy_stable_key(r)], r) for r in all_records],
+                        key=lambda x: x[0],
+                    )
+                    reanchor_double_star_before_reg_for_account(
+                        ordered,
+                        account_code=new_code,
+                        before_reg_n=int(edited_n),
+                    )
             top.destroy()
             persist_db_after_edit(stable_key, ensure_reselected_visible=True)
 
@@ -12196,13 +12341,7 @@ def build_ui(
         return f"{base}{'*' * n}" if (base or n) else ""
 
     def _set_account_flags(rec: dict, which: str, stars: int) -> None:
-        fk = "account_primary_flags" if which == "primary" else "account_secondary_flags"
-        ck = "account_primary_code" if which == "primary" else "account_secondary_code"
-        wk = "account_primary_with_flags" if which == "primary" else "account_secondary_with_flags"
-        rec[fk] = _flags_set_star_count(str(rec.get(fk) or ""), stars)
-        code = str(rec.get(ck) or "").strip()
-        fl = str(rec.get(fk) or "")
-        rec[wk] = f"{code}{fl}" if code else ""
+        apply_account_verification_star_count(rec, which, stars)
 
     def _build_reg_index_maps() -> tuple[list[dict], dict[str, int]]:
         all_records = [r for y in cur_db().get("years", []) for r in y.get("records", [])]
@@ -12278,10 +12417,9 @@ def build_ui(
         ):
             return
 
-        selected_stars = st_a if side == "primary" else st_b
-        found_higher_double = False
-
-        # 1) Pulizia secondi asterischi sulle registrazioni successive con lo stesso conto.
+        # 1) Sulle registrazioni successive dello stesso conto: togliere solo il secondo asterisco
+        # (``**`` → ``*``). Non spostare ``**`` sulla registrazione precedente: un eventuale ``**``
+        # già presente più indietro resta valido.
         for rr in reg_all:
             k = record_legacy_stable_key(rr)
             nreg = reg_map.get(k, 0)
@@ -12290,47 +12428,16 @@ def build_ui(
             y_acc = acc_by_year.get(rr.get("year"), [])
             r_a = account_name_for_record(rr, y_acc, "primary")
             r_b = account_name_for_record(rr, y_acc, "secondary")
-            touched = False
             if r_a == target_account_name:
                 sc = _flags_star_count(str(rr.get("account_primary_flags") or ""))
                 if sc >= 2:
                     _set_account_flags(rr, "primary", 1)
-                    found_higher_double = True
-                    touched = True
             if r_b == target_account_name:
                 sc = _flags_star_count(str(rr.get("account_secondary_flags") or ""))
                 if sc >= 2:
                     _set_account_flags(rr, "secondary", 1)
-                    found_higher_double = True
-                    touched = True
-            if touched:
-                continue
 
-        # 2) Se richiesto, promuovi la registrazione precedente dello stesso conto al doppio asterisco.
-        must_promote_previous = (selected_stars >= 2) or found_higher_double
-        if must_promote_previous:
-            prev_rec: dict | None = None
-            prev_side: str | None = None
-            prev_reg = -1
-            for rr in reg_all:
-                k = record_legacy_stable_key(rr)
-                nreg = reg_map.get(k, 0)
-                if nreg >= selected_reg_n or nreg <= prev_reg:
-                    continue
-                y_acc = acc_by_year.get(rr.get("year"), [])
-                r_a = account_name_for_record(rr, y_acc, "primary")
-                r_b = account_name_for_record(rr, y_acc, "secondary")
-                if r_a == target_account_name:
-                    prev_rec, prev_side, prev_reg = rr, "primary", nreg
-                elif r_b == target_account_name:
-                    prev_rec, prev_side, prev_reg = rr, "secondary", nreg
-            if prev_rec is not None and prev_side is not None:
-                fk = "account_primary_flags" if prev_side == "primary" else "account_secondary_flags"
-                cur_st = _flags_star_count(str(prev_rec.get(fk) or ""))
-                if cur_st < 2:
-                    _set_account_flags(prev_rec, prev_side, 2)
-
-        # 3) Rimuovi la verifica dalla registrazione corrente (tutti gli asterischi lato conto scelto).
+        # 2) Rimuovi la verifica dalla registrazione corrente (tutti gli asterischi lato conto scelto).
         _set_account_flags(rec, side, 0)
 
         # Persistenza + refresh UI
@@ -23587,9 +23694,10 @@ th {{ background:#efefef; text-align:left; }}
         criterio data >= alla data sulla riga ``**``.
         Senza ``**``: fino alla chiusura estratto inclusa (data > chiusura esclusa salvo righe già con ``*``).
 
-        ``exclude_after_cutoff=False``: per il solo riepilogo risultati (elenco non verificate, somma,
-        proiezione) sono incluse anche le registrazioni con data dopo la chiusura dell'estratto; le eccezioni
-        sul confine ``**`` e la numerazione globale si applicano in ``_ver_verification_summary``.
+        ``exclude_after_cutoff=False``: per il riepilogo risultati (elenco non verificate, somma,
+        proiezione) sono incluse anche le registrazioni con data dopo la chiusura dell'estratto,
+        sempre entro lo scope del confine ``**`` (``reg_n >= floor``). Le righe con ``reg_n < floor``
+        restano fuori dal riepilogo come dalla ricerca abbinamenti.
         """
         if floor_reg is not None:
             if reg_n < floor_reg:
@@ -23764,6 +23872,7 @@ th {{ background:#efefef; text-align:left; }}
                 floor_reg=floor_reg,
                 floor_date_iso=floor_date_iso,
                 cutoff_iso=cutoff_iso_av,
+                exclude_after_cutoff=False,
             ):
                 continue
             if _ver_account_stars(rec, side) < 1:
@@ -25485,16 +25594,28 @@ th {{ background:#efefef; text-align:left; }}
             touches, side = _ver_record_touches_account(rec, ac)
             if not touches:
                 continue
-            if not _ver_record_in_verification_scope(
+            stars = _ver_account_stars(rec, side)
+            in_scope_ds = _ver_record_in_verification_scope(
                 reg_n=reg_n,
                 rec=rec,
                 side=side,
                 floor_reg=floor_reg,
                 floor_date_iso=floor_date_iso,
                 cutoff_iso=cutoff_iso_ds,
-            ):
+            )
+            if not in_scope_ds:
+                # Non saltare i buchi Movimenti-visibili solo perché data > chiusura estratto:
+                # altrimenti ** può avanzare oltre righe unmarked che restano intrappolate sotto il floor.
+                if verification_post_cutoff_unmarked_breaks_double_star_chain(
+                    stars=stars,
+                    date_iso=str(rec.get("date_iso") or ""),
+                    cutoff_iso=cutoff_iso_ds,
+                    reg_n=reg_n,
+                    floor_reg=floor_reg,
+                    in_movimenti=show_record_in_movements_grid(rec),
+                ):
+                    break
                 continue
-            stars = _ver_account_stars(rec, side)
             if stars >= 1:
                 last_verified_rec = rec
                 last_verified_side = side
@@ -25618,17 +25739,6 @@ th {{ background:#efefef; text-align:left; }}
                 cutoff_iso=cutoff_iso,
                 exclude_after_cutoff=False,
             )
-            if not in_scope_rs:
-                # Anche dopo chiusura estratto: include solo righe fuori fascia ``**`` per num. glob.,
-                # ma con data dopo la chiusura (non si applica alla ricerca abbinamenti).
-                if (
-                    floor_reg is not None
-                    and reg_n < floor_reg
-                    and stars_uv < 1
-                ):
-                    d_sup = str(rec.get("date_iso") or "").strip()
-                    if d_sup and cutoff_iso and d_sup > cutoff_iso:
-                        in_scope_rs = True
             if not in_scope_rs:
                 continue
             count_total_touching += 1

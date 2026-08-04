@@ -22,6 +22,8 @@ Punti collegati: `ent_amt`, filtri Movimenti, `ent_per_amt`, dialog **Modifica i
 
 - **Data**: click sul campo data apre `open_bounded_date_calendar_popup` con gli stessi vincoli della validazione al salvataggio (anno contabile, 5 anni, intervallo ricerca se filtro per data).
 - **Dal conto / al conto**: il menu usa l'elenco **ordinato** dei nomi ma la preselezione deve basarsi sul **nome del conto** della registrazione (`accounts[indice_codice]`), non sull'indice nella lista ordinata.
+- **Cambio conto**: se il nuovo conto ha `**` su registrazioni **successive**, quei `**` diventano `*` e il `**` viene riposizionato sulla registrazione precedente dello stesso conto (`reanchor_double_star_before_reg_for_account`).
+- **Forza cancellazione verifica**: toglie la verifica dalla riga corrente; eventuali `**` su registrazioni **successive** dello stesso conto diventano `*`. **Non** pone `**` sulla registrazione precedente (un `**` già presente più indietro resta invariato).
 
 ## Nuova registrazione — Nota (Girata conto/conto, 2° conto Cassa)
 

@@ -88,9 +88,10 @@ def _paragraphs() -> list[str]:
         "",
         "8. Appendice: rischi noti nella sola procedura di verifica conto corrente (PDF)",
         "Non risolvono i S EUR dell'ibrido se i movimenti sono gia' corretti, ma possono confondere il riepilogo:",
-        "- Riepilogo che include per supplemento righe contate in sum_unverified ma con reg_n < ** fuori scope in "
-        "ricerca abbinamenti => righe non verificabili in sessione ma presenti nella somma.",
-        "- _ver_all_verified con scope di cutoff diverso dal riepilogo => messaggio 'completamente verificato' incoerente.",
+        "- Riepilogo allineato allo scope di ricerca: le righe con reg_n < ** non entrano piu' in "
+        "sum_unverified (rimosso il supplemento post-cutoff sotto floor).",
+        "- Avanzamento **: le unmarked Movimenti-visibili con data > chiusura estratto interrompono la catena "
+        "(verification_post_cutoff_unmarked_breaks_double_star_chain), cosi' non restano intrappolate sotto il floor.",
         "- 'Riavvia ricerca' che auto-verifica un unico candidato senza vincolo PDF se la coda e' vuota => rischio "
         "asterisco sulla riga sbagliata a parita' importo.",
         "- Saldo estratto letto come stringa con Decimal() senza normalize_euro_input in alcuni percorsi.",
