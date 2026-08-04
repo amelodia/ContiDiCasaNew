@@ -29,3 +29,4 @@ legacy_import/*.enc
 # PyInstaller (scripts/build_macos_app.sh)
 build/
 dist/
+artifacts/
