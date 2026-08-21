@@ -26,6 +26,7 @@ legacy_import/*.enc
 # Cursor / log di debug locale
 .cursor/debug*.log
 
-# PyInstaller (scripts/build_macos_app.sh)
+# PyInstaller (scripts/build_macos_app.sh, scripts/build_windows_app.ps1)
 build/
 dist/
+artifacts/
