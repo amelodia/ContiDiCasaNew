@@ -3243,6 +3243,62 @@ def format_amount_for_output(rec: dict) -> tuple[str, str]:
     return f"{prefix}{formatted} {currency}", ("neg" if value < 0 else "pos")
 
 
+def movement_search_flip_amount_for_filtered_account(
+    rec: dict,
+    *,
+    filter_account_norm: str,
+    account_1_name: str = "",
+    account_2_name: str = "",
+) -> bool:
+    """True se in ricerca Movimenti su un conto specifico la Girata va vista dal 2° conto.
+
+    Solo con filtro conto (non «Tutti i conti»), categoria Girata conto/conto, e il conto
+    ricercato esclusivamente al secondo posto: segno/colore importo si invertono.
+    """
+    q = (filter_account_norm or "").strip().lower()
+    if not q:
+        return False
+    if not is_giroconto_record(rec):
+        return False
+    a1 = (account_1_name or str(rec.get("account_primary_name") or "")).strip().lower()
+    a2 = (account_2_name or str(rec.get("account_secondary_name") or "")).strip().lower()
+    if not a2:
+        return False
+    # Solo se il filtro coincide col 2° e non anche col 1° (stesso nome su entrambi).
+    return q == a2 and q != a1
+
+
+def format_amount_for_movement_search(
+    rec: dict,
+    *,
+    filter_account_norm: str = "",
+    account_1_name: str = "",
+    account_2_name: str = "",
+) -> tuple[str, str]:
+    """Come ``format_amount_for_output``, con inversione segno/colore per Girata sul 2° conto filtrato."""
+    flip = movement_search_flip_amount_for_filtered_account(
+        rec,
+        filter_account_norm=filter_account_norm,
+        account_1_name=account_1_name,
+        account_2_name=account_2_name,
+    )
+    if not flip:
+        return format_amount_for_output(rec)
+    year = int(rec.get("year", 0))
+    if year <= 2001 and rec.get("amount_lire_original") is not None:
+        value = -to_decimal(rec["amount_lire_original"])
+        currency = "L"
+        prefix = "+" if value >= 0 else ""
+        rounded_lire = int(abs(value).quantize(Decimal("1")))
+        grouped_lire = f"{rounded_lire:,}".replace(",", ".")
+        amount_text = f"{prefix}{'-' if value < 0 else ''}{grouped_lire} {currency}"
+        return amount_text, ("neg" if value < 0 else "pos")
+    value = -to_decimal(rec["amount_eur"])
+    prefix = "+" if value >= 0 else ""
+    formatted = format_euro_it(value)
+    return f"{prefix}{formatted} €", ("neg" if value < 0 else "pos")
+
+
 def format_saldo_cell(valuta: str, amount: Decimal) -> str:
     """Allinea stile movimenti: lire senza decimali, euro con 2 decimali e suffisso valuta."""
     if valuta == "L":
@@ -3272,6 +3328,23 @@ def is_giroconto_record(rec: dict) -> bool:
     if "GIRATA.CONTO/CONTO" in cat_name or "GIRATA CONTO/CONTO" in cat_name:
         return True
     return _category_code_int(rec) == 1
+
+
+def verification_candidate_category_display(cat_name: str, rec: dict, *, verified_side: str) -> str:
+    """Categoria in griglia candidati verifica: per Girata aggiunge l'altro conto (1° o 2°).
+
+    ``verified_side`` è il lato del conto in verifica (``primary`` / ``secondary``):
+    l'altro conto è quindi il 2° oppure il 1°.
+    """
+    base = (cat_name or "").strip() or "—"
+    if not is_giroconto_record(rec):
+        return base
+    side = (verified_side or "primary").strip().lower()
+    if side == "secondary":
+        other = str(rec.get("account_primary_name") or "").strip() or "—"
+        return f"{base} — 1° conto: {other}"
+    other = str(rec.get("account_secondary_name") or "").strip() or "—"
+    return f"{base} — 2° conto: {other}"
 
 
 def verification_account_amount_flip(db: dict, rec: dict, side: str) -> bool:
@@ -12927,7 +13000,12 @@ th {{ background:#efefef; text-align:left; }}
             )
             if not ok:
                 continue
-            amount_text, amount_tag = format_amount_for_output(r)
+            amount_text, amount_tag = format_amount_for_movement_search(
+                r,
+                filter_account_norm=str(st.get("q_acc") or ""),
+                account_1_name=account_1_name,
+                account_2_name=account_2_name,
+            )
             stripe = f"stripe{row_i % 2}"
             rid = record_legacy_stable_key(r)
             reg_text = str(reg_seq_map[rid])
@@ -22040,6 +22118,9 @@ th {{ background:#efefef; text-align:left; }}
             cat_name = category_name_for_record(rec, y_cat)
             _tc, side_c = _ver_record_touches_account(rec, acc_code_c)
             side_disp = side_c if _tc else "primary"
+            cat_disp = verification_candidate_category_display(
+                cat_name, rec, verified_side=side_disp
+            )
             amount_text, tone = format_amount_for_verification_account(d, rec, side=side_disp)
             amt_tag = "ver_amt_neg" if tone == "neg" else "ver_amt_pos"
             note_cell = _ver_trunc_ver_result_cell(str(rec.get("note") or ""), 220)
@@ -22052,7 +22133,7 @@ th {{ background:#efefef; text-align:left; }}
                     amount_text,
                     note_cell,
                     to_italian_date(str(rec.get("date_iso", ""))),
-                    cat_name,
+                    cat_disp,
                 ),
                 tags=(amt_tag,),
             )
