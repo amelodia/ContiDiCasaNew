@@ -1905,6 +1905,18 @@ def build_immissione_calendar_toplevel(
     if cur > field_max:
         cur = field_max
 
+    # Un poco più grandi delle etichette filtri: font + celle più spaziose.
+    try:
+        _fname = ui_font[0] if isinstance(ui_font, tuple) and ui_font else "TkDefaultFont"
+        _fsize = int(ui_font[1]) if isinstance(ui_font, tuple) and len(ui_font) > 1 else 12
+        _frest = ui_font[2:] if isinstance(ui_font, tuple) and len(ui_font) > 2 else ("bold",)
+        cal_font: tuple = (_fname, max(_fsize + 2, 13), *_frest)
+    except Exception:
+        cal_font = ("TkDefaultFont", 14, "bold")
+    _cell_w = 4
+    _cell_padx = 4
+    _cell_pady = 4
+
     top = tk.Toplevel(root)
     top.title(title)
     top.transient(root)
@@ -1934,7 +1946,7 @@ def build_immissione_calendar_toplevel(
         higher = [y for y in years_available if y >= cur_year]
         cur_year = min(higher) if higher else max(years_available)
 
-    header = ttk.Frame(top, padding=6)
+    header = ttk.Frame(top, padding=8)
     header.pack(fill=tk.X)
     btns = ttk.Frame(header)
     btns.pack(side=tk.LEFT)
@@ -1998,15 +2010,15 @@ def build_immissione_calendar_toplevel(
         cell = tk.Label(
             parent,
             text=str(day_num),
-            width=3,
-            padx=2,
-            pady=2,
+            width=_cell_w,
+            padx=_cell_padx,
+            pady=_cell_pady,
             fg=fg,
             bg=bg,
             relief=tk.RAISED,
             bd=1,
             highlightthickness=0,
-            font=ui_font,
+            font=cal_font,
         )
         if in_bounds or (outside_month and navigable):
             cell.configure(cursor="hand2")
@@ -2028,10 +2040,10 @@ def build_immissione_calendar_toplevel(
         years_available, pin_year=date.today().year
     )
     month_menu = tk.OptionMenu(btns, month_var, *[_IT_MONTH_NAMES[i] for i in range(1, 13)])
-    month_menu.configure(font=ui_font, highlightthickness=0)
-    month_menu.pack(side=tk.LEFT, padx=(0, 6))
+    month_menu.configure(font=cal_font, highlightthickness=0)
+    month_menu.pack(side=tk.LEFT, padx=(0, 8))
     year_menu = tk.OptionMenu(btns, year_var, *[str(y) for y in _years_in_menu])
-    year_menu.configure(font=ui_font, highlightthickness=0)
+    year_menu.configure(font=cal_font, highlightthickness=0)
     year_menu.pack(side=tk.LEFT, padx=(0, 0))
 
     suppress_nav_trace = False
@@ -2086,7 +2098,7 @@ def build_immissione_calendar_toplevel(
     year_var.trace_add("write", _on_year_changed)
 
     # Griglia unica: intestazioni + giorni (stessa larghezza colonne).
-    days_frame = tk.Frame(top, padx=6, pady=6)
+    days_frame = tk.Frame(top, padx=8, pady=8)
     days_frame.pack(fill=tk.BOTH, expand=True)
     for c in range(7):
         days_frame.grid_columnconfigure(c, weight=1, uniform="calday")
@@ -2101,13 +2113,13 @@ def build_immissione_calendar_toplevel(
             tk.Label(
                 days_frame,
                 text=name,
-                width=3,
-                padx=2,
-                pady=2,
-                font=ui_font,
+                width=_cell_w,
+                padx=_cell_padx,
+                pady=_cell_pady,
+                font=cal_font,
                 fg="#333333",
                 bg=days_frame.cget("bg"),
-            ).grid(row=0, column=i, padx=1, pady=(0, 2), sticky="nsew")
+            ).grid(row=0, column=i, padx=2, pady=(0, 4), sticky="nsew")
 
         first_wd = date(cur_year, cur_month, 1).weekday()
         days_in_month = calendar.monthrange(cur_year, cur_month)[1]
@@ -2119,7 +2131,7 @@ def build_immissione_calendar_toplevel(
             day_num = prev_dim - first_wd + 1 + i
             dsel = date(prev_y, prev_m, day_num)
             _make_day_cell(days_frame, day_num=day_num, dsel=dsel, outside_month=True).grid(
-                row=1, column=i, padx=1, pady=1, sticky="nsew"
+                row=1, column=i, padx=2, pady=2, sticky="nsew"
             )
 
         for day_num in range(1, days_in_month + 1):
@@ -2128,7 +2140,7 @@ def build_immissione_calendar_toplevel(
             col = idx % 7
             dsel = date(cur_year, cur_month, day_num)
             _make_day_cell(days_frame, day_num=day_num, dsel=dsel, outside_month=False).grid(
-                row=row + 1, column=col, padx=1, pady=1, sticky="nsew"
+                row=row + 1, column=col, padx=2, pady=2, sticky="nsew"
             )
 
         total = first_wd + days_in_month
@@ -2139,10 +2151,10 @@ def build_immissione_calendar_toplevel(
             dsel = date(next_y, next_m, day_num)
             col = (total + i) % 7
             _make_day_cell(days_frame, day_num=day_num, dsel=dsel, outside_month=True).grid(
-                row=last_row + 1, column=col, padx=1, pady=1, sticky="nsew"
+                row=last_row + 1, column=col, padx=2, pady=2, sticky="nsew"
             )
 
-    footer = ttk.Frame(top, padding=6)
+    footer = ttk.Frame(top, padding=8)
     footer.pack(fill=tk.X)
 
     def _on_pick_today() -> None:
@@ -10605,19 +10617,27 @@ def build_ui(
     )
     _mov_style.configure("MovCdc.TCombobox", font=filter_ui_font, fieldbackground=CDC_ENTRY_FIELD_BG)
 
-    _ALL_CATEGORIES_LABEL = "Tutte"
-    _ALL_ACCOUNTS_LABEL = "Tutti"
+    _ALL_CATEGORIES_LABEL = "Categoria"
+    _ALL_ACCOUNTS_LABEL = "Conto"
 
-    ttk.Label(filters_text_inner, text="Categoria", style="MovCdc.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+    def _is_all_categories_filter(raw: str) -> bool:
+        s = (raw or "").strip()
+        return s in ("", _ALL_CATEGORIES_LABEL, "Tutte")
+
+    def _is_all_accounts_filter(raw: str) -> bool:
+        s = (raw or "").strip()
+        return s in ("", _ALL_ACCOUNTS_LABEL, "Tutti")
+
     category_entry = ttk.Combobox(
         filters_text_inner,
         textvariable=text_category_preview_var,
         state="readonly",
-        width=12,
-        values=("",),
+        width=14,
+        values=(_ALL_CATEGORIES_LABEL,),
         style="MovCdc.TCombobox",
     )
     category_entry.pack(side=tk.LEFT, padx=(0, 6))
+    text_category_preview_var.set(_ALL_CATEGORIES_LABEL)
 
     _MOV_AGG_CAT_BTN_BG = "#1565c0"
     _MOV_AGG_CAT_BTN_ACT = "#0d47a1"
@@ -10710,7 +10730,7 @@ def build_ui(
             return False
         for idx, nm in enumerate(vals):
             sn = str(nm or "").strip()
-            if not sn or sn == _ALL_CATEGORIES_LABEL:
+            if not sn or _is_all_categories_filter(sn):
                 continue
             if not sn.lower().startswith(pref):
                 continue
@@ -10733,16 +10753,16 @@ def build_ui(
 
     bind_ttk_combobox_letter_jump_with_popdown(category_entry, on_letter=_mov_cat_letter_jump)
 
-    ttk.Label(filters_text_inner, text="Conto", style="MovCdc.TLabel").pack(side=tk.LEFT, padx=(0, 6))
     account_entry = ttk.Combobox(
         filters_text_inner,
         textvariable=text_account_preview_var,
         state="readonly",
-        width=11,
-        values=("",),
+        width=12,
+        values=(_ALL_ACCOUNTS_LABEL,),
         style="MovCdc.TCombobox",
     )
     account_entry.pack(side=tk.LEFT, padx=(0, 8))
+    text_account_preview_var.set(_ALL_ACCOUNTS_LABEL)
 
     bind_ttk_combobox_prefix_letter_jump(
         account_entry,
@@ -10750,10 +10770,17 @@ def build_ui(
             text_account_preview_var.set(nm),
             account_entry.current(idx),
         ),
-        skip_value=lambda s: s == _ALL_ACCOUNTS_LABEL,
+        skip_value=_is_all_accounts_filter,
     )
 
-    ttk.Label(filters_text_inner, text="Importo", style="MovCdc.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+    filter_field_label_font = _ui_font_tuple(11, "bold")
+    _mov_style.configure(
+        "MovCdcField.TLabel",
+        font=filter_field_label_font,
+        background=MOVIMENTI_PAGE_BG,
+        foreground=UI_FG_FILTER_LABEL,
+    )
+    ttk.Label(filters_text_inner, text="Importo", style="MovCdcField.TLabel").pack(side=tk.LEFT, padx=(0, 6))
     amount_filter_row = ttk.Frame(filters_text_inner)
     amount_filter_entry = _euro_amount_entry(
         amount_filter_row,
@@ -10786,7 +10813,7 @@ def build_ui(
         external_focusout=True,
     )
 
-    ttk.Label(filters_text_inner, text="Assegno", style="MovCdc.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+    ttk.Label(filters_text_inner, text="Assegno", style="MovCdcField.TLabel").pack(side=tk.LEFT, padx=(0, 6))
     cheque_entry = ttk.Entry(
         filters_text_inner,
         textvariable=text_cheque_preview_var,
@@ -10798,7 +10825,7 @@ def build_ui(
         cheque_entry, text_cheque_preview_var, max_len=MAX_CHEQUE_LEN, strip_edges=False
     )
 
-    ttk.Label(filters_text_inner, text="Nota", style="MovCdc.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+    ttk.Label(filters_text_inner, text="Nota", style="MovCdcField.TLabel").pack(side=tk.LEFT, padx=(0, 6))
     note_entry = ttk.Entry(
         filters_text_inner,
         textvariable=text_note_preview_var,
@@ -10846,7 +10873,6 @@ def build_ui(
     reg_to_entry = ttk.Entry(reg_controls_inner, textvariable=reg_to_preview_var, width=7, style="MovCdc.TEntry")
     reg_to_entry.pack(side=tk.LEFT, padx=(0, 12))
 
-    ttk.Label(reg_controls_inner, text="Conto", style="MovCdc.TLabel").pack(side=tk.LEFT, padx=(0, 6))
     reg_account_entry = ttk.Combobox(
         reg_controls_inner,
         textvariable=text_account_preview_var,
@@ -10862,7 +10888,7 @@ def build_ui(
             text_account_preview_var.set(nm),
             reg_account_entry.current(idx),
         ),
-        skip_value=lambda s: s == _ALL_ACCOUNTS_LABEL,
+        skip_value=_is_all_accounts_filter,
     )
 
     def _norm_cat_menu_label(s: str) -> str:
@@ -10991,13 +11017,13 @@ def build_ui(
             text_account_preview_var.set(_ALL_ACCOUNTS_LABEL)
         if (
             text_category_preview_var.get()
-            and text_category_preview_var.get() != _ALL_CATEGORIES_LABEL
+            and not _is_all_categories_filter(text_category_preview_var.get())
             and text_category_preview_var.get() not in cats
         ):
             text_category_preview_var.set(_ALL_CATEGORIES_LABEL)
         if (
             text_account_preview_var.get()
-            and text_account_preview_var.get() != _ALL_ACCOUNTS_LABEL
+            and not _is_all_accounts_filter(text_account_preview_var.get())
             and text_account_preview_var.get() not in accs
         ):
             text_account_preview_var.set(_ALL_ACCOUNTS_LABEL)
@@ -11174,9 +11200,9 @@ def build_ui(
         agg_f = (text_aggregate_category_applied_var.get() or "").strip()
         if agg_f:
             parts.append(f"per categorie il cui nome contiene «{agg_f}»")
-        elif cat and cat != _ALL_CATEGORIES_LABEL:
+        elif cat and not _is_all_categories_filter(cat):
             parts.append(f"per la categoria {cat}")
-        if acc and acc != _ALL_ACCOUNTS_LABEL:
+        if acc and not _is_all_accounts_filter(acc):
             parts.append(f"per il conto {acc}")
         amt = (text_amount_applied_var.get() or "").strip()
         if mode == "date" and amt:
@@ -13058,8 +13084,8 @@ th {{ background:#efefef; text-align:left; }}
     def _build_movement_search_filter_state() -> dict[str, object]:
         q_cat_raw = text_category_applied_var.get().strip()
         q_acc_raw = text_account_applied_var.get().strip()
-        q_cat = "" if q_cat_raw in ("", _ALL_CATEGORIES_LABEL) else q_cat_raw.lower()
-        q_acc = "" if q_acc_raw in ("", _ALL_ACCOUNTS_LABEL) else q_acc_raw.lower()
+        q_cat = "" if _is_all_categories_filter(q_cat_raw) else q_cat_raw.lower()
+        q_acc = "" if _is_all_accounts_filter(q_acc_raw) else q_acc_raw.lower()
         q_chq = (text_cheque_applied_var.get() or "").lower()
         q_note = (text_note_applied_var.get() or "").casefold()
         q_amt_raw = (text_amount_applied_var.get() or "").strip()
@@ -13206,7 +13232,7 @@ th {{ background:#efefef; text-align:left; }}
     ) -> None:
         agg_raw = (text_aggregate_category_applied_var.get() or "").strip()
         cat_raw = (text_category_applied_var.get() or "").strip()
-        if not agg_raw and (not cat_raw or cat_raw == _ALL_CATEGORIES_LABEL):
+        if not agg_raw and _is_all_categories_filter(cat_raw):
             saldo_parziale_categoria_ricerca_text[0] = ""
             return
         st = _build_movement_search_filter_state()
@@ -14266,7 +14292,9 @@ th {{ background:#efefef; text-align:left; }}
         reg_account_entry.configure(values=acc_vals)
         if not text_account_preview_var.get():
             text_account_preview_var.set(_ALL_ACCOUNTS_LABEL)
-        if text_account_preview_var.get() != _ALL_ACCOUNTS_LABEL and text_account_preview_var.get() not in accs:
+        if text_account_preview_var.get() and not _is_all_accounts_filter(
+            text_account_preview_var.get()
+        ) and text_account_preview_var.get() not in accs:
             text_account_preview_var.set(_ALL_ACCOUNTS_LABEL)
 
     def open_calendar_for(which: str) -> tk.Toplevel | None:
@@ -14539,7 +14567,13 @@ th {{ background:#efefef; text-align:left; }}
         )
 
     fields_row = ttk.Frame(date_controls_left, style="MovCdc.TFrame")
-    # Visibile solo con «Date a scelta» (pack in ``_refresh_custom_date_fields_visibility``).
+    # Visibile solo con «Date a scelta»; altrimenti un keeper mantiene l'altezza riga
+    # (stessa distanza verticale tra 1ª e 2ª riga filtri).
+    fields_height_keeper = tk.Frame(
+        date_controls_left, bg=MOVIMENTI_PAGE_BG, highlightthickness=0, width=1, height=1
+    )
+    fields_height_keeper.pack_propagate(False)
+    _fields_row_keep_h: list[int] = [28]
 
     ttk.Label(fields_row, text="dal", style="MovCdc.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 5))
     date_from_disp_var = tk.StringVar()
@@ -14579,18 +14613,43 @@ th {{ background:#efefef; text-align:left; }}
     def _refresh_custom_date_fields_visibility() -> None:
         custom = date_preset_preview_var.get() == "custom"
         try:
-            mapped = bool(fields_row.winfo_ismapped())
+            fields_mapped = bool(fields_row.winfo_ismapped())
         except tk.TclError:
-            mapped = False
-        if custom and not mapped:
-            fields_row.pack(side=tk.LEFT, padx=(8, 0))
-        elif not custom and mapped:
-            fields_row.pack_forget()
+            fields_mapped = False
+        try:
+            keeper_mapped = bool(fields_height_keeper.winfo_ismapped())
+        except tk.TclError:
+            keeper_mapped = False
+        if custom:
+            if keeper_mapped:
+                fields_height_keeper.pack_forget()
+            if not fields_mapped:
+                fields_row.pack(side=tk.LEFT, padx=(8, 0))
             try:
-                _close_calendar("from")
-                _close_calendar("to")
-            except Exception:
+                date_controls_left.update_idletasks()
+                h = int(fields_row.winfo_reqheight() or 0)
+                if h > 8:
+                    _fields_row_keep_h[0] = h
+            except tk.TclError:
                 pass
+        else:
+            if fields_mapped:
+                try:
+                    date_controls_left.update_idletasks()
+                    h = int(fields_row.winfo_reqheight() or 0)
+                    if h > 8:
+                        _fields_row_keep_h[0] = h
+                except tk.TclError:
+                    pass
+                fields_row.pack_forget()
+                try:
+                    _close_calendar("from")
+                    _close_calendar("to")
+                except Exception:
+                    pass
+            if not keeper_mapped:
+                fields_height_keeper.configure(width=1, height=max(28, int(_fields_row_keep_h[0])))
+                fields_height_keeper.pack(side=tk.LEFT)
 
     def _close_calendar(which: str) -> None:
         nonlocal calendar_popup_from, calendar_popup_to
@@ -14994,6 +15053,16 @@ th {{ background:#efefef; text-align:left; }}
     _sync_date_displays_from_iso()
 
     refresh_date_preset_button_styles()
+    # Misura altezza «dal/al» e applica il keeper così la 2ª riga ha già lo stesso scarto
+    # verticale di quando «Date a scelta» è attivo.
+    try:
+        fields_row.pack(side=tk.LEFT, padx=(8, 0))
+        date_controls_left.update_idletasks()
+        _fields_row_keep_h[0] = max(28, int(fields_row.winfo_reqheight() or 28))
+        fields_row.pack_forget()
+    except tk.TclError:
+        pass
+    _refresh_custom_date_fields_visibility()
     refresh_date_preview_from_modes()
     # Alla prima apertura, la griglia deve riflettere i default preset.
     date_preset_applied_var.set(date_preset_preview_var.get())
