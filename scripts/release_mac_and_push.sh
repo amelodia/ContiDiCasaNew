@@ -38,10 +38,17 @@ fi
 git push -u origin HEAD
 
 bash scripts/build_macos_app.sh
-codesign -s - --deep dist/ContiDiCasa.app
+codesign -s - --deep --force dist/ContiDiCasa.app
 
 rm -rf /Applications/ContiDiCasa.app
 cp -R dist/ContiDiCasa.app /Applications/
+
+# Se PyInstaller/spec ha alzato di nuovo BUILD, allinea Git
+if ! git diff --quiet -- app_version.py; then
+  git add app_version.py
+  git commit -m "versione x ${DATA} — sync APP_VERSION dopo build Mac." || true
+  git push -u origin HEAD || true
+fi
 
 echo
 echo "Mac OK: /Applications/ContiDiCasa.app"
