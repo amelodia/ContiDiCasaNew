@@ -25,6 +25,11 @@ Punti collegati: `ent_amt`, filtri Movimenti, `ent_per_amt`, dialog **Modifica i
 - **Cambio conto**: se il nuovo conto ha `**` su registrazioni **successive**, quei `**` diventano `*` e il `**` viene riposizionato sulla registrazione precedente dello stesso conto (`reanchor_double_star_before_reg_for_account`).
 - **Forza cancellazione verifica**: toglie la verifica dalla riga corrente; eventuali `**` su registrazioni **successive** dello stesso conto diventano `*`. **Non** pone `**` sulla registrazione precedente (un `**` già presente più indietro resta invariato).
 
+## Carte di credito — conto di riferimento
+
+- In **Opzioni → Conti** il conto di riferimento di una carta è **modificabile** (non congelata).
+- Al cambio si aggiorna `credit_card_reference_code` su tutti gli anni; gli **addebiti previsti** in Saldi (riga spese carte) seguono automaticamente il nuovo conto ordinario — senza riscrivere le girate di chiusura già registrate.
+
 ## Nuova registrazione — Nota (Girata conto/conto, 2° conto Cassa)
 
 - Preimpostazione: **`Aut ` + `gg/mm` + uno spazio finale** (es. `Aut 15/03 `) per continuare a digitare dopo la data, **salvo** se il **primo conto** è **Cassa** o **conto carta** (in tal caso niente «Aut», modello **Giroconto** come negli altri casi).

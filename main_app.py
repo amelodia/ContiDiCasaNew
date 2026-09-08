@@ -2585,6 +2585,66 @@ def propagate_account_estratti_pdf_stem_by_code(db: dict, code: str, stem: str) 
             break
 
 
+def reference_accounts_for_credit_card(db: dict) -> list[tuple[str, str]]:
+    """Conti ordinari ammessi come riferimento carta: ``(nome, codice)``.
+
+    Esclude carte di credito, Cassa e VIRTUALE.
+    """
+    out: list[tuple[str, str]] = []
+    for a in merge_account_charts_across_years(db):
+        code = str(a.get("code", "")).strip()
+        name = str(a.get("name", "") or "").strip()
+        if not code or not name:
+            continue
+        if bool(a.get("credit_card")):
+            continue
+        nu = name.upper()
+        if nu == "CASSA" or nu == str(VIRTUALE_ACCOUNT_NAME).upper():
+            continue
+        out.append((name, code))
+    return out
+
+
+def validate_credit_card_reference_code(db: dict, card_code: str, ref_code: str) -> str | None:
+    """None se ``ref_code`` è un riferimento valido per la carta ``card_code``; altrimenti messaggio errore."""
+    cc = str(card_code or "").strip()
+    rc = str(ref_code or "").strip()
+    if not cc:
+        return "Codice conto carta non valido."
+    if not rc:
+        return "Selezionare un conto di riferimento."
+    if account_codes_match_for_verification(cc, rc):
+        return "Il conto di riferimento non può essere la stessa carta."
+    card = account_dict_for_code_latest_year(db, cc)
+    if not card or not bool(card.get("credit_card")):
+        return "Il conto indicato non è una carta di credito."
+    ref = account_dict_for_code_latest_year(db, rc)
+    if not ref:
+        return "Conto di riferimento non trovato nel piano conti."
+    if bool(ref.get("credit_card")):
+        return "Il conto di riferimento non può essere un conto carta di credito."
+    ref_nm = str(ref.get("name", "") or "").strip()
+    if plan_conti_account_is_cassa(ref_nm):
+        return "Il conto di riferimento non può essere Cassa."
+    if ref_nm.upper() == str(VIRTUALE_ACCOUNT_NAME).upper():
+        return "Il conto di riferimento non può essere VIRTUALE."
+    return None
+
+
+def propagate_account_credit_card_reference_by_code(db: dict, card_code: str, ref_code: str) -> None:
+    """Imposta ``credit_card_reference_code`` su tutti gli anni per il codice carta indicato."""
+    sc = str(card_code).strip()
+    rc = str(ref_code).strip()
+    for yb in db.get("years", []) or []:
+        for a in yb.get("accounts", []) or []:
+            if str(a.get("code", "")).strip() != sc:
+                continue
+            if not bool(a.get("credit_card")):
+                break
+            a["credit_card_reference_code"] = rc
+            break
+
+
 def account_estratti_pdf_stem_for_code(db: dict, acc_code: str) -> str:
     """
     Nome base file estratto PDF per il codice conto, senza suffisso mese/trimestre.
@@ -31057,8 +31117,8 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     ttk.Label(
         lf_acc,
         text=(
-            "Per i conti carta di credito è indicato il conto di riferimento: non può essere modificato. "
-            "Per collegare la carta a un conto ordinario diverso occorre creare un nuovo conto carta di credito."
+            "Per i conti carta di credito è indicato il conto di riferimento (modificabile). "
+            "Al cambio, gli addebiti previsti nella tabella Saldi passano automaticamente al nuovo conto ordinario."
         ),
         wraplength=820,
         foreground="#555555",
@@ -31487,7 +31547,138 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 ).grid(row=ri, column=2, sticky="w", padx=2, pady=1)
             else:
                 ttk.Label(plan_acc_grid, text="—", foreground="#888888").grid(row=ri, column=2, sticky="w", padx=2, pady=1)
-            ttk.Label(plan_acc_grid, text=ref_disp, wraplength=280).grid(row=ri, column=3, sticky="we", padx=2, pady=1)
+            if is_cc_row and not is_frozen:
+                ref_cell = ttk.Frame(plan_acc_grid)
+                ref_cell.grid(row=ri, column=3, sticky="we", padx=2, pady=1)
+                ttk.Label(ref_cell, text=ref_disp or "—", wraplength=200).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+                def _edit_cc_ref(cd: str = code, cur_ref: str = ref_cd, card_nm: str = raw_nm) -> None:
+                    dd = cur_db()
+                    choices = reference_accounts_for_credit_card(dd)
+                    if not choices:
+                        messagebox.showwarning(
+                            "Conto di riferimento",
+                            "Non è disponibile alcun conto di riferimento: servono conti ordinari nel piano "
+                            "(esclusi Cassa, VIRTUALE e altri conti carta di credito).",
+                            parent=root,
+                        )
+                        return
+                    top_ref = tk.Toplevel(root)
+                    top_ref.title("Modifica conto di riferimento")
+                    top_ref.transient(root)
+                    top_ref.grab_set()
+                    fr = ttk.Frame(top_ref, padding=14)
+                    fr.pack(fill=tk.BOTH, expand=True)
+                    ttk.Label(
+                        fr,
+                        text=(
+                            f"Carta «{card_nm.strip() or cd}» (codice {cd}).\n"
+                            "Scegli il nuovo conto ordinario di riferimento. "
+                            "Gli addebiti previsti in Saldi passeranno a quel conto."
+                        ),
+                        wraplength=440,
+                    ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+                    name_by_code = {c: n for n, c in choices}
+                    pre_name = name_by_code.get(cur_ref) or choices[0][0]
+                    ref_var = tk.StringVar(value=pre_name)
+                    ttk.Label(fr, text="Conto di riferimento").grid(row=1, column=0, sticky="nw", pady=2)
+                    cb_ref = ttk.Combobox(
+                        fr, textvariable=ref_var, width=34, state="readonly", values=[n for n, _ in choices]
+                    )
+                    cb_ref.grid(row=1, column=1, sticky="we", padx=(8, 0), pady=2)
+                    _combo_cleanup_ref = bind_ttk_combobox_prefix_letter_jump(
+                        cb_ref,
+                        on_pick=lambda nm, idx: (ref_var.set(nm), cb_ref.current(idx)),
+                    )
+
+                    def _on_ref_edit_destroy(e: tk.Event) -> None:
+                        if getattr(e, "widget", None) is top_ref:
+                            _combo_cleanup_ref()
+
+                    top_ref.bind("<Destroy>", _on_ref_edit_destroy)
+                    fr.columnconfigure(1, weight=1)
+                    er_ref = ttk.Label(fr, text="", foreground="#b00020", wraplength=440)
+                    er_ref.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+                    def _ref_close() -> None:
+                        try:
+                            top_ref.destroy()
+                        except Exception:
+                            pass
+
+                    def _code_for_display(display_name: str) -> str:
+                        dn = (display_name or "").strip()
+                        for n, c in choices:
+                            if n == dn:
+                                return c
+                        return str(choices[0][1])
+
+                    def _ref_ok() -> None:
+                        er_ref.configure(text="")
+                        new_ref = _code_for_display(ref_var.get())
+                        err = validate_credit_card_reference_code(dd, cd, new_ref)
+                        if err:
+                            er_ref.configure(text=err)
+                            return
+                        if account_codes_match_for_verification(cur_ref, new_ref):
+                            _ref_close()
+                            return
+                        old_nm = (name_by_code.get(cur_ref) or cur_ref or "—").strip()
+                        new_nm = (name_by_code.get(new_ref) or new_ref).strip()
+                        if not messagebox.askyesno(
+                            "Conto di riferimento",
+                            f"Spostare il riferimento della carta da «{old_nm}» a «{new_nm}»?\n\n"
+                            "Gli addebiti previsti in Saldi passeranno al nuovo conto.",
+                            parent=top_ref,
+                        ):
+                            return
+                        dd_before = copy.deepcopy(dd)
+                        propagate_account_credit_card_reference_by_code(dd, cd, new_ref)
+                        try:
+                            save_encrypted_db_dual(
+                                dd,
+                                Path(data_file_var.get()),
+                                Path(key_file_var.get()),
+                            )
+                        except Exception as exc:
+                            db_holder[0] = dd_before
+                            messagebox.showerror("Conti", str(exc), parent=top_ref)
+                            return
+                        plan_conti_status_var.set(
+                            f"Conto di riferimento aggiornato: «{old_nm}» → «{new_nm}» (database salvato)."
+                        )
+                        _movements_dirty[0] = True
+                        try:
+                            refresh_balance_footer()
+                            refresh_category_account_dropdowns()
+                        except Exception:
+                            pass
+                        _ref_close()
+                        _reload_plan_conti_form()
+
+                    bref = ttk.Frame(fr)
+                    bref.grid(row=3, column=0, columnspan=2, sticky="e", pady=(8, 0))
+                    ttk.Button(bref, text="Annulla", command=_ref_close).pack(side=tk.RIGHT, padx=(8, 0))
+                    ttk.Button(bref, text="Salva", command=_ref_ok).pack(side=tk.RIGHT)
+                    try:
+                        cb_ref.focus_set()
+                    except Exception:
+                        pass
+
+                mod_lbl = tk.Label(
+                    ref_cell,
+                    text="Modifica",
+                    font=("TkDefaultFont", 9, "bold"),
+                    bg=_plan_acc_red_bg,
+                    fg=_plan_acc_red_fg,
+                    padx=8,
+                    pady=2,
+                    cursor="hand2",
+                )
+                mod_lbl.pack(side=tk.RIGHT, padx=(6, 0))
+                mod_lbl.bind("<Button-1>", lambda _e, fn=_edit_cc_ref: fn())
+            else:
+                ttk.Label(plan_acc_grid, text=ref_disp, wraplength=280).grid(row=ri, column=3, sticky="we", padx=2, pady=1)
             ttk.Label(plan_acc_grid, text=bal_s).grid(row=ri, column=4, sticky="w", padx=2, pady=1)
             stem_est = "readonly" if row_locked else "normal"
             ttk.Entry(plan_acc_grid, textvariable=stem_v, width=28, state=stem_est).grid(
@@ -31887,19 +32078,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         wiz: dict[str, object] = {"credit_card": False, "credit_card_reference_code": ""}
 
         def _reference_accounts_for_credit_card(dd: dict) -> list[tuple[str, str]]:
-            out: list[tuple[str, str]] = []
-            for a in merge_account_charts_across_years(dd):
-                code = str(a.get("code", "")).strip()
-                name = str(a.get("name", "") or "").strip()
-                if not code or not name:
-                    continue
-                if bool(a.get("credit_card")):
-                    continue
-                nu = name.upper()
-                if nu == "CASSA" or nu == str(VIRTUALE_ACCOUNT_NAME).upper():
-                    continue
-                out.append((name, code))
-            return out
+            return reference_accounts_for_credit_card(dd)
 
         def _base_new_acc(name_stored: str) -> dict:
             acc: dict[str, object] = {"code": nxt_s, "name": name_stored}
@@ -32382,8 +32561,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 text=(
                     "Scegli il conto di riferimento per la carta: deve essere un conto ordinario "
                     "(non Cassa, non VIRTUALE, non un altro conto carta di credito). "
-                    "Non potrà essere modificato in seguito: per collegare la carta a un altro conto ordinario "
-                    "occorrerà creare un nuovo conto carta di credito."
+                    "Potrai modificarlo in seguito dalla pagina Opzioni → Conti."
                 ),
                 wraplength=440,
             ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
@@ -32419,8 +32597,20 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                 if not cc_ref:
                     er_ref.configure(text="Selezionare un conto di riferimento.")
                     return
-                if account_is_credit_card_by_code(cur_db(), cc_ref):
+                # Validazione condivisa (carta non ancora nel piano: controlla solo il ref).
+                ref_acc = account_dict_for_code_latest_year(cur_db(), cc_ref)
+                if not ref_acc:
+                    er_ref.configure(text="Conto di riferimento non trovato nel piano conti.")
+                    return
+                if bool(ref_acc.get("credit_card")):
                     er_ref.configure(text="Il conto di riferimento non può essere un conto carta di credito.")
+                    return
+                ref_nm = str(ref_acc.get("name", "") or "").strip()
+                if plan_conti_account_is_cassa(ref_nm):
+                    er_ref.configure(text="Il conto di riferimento non può essere Cassa.")
+                    return
+                if ref_nm.upper() == str(VIRTUALE_ACCOUNT_NAME).upper():
+                    er_ref.configure(text="Il conto di riferimento non può essere VIRTUALE.")
                     return
                 wiz["credit_card"] = True
                 wiz["credit_card_reference_code"] = cc_ref
