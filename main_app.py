@@ -5543,6 +5543,28 @@ def _hex_to_rgb_triplet(hex_color: str) -> tuple[int, int, int]:
     return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
 
 
+def _stat_print_signed_amount_tone(raw: object) -> str | None:
+    """Per stampa statistiche: ``pos`` / ``neg`` se la cella sembra un importo/% firmato, altrimenti None."""
+    s = str(raw or "").strip().replace("\u2212", "-").replace("–", "-").replace("—", "-")
+    if not s or s in {"-", "n/d", "N/D", "(vuoto)"}:
+        return None
+    # Toglie simboli di valuta / percento lasciando il segno iniziale.
+    body = s.replace("€", "").replace("%", "").replace("L", "").strip()
+    if not body:
+        return None
+    if body[0] == "-":
+        rest = body[1:].lstrip()
+        if not rest:
+            return None
+        return "neg"
+    if body[0] == "+":
+        return "pos"
+    # Numero senza segno esplicito (es. zero): neutro → None (nero).
+    if body[0].isdigit() or body[0] in ".,":
+        return None
+    return None
+
+
 def _open_generated_pdf(path: str) -> None:
     p = str(Path(path).resolve())
     if not os.path.isfile(p):
@@ -5660,15 +5682,9 @@ def _print_statistics_fpdf(
 
         def _section_col_widths(ncols: int) -> list[float]:
             n = max(1, ncols)
-            if n >= 8:
-                w0 = min(52.0, epw * 0.19)
-                w_rest = (epw - w0) / float(n - 1)
-                return [w0] + [w_rest] * (n - 1)
-            if n == 1:
-                return [epw]
-            w0 = min(58.0, epw * 0.36)
-            w_rest = (epw - w0) / float(n - 1)
-            return [w0] + [w_rest] * (n - 1)
+            # Stessa larghezza per tutte le colonne (come in tabella schermo Statistiche per conti).
+            w = epw / float(n)
+            return [w] * n
 
         for sec_title, heads, rows in sections:
             if pdf.get_y() > y_break - 28:
@@ -5716,17 +5732,26 @@ def _print_statistics_fpdf(
                     rlist = rlist[: len(heads_use)]
                     nm = str(rlist[0])
                     is_total = nm.strip().upper() == "TOTALI"
-                    pdf.set_font("Helvetica", "B" if is_total else "", 6.5)
-                    pdf.set_text_color(0, 0, 0)
                     for ci, wi in enumerate(col_widths):
                         raw = rlist[ci] if ci < len(rlist) else ""
                         txt = _pdf_safe_text(raw)
                         align = "L" if ci == 0 else "R"
                         if ci == 0 and len(txt) > 36:
                             txt = txt[:35] + "."
-                        elif ci > 0 and len(txt) > 24:
-                            txt = txt[:23] + "."
+                        elif ci > 0 and len(txt) > 28:
+                            txt = txt[:27] + "."
+                        tone = None if ci == 0 else _stat_print_signed_amount_tone(raw)
+                        if tone == "neg":
+                            pdf.set_text_color(*_hex_to_rgb_triplet(COLOR_AMOUNT_NEG))
+                            pdf.set_font("Helvetica", "B", 6.5)
+                        elif tone == "pos":
+                            pdf.set_text_color(*_hex_to_rgb_triplet(COLOR_AMOUNT_POS))
+                            pdf.set_font("Helvetica", "B", 6.5)
+                        else:
+                            pdf.set_text_color(0, 0, 0)
+                            pdf.set_font("Helvetica", "B" if (is_total or ci > 0) else "", 6.5)
                         pdf.cell(wi, row_h, txt, border=1, align=align)
+                    pdf.set_text_color(0, 0, 0)
                     pdf.ln(row_h)
             pdf.ln(3)
 
@@ -26886,15 +26911,28 @@ th {{ background:#efefef; text-align:left; }}
     _stat_month_right_cols = ("ini", "fin", "dsaldo", "pct", "entr", "usc", "net")
     _stat_m_cols_rt4 = _stat_month_right_cols[:4]
     _stat_m_cols_rt3 = _stat_month_right_cols[4:]
+    _stat_heading_font = tkfont.Font(family=_stat_ffam, size=_stat_fsz, weight="bold")
+    # Larghezza uniforme = titolo più lungo tipico («Saldo alla data gg/mm/aaaa») + padding.
+    _stat_m_title_samples = (
+        "2099 - Conti",
+        "Saldo alla data 31/12/2099",
+        "Δ saldi",
+        "Var %",
+        "Entrate",
+        "Uscite",
+        "Netto",
+    )
+    _stat_m_uniform_w = max(_stat_heading_font.measure(t) for t in _stat_m_title_samples) + 28
+    _stat_m_uniform_w = max(120, int(_stat_m_uniform_w))
     _stat_m_head_it = (
-        ("conto", "Conto", 268),
-        ("ini", "Saldo alla data —", 200),
-        ("fin", "Saldo alla data —", 200),
-        ("dsaldo", "Δ saldi", 108),
-        ("pct", "Var %", 80),
-        ("entr", "Entrate", 110),
-        ("usc", "Uscite", 110),
-        ("net", "Netto", 110),
+        ("conto", "Conto", _stat_m_uniform_w),
+        ("ini", "Saldo alla data —", _stat_m_uniform_w),
+        ("fin", "Saldo alla data —", _stat_m_uniform_w),
+        ("dsaldo", "Δ saldi", _stat_m_uniform_w),
+        ("pct", "Var %", _stat_m_uniform_w),
+        ("entr", "Entrate", _stat_m_uniform_w),
+        ("usc", "Uscite", _stat_m_uniform_w),
+        ("net", "Netto", _stat_m_uniform_w),
     )
     _stat_m_widths_rt4 = tuple(t[2] for t in _stat_m_head_it[1:5])
     _stat_m_widths_rt3 = tuple(t[2] for t in _stat_m_head_it[5:8])
@@ -27108,8 +27146,9 @@ th {{ background:#efefef; text-align:left; }}
             except tk.TclError:
                 pass
             try:
-                xm = int(rt4.winfo_x()) + int(rt4.winfo_width())
-                xa = int(rt3.winfo_x()) + int(rt3.winfo_width())
+                fx = int(fr_data.winfo_rootx())
+                xm = int(rt4.winfo_rootx()) - fx + int(rt4.winfo_width())
+                xa = int(rt3.winfo_rootx()) - fx + int(rt3.winfo_width())
                 sep_mid.place(in_=fr_data, x=xm, y=0, width=_o, height=h, anchor="nw")
                 sep_after.place(in_=fr_data, x=xa, y=0, width=_o, height=h, anchor="nw")
             except tk.TclError:
@@ -27187,12 +27226,22 @@ th {{ background:#efefef; text-align:left; }}
             w.bind("<Configure>", lambda e, r=relayout: r(), add="+")
         return relayout
 
-    def _stat_overlay_inner_vlines(tv: ttk.Treeview, widths: tuple[int, ...]) -> Callable[[], None]:
-        """Solo linee sottili tra celle nelle griglie dati (larghezza _STAT_LINE_INNER)."""
+    def _stat_overlay_inner_vlines(tv: ttk.Treeview, widths_ref: list[int]) -> Callable[[], None]:
+        """Linee sottili tra celle: posizioni assolute (le colonne Treeview non stretchano)."""
         _wi = int(_STAT_LINE_INNER)
-        bars = [tk.Frame(tv, width=_wi, bg="#cfcfcf", highlightthickness=0, bd=0) for _ in range(max(0, len(widths) - 1))]
+        bars: list[tk.Frame] = []
 
         def relayout(_e: tk.Event | None = None) -> None:
+            nonlocal bars
+            widths = [max(1, int(x)) for x in widths_ref]
+            need = max(0, len(widths) - 1)
+            while len(bars) < need:
+                bars.append(tk.Frame(tv, width=_wi, bg="#cfcfcf", highlightthickness=0, bd=0))
+            for extra in bars[need:]:
+                try:
+                    extra.place_forget()
+                except tk.TclError:
+                    pass
             try:
                 W = int(tv.winfo_width())
                 h_win = max(int(tv.winfo_height()), 2)
@@ -27200,13 +27249,16 @@ th {{ background:#efefef; text-align:left; }}
                 H = max(2, min(h_win, h_tab))
             except tk.TclError:
                 return
-            tot = float(sum(widths)) or 1.0
-            k = W / tot if W > 0 else 1.0
             pos = 0.0
-            for i, wi in enumerate(widths[:-1]):
-                pos += wi * k
+            for i in range(need):
+                pos += float(widths[i])
                 xi = int(round(pos))
-                xi = max(1, min(W - 2, xi))
+                if xi < 1 or xi > W - 2:
+                    try:
+                        bars[i].place_forget()
+                    except tk.TclError:
+                        pass
+                    continue
                 bars[i].place(x=xi, y=0, width=_wi, height=H)
 
         tv.bind("<Configure>", relayout, add="+")
@@ -27217,10 +27269,11 @@ th {{ background:#efefef; text-align:left; }}
         _parent: ttk.Frame,
     ) -> tuple[ttk.Frame, ttk.Treeview, ttk.Treeview, ttk.Treeview, ttk.Scrollbar, ttk.Scrollbar, Callable[..., None]]:
         wrap = ttk.Frame(_parent, style="MovCdc.TFrame")
-        _data_w_m = int(sum(_stat_m_widths_rt4) + sum(_stat_m_widths_rt3))
+        _w_live4 = [int(x) for x in _stat_m_widths_rt4]
+        _w_live3 = [int(x) for x in _stat_m_widths_rt3]
         wrap.columnconfigure(0, minsize=int(_STAT_LINE_OUTER), weight=0)
         wrap.columnconfigure(1, weight=0)
-        wrap.columnconfigure(2, weight=1, minsize=_data_w_m)
+        wrap.columnconfigure(2, weight=1, minsize=120)
         wrap.columnconfigure(3, weight=0)
         wrap.rowconfigure(1, weight=1)
         hr_top = _stat_hrule_heavy(wrap)
@@ -27235,19 +27288,39 @@ th {{ background:#efefef; text-align:left; }}
             style="StatCdc.Treeview",
         )
         sep1 = _stat_sep_heavy(wrap)
-        fr_data = ttk.Frame(wrap, style="MovCdc.TFrame")
-        fr_data.grid(row=1, column=2, sticky="nsew")
+
+        # Canvas: scroll orizzontale unico sul blocco dati (rt4+rt3), senza xview desincronizzato.
+        try:
+            _canvas_bg = str(_stat_sty.lookup("MovCdc.TFrame", "background") or CDC_GRID_STRIPE1_BG)
+        except tk.TclError:
+            _canvas_bg = CDC_GRID_STRIPE1_BG
+        data_canvas = tk.Canvas(wrap, highlightthickness=0, bd=0, background=_canvas_bg)
+        data_canvas.grid(row=1, column=2, sticky="nsew")
+        fr_data = ttk.Frame(data_canvas, style="MovCdc.TFrame")
+        _data_win = data_canvas.create_window((0, 0), window=fr_data, anchor="nw")
         fr_data.rowconfigure(0, weight=1)
-        fr_data.columnconfigure(0, weight=44, minsize=int(sum(_stat_m_widths_rt4)))
-        fr_data.columnconfigure(1, minsize=1)
-        fr_data.columnconfigure(2, weight=33, minsize=int(sum(_stat_m_widths_rt3)))
-        fr_data.columnconfigure(3, minsize=1)
+        fr_data.columnconfigure(0, weight=0)
+        fr_data.columnconfigure(1, weight=0)
+        fr_data.columnconfigure(2, weight=0)
+        fr_data.columnconfigure(3, weight=0)
+
+        fr4 = ttk.Frame(fr_data, style="MovCdc.TFrame", width=int(sum(_w_live4)))
+        fr4.grid(row=0, column=0, sticky="nsew")
+        fr4.grid_propagate(False)
+        fr4.rowconfigure(0, weight=1)
+        fr4.columnconfigure(0, weight=1)
         sep_mid = tk.Frame(fr_data, width=int(_STAT_LINE_OUTER), bg="#555555", highlightthickness=0, bd=0)
         sep_mid.grid(row=0, column=1, sticky="ns")
+        fr3 = ttk.Frame(fr_data, style="MovCdc.TFrame", width=int(sum(_w_live3)))
+        fr3.grid(row=0, column=2, sticky="nsew")
+        fr3.grid_propagate(False)
+        fr3.rowconfigure(0, weight=1)
+        fr3.columnconfigure(0, weight=1)
         sep_after = tk.Frame(fr_data, width=int(_STAT_LINE_OUTER), bg="#555555", highlightthickness=0, bd=0)
         sep_after.grid(row=0, column=3, sticky="ns")
+
         rt4 = ttk.Treeview(
-            fr_data,
+            fr4,
             columns=_stat_m_cols_rt4,
             show="headings",
             height=18,
@@ -27256,14 +27329,14 @@ th {{ background:#efefef; text-align:left; }}
         )
         rt4.grid(row=0, column=0, sticky="nsew")
         rt3 = ttk.Treeview(
-            fr_data,
+            fr3,
             columns=_stat_m_cols_rt3,
             show="headings",
             height=18,
             selectmode="browse",
             style="StatCdc.Treeview",
         )
-        rt3.grid(row=0, column=2, sticky="nsew")
+        rt3.grid(row=0, column=0, sticky="nsew")
         _m0_cid, _m0_txt, _m0_w = _stat_m_head_it[0]
         lt.heading(_m0_cid, text=_m0_txt, anchor=tk.W)
         lt.column(_m0_cid, width=_m0_w, minwidth=_m0_w, stretch=False, anchor=tk.W)
@@ -27273,18 +27346,33 @@ th {{ background:#efefef; text-align:left; }}
         for cid, txt, w in _stat_m_head_it[5:8]:
             rt3.heading(cid, text=txt, anchor=tk.E)
             rt3.column(cid, width=w, minwidth=w, stretch=False, anchor=tk.E)
-        m_v4 = _stat_overlay_inner_vlines(rt4, _stat_m_widths_rt4)
-        m_v3 = _stat_overlay_inner_vlines(rt3, _stat_m_widths_rt3)
+        m_v4 = _stat_overlay_inner_vlines(rt4, _w_live4)
+        m_v3 = _stat_overlay_inner_vlines(rt3, _w_live3)
         rt4.lift()
         rt3.lift()
         ylock: list[bool] = [False]
+
+        def _sync_data_canvas(_e: tk.Event | None = None) -> None:
+            try:
+                wrap.update_idletasks()
+                h = max(1, int(data_canvas.winfo_height()))
+                w4 = max(1, int(sum(_w_live4)))
+                w3 = max(1, int(sum(_w_live3)))
+                fr4.configure(width=w4, height=h)
+                fr3.configure(width=w3, height=h)
+                content_w = w4 + w3 + 2 * int(_STAT_LINE_OUTER)
+                data_canvas.itemconfigure(_data_win, width=content_w, height=h)
+                data_canvas.configure(scrollregion=(0, 0, content_w, h))
+            except tk.TclError:
+                pass
+
         _stat_table_relayout_m = _stat_attach_synced_table_hrules(
             wrap,
             lt,
             rt4,
             rt3,
             fr_data,
-            vline_relays=(m_v4, m_v3),
+            vline_relays=(m_v4, m_v3, _sync_data_canvas),
             heavy_seps=(sep0, sep1, sep_mid, sep_after),
         )
 
@@ -27307,31 +27395,35 @@ th {{ background:#efefef; text-align:left; }}
                 ylock[0] = False
             wrap.after_idle(_stat_table_relayout_m)
 
-        def _xview_both(*args: object) -> None:
-            rt4.xview(*args)
-            rt3.xview(*args)
-            wrap.after_idle(_stat_table_relayout_m)
-
         vsb = ttk.Scrollbar(wrap, orient="vertical", command=_scroll_y)
-        hsb = ttk.Scrollbar(wrap, orient="horizontal", command=_xview_both)
-
-        def _hsb_set(f: str, l: str) -> None:
-            hsb.set(f, l)
+        hsb = ttk.Scrollbar(wrap, orient="horizontal", command=data_canvas.xview)
+        data_canvas.configure(xscrollcommand=hsb.set)
 
         lt.configure(yscrollcommand=_yset)
-        rt4.configure(yscrollcommand=_yset, xscrollcommand=_hsb_set)
-        rt3.configure(yscrollcommand=_yset, xscrollcommand=_hsb_set)
+        rt4.configure(yscrollcommand=_yset)
+        rt3.configure(yscrollcommand=_yset)
         lt.grid(row=1, column=1, sticky="ns")
         vsb.grid(row=1, column=3, sticky="ns")
         hsb.grid(row=2, column=2, sticky="ew")
         wrap._stat_relayout = _stat_table_relayout_m
+        wrap._stat_fr_data = fr_data
+        wrap._stat_fr4 = fr4
+        wrap._stat_fr3 = fr3
+        wrap._stat_data_canvas = data_canvas
+        wrap._stat_w_live4 = _w_live4
+        wrap._stat_w_live3 = _w_live3
+        wrap._stat_sync_data_canvas = _sync_data_canvas
+        data_canvas.bind("<Configure>", lambda _e: _sync_data_canvas(), add="+")
+        fr_data.bind("<Configure>", lambda _e: _sync_data_canvas(), add="+")
         wrap.after_idle(_stat_table_relayout_m)
+        wrap.after_idle(_sync_data_canvas)
         lt.tag_configure("statconto", foreground="#000000", font=(_stat_ffam, _stat_fsz, "bold"))
+        _amt_bold = (_stat_ffam, _stat_fsz, "bold")
         for _tv in (lt, rt4, rt3):
-            _tv.tag_configure("statpos", foreground=COLOR_AMOUNT_POS)
-            _tv.tag_configure("statneg", foreground=COLOR_AMOUNT_NEG)
-            _tv.tag_configure("statzero", foreground="#333333")
-            _tv.tag_configure("statneu", foreground="#111111")
+            _tv.tag_configure("statpos", foreground=COLOR_AMOUNT_POS, font=_amt_bold)
+            _tv.tag_configure("statneg", foreground=COLOR_AMOUNT_NEG, font=_amt_bold)
+            _tv.tag_configure("statzero", foreground="#333333", font=_amt_bold)
+            _tv.tag_configure("statneu", foreground="#111111", font=_amt_bold)
         return wrap, lt, rt4, rt3, vsb, hsb, _scroll_y
 
     stat_m_curr_wrap, stat_tv_m_c_left, stat_tv_m_c_r4, stat_tv_m_c_r3, _stat_m_c_vsb, _stat_m_c_hsb, _stat_m_c_scroll_y = _stat_build_month_pair(
@@ -27351,10 +27443,12 @@ th {{ background:#efefef; text-align:left; }}
         t_ini, t_fin = _stat_month_saldo_date_labels_for_ym(y, m)
         stat_tv_m_c_r4.heading("ini", text=t_ini, anchor=tk.E)
         stat_tv_m_c_r4.heading("fin", text=t_fin, anchor=tk.E)
+        _stat_m_sync_uniform_column_widths()
 
     def _stat_apply_month_table_headings_placeholder() -> None:
         stat_tv_m_c_r4.heading("ini", text="Saldo alla data —", anchor=tk.E)
         stat_tv_m_c_r4.heading("fin", text="Saldo alla data —", anchor=tk.E)
+        _stat_m_sync_uniform_column_widths()
 
     def _stat_m_heads_list_for_ym(y: int, m: int) -> list[str]:
         t_ini, t_fin = _stat_month_saldo_date_labels_for_ym(y, m)
@@ -27369,9 +27463,56 @@ th {{ background:#efefef; text-align:left; }}
         t_ini, t_fin = _stat_year_saldo_date_labels_for_ry(ry)
         stat_tv_m_c_r4.heading("ini", text=t_ini, anchor=tk.E)
         stat_tv_m_c_r4.heading("fin", text=t_fin, anchor=tk.E)
+        _stat_m_sync_uniform_column_widths()
 
     def _stat_apply_conti_column_heading(y_label: int) -> None:
         stat_tv_m_c_left.heading("conto", text=f"{y_label} - Conti", anchor=tk.W)
+        _stat_m_sync_uniform_column_widths()
+
+    def _stat_m_current_heading_texts() -> list[str]:
+        return [
+            str(stat_tv_m_c_left.heading("conto", "text") or ""),
+            str(stat_tv_m_c_r4.heading("ini", "text") or ""),
+            str(stat_tv_m_c_r4.heading("fin", "text") or ""),
+            str(stat_tv_m_c_r4.heading("dsaldo", "text") or ""),
+            str(stat_tv_m_c_r4.heading("pct", "text") or ""),
+            str(stat_tv_m_c_r3.heading("entr", "text") or ""),
+            str(stat_tv_m_c_r3.heading("usc", "text") or ""),
+            str(stat_tv_m_c_r3.heading("net", "text") or ""),
+        ]
+
+    def _stat_m_sync_uniform_column_widths() -> None:
+        """Tutte le colonne stessa larghezza = misura del titolo più lungo (+ padding)."""
+        heads = [h for h in _stat_m_current_heading_texts() if h.strip()]
+        samples = list(_stat_m_title_samples) + heads
+        w = max(_stat_heading_font.measure(t) for t in samples) + 28
+        w = max(120, int(w))
+        try:
+            stat_tv_m_c_left.column("conto", width=w, minwidth=w)
+            for cid in _stat_m_cols_rt4:
+                stat_tv_m_c_r4.column(cid, width=w, minwidth=w)
+            for cid in _stat_m_cols_rt3:
+                stat_tv_m_c_r3.column(cid, width=w, minwidth=w)
+            live4 = getattr(stat_m_curr_wrap, "_stat_w_live4", None)
+            live3 = getattr(stat_m_curr_wrap, "_stat_w_live3", None)
+            if isinstance(live4, list):
+                for i in range(len(live4)):
+                    live4[i] = w
+            if isinstance(live3, list):
+                for i in range(len(live3)):
+                    live3[i] = w
+            fr4 = getattr(stat_m_curr_wrap, "_stat_fr4", None)
+            fr3 = getattr(stat_m_curr_wrap, "_stat_fr3", None)
+            if fr4 is not None:
+                fr4.configure(width=4 * w)
+            if fr3 is not None:
+                fr3.configure(width=3 * w)
+            sync_cv = getattr(stat_m_curr_wrap, "_stat_sync_data_canvas", None)
+            if callable(sync_cv):
+                sync_cv()
+        except tk.TclError:
+            pass
+        _stat_m_invoke_month_wraps_relayout()
 
     def _stat_m_invoke_month_wraps_relayout() -> None:
         fn = getattr(stat_m_curr_wrap, "_stat_relayout", None)
@@ -27959,7 +28100,15 @@ th {{ background:#efefef; text-align:left; }}
                 for ci, cell in enumerate(row):
                     ce = html_module.escape(str(cell))
                     al = "right" if ci else "left"
-                    tds.append(f'<td style="text-align:{al}">{ce}</td>')
+                    tone = None if ci == 0 else _stat_print_signed_amount_tone(cell)
+                    cls = ""
+                    if tone == "pos":
+                        cls = ' class="amt-pos"'
+                    elif tone == "neg":
+                        cls = ' class="amt-neg"'
+                    elif ci > 0:
+                        cls = ' class="amt-bold"'
+                    tds.append(f'<td{cls} style="text-align:{al}">{ce}</td>')
                 body_lines.append("<tr>" + "".join(tds) + "</tr>")
             tbody = "\n".join(body_lines) if body_lines else '<tr><td colspan="99">(vuoto)</td></tr>'
             h2_html = (
@@ -27970,6 +28119,8 @@ th {{ background:#efefef; text-align:left; }}
             sec_html.append(
                 f'{h2_html}<table class="st"><thead><tr>{ths}</tr></thead><tbody>{tbody}</tbody></table>'
             )
+        pos_hex = COLOR_AMOUNT_POS
+        neg_hex = COLOR_AMOUNT_NEG
         return f"""<!DOCTYPE html>
 <html lang="it">
 <head>
@@ -27979,9 +28130,16 @@ th {{ background:#efefef; text-align:left; }}
   body {{ font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 7mm; font-size: 8pt; }}
   h1 {{ font-size: 11pt; margin: 0 0 6px 0; }}
   .meta {{ font-size: 7.5pt; color: #333; margin-bottom: 8px; }}
-  table.st {{ width: 100%; border-collapse: collapse; font-size: {tbl_pt}pt; margin-bottom: 14px; }}
-  table.st th, table.st td {{ border: 1px solid #bbb; padding: 3px 5px; }}
+  table.st {{ width: 100%; border-collapse: collapse; font-size: {tbl_pt}pt; margin-bottom: 14px; table-layout: fixed; }}
+  table.st th, table.st td {{ border: 1px solid #bbb; padding: 3px 5px; overflow: hidden; }}
   table.st th {{ background: #e3f2fd; font-weight: 600; }}
+  table.st td.amt-pos {{ color: {pos_hex}; font-weight: 700; }}
+  table.st td.amt-neg {{ color: {neg_hex}; font-weight: 700; }}
+  table.st td.amt-bold {{ font-weight: 700; }}
+  @media print {{
+    table.st td.amt-pos {{ color: {pos_hex} !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+    table.st td.amt-neg {{ color: {neg_hex} !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+  }}
 </style>
 </head>
 <body>
