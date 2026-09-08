@@ -25,6 +25,11 @@ Punti collegati: `ent_amt`, filtri Movimenti, `ent_per_amt`, dialog **Modifica i
 - **Cambio conto**: se il nuovo conto ha `**` su registrazioni **successive**, quei `**` diventano `*` e il `**` viene riposizionato sulla registrazione precedente dello stesso conto (`reanchor_double_star_before_reg_for_account`).
 - **Forza cancellazione verifica**: toglie la verifica dalla riga corrente; eventuali `**` su registrazioni **successive** dello stesso conto diventano `*`. **Non** pone `**` sulla registrazione precedente (un `**` già presente più indietro resta invariato).
 
+## Verifica — confine `**`
+
+- Il `**` **non** deve avanzare oltre buchi Movimenti-visibili senza `*` sullo stesso conto (anche con data oltre la chiusura estratto).
+- In riepilogo, se restano buchi sotto il floor `**` (progressivo minore), avvisare e indicare «Forza verifica» sulla riga con `**`.
+
 ## Carte di credito — conto di riferimento
 
 - In **Opzioni → Conti** il conto di riferimento di una carta è **modificabile** (non congelata).

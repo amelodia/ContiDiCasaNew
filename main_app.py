@@ -8391,6 +8391,18 @@ def verification_flag_star_equivalent_count(flags: str) -> int:
     return len(t)
 
 
+def verification_unmarked_movimenti_breaks_double_star_chain(
+    *,
+    stars: int,
+    in_movimenti: bool,
+) -> bool:
+    """True se una riga senza ``*`` visibile in Movimenti deve interrompere l'avanzamento di ``**``.
+
+    Nessun ``**`` oltre un buco aperto sullo stesso conto (anche con data oltre la chiusura estratto).
+    """
+    return int(stars) < 1 and bool(in_movimenti)
+
+
 def verification_post_cutoff_unmarked_breaks_double_star_chain(
     *,
     stars: int,
@@ -8400,20 +8412,54 @@ def verification_post_cutoff_unmarked_breaks_double_star_chain(
     floor_reg: int | None,
     in_movimenti: bool,
 ) -> bool:
-    """True se una riga non verificata oltre la chiusura estratto deve interrompere l'avanzamento di ``**``.
+    """Compat: oggi coincide col break su ogni unmarked Movimenti-visibile (il cutoff non esclude più i buchi)."""
+    _ = (date_iso, cutoff_iso, reg_n, floor_reg)
+    return verification_unmarked_movimenti_breaks_double_star_chain(
+        stars=stars, in_movimenti=in_movimenti
+    )
 
-    Evita di collocare ``**`` oltre buchi Movimenti-visibili che resterebbero con ``reg_n`` inferiore al floor
-    (non più abbinabili, ma prima conteggiabili nel riepilogo via supplemento).
+
+def list_verification_gaps_under_double_star_floor(
+    ordered: list[tuple[int, dict]],
+    *,
+    account_code: str,
+    floor_reg: int,
+    min_date_iso: str,
+) -> list[tuple[int, dict, str]]:
+    """Buchi Movimenti-visibili senza ``*`` con ``reg_n < floor`` e data >= ``min_date_iso``.
+
+    Usato nel riepilogo verifica per segnalare registrazioni intrappolate sotto il confine ``**``.
     """
-    if stars >= 1 or not in_movimenti:
-        return False
-    d_gap = str(date_iso or "").strip()
-    cut = str(cutoff_iso or "").strip()
-    if not d_gap or not cut or d_gap <= cut:
-        return False
-    if floor_reg is not None and reg_n <= floor_reg:
-        return False
-    return True
+    ac = str(account_code or "").strip()
+    min_d = str(min_date_iso or "").strip()
+    if not ac or floor_reg <= 0:
+        return []
+    out: list[tuple[int, dict, str]] = []
+    for reg_n, rec in ordered:
+        if reg_n >= floor_reg:
+            break
+        if rec.get("is_cancelled"):
+            continue
+        sides = record_sides_touching_account_code(rec, ac)
+        if not sides:
+            continue
+        side = sides[0]
+        best_st = -1
+        for s in sides:
+            fk = "account_primary_flags" if s == "primary" else "account_secondary_flags"
+            st = verification_flag_star_equivalent_count(str(rec.get(fk) or ""))
+            if st > best_st:
+                best_st = st
+                side = s
+        if best_st >= 1:
+            continue
+        if not show_record_in_movements_grid(rec):
+            continue
+        d = str(rec.get("date_iso") or "").strip()
+        if min_d and d and d < min_d:
+            continue
+        out.append((reg_n, rec, side))
+    return out
 
 
 def apply_account_verification_star_count(rec: dict, which: str, stars: int) -> None:
@@ -25621,6 +25667,9 @@ th {{ background:#efefef; text-align:left; }}
         Vale anche per i conti carta, così resta un confine di ricerca dopo la verifica (ultima * in periodo).
         Se in seguito si registra la girata di chiusura carta dall'app, ``_ver_place_double_star_on_cc_settlement``
         abbassa eventuali ** precedenti a * e colloca ** sulla girata di chiusura.
+
+        Qualsiasi riga Movimenti-visibile senza ``*`` sullo stesso conto interrompe la catena (anche oltre
+        la chiusura estratto): il ``**`` non deve avanzare oltre buchi aperti.
         """
         ac = str(acc_code or "").strip() or str(ver_session_account_code[0] or "").strip()
         if not ac:
@@ -25631,12 +25680,7 @@ th {{ background:#efefef; text-align:left; }}
             key=lambda x: x[0],
         )
 
-        floor_reg, floor_date_iso = _ver_last_double_star_floor(ordered, ac)
-        cutoff_raw_ds = ver_cutoff_date_var.get().strip()
-        try:
-            cutoff_iso_ds = parse_italian_ddmmyyyy_to_iso(cutoff_raw_ds)
-        except Exception:
-            cutoff_iso_ds = date.today().isoformat()
+        floor_reg, _floor_date_iso = _ver_last_double_star_floor(ordered, ac)
         marker_double_idx: int | None = None
         if floor_reg is not None:
             for i, (reg_n, rec) in enumerate(ordered):
@@ -25648,41 +25692,21 @@ th {{ background:#efefef; text-align:left; }}
         last_verified_rec: dict | None = None
         last_verified_side: str = ""
         for i in range(start_scan, len(ordered)):
-            reg_n, rec = ordered[i]
+            _reg_n, rec = ordered[i]
             if rec.get("is_cancelled"):
                 continue
             touches, side = _ver_record_touches_account(rec, ac)
             if not touches:
                 continue
             stars = _ver_account_stars(rec, side)
-            in_scope_ds = _ver_record_in_verification_scope(
-                reg_n=reg_n,
-                rec=rec,
-                side=side,
-                floor_reg=floor_reg,
-                floor_date_iso=floor_date_iso,
-                cutoff_iso=cutoff_iso_ds,
-            )
-            if not in_scope_ds:
-                # Non saltare i buchi Movimenti-visibili solo perché data > chiusura estratto:
-                # altrimenti ** può avanzare oltre righe unmarked che restano intrappolate sotto il floor.
-                if verification_post_cutoff_unmarked_breaks_double_star_chain(
-                    stars=stars,
-                    date_iso=str(rec.get("date_iso") or ""),
-                    cutoff_iso=cutoff_iso_ds,
-                    reg_n=reg_n,
-                    floor_reg=floor_reg,
-                    in_movimenti=show_record_in_movements_grid(rec),
-                ):
-                    break
-                continue
+            if verification_unmarked_movimenti_breaks_double_star_chain(
+                stars=stars,
+                in_movimenti=show_record_in_movements_grid(rec),
+            ):
+                break
             if stars >= 1:
                 last_verified_rec = rec
                 last_verified_side = side
-            else:
-                # Righe fuori dalla griglia Movimenti (es. Dotazione cat.0) non devono interrompere la catena.
-                if show_record_in_movements_grid(rec):
-                    break
 
         if last_verified_rec is not None:
             if marker_double_idx is not None:
@@ -25889,6 +25913,56 @@ th {{ background:#efefef; text-align:left; }}
                     f"(anteriori alla chiusura: {n_before_closure}, successive: {n_after_closure})."
                 )
             )
+
+        # Rete di sicurezza: buchi sotto il ** (fuori dalla ricerca) non devono restare silenziosi.
+        try:
+            all_records_g, reg_map_g = _build_reg_index_maps()
+            ordered_g = sorted(
+                [(reg_map_g[record_legacy_stable_key(r)], r) for r in all_records_g],
+                key=lambda x: x[0],
+            )
+            floor_g, _fd_g = _ver_last_double_star_floor(ordered_g, ac)
+            gap_warn = ""
+            if floor_g is not None:
+                try:
+                    cut_d = date.fromisoformat(str(cutoff_iso)[:10])
+                    min_gap_d = (cut_d.replace(year=cut_d.year - 1)).isoformat()
+                except Exception:
+                    min_gap_d = "1970-01-01"
+                gaps_under = list_verification_gaps_under_double_star_floor(
+                    ordered_g,
+                    account_code=ac,
+                    floor_reg=int(floor_g),
+                    min_date_iso=min_gap_d,
+                )
+                if gaps_under:
+                    nums = ", ".join(str(n) for n, _r, _s in gaps_under[:8])
+                    more = "" if len(gaps_under) <= 8 else f" (+{len(gaps_under) - 8})"
+                    gap_warn = (
+                        f" Attenzione: {len(gaps_under)} registrazioni non verificate "
+                        f"con numero inferiore al ** (es. {nums}{more}): fuori dalla ricerca. "
+                        "Usare «Forza verifica» sulla riga con ** per riaprire il fascio."
+                    )
+                    cur_title = ver_results_title.cget("text") or ""
+                    ver_results_title.configure(text=(cur_title + gap_warn).strip())
+                    try:
+                        messagebox.showwarning(
+                            "Verifica — buchi sotto il doppio asterisco",
+                            (
+                                f"Ci sono {len(gaps_under)} registrazioni non verificate "
+                                f"con progressivo minore del confine ** (n. {floor_g}).\n\n"
+                                f"Esempi: {nums}{more}\n\n"
+                                "Non compaiono nella ricerca abbinamenti finché il ** resta lì. "
+                                "Apri la riga con ** in Movimenti e usa «Forza verifica», "
+                                "poi ripeti la verifica di quei movimenti."
+                            ),
+                            parent=verifica_frame,
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         ver_unver_tree.delete(*ver_unver_tree.get_children())
 
         uvi = 0

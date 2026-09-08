@@ -90,8 +90,9 @@ def _paragraphs() -> list[str]:
         "Non risolvono i S EUR dell'ibrido se i movimenti sono gia' corretti, ma possono confondere il riepilogo:",
         "- Riepilogo allineato allo scope di ricerca: le righe con reg_n < ** non entrano piu' in "
         "sum_unverified (rimosso il supplemento post-cutoff sotto floor).",
-        "- Avanzamento **: le unmarked Movimenti-visibili con data > chiusura estratto interrompono la catena "
-        "(verification_post_cutoff_unmarked_breaks_double_star_chain), cosi' non restano intrappolate sotto il floor.",
+        "- Avanzamento **: qualsiasi unmarked Movimenti-visibile sullo stesso conto interrompe la catena "
+        "(verification_unmarked_movimenti_breaks_double_star_chain), anche oltre la chiusura estratto.",
+        "- Riepilogo: se restano buchi con reg_n < ** (finestra recente), avviso esplicito e invito a Forza verifica.",
         "- 'Riavvia ricerca' che auto-verifica un unico candidato senza vincolo PDF se la coda e' vuota => rischio "
         "asterisco sulla riga sbagliata a parita' importo.",
         "- Saldo estratto letto come stringa con Decimal() senza normalize_euro_input in alcuni percorsi.",
