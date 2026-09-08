@@ -1841,6 +1841,23 @@ def date_minus_calendar_years(d: date, years: int) -> date:
     return date(y, m, min(day, last))
 
 
+_IT_MONTH_NAMES: tuple[str, ...] = (
+    "",
+    "Gennaio",
+    "Febbraio",
+    "Marzo",
+    "Aprile",
+    "Maggio",
+    "Giugno",
+    "Luglio",
+    "Agosto",
+    "Settembre",
+    "Ottobre",
+    "Novembre",
+    "Dicembre",
+)
+
+
 def years_for_calendar_option_menu(available: list[int], *, pin_year: int) -> list[int]:
     """
     Tendine anni per calendari: ``pin_year`` in cima (l'anno "corrente" d'uso), resto in ordine decrescente.
@@ -1872,10 +1889,13 @@ def build_immissione_calendar_toplevel(
     current: date,
     on_date_chosen: Callable[[date], None],
     ui_font: tuple = ("TkDefaultFont", 12, "bold"),
+    years_available: list[int] | None = None,
+    validate_pick: Callable[[date], tuple[bool, str]] | None = None,
 ) -> tk.Toplevel:
     """
-    Popup calendario allineato ai filtri data Movimenti (layout compatto, sotto il campo,
-    anni nel range, giorni fuori range disabilitati). Non modale (grab rilasciato).
+    Popup calendario condiviso (filtri Movimenti, immissione, periodiche, …):
+    mesi in italiano, tendina mese/anno, intestazioni allineate alla griglia,
+    giorni del mese precedente/successivo nelle righe di bordo.
     """
     if field_min > field_max:
         field_min, field_max = field_max, field_min
@@ -1902,7 +1922,12 @@ def build_immissione_calendar_toplevel(
     cur_year = cur.year
     cur_month = cur.month
 
-    years_available = [y for y in range(field_min.year, field_max.year + 1)]
+    if years_available is None:
+        years_available = list(range(field_min.year, field_max.year + 1))
+    else:
+        years_available = [
+            y for y in sorted({int(y) for y in years_available}) if field_min.year <= y <= field_max.year
+        ]
     if not years_available:
         years_available = [cur_year]
     if cur_year not in years_available:
@@ -1911,11 +1936,8 @@ def build_immissione_calendar_toplevel(
 
     header = ttk.Frame(top, padding=6)
     header.pack(fill=tk.X)
-    title_lbl = ttk.Label(header, font=("TkDefaultFont", 10, "bold"))
-    title_lbl.pack(side=tk.LEFT)
-
     btns = ttk.Frame(header)
-    btns.pack(side=tk.RIGHT)
+    btns.pack(side=tk.LEFT)
 
     def _prev_month(y: int, m: int) -> tuple[int, int]:
         return (y - 1, 12) if m == 1 else (y, m - 1)
@@ -1923,155 +1945,212 @@ def build_immissione_calendar_toplevel(
     def _next_month(y: int, m: int) -> tuple[int, int]:
         return (y + 1, 1) if m == 12 else (y, m + 1)
 
-    def _cell_pick(dsel: date) -> None:
+    def _month_key(y: int, m: int) -> tuple[int, int]:
+        return (y, m)
+
+    min_month_key = (field_min.year, field_min.month)
+    max_month_key = (field_max.year, field_max.month)
+
+    def _try_pick(dsel: date) -> None:
+        if validate_pick is not None:
+            ok, err = validate_pick(dsel)
+            if not ok:
+                messagebox.showerror("Data non coerente", err, parent=top)
+                return
         on_date_chosen(dsel)
         try:
             top.destroy()
         except Exception:
             pass
 
+    def _goto_month(y: int, m: int) -> None:
+        nonlocal cur_year, cur_month
+        if _month_key(y, m) < min_month_key or _month_key(y, m) > max_month_key:
+            return
+        if y not in years_available:
+            return
+        cur_year, cur_month = y, m
+        render()
+
+    def _on_day_click(dsel: date) -> None:
+        if field_min <= dsel <= field_max:
+            _try_pick(dsel)
+            return
+        _goto_month(dsel.year, dsel.month)
+
+    def _make_day_cell(
+        parent: tk.Misc,
+        *,
+        day_num: int,
+        dsel: date,
+        outside_month: bool,
+    ) -> tk.Label:
+        in_bounds = field_min <= dsel <= field_max
+        navigable = min_month_key <= _month_key(dsel.year, dsel.month) <= max_month_key
+        fg = "#111111"
+        bg = CDC_CAL_CELL_BG
+        if outside_month:
+            fg = "#6a7a86"
+            bg = "#e8eef2"
+        if not in_bounds and not (outside_month and navigable):
+            fg = CDC_CAL_DISABLED_LABEL_FG
+            bg = CDC_CAL_DISABLED_BG
+        cell = tk.Label(
+            parent,
+            text=str(day_num),
+            width=3,
+            padx=2,
+            pady=2,
+            fg=fg,
+            bg=bg,
+            relief=tk.RAISED,
+            bd=1,
+            highlightthickness=0,
+            font=ui_font,
+        )
+        if in_bounds or (outside_month and navigable):
+            cell.configure(cursor="hand2")
+            cell.bind("<Button-1>", lambda _e, dd=dsel: _on_day_click(dd))
+        if dsel == selected_date and in_bounds:
+            cell.configure(
+                bg=CDC_CAL_SELECTED_BG,
+                relief=tk.SUNKEN,
+                bd=2,
+                highlightthickness=1,
+                highlightbackground="#5fa8c4",
+                highlightcolor="#5fa8c4",
+            )
+        return cell
+
+    year_var = tk.StringVar(value=str(cur_year))
+    month_var = tk.StringVar(value=_IT_MONTH_NAMES[cur_month])
+    _years_in_menu = years_for_calendar_option_menu(
+        years_available, pin_year=date.today().year
+    )
+    month_menu = tk.OptionMenu(btns, month_var, *[_IT_MONTH_NAMES[i] for i in range(1, 13)])
+    month_menu.configure(font=ui_font, highlightthickness=0)
+    month_menu.pack(side=tk.LEFT, padx=(0, 6))
+    year_menu = tk.OptionMenu(btns, year_var, *[str(y) for y in _years_in_menu])
+    year_menu.configure(font=ui_font, highlightthickness=0)
+    year_menu.pack(side=tk.LEFT, padx=(0, 0))
+
+    suppress_nav_trace = False
+
+    def _sync_nav_vars() -> None:
+        nonlocal suppress_nav_trace
+        want_y, want_m = str(cur_year), _IT_MONTH_NAMES[cur_month]
+        if year_var.get() != want_y or month_var.get() != want_m:
+            suppress_nav_trace = True
+            year_var.set(want_y)
+            month_var.set(want_m)
+            suppress_nav_trace = False
+
+    def _on_month_changed(*_args: object) -> None:
+        nonlocal cur_month
+        if suppress_nav_trace:
+            return
+        name = month_var.get()
+        try:
+            m = _IT_MONTH_NAMES.index(name)
+        except ValueError:
+            return
+        if m < 1 or m == cur_month:
+            return
+        if _month_key(cur_year, m) < min_month_key or _month_key(cur_year, m) > max_month_key:
+            _sync_nav_vars()
+            return
+        cur_month = m
+        render()
+
+    def _on_year_changed(*_args: object) -> None:
+        nonlocal cur_year, cur_month
+        if suppress_nav_trace:
+            return
+        try:
+            y = int(year_var.get())
+        except Exception:
+            return
+        if y == cur_year:
+            return
+        if y not in years_available:
+            _sync_nav_vars()
+            return
+        cur_year = y
+        if _month_key(cur_year, cur_month) < min_month_key:
+            cur_month = field_min.month if cur_year == field_min.year else 1
+        elif _month_key(cur_year, cur_month) > max_month_key:
+            cur_month = field_max.month if cur_year == field_max.year else 12
+        render()
+
+    month_var.trace_add("write", _on_month_changed)
+    year_var.trace_add("write", _on_year_changed)
+
+    # Griglia unica: intestazioni + giorni (stessa larghezza colonne).
+    days_frame = tk.Frame(top, padx=6, pady=6)
+    days_frame.pack(fill=tk.BOTH, expand=True)
+    for c in range(7):
+        days_frame.grid_columnconfigure(c, weight=1, uniform="calday")
+
     def render() -> None:
         nonlocal cur_year, cur_month
         for child in list(days_frame.winfo_children()):
             child.destroy()
-        title_lbl.configure(text=f"{calendar.month_name[cur_month]} {cur_year}")
-        _update_month_nav_state()
-        nonlocal suppress_year_trace
-        if year_var.get() != str(cur_year):
-            suppress_year_trace = True
-            year_var.set(str(cur_year))
-            suppress_year_trace = False
+        _sync_nav_vars()
+
+        for i, name in enumerate(["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]):
+            tk.Label(
+                days_frame,
+                text=name,
+                width=3,
+                padx=2,
+                pady=2,
+                font=ui_font,
+                fg="#333333",
+                bg=days_frame.cget("bg"),
+            ).grid(row=0, column=i, padx=1, pady=(0, 2), sticky="nsew")
 
         first_wd = date(cur_year, cur_month, 1).weekday()
         days_in_month = calendar.monthrange(cur_year, cur_month)[1]
+        prev_y, prev_m = _prev_month(cur_year, cur_month)
+        prev_dim = calendar.monthrange(prev_y, prev_m)[1]
+        next_y, next_m = _next_month(cur_year, cur_month)
 
         for i in range(first_wd):
-            ttk.Label(days_frame, text="").grid(row=0, column=i, padx=1, pady=1, sticky="nsew")
+            day_num = prev_dim - first_wd + 1 + i
+            dsel = date(prev_y, prev_m, day_num)
+            _make_day_cell(days_frame, day_num=day_num, dsel=dsel, outside_month=True).grid(
+                row=1, column=i, padx=1, pady=1, sticky="nsew"
+            )
 
         for day_num in range(1, days_in_month + 1):
             idx = first_wd + day_num - 1
             row = idx // 7
             col = idx % 7
             dsel = date(cur_year, cur_month, day_num)
-            in_bounds = field_min <= dsel <= field_max
-            cell = tk.Label(
-                days_frame,
-                text=str(day_num),
-                width=3,
-                padx=2,
-                pady=2,
-                fg="#111111",
-                bg=CDC_CAL_CELL_BG,
-                relief=tk.RAISED,
-                bd=1,
-                highlightthickness=0,
-                font=ui_font,
+            _make_day_cell(days_frame, day_num=day_num, dsel=dsel, outside_month=False).grid(
+                row=row + 1, column=col, padx=1, pady=1, sticky="nsew"
             )
-            if in_bounds:
-                cell.configure(cursor="hand2")
-                cell.bind("<Button-1>", lambda _e, dd=dsel: _cell_pick(dd))
-            else:
-                cell.configure(fg=CDC_CAL_DISABLED_LABEL_FG, bg=CDC_CAL_DISABLED_BG)
 
-            if dsel == selected_date:
-                cell.configure(
-                    bg=CDC_CAL_SELECTED_BG,
-                    relief=tk.SUNKEN,
-                    bd=2,
-                    highlightthickness=1,
-                    highlightbackground="#5fa8c4",
-                    highlightcolor="#5fa8c4",
-                )
-
-            cell.grid(row=row + 1, column=col, padx=1, pady=1, sticky="nsew")
-
-        for c in range(7):
-            days_frame.grid_columnconfigure(c, weight=1)
-
-    year_var = tk.StringVar(value=str(cur_year))
-    _years_in_menu = years_for_calendar_option_menu(
-        years_available, pin_year=date.today().year
-    )
-    year_menu = tk.OptionMenu(btns, year_var, *[str(y) for y in _years_in_menu])
-    year_menu.pack(side=tk.LEFT, padx=(0, 6))
-
-    suppress_year_trace = False
-
-    def _on_year_changed(*_args: object) -> None:
-        nonlocal cur_year
-        if suppress_year_trace:
-            return
-        y = int(year_var.get())
-        if y == cur_year:
-            return
-        cur_year = y
-        render()
-
-    year_var.trace_add("write", _on_year_changed)
-
-    btn_month_minus = ttk.Button(btns, text="<<", command=lambda: _jump_month(-1))
-    btn_month_plus = ttk.Button(btns, text=">>", command=lambda: _jump_month(1))
-    btn_month_minus.pack(side=tk.LEFT, padx=(0, 4))
-    btn_month_plus.pack(side=tk.LEFT, padx=(0, 0))
-
-    min_month_key = (field_min.year, field_min.month)
-    max_month_key = (field_max.year, field_max.month)
-
-    def _month_key(y: int, m: int) -> tuple[int, int]:
-        return (y, m)
-
-    def _update_month_nav_state() -> None:
-        prev_y, prev_m = _prev_month(cur_year, cur_month)
-        next_y, next_m = _next_month(cur_year, cur_month)
-        btn_month_minus.configure(
-            state=("normal" if _month_key(prev_y, prev_m) >= min_month_key else "disabled")
-        )
-        btn_month_plus.configure(
-            state=("normal" if _month_key(next_y, next_m) <= max_month_key else "disabled")
-        )
-
-    def _jump_month(delta: int) -> None:
-        nonlocal cur_year, cur_month
-        if delta < 0:
-            cur_year, cur_month = _prev_month(cur_year, cur_month)
-        else:
-            cur_year, cur_month = _next_month(cur_year, cur_month)
-        if cur_year not in years_available:
-            higher = [y for y in years_available if y >= cur_year]
-            cur_year = min(higher) if higher else max(years_available)
-        nonlocal suppress_year_trace
-        if year_var.get() != str(cur_year):
-            suppress_year_trace = True
-            year_var.set(str(cur_year))
-            suppress_year_trace = False
-        render()
-
-    labels = ttk.Frame(top, padding=(6, 0, 6, 0))
-    labels.pack(fill=tk.X)
-    for i, name in enumerate(["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]):
-        ttk.Label(labels, text=name, font=ui_font).grid(row=0, column=i, padx=1, pady=2, sticky="nsew")
-
-    days_frame = tk.Frame(top, padx=6, pady=6)
-    days_frame.pack(fill=tk.BOTH, expand=True)
-    for c in range(7):
-        days_frame.grid_columnconfigure(c, weight=1)
+        total = first_wd + days_in_month
+        trail = (7 - (total % 7)) % 7
+        last_row = (total - 1) // 7
+        for i in range(trail):
+            day_num = i + 1
+            dsel = date(next_y, next_m, day_num)
+            col = (total + i) % 7
+            _make_day_cell(days_frame, day_num=day_num, dsel=dsel, outside_month=True).grid(
+                row=last_row + 1, column=col, padx=1, pady=1, sticky="nsew"
+            )
 
     footer = ttk.Frame(top, padding=6)
     footer.pack(fill=tk.X)
-    ttk.Button(
-        footer,
-        text="Oggi",
-        command=lambda: _on_pick_today(),
-    ).pack(side=tk.LEFT)
 
     def _on_pick_today() -> None:
         tdy = date.today()
         picked = max(field_min, min(tdy, field_max))
-        on_date_chosen(picked)
-        try:
-            top.destroy()
-        except Exception:
-            pass
+        _try_pick(picked)
+
+    ttk.Button(footer, text="Oggi", command=_on_pick_today).pack(side=tk.LEFT)
 
     render()
 
@@ -10297,7 +10376,8 @@ def build_ui(
         _frame_to_tab_label[frame] = lbl
         return lbl
 
-    _mk_cdc_tab("Movimenti e correzioni", movimenti_frame).pack(side=tk.LEFT, padx=(0, 6))
+    lbl_tab_movimenti = _mk_cdc_tab("Movimenti e correzioni", movimenti_frame)
+    lbl_tab_movimenti.pack(side=tk.LEFT, padx=(0, 6))
     _mk_cdc_tab("Nuove registrazioni", nuovi_dati_frame).pack(side=tk.LEFT, padx=(0, 6))
     _mk_cdc_tab("Registrazioni periodiche", periodiche_dati_frame).pack(side=tk.LEFT, padx=(0, 6))
     _mk_cdc_tab("Verifica", verifica_frame).pack(side=tk.LEFT, padx=(0, 6))
@@ -10414,29 +10494,96 @@ def build_ui(
 
     mov_filters_block = tk.Frame(movimenti_body, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
 
-    # Prime due righe chip / data: tutta la larghezza pagina (centrate in ``filters_row`` / ``filters_search_row``).
-    filters_row = ttk.Frame(mov_filters_block, style="MovCdc.TFrame")
+    # Stesso gap tra chip preset (padx 6) — usato anche a destra di «Cerca».
+    _FILTER_ROW_BUTTON_GAP = 6
+
+    # Prime due righe: blocco (Cerca + chip/preset) centrato; poi allinea il sx di Cerca al tab.
+    mov_filters_top_outer = tk.Frame(mov_filters_block, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
+    mov_filters_top_outer.pack(fill=tk.X, pady=(0, 0))
+    mov_filters_top_left_spacer = tk.Frame(
+        mov_filters_top_outer, bg=MOVIMENTI_PAGE_BG, highlightthickness=0, width=1, height=1
+    )
+    mov_filters_top_left_spacer.pack(side=tk.LEFT, fill=tk.Y)
+    mov_filters_top_left_spacer.pack_propagate(False)
+    mov_filters_top_pair = tk.Frame(mov_filters_top_outer, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
+    mov_filters_top_pair.pack(side=tk.LEFT, anchor=tk.N)
+    mov_cerca_sidebar = tk.Frame(mov_filters_top_pair, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
+    mov_cerca_sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=(0, _FILTER_ROW_BUTTON_GAP))
+    mov_filters_chip_stack = tk.Frame(mov_filters_top_pair, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
+    mov_filters_chip_stack.pack(side=tk.LEFT, fill=tk.Y)
+
+    filters_row = ttk.Frame(mov_filters_chip_stack, style="MovCdc.TFrame")
     filters_row.pack(fill=tk.X, pady=(0, 0))
     filters_top_inner = ttk.Frame(filters_row, style="MovCdc.TFrame")
-    filters_top_inner.pack(anchor=tk.CENTER)
+    filters_top_inner.pack(anchor=tk.W)
 
-    filters_search_row = ttk.Frame(mov_filters_block, style="MovCdc.TFrame")
+    filters_search_row = ttk.Frame(mov_filters_chip_stack, style="MovCdc.TFrame")
     filters_search_row.pack(fill=tk.X, pady=(0, 0 if _is_macos_ui else 1))
 
-    # Terza riga (filtri testuali): come prima — colonna «Cerca» a sinistra e contenuto a destra.
+    # Terza riga: solo filtri testuali (Categoria / Conto / …), centrati come prima.
     mov_filters_bottom = tk.Frame(mov_filters_block, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     mov_filters_bottom.pack(fill=tk.X, pady=(0, 0))
-    mov_cerca_sidebar = tk.Frame(mov_filters_bottom, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     mov_filters_inner = ttk.Frame(mov_filters_bottom, style="MovCdc.TFrame")
-    mov_cerca_sidebar.pack(side=tk.LEFT, fill=tk.BOTH, padx=(0, 10))
     mov_filters_inner.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
     mov_filters_block.pack(fill=tk.X, pady=(0, 0))
 
     # Riga controlli per Ricerca per registrazione (visibile solo in quella modalità)
     reg_controls_row = ttk.Frame(filters_search_row, style="MovCdc.TFrame")
-    reg_controls_row.pack(anchor=tk.CENTER)
+    reg_controls_row.pack(anchor=tk.W)
     reg_controls_row.pack_forget()
+
+    def _sync_mov_filters_top_to_tab(_event: object | None = None) -> None:
+        """Centra il blocco Cerca+chip; allinea il bordo sinistro di Cerca al tab Movimenti."""
+        try:
+            if not mov_filters_top_outer.winfo_ismapped():
+                return
+            mov_filters_top_outer.update_idletasks()
+            outer_w = int(mov_filters_top_outer.winfo_width())
+            pair_w = int(mov_filters_top_pair.winfo_reqwidth())
+            if outer_w <= 1 or pair_w <= 1:
+                return
+            # 1) centro pagina
+            pad = max(0, (outer_w - pair_w) // 2)
+            # 2) regola il margine sinistro di Cerca sul tab «Movimenti e correzioni»
+            try:
+                if lbl_tab_movimenti.winfo_ismapped():
+                    tab_x = int(lbl_tab_movimenti.winfo_rootx())
+                    outer_x = int(mov_filters_top_outer.winfo_rootx())
+                    align = tab_x - outer_x
+                    max_pad = max(0, outer_w - pair_w)
+                    if align < 0:
+                        pad = 0
+                    elif align <= max_pad:
+                        pad = align
+            except tk.TclError:
+                pass
+            pad = max(1, int(pad))
+            if int(mov_filters_top_left_spacer.cget("width") or 0) != pad:
+                mov_filters_top_left_spacer.configure(width=pad, height=1)
+        except tk.TclError:
+            pass
+
+    _mov_filters_top_sync_after: list[str | None] = [None]
+
+    def _schedule_mov_filters_top_to_tab(_event: object | None = None) -> None:
+        jid = _mov_filters_top_sync_after[0]
+        if jid is not None:
+            try:
+                root.after_cancel(jid)
+            except (tk.TclError, ValueError):
+                pass
+        _mov_filters_top_sync_after[0] = root.after_idle(_sync_mov_filters_top_to_tab)
+
+    mov_filters_top_outer.bind("<Configure>", _schedule_mov_filters_top_to_tab, add=True)
+    mov_filters_top_pair.bind("<Configure>", _schedule_mov_filters_top_to_tab, add=True)
+    try:
+        cdc_tab_btn_row.bind("<Configure>", _schedule_mov_filters_top_to_tab, add=True)
+        lbl_tab_movimenti.bind("<Configure>", _schedule_mov_filters_top_to_tab, add=True)
+        root.bind("<Configure>", _schedule_mov_filters_top_to_tab, add=True)
+    except tk.TclError:
+        pass
+    root.after_idle(_sync_mov_filters_top_to_tab)
 
     filters_text_row = ttk.Frame(mov_filters_inner, style="MovCdc.TFrame")
     filters_text_row.pack(fill=tk.X, pady=(0, 0))
@@ -10672,7 +10819,7 @@ def build_ui(
 
     reg_btn_last12 = tk.Label(
         reg_controls_inner,
-        text="Ultimi 12 mesi",
+        text="Ultimo anno",
         cursor="hand2",
         highlightthickness=0,
         font=filter_ui_font,
@@ -12869,6 +13016,10 @@ th {{ background:#efefef; text-align:left; }}
             movimenti_main_stack.rowconfigure(1, weight=0, minsize=0)
             mov_filters_block.pack(fill=tk.X, pady=(0, 0), before=records_frame)
             balance_footer.grid(row=1, column=0, sticky="ew")
+            try:
+                _schedule_mov_filters_top_to_tab()
+            except Exception:
+                pass
             records_frame.pack(fill=tk.BOTH, expand=True)
             try:
                 refresh_date_controls_visibility()
@@ -13324,8 +13475,6 @@ th {{ background:#efefef; text-align:left; }}
 
         lbl.bind("<Enter>", _ent)
         lbl.bind("<Leave>", _lev)
-
-    _FILTER_ROW_BUTTON_GAP = 6
 
     g1 = ttk.Frame(filters_top_inner, style="MovCdc.TFrame")
     g1.pack(side=tk.LEFT, anchor=tk.W)
@@ -13818,7 +13967,8 @@ th {{ background:#efefef; text-align:left; }}
     _CERCA_GREEN = "#ffff0b"
     _CERCA_GREEN_ACTIVE = "#e6e600"
     _CERCA_FG = "#1a1a1a"
-    _mov_cerca_col_w = _ui_scaled_int(96, min_value=88)
+    # Colonna «Cerca»: altezza = prime due righe filtri; gap destro = _FILTER_ROW_BUTTON_GAP.
+    _mov_cerca_col_w = _ui_scaled_int(112, min_value=100)
     mov_cerca_btn_col = tk.Frame(
         mov_cerca_sidebar,
         bg=MOVIMENTI_PAGE_BG,
@@ -13829,15 +13979,15 @@ th {{ background:#efefef; text-align:left; }}
     mov_cerca_btn_col.pack_propagate(False)
     mov_cerca_square = tk.Frame(mov_cerca_btn_col, bg=_CERCA_GREEN, highlightthickness=0)
     mov_cerca_square.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-    _cerca_btn_font = (filter_ui_font[0], filter_ui_font[1] + 3, "bold") if len(filter_ui_font) >= 2 else filter_ui_font
+    _cerca_btn_font = (filter_ui_font[0], filter_ui_font[1] + 5, "bold") if len(filter_ui_font) >= 2 else filter_ui_font
     lbl_cerca = tk.Label(
         mov_cerca_square,
         text="Cerca",
         cursor="hand2",
         highlightthickness=0,
         font=_cerca_btn_font,
-        padx=4,
-        pady=12,
+        padx=8,
+        pady=4,
         bg=_CERCA_GREEN,
         fg=_CERCA_FG,
         relief=tk.RAISED,
@@ -13931,10 +14081,28 @@ th {{ background:#efefef; text-align:left; }}
         mx = _dataset_max_date or date.today()
         return mn, mx
 
+    def _preset_anchor_today(*, allowed_max: date) -> date:
+        """Ancora dei preset a mesi: oggi se future comprese; allowed_max (= oggi) se escluse."""
+        return allowed_max if filter_future_preview_var.get() == "exclude" else date.today()
+
     def _preset_rolling_start_date(months: int, *, allowed_min: date, allowed_max: date) -> date:
-        """Inizio intervallo «Ultimi N mesi»: con future escluse ancorato a oggi (= allowed_max); con future comprese ancorato a oggi ma il massimo resta allowed_max (es. ultima data futura nel dataset)."""
-        anchor = allowed_max if filter_future_preview_var.get() == "exclude" else date.today()
-        start = _add_months(anchor, -months)
+        """Inizio preset a mesi di calendario (non durata fissa da oggi).
+
+        - ``months == 12`` («Ultimo anno»): 1 gennaio dell'anno in corso.
+        - ``months == 1``: giorno 1 del mese in corso.
+        - ``months > 1``: giorno 1 del N-esimo mese precedente (es. 6 → 1° del 6° mese prima).
+
+        L'ancora è oggi (future comprese) oppure ``allowed_max`` (future escluse); il massimo
+        dell'intervallo resta ``allowed_max`` (può includere date future del dataset).
+        """
+        anchor = _preset_anchor_today(allowed_max=allowed_max)
+        first_of_month = date(anchor.year, anchor.month, 1)
+        if months >= 12:
+            start = date(anchor.year, 1, 1)
+        elif months <= 1:
+            start = first_of_month
+        else:
+            start = _add_months(first_of_month, -months)
         start = max(allowed_min, start)
         if start > allowed_max:
             start = allowed_max
@@ -13948,8 +14116,7 @@ th {{ background:#efefef; text-align:left; }}
         if preset_id == "all_time":
             return allowed_min, allowed_max
 
-        # Tutti gli intervalli «Ultimi N mesi» (1…12) usano la stessa regola: con future
-        # comprese l’inizio è oggi − N mesi; con future escluse è allowed_max (= oggi) − N mesi.
+        # «Ultimo anno» / Nm: inizio al 1° del mese di riferimento (o 1/1 per l'anno).
         months = 12
         if preset_id == "last_6":
             months = 6
@@ -13989,6 +14156,17 @@ th {{ background:#efefef; text-align:left; }}
         # L'apertura calendario resta comunque subordinata a "Date a scelta".
         date_from_entry.configure(state="normal")
         date_to_entry.configure(state="normal")
+        try:
+            _refresh_custom_date_fields_visibility()
+        except NameError:
+            pass
+
+    def _custom_default_range_ends() -> tuple[date, date]:
+        """Per «Date a scelta»: dal = inizio Ultimo anno; al = oggi (clamp sul dataset)."""
+        mn, mx = _dataset_minmax_safe()
+        today_c = max(mn, min(date.today(), mx))
+        start_12 = _preset_rolling_start_date(12, allowed_min=mn, allowed_max=mx)
+        return start_12, today_c
 
     def refresh_date_preview_from_modes(*, normalize_custom_range: bool = False) -> None:
         preset_id = date_preset_preview_var.get()
@@ -14000,21 +14178,20 @@ th {{ background:#efefef; text-align:left; }}
             refresh_date_fields_from_current_preset()
         else:
             if not date_custom_manual_override:
-                # Preimpostazione comodità: ultimi 12 mesi, ma i vincoli di scelta restano globali.
-                start_12 = _preset_rolling_start_date(12, allowed_min=min_allowed, allowed_max=max_allowed)
+                start_12, today_c = _custom_default_range_ends()
                 if filter_direction_preview_var.get() == "backward":
-                    date_from_preview_var.set(max_allowed.isoformat())
+                    date_from_preview_var.set(today_c.isoformat())
                     date_to_preview_var.set(start_12.isoformat())
                 else:
                     date_from_preview_var.set(start_12.isoformat())
-                    date_to_preview_var.set(max_allowed.isoformat())
+                    date_to_preview_var.set(today_c.isoformat())
                 _normalize_range_preview()
             else:
-                # Clamp dei valori custom entro i limiti attuali.
+                # Clamp: i campi custom possono arrivare fino all'ultima registrazione.
                 d_from = _parse_iso_to_date(date_from_preview_var.get()) or min_allowed
-                d_to = _parse_iso_to_date(date_to_preview_var.get()) or max_allowed
-                d_from = max(min_allowed, min(d_from, max_allowed))
-                d_to = max(min_allowed, min(d_to, max_allowed))
+                d_to = _parse_iso_to_date(date_to_preview_var.get()) or max(min_allowed, min(date.today(), mx))
+                d_from = max(min_allowed, min(d_from, mx))
+                d_to = max(min_allowed, min(d_to, mx))
                 date_from_preview_var.set(d_from.isoformat())
                 date_to_preview_var.set(d_to.isoformat())
                 if normalize_custom_range:
@@ -14033,7 +14210,7 @@ th {{ background:#efefef; text-align:left; }}
         min_allowed = mn
         if preset_id == "all_time":
             return min_allowed.isoformat(), max_allowed.isoformat()
-        # last_12 (stessa ancora «ultimi 12 mesi» dei preset data: oggi se future comprese)
+        # last_12 = Ultimo anno (1 gennaio), stessa regola dei preset data
         start_12 = _preset_rolling_start_date(12, allowed_min=min_allowed, allowed_max=max_allowed)
         return start_12.isoformat(), max_allowed.isoformat()
 
@@ -14097,297 +14274,53 @@ th {{ background:#efefef; text-align:left; }}
             return None
 
         mn, mx = _dataset_minmax_safe()
-        global_min = mn
-        global_max = date.today() if filter_future_preview_var.get() == "exclude" else mx
-
-        d_from = _parse_iso_to_date(date_from_preview_var.get())
-        d_to = _parse_iso_to_date(date_to_preview_var.get())
-
-        # Nei limiti globali il calendario consente l'intero periodo consentito
-        # (Include/Esclude date future). L'ordine "dalla/alla" viene poi sistemato
-        # da _normalize_range_preview() dopo la scelta.
-        field_min = global_min
-        field_max = global_max
-        if which == "from":
-            current = d_from or field_min
-        else:
-            current = d_to or field_min
-
+        # Calendari filtri: fino all'ultima registrazione nel DB (non limitati a oggi).
+        field_min, field_max = mn, mx
         if field_min > field_max:
             field_min, field_max = field_max, field_min
 
-        # clamp current
-        if current < field_min:
-            current = field_min
-        if current > field_max:
-            current = field_max
+        d_from = _parse_iso_to_date(date_from_preview_var.get())
+        d_to = _parse_iso_to_date(date_to_preview_var.get())
+        today_c = max(field_min, min(date.today(), field_max))
+        if which == "from":
+            current = d_from or today_c
+        else:
+            current = d_to or today_c
+        current = max(field_min, min(current, field_max))
 
-        top = tk.Toplevel(root)
-        top.title(
-            "Seleziona data di inizio ricerca"
-            if which == "from"
-            else "Seleziona data di fine ricerca"
-        )
-        top.transient(root)
-        # Nascosto finché non è calcolata la geometry sotto i campi data (evita flash in posizione sbagliata).
-        try:
-            top.withdraw()
-        except Exception:
-            pass
-        # Non rendiamo modale (grab): serve poter cliccare di nuovo sulla casella data
-        # per chiudere il popup e passare alla digitazione manuale.
-        try:
-            top.grab_release()
-        except Exception:
-            pass
-        top.protocol("WM_DELETE_WINDOW", lambda: top.destroy())
-
-        selected_date = current
-        cur_year = current.year
-        cur_month = current.month
-
-        # Anni presenti nel DB (per evitare di scegliere anni vuoti).
         years_available = [
             y for y in _dataset_years_with_records if field_min.year <= y <= field_max.year
         ]
-        if not years_available:
-            years_available = [cur_year]
-        if cur_year not in years_available:
-            # scegli l'anno più vicino in lista (preferendo quello superiore)
-            higher = [y for y in years_available if y >= cur_year]
-            cur_year = min(higher) if higher else max(years_available)
 
-        header = ttk.Frame(top, padding=6)
-        header.pack(fill=tk.X)
-        title_lbl = ttk.Label(header, font=("TkDefaultFont", 10, "bold"))
-        title_lbl.pack(side=tk.LEFT)
-
-        btns = ttk.Frame(header)
-        btns.pack(side=tk.RIGHT)
-
-        def _prev_month(y: int, m: int) -> tuple[int, int]:
-            return (y - 1, 12) if m == 1 else (y, m - 1)
-
-        def _next_month(y: int, m: int) -> tuple[int, int]:
-            return (y + 1, 1) if m == 12 else (y, m + 1)
-
-        def render() -> None:
-            nonlocal cur_year, cur_month
-            for child in list(days_frame.winfo_children()):
-                child.destroy()
-            title_lbl.configure(text=f"{calendar.month_name[cur_month]} {cur_year}")
-            _update_month_nav_state()
-            # Mantieni allineata la tendina anno anche se render è chiamato da altri percorsi.
-            nonlocal suppress_year_trace
-            if year_var.get() != str(cur_year):
-                suppress_year_trace = True
-                year_var.set(str(cur_year))
-                suppress_year_trace = False
-
-            first_wd = date(cur_year, cur_month, 1).weekday()  # Lun=0
-            days_in_month = calendar.monthrange(cur_year, cur_month)[1]
-
-            # intestazioni vuote
-            for i in range(first_wd):
-                ttk.Label(days_frame, text="").grid(row=0, column=i, padx=1, pady=1, sticky="nsew")
-
-            for day_num in range(1, days_in_month + 1):
-                idx = first_wd + day_num - 1
-                row = idx // 7
-                col = idx % 7
-                dsel = date(cur_year, cur_month, day_num)
-                in_bounds = field_min <= dsel <= field_max
-                # Su macOS i tk.Button possono ignorare bg/relief (si vede solo la cornice).
-                # Usiamo Label cliccabili per un look consistente.
-                cell = tk.Label(
-                    days_frame,
-                    text=str(day_num),
-                    width=3,
-                    padx=2,
-                    pady=2,
-                    fg="#111111",
-                    bg=CDC_CAL_CELL_BG,
-                    relief=tk.RAISED,
-                    bd=1,
-                    highlightthickness=0,
-                )
-                if in_bounds:
-                    cell.configure(cursor="hand2")
-                    cell.bind("<Button-1>", lambda _e, dd=dsel: on_pick(dd))
-                else:
-                    cell.configure(fg="#999999", bg=CDC_CAL_DISABLED_BG)
-
-                if dsel == selected_date:
-                    cell.configure(
-                        bg=CDC_CAL_SELECTED_BG,
-                        relief=tk.SUNKEN,
-                        bd=2,
-                        highlightthickness=1,
-                        highlightbackground="#5fa8c4",
-                        highlightcolor="#5fa8c4",
-                    )
-
-                cell.grid(row=row + 1, column=col, padx=1, pady=1, sticky="nsew")
-
-            for c in range(7):
-                days_frame.grid_columnconfigure(c, weight=1)
-
-        def on_pick(dsel: date) -> None:
-            ok, err = _movement_custom_date_respects_direction(which, dsel)
-            if not ok:
-                messagebox.showerror("Data non coerente", err, parent=top)
-                return
+        def _on_chosen(dsel: date) -> None:
+            nonlocal date_custom_manual_override
             if which == "from":
                 date_from_preview_var.set(dsel.isoformat())
             else:
                 date_to_preview_var.set(dsel.isoformat())
-            nonlocal date_custom_manual_override
             date_custom_manual_override = True
             refresh_date_entry_states()
             try:
                 refresh_category_account_dropdowns()
             except Exception:
                 pass
-            top.destroy()
 
-        # Anni: menu a tendina (evita anni senza registrazioni; anno calendario corrente in cima, poi in discesa).
-        year_var = tk.StringVar(value=str(cur_year))
-        _years_in_menu = years_for_calendar_option_menu(
-            years_available, pin_year=date.today().year
+        return build_immissione_calendar_toplevel(
+            root,
+            title=(
+                "Seleziona data di inizio ricerca"
+                if which == "from"
+                else "Seleziona data di fine ricerca"
+            ),
+            anchor=date_from_entry if which == "from" else date_to_entry,
+            field_min=field_min,
+            field_max=field_max,
+            current=current,
+            on_date_chosen=_on_chosen,
+            ui_font=filter_ui_font,
+            years_available=years_available or None,
+            validate_pick=lambda dsel: _movement_custom_date_respects_direction(which, dsel),
         )
-        year_menu = tk.OptionMenu(btns, year_var, *[str(y) for y in _years_in_menu])
-        year_menu.pack(side=tk.LEFT, padx=(0, 6))
-
-        suppress_year_trace = False
-
-        def _on_year_changed(*_args: object) -> None:
-            nonlocal cur_year
-            if suppress_year_trace:
-                return
-            y = int(year_var.get())
-            if y == cur_year:
-                return
-            cur_year = y
-            render()
-
-        year_var.trace_add("write", _on_year_changed)
-
-        btn_month_minus = ttk.Button(btns, text="<<", command=lambda: _jump_month(-1))
-        btn_month_plus = ttk.Button(btns, text=">>", command=lambda: _jump_month(1))
-        btn_month_minus.pack(side=tk.LEFT, padx=(0, 4))
-        btn_month_plus.pack(side=tk.LEFT, padx=(0, 0))
-
-        min_month_key = (field_min.year, field_min.month)
-        max_month_key = (field_max.year, field_max.month)
-
-        def _month_key(y: int, m: int) -> tuple[int, int]:
-            return (y, m)
-
-        def _update_month_nav_state() -> None:
-            prev_y, prev_m = _prev_month(cur_year, cur_month)
-            next_y, next_m = _next_month(cur_year, cur_month)
-            btn_month_minus.configure(
-                state=("normal" if _month_key(prev_y, prev_m) >= min_month_key else "disabled")
-            )
-            btn_month_plus.configure(
-                state=("normal" if _month_key(next_y, next_m) <= max_month_key else "disabled")
-            )
-
-        def _jump_month(delta: int) -> None:
-            nonlocal cur_year, cur_month
-            if delta < 0:
-                cur_year, cur_month = _prev_month(cur_year, cur_month)
-            else:
-                cur_year, cur_month = _next_month(cur_year, cur_month)
-            if cur_year not in years_available:
-                higher = [y for y in years_available if y >= cur_year]
-                cur_year = min(higher) if higher else max(years_available)
-            # sincronizza la tendina quando cambia anno (anche se l'anno è valido)
-            nonlocal suppress_year_trace
-            if year_var.get() != str(cur_year):
-                suppress_year_trace = True
-                year_var.set(str(cur_year))
-                suppress_year_trace = False
-            render()
-
-        # giorni settimana
-        labels = ttk.Frame(top, padding=(6, 0, 6, 0))
-        labels.pack(fill=tk.X)
-        for i, name in enumerate(["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]):
-            ttk.Label(labels, text=name).grid(row=0, column=i, padx=1, pady=2, sticky="nsew")
-
-        days_frame = tk.Frame(top, padx=6, pady=6)
-        days_frame.pack(fill=tk.BOTH, expand=True)
-        for c in range(7):
-            days_frame.grid_columnconfigure(c, weight=1)
-
-        footer = ttk.Frame(top, padding=6)
-        footer.pack(fill=tk.X)
-        ttk.Button(
-            footer,
-            text="Oggi",
-            command=lambda: _on_pick_today(),
-        ).pack(side=tk.LEFT)
-
-        def _on_pick_today() -> None:
-            today = date.today()
-            # rispetta solo i vincoli globali (include/exclude), poi normalizza l'ordine
-            # in base a "All'indietro/In avanti".
-            today_clamped = max(global_min, min(today, global_max))
-            ok, err = _movement_custom_date_respects_direction(which, today_clamped)
-            if not ok:
-                messagebox.showerror("Data non coerente", err, parent=top)
-                return
-            if which == "from":
-                date_from_preview_var.set(today_clamped.isoformat())
-            else:
-                date_to_preview_var.set(today_clamped.isoformat())
-            refresh_date_entry_states()
-            try:
-                refresh_category_account_dropdowns()
-            except Exception:
-                pass
-            top.destroy()
-
-        render()
-
-        def _place_calendar_below_anchor() -> None:
-            """Apre il popup subito sotto il campo data (o sopra se non c’è spazio in basso)."""
-            try:
-                anchor = date_from_entry if which == "from" else date_to_entry
-                top.update_idletasks()
-                root.update_idletasks()
-                ex = int(anchor.winfo_rootx())
-                ey_top = int(anchor.winfo_rooty())
-                ey_bottom = int(ey_top + anchor.winfo_height())
-                w = max(1, int(top.winfo_reqwidth()))
-                h = max(1, int(top.winfo_reqheight()))
-                scr_w = int(top.winfo_screenwidth())
-                scr_h = int(top.winfo_screenheight())
-                gap = 4
-                x = ex
-                y = ey_bottom + gap
-                if x + w > scr_w - 10:
-                    x = max(10, scr_w - w - 10)
-                if y + h > scr_h - 10:
-                    y = ey_top - h - gap
-                if y < 10:
-                    y = 10
-                top.geometry(f"{w}x{h}+{x}+{y}")
-            except Exception:
-                pass
-
-        _place_calendar_below_anchor()
-        try:
-            top.deiconify()
-            top.lift()
-        except Exception:
-            pass
-        try:
-            top.focus_force()
-        except Exception:
-            pass
-        return top
 
     def refresh_date_controls_visibility() -> None:
         if _movimenti_elenco_expanded[0]:
@@ -14395,14 +14328,14 @@ th {{ background:#efefef; text-align:left; }}
         mode = filter_order_preview_var.get()
         if mode == "date":
             reg_controls_row.pack_forget()
-            date_controls_left.pack(anchor=tk.CENTER)
+            date_controls_left.pack(anchor=tk.W)
             # Stessa gerarchia di ``mov_filters_inner`` (non più ``before=records_frame``).
             filters_text_row.pack(fill=tk.X, pady=(0, 0 if _is_macos_ui else 1))
             refresh_category_account_dropdowns()
         elif mode == "registration":
             date_controls_left.pack_forget()
             filters_text_row.pack_forget()
-            reg_controls_row.pack(anchor=tk.CENTER)
+            reg_controls_row.pack(anchor=tk.W)
             try:
                 refresh_registration_scope_and_controls()
             except Exception:
@@ -14466,10 +14399,10 @@ th {{ background:#efefef; text-align:left; }}
         except Exception:
             pass
 
-    date_controls_left.pack(anchor=tk.CENTER)
+    date_controls_left.pack(anchor=tk.W)
 
     _PRESETS: list[tuple[str, str]] = [
-        ("last_12", "Ultimi 12m"),
+        ("last_12", "Ultimo anno"),
         ("all_time", "Tutto"),
         ("last_6", "6m"),
         ("last_4", "4m"),
@@ -14499,29 +14432,28 @@ th {{ background:#efefef; text-align:left; }}
         nonlocal date_custom_manual_override
         if preset_id == "custom":
             date_custom_manual_override = False
-            # Quando si attiva "Date a scelta" i calendari devono permettere la scelta
-            # sull'intero periodo: impostiamo quindi dai limiti globali consentiti,
-            # tenendo conto di Comprese/Escluse e della direzione (All'indietro/In avanti).
-            mn = _dataset_min_date or date.today()
-            mx = _dataset_max_date or date.today()
-            global_max = date.today() if filter_future_preview_var.get() == "exclude" else mx
-            global_min = mn
-            # Preimpostazione comodità: ultimi 12 mesi (poi la scelta resta possibile su tutto il periodo).
-            start_12 = _preset_rolling_start_date(12, allowed_min=global_min, allowed_max=global_max)
+            start_12, today_c = _custom_default_range_ends()
             if filter_direction_preview_var.get() == "backward":
-                date_from_preview_var.set(global_max.isoformat())
+                date_from_preview_var.set(today_c.isoformat())
                 date_to_preview_var.set(start_12.isoformat())
             else:
                 date_from_preview_var.set(start_12.isoformat())
-                date_to_preview_var.set(global_max.isoformat())
+                date_to_preview_var.set(today_c.isoformat())
             _normalize_range_preview()
         else:
             refresh_date_fields_from_current_preset()
+            try:
+                date_year_var.set("Anno")
+            except Exception:
+                pass
         refresh_date_preset_button_styles()
         refresh_date_entry_states()
         refresh_category_account_dropdowns()
 
+    # Chip preset fino a 1m; poi tendina Anno; poi «Date a scelta».
     for pid, text in _PRESETS:
+        if pid == "custom":
+            continue
         b = tk.Label(
             presets_row,
             text=text,
@@ -14535,6 +14467,70 @@ th {{ background:#efefef; text-align:left; }}
         b.pack(side=tk.LEFT, padx=(0, 6))
         date_preset_buttons[pid] = b
 
+    date_year_var = tk.StringVar(value="Anno")
+
+    def _date_year_choices() -> list[int]:
+        years = sorted({int(y) for y in (_dataset_years_with_records or [])}, reverse=True)
+        if years:
+            return years
+        mn, mx = _dataset_minmax_safe()
+        return list(range(mx.year, mn.year - 1, -1))
+
+    def _apply_whole_year_filter(year_raw: object) -> None:
+        try:
+            y = int(str(year_raw).strip())
+        except Exception:
+            return
+        nonlocal date_custom_manual_override
+        date_preset_preview_var.set("custom")
+        date_custom_manual_override = True
+        d_start = date(y, 1, 1)
+        d_end = date(y, 12, 31)
+        if filter_direction_preview_var.get() == "backward":
+            date_from_preview_var.set(d_end.isoformat())
+            date_to_preview_var.set(d_start.isoformat())
+        else:
+            date_from_preview_var.set(d_start.isoformat())
+            date_to_preview_var.set(d_end.isoformat())
+        date_year_var.set(str(y))
+        _sync_date_displays_from_iso()
+        refresh_date_preset_button_styles()
+        refresh_date_entry_states()
+        try:
+            refresh_category_account_dropdowns()
+        except Exception:
+            pass
+
+    _year_menu_choices = _date_year_choices() or [date.today().year]
+    date_year_menu = tk.OptionMenu(
+        presets_row, date_year_var, "Anno", *[str(y) for y in _year_menu_choices], command=_apply_whole_year_filter
+    )
+    date_year_menu.configure(font=filter_ui_font, highlightthickness=0)
+    date_year_menu.pack(side=tk.LEFT, padx=(0, 6))
+
+    def refresh_date_year_menu() -> None:
+        years = _date_year_choices()
+        menu = date_year_menu["menu"]
+        menu.delete(0, "end")
+        menu.add_command(label="Anno", command=lambda: date_year_var.set("Anno"))
+        for y in years:
+            menu.add_command(label=str(y), command=lambda yy=y: _apply_whole_year_filter(yy))
+        if date_year_var.get() not in {str(y) for y in years} and date_year_var.get() != "Anno":
+            date_year_var.set("Anno")
+
+    _custom_preset_btn = tk.Label(
+        presets_row,
+        text="Date a scelta",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=7,
+        pady=_mov_filter_btn_pady,
+    )
+    _custom_preset_btn.bind("<Button-1>", lambda _e: pick_date_preset("custom"))
+    _custom_preset_btn.pack(side=tk.LEFT, padx=(0, 6))
+    date_preset_buttons["custom"] = _custom_preset_btn
+
     for _p_h, _b_h in date_preset_buttons.items():
         _filter_chip_hover(
             _b_h,
@@ -14543,7 +14539,7 @@ th {{ background:#efefef; text-align:left; }}
         )
 
     fields_row = ttk.Frame(date_controls_left, style="MovCdc.TFrame")
-    fields_row.pack(side=tk.LEFT, padx=(8, 0))
+    # Visibile solo con «Date a scelta» (pack in ``_refresh_custom_date_fields_visibility``).
 
     ttk.Label(fields_row, text="dal", style="MovCdc.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 5))
     date_from_disp_var = tk.StringVar()
@@ -14579,53 +14575,22 @@ th {{ background:#efefef; text-align:left; }}
         style="DateEntry.TEntry",
     )
     date_to_entry.grid(row=0, column=3, sticky="w")
-    ttk.Label(fields_row, text="anno", style="MovCdc.TLabel").grid(row=0, column=4, sticky="w", padx=(8, 5))
-    date_year_var = tk.StringVar(value="Anno")
 
-    def _date_year_choices() -> list[int]:
-        years = sorted({int(y) for y in (_dataset_years_with_records or [])}, reverse=True)
-        if years:
-            return years
-        mn, mx = _dataset_minmax_safe()
-        return list(range(mx.year, mn.year - 1, -1))
-
-    def _apply_whole_year_filter(year_raw: object) -> None:
+    def _refresh_custom_date_fields_visibility() -> None:
+        custom = date_preset_preview_var.get() == "custom"
         try:
-            y = int(str(year_raw).strip())
-        except Exception:
-            return
-        nonlocal date_custom_manual_override
-        date_preset_preview_var.set("custom")
-        date_custom_manual_override = True
-        d_start = date(y, 1, 1)
-        d_end = date(y, 12, 31)
-        if filter_direction_preview_var.get() == "backward":
-            date_from_preview_var.set(d_end.isoformat())
-            date_to_preview_var.set(d_start.isoformat())
-        else:
-            date_from_preview_var.set(d_start.isoformat())
-            date_to_preview_var.set(d_end.isoformat())
-        date_year_var.set(str(y))
-        _sync_date_displays_from_iso()
-        refresh_date_preset_button_styles()
-        refresh_date_entry_states()
-        try:
-            refresh_category_account_dropdowns()
-        except Exception:
-            pass
-
-    date_year_menu = tk.OptionMenu(fields_row, date_year_var, *[str(y) for y in _date_year_choices()], command=_apply_whole_year_filter)
-    date_year_menu.configure(font=filter_ui_font, highlightthickness=0)
-    date_year_menu.grid(row=0, column=5, sticky="w")
-
-    def refresh_date_year_menu() -> None:
-        years = _date_year_choices()
-        menu = date_year_menu["menu"]
-        menu.delete(0, "end")
-        for y in years:
-            menu.add_command(label=str(y), command=lambda yy=y: _apply_whole_year_filter(yy))
-        if date_year_var.get() not in {str(y) for y in years}:
-            date_year_var.set("Anno")
+            mapped = bool(fields_row.winfo_ismapped())
+        except tk.TclError:
+            mapped = False
+        if custom and not mapped:
+            fields_row.pack(side=tk.LEFT, padx=(8, 0))
+        elif not custom and mapped:
+            fields_row.pack_forget()
+            try:
+                _close_calendar("from")
+                _close_calendar("to")
+            except Exception:
+                pass
 
     def _close_calendar(which: str) -> None:
         nonlocal calendar_popup_from, calendar_popup_to
@@ -14771,10 +14736,10 @@ th {{ background:#efefef; text-align:left; }}
             _sync_date_displays_from_iso()
             return
 
-        # Valida formato e limiti come il calendario.
+        # Valida formato e limiti come il calendario (fino all'ultima registrazione).
         mn, mx = _dataset_minmax_safe()
         global_min = mn
-        global_max = date.today() if filter_future_preview_var.get() == "exclude" else mx
+        global_max = mx
 
         raw = date_from_disp_var.get() if which == "from" else date_to_disp_var.get()
         def _refocus_manual() -> None:
@@ -26788,15 +26753,34 @@ th {{ background:#efefef; text-align:left; }}
     stat_report_conti_btn.bind("<Button-1>", lambda _e: _stat_select_report_mode("conti"))
     stat_report_categorie_btn.bind("<Button-1>", lambda _e: _stat_select_report_mode("categorie"))
     stat_mode_row = ttk.Frame(stat_header, style="MovCdc.TFrame")
-    stat_mode_row.grid(row=1, column=0, sticky="w")
+    stat_mode_row.grid(row=1, column=0, sticky="ew", pady=(6, 8))
+    # Controlli subito sopra le tabelle: più grandi e leggibili (conti e categorie).
+    _stat_ctrl_fsz = 14
+    _stat_ctrl_font = _ui_font_tuple(_stat_ctrl_fsz)
+    _stat_ctrl_font_b = _ui_font_tuple(_stat_ctrl_fsz, "bold")
+    _stat_ctrl_btn_font = _ui_font_tuple(12, "bold")
+    _stat_ctrl_sty = ttk.Style(root)
+    _stat_ctrl_sty.configure("StatCtrl.TLabel", font=_stat_ctrl_font_b)
+    _stat_ctrl_sty.configure("StatCtrl.TRadiobutton", font=_stat_ctrl_font_b)
+    try:
+        _stat_ctrl_sty.configure("StatCtrl.TCombobox", font=_stat_ctrl_font)
+    except tk.TclError:
+        pass
+    try:
+        _stat_ctrl_sty.map("StatCtrl.TCombobox", fieldbackground=[("readonly", "#ffffff")])
+    except tk.TclError:
+        pass
+
     stat_year_sp = tk.Spinbox(
         stat_mode_row,
         from_=_stat_y_min,
         to=_stat_y_max,
         textvariable=stat_ref_year,
         width=6,
+        font=_stat_ctrl_font_b,
+        justify=tk.CENTER,
     )
-    stat_year_sp.pack(side=tk.LEFT, padx=(0, 12))
+    stat_year_sp.pack(side=tk.LEFT, padx=(0, 14), pady=4)
     _stat_rb_intero: dict[str, ttk.Radiobutton] = {}
 
     def _stat_sync_intero_label(*_a: object) -> None:
@@ -26819,29 +26803,33 @@ th {{ background:#efefef; text-align:left; }}
         text="",
         variable=stat_view_mode,
         value="full",
+        style="StatCtrl.TRadiobutton",
     )
-    _stat_rb_intero["b"].pack(side=tk.LEFT, padx=(0, 8))
+    _stat_rb_intero["b"].pack(side=tk.LEFT, padx=(0, 12), pady=4)
     stat_month_rb = ttk.Radiobutton(
         stat_mode_row,
         text="Scelta del mese",
         variable=stat_view_mode,
         value="month",
+        style="StatCtrl.TRadiobutton",
     )
-    stat_month_rb.pack(side=tk.LEFT, padx=(0, 12))
-    stat_month_lbl = ttk.Label(stat_mode_row, text="Mese concluso:", style="MovCdc.TLabel")
-    stat_month_lbl.pack(side=tk.LEFT, padx=(0, 8))
-    stat_month_cb = ttk.Combobox(stat_mode_row, width=14, state="disabled")
-    stat_month_cb.pack(side=tk.LEFT, padx=(0, 8))
-    stat_history_category_lbl = ttk.Label(stat_mode_row, text="Categoria:", style="MovCdc.TLabel")
+    stat_month_rb.pack(side=tk.LEFT, padx=(0, 14), pady=4)
+    stat_month_lbl = ttk.Label(stat_mode_row, text="Mese concluso:", style="StatCtrl.TLabel")
+    stat_month_lbl.pack(side=tk.LEFT, padx=(0, 8), pady=4)
+    stat_month_cb = ttk.Combobox(stat_mode_row, width=12, state="disabled", style="StatCtrl.TCombobox", font=_stat_ctrl_font)
+    stat_month_cb.pack(side=tk.LEFT, padx=(0, 10), pady=4)
+    stat_history_category_lbl = ttk.Label(stat_mode_row, text="Categoria:", style="StatCtrl.TLabel")
     stat_history_category_cb = ttk.Combobox(
         stat_mode_row,
         textvariable=stat_category_history_var,
-        width=34,
+        width=28,
         state="readonly",
+        style="StatCtrl.TCombobox",
+        font=_stat_ctrl_font,
     )
     _stat_sync_intero_label()
     stat_mode_actions = ttk.Frame(stat_mode_row, style="MovCdc.TFrame")
-    stat_mode_actions.pack(side=tk.LEFT, padx=(8, 0))
+    stat_mode_actions.pack(side=tk.LEFT, padx=(10, 0), pady=4)
 
     def _stat_replay_months_for_ref_y(td: date, ref_y: int) -> list[tuple[int, int]]:
         """Tutti i mesi 1–12 dell'anno scelto (nessun arco sull'anno prec.)."""
@@ -26870,6 +26858,22 @@ th {{ background:#efefef; text-align:left; }}
     )
     _stat_sty.configure(
         "StatCdc.Treeview.Heading",
+        font=(_stat_ffam, _stat_fsz, "bold"),
+        background=CDC_GRID_HEADING_BG,
+        foreground="#1a1a1a",
+    )
+    # Importi statistiche conti: bold nello stile (i tag impostano solo il colore — evita glitch Aqua).
+    _stat_sty.configure(
+        "StatAmt.Treeview",
+        font=(_stat_ffam, _stat_fsz, "bold"),
+        rowheight=_stat_rowh,
+        borderwidth=0,
+        relief="flat",
+        background=CDC_GRID_STRIPE1_BG,
+        fieldbackground=CDC_GRID_STRIPE1_BG,
+    )
+    _stat_sty.configure(
+        "StatAmt.Treeview.Heading",
         font=(_stat_ffam, _stat_fsz, "bold"),
         background=CDC_GRID_HEADING_BG,
         foreground="#1a1a1a",
@@ -26922,8 +26926,10 @@ th {{ background:#efefef; text-align:left; }}
         "Uscite",
         "Netto",
     )
-    _stat_m_uniform_w = max(_stat_heading_font.measure(t) for t in _stat_m_title_samples) + 28
+    _stat_m_uniform_w = max(_stat_heading_font.measure(t) for t in _stat_m_title_samples) + 36
     _stat_m_uniform_w = max(120, int(_stat_m_uniform_w))
+    # Pixel extra oltre la somma colonne: bordo/chrome Treeview (altrimenti le celle si comprimono e tagliano a destra).
+    _STAT_M_TREE_CHROME = 10
     _stat_m_head_it = (
         ("conto", "Conto", _stat_m_uniform_w),
         ("ini", "Saldo alla data —", _stat_m_uniform_w),
@@ -27325,7 +27331,7 @@ th {{ background:#efefef; text-align:left; }}
             show="headings",
             height=18,
             selectmode="browse",
-            style="StatCdc.Treeview",
+            style="StatAmt.Treeview",
         )
         rt4.grid(row=0, column=0, sticky="nsew")
         rt3 = ttk.Treeview(
@@ -27334,7 +27340,7 @@ th {{ background:#efefef; text-align:left; }}
             show="headings",
             height=18,
             selectmode="browse",
-            style="StatCdc.Treeview",
+            style="StatAmt.Treeview",
         )
         rt3.grid(row=0, column=0, sticky="nsew")
         _m0_cid, _m0_txt, _m0_w = _stat_m_head_it[0]
@@ -27356,8 +27362,8 @@ th {{ background:#efefef; text-align:left; }}
             try:
                 wrap.update_idletasks()
                 h = max(1, int(data_canvas.winfo_height()))
-                w4 = max(1, int(sum(_w_live4)))
-                w3 = max(1, int(sum(_w_live3)))
+                w4 = max(1, int(sum(_w_live4)) + int(_STAT_M_TREE_CHROME))
+                w3 = max(1, int(sum(_w_live3)) + int(_STAT_M_TREE_CHROME))
                 fr4.configure(width=w4, height=h)
                 fr3.configure(width=w3, height=h)
                 content_w = w4 + w3 + 2 * int(_STAT_LINE_OUTER)
@@ -27418,12 +27424,12 @@ th {{ background:#efefef; text-align:left; }}
         wrap.after_idle(_stat_table_relayout_m)
         wrap.after_idle(_sync_data_canvas)
         lt.tag_configure("statconto", foreground="#000000", font=(_stat_ffam, _stat_fsz, "bold"))
-        _amt_bold = (_stat_ffam, _stat_fsz, "bold")
         for _tv in (lt, rt4, rt3):
-            _tv.tag_configure("statpos", foreground=COLOR_AMOUNT_POS, font=_amt_bold)
-            _tv.tag_configure("statneg", foreground=COLOR_AMOUNT_NEG, font=_amt_bold)
-            _tv.tag_configure("statzero", foreground="#333333", font=_amt_bold)
-            _tv.tag_configure("statneu", foreground="#111111", font=_amt_bold)
+            # Solo colore: il bold degli importi è nello stile StatAmt.Treeview.
+            _tv.tag_configure("statpos", foreground=COLOR_AMOUNT_POS)
+            _tv.tag_configure("statneg", foreground=COLOR_AMOUNT_NEG)
+            _tv.tag_configure("statzero", foreground="#333333")
+            _tv.tag_configure("statneu", foreground="#111111")
         return wrap, lt, rt4, rt3, vsb, hsb, _scroll_y
 
     stat_m_curr_wrap, stat_tv_m_c_left, stat_tv_m_c_r4, stat_tv_m_c_r3, _stat_m_c_vsb, _stat_m_c_hsb, _stat_m_c_scroll_y = _stat_build_month_pair(
@@ -27439,16 +27445,18 @@ th {{ background:#efefef; text-align:left; }}
         fin_iso = _stats_month_last_iso(y, m)
         return _stat_lbl_saldo_alla_data(ini_iso), _stat_lbl_saldo_alla_data(fin_iso)
 
-    def _stat_apply_month_table_headings(y: int, m: int) -> None:
+    def _stat_apply_month_table_headings(y: int, m: int, *, sync: bool = True) -> None:
         t_ini, t_fin = _stat_month_saldo_date_labels_for_ym(y, m)
         stat_tv_m_c_r4.heading("ini", text=t_ini, anchor=tk.E)
         stat_tv_m_c_r4.heading("fin", text=t_fin, anchor=tk.E)
-        _stat_m_sync_uniform_column_widths()
+        if sync:
+            _stat_m_sync_uniform_column_widths()
 
-    def _stat_apply_month_table_headings_placeholder() -> None:
+    def _stat_apply_month_table_headings_placeholder(*, sync: bool = True) -> None:
         stat_tv_m_c_r4.heading("ini", text="Saldo alla data —", anchor=tk.E)
         stat_tv_m_c_r4.heading("fin", text="Saldo alla data —", anchor=tk.E)
-        _stat_m_sync_uniform_column_widths()
+        if sync:
+            _stat_m_sync_uniform_column_widths()
 
     def _stat_m_heads_list_for_ym(y: int, m: int) -> list[str]:
         t_ini, t_fin = _stat_month_saldo_date_labels_for_ym(y, m)
@@ -27459,15 +27467,17 @@ th {{ background:#efefef; text-align:left; }}
         fin_iso = date(ry, 12, 31).isoformat()[:10]
         return _stat_lbl_saldo_alla_data(ini_iso), _stat_lbl_saldo_alla_data(fin_iso)
 
-    def _stat_apply_month_table_headings_for_year(ry: int) -> None:
+    def _stat_apply_month_table_headings_for_year(ry: int, *, sync: bool = True) -> None:
         t_ini, t_fin = _stat_year_saldo_date_labels_for_ry(ry)
         stat_tv_m_c_r4.heading("ini", text=t_ini, anchor=tk.E)
         stat_tv_m_c_r4.heading("fin", text=t_fin, anchor=tk.E)
-        _stat_m_sync_uniform_column_widths()
+        if sync:
+            _stat_m_sync_uniform_column_widths()
 
-    def _stat_apply_conti_column_heading(y_label: int) -> None:
+    def _stat_apply_conti_column_heading(y_label: int, *, sync: bool = True) -> None:
         stat_tv_m_c_left.heading("conto", text=f"{y_label} - Conti", anchor=tk.W)
-        _stat_m_sync_uniform_column_widths()
+        if sync:
+            _stat_m_sync_uniform_column_widths()
 
     def _stat_m_current_heading_texts() -> list[str]:
         return [
@@ -27485,7 +27495,7 @@ th {{ background:#efefef; text-align:left; }}
         """Tutte le colonne stessa larghezza = misura del titolo più lungo (+ padding)."""
         heads = [h for h in _stat_m_current_heading_texts() if h.strip()]
         samples = list(_stat_m_title_samples) + heads
-        w = max(_stat_heading_font.measure(t) for t in samples) + 28
+        w = max(_stat_heading_font.measure(t) for t in samples) + 36
         w = max(120, int(w))
         try:
             stat_tv_m_c_left.column("conto", width=w, minwidth=w)
@@ -27503,10 +27513,11 @@ th {{ background:#efefef; text-align:left; }}
                     live3[i] = w
             fr4 = getattr(stat_m_curr_wrap, "_stat_fr4", None)
             fr3 = getattr(stat_m_curr_wrap, "_stat_fr3", None)
+            chrome = int(_STAT_M_TREE_CHROME)
             if fr4 is not None:
-                fr4.configure(width=4 * w)
+                fr4.configure(width=4 * w + chrome)
             if fr3 is not None:
-                fr3.configure(width=3 * w)
+                fr3.configure(width=3 * w + chrome)
             sync_cv = getattr(stat_m_curr_wrap, "_stat_sync_data_canvas", None)
             if callable(sync_cv):
                 sync_cv()
@@ -27578,13 +27589,14 @@ th {{ background:#efefef; text-align:left; }}
         rid_ctr: list[int],
         name: str,
         right_vals: tuple[str, ...],
-        d_saldo: Decimal | None,
-        d_net: Decimal | None,
+        color_left: Decimal | None,
+        color_right: Decimal | None,
     ) -> None:
+        """``color_left`` / ``color_right``: segno per il colore del blocco (tipicamente saldo fin / netto)."""
         rid_ctr[0] += 1
         rid = f"m{rid_ctr[0]}"
-        tag_l = "statneu" if d_saldo is None else _stat_tag_from_delta(d_saldo)
-        tag_r = "statneu" if d_net is None else _stat_tag_from_delta(d_net)
+        tag_l = "statneu" if color_left is None else _stat_tag_from_delta(color_left)
+        tag_r = "statneu" if color_right is None else _stat_tag_from_delta(color_right)
         lt.insert("", tk.END, iid=rid, values=(name,), tags=("statconto",))
         rt4.insert("", tk.END, iid=rid, values=tuple(right_vals[:4]), tags=(tag_l,))
         rt3.insert("", tk.END, iid=rid, values=tuple(right_vals[4:7]), tags=(tag_r,))
@@ -27723,7 +27735,18 @@ th {{ background:#efefef; text-align:left; }}
         _stat_compact_category_table_height(stat_cat_neg_tv)
         _stat_compact_category_table_height(stat_cat_zero_tv)
 
+    _stat_fill_lock: list[bool] = [False]
+
     def _stat_fill_selected_month(_e: tk.Event | None = None) -> None:
+        if _stat_fill_lock[0]:
+            return
+        _stat_fill_lock[0] = True
+        try:
+            _stat_fill_selected_month_body()
+        finally:
+            _stat_fill_lock[0] = False
+
+    def _stat_fill_selected_month_body() -> None:
         def _body() -> None:
             db = db_holder[0]
             td = date.today()
@@ -27735,35 +27758,35 @@ th {{ background:#efefef; text-align:left; }}
             _stat_m_clear()
             _nr = len(_stat_month_right_cols)
             _empty_m = tuple([""] * _nr)
-            _stat_apply_conti_column_heading(ry)
+            _stat_apply_conti_column_heading(ry, sync=False)
             if not db.get("years"):
-                _stat_apply_month_table_headings_placeholder()
+                _stat_apply_month_table_headings_placeholder(sync=False)
                 _stat_m_insert_placeholder("(Nessun dato)", _empty_m, None, None)
                 return
             ym_sel = _stat_ym_from_month_combo()
             if ym_sel is None:
-                _stat_apply_month_table_headings_placeholder()
+                _stat_apply_month_table_headings_placeholder(sync=False)
                 _stat_m_insert_placeholder("Scegli un mese nel menu a tendina.", _empty_m, None, None)
                 return
             y, m = ym_sel
             if y != ry:
-                _stat_apply_month_table_headings_placeholder()
+                _stat_apply_month_table_headings_placeholder(sync=False)
                 _stat_m_insert_placeholder("(Mese non coerente con l'anno scelto.)", _empty_m, None, None)
                 return
             months_need = [ym_sel]
             accounts, _snaps, flows = stats_replay_month_snapshots_and_flows(db, months_need, today=td)
             n = len(accounts)
             if n == 0:
-                _stat_apply_month_table_headings(y, m)
+                _stat_apply_month_table_headings(y, m, sync=False)
                 _stat_m_insert_placeholder("(Nessun conto)", _empty_m, None, None)
                 return
             ini_h, fin_h = stats_hybrid_balances_month_endpoints(db, y, m)
             if ini_h is None or fin_h is None:
-                _stat_apply_month_table_headings(y, m)
+                _stat_apply_month_table_headings(y, m, sync=False)
                 _stat_m_insert_placeholder("(Saldi alla data non disponibili)", _empty_m, None, None)
                 return
             if ym_sel not in flows:
-                _stat_apply_month_table_headings(y, m)
+                _stat_apply_month_table_headings(y, m, sync=False)
                 _stat_m_insert_placeholder("(Flussi non disponibili per il mese)", _empty_m, None, None)
                 return
             sum_ini = sum_fin = sum_d = sum_ent = sum_usc = sum_net = Decimal("0")
@@ -27794,8 +27817,9 @@ th {{ background:#efefef; text-align:left; }}
                     _stat_cell_eur_uscita(fu),
                     _stat_cell_eur(fn),
                 )
+                # Colore: saldo finale (sinistra) e netto (destra) — non il solo Δ (che rendeva rossi i totali positivi).
                 _stat_m_triple_insert(
-                    stat_tv_m_c_left, stat_tv_m_c_r4, stat_tv_m_c_r3, _stat_m_row_id_c, name, row_c, d, fn
+                    stat_tv_m_c_left, stat_tv_m_c_r4, stat_tv_m_c_r3, _stat_m_row_id_c, name, row_c, fin, fn
                 )
             tot_pct = stats_format_pct_saldo_change(sum_ini, sum_fin)
             row_sigma_c = (
@@ -27814,14 +27838,15 @@ th {{ background:#efefef; text-align:left; }}
                 _stat_m_row_id_c,
                 "TOTALI",
                 row_sigma_c,
-                sum_d,
+                sum_fin,
                 sum_net,
             )
-            _stat_apply_month_table_headings(y, m)
+            _stat_apply_month_table_headings(y, m, sync=False)
 
         try:
             _body()
         finally:
+            _stat_m_sync_uniform_column_widths()
             _stat_m_invoke_month_wraps_relayout()
 
     stat_month_cb.bind("<<ComboboxSelected>>", _stat_fill_selected_month, add="+")
@@ -27832,6 +27857,15 @@ th {{ background:#efefef; text-align:left; }}
     )
 
     def _stat_fill_full_year_table() -> None:
+        if _stat_fill_lock[0]:
+            return
+        _stat_fill_lock[0] = True
+        try:
+            _stat_fill_full_year_table_body()
+        finally:
+            _stat_fill_lock[0] = False
+
+    def _stat_fill_full_year_table_body() -> None:
         db = db_holder[0]
         td = date.today()
         try:
@@ -27842,18 +27876,20 @@ th {{ background:#efefef; text-align:left; }}
         _stat_m_clear()
         _nr = len(_stat_month_right_cols)
         _empty_m = tuple([""] * _nr)
-        _stat_apply_conti_column_heading(ry)
+        _stat_apply_conti_column_heading(ry, sync=False)
         if not db.get("years"):
-            _stat_apply_month_table_headings_placeholder()
+            _stat_apply_month_table_headings_placeholder(sync=False)
             _stat_m_insert_placeholder("(Nessun dato)", _empty_m, None, None)
+            _stat_m_sync_uniform_column_widths()
             _stat_m_invoke_month_wraps_relayout()
             return
         replay_months = _stat_replay_months_for_ref_y(td, ry)
         accounts, snaps, flows = stats_replay_month_snapshots_and_flows(db, replay_months, today=td)
         n = len(accounts)
         if n == 0:
-            _stat_apply_month_table_headings_for_year(ry)
+            _stat_apply_month_table_headings_for_year(ry, sync=False)
             _stat_m_insert_placeholder("(Nessun conto)", _empty_m, None, None)
+            _stat_m_sync_uniform_column_widths()
             _stat_m_invoke_month_wraps_relayout()
             return
 
@@ -27929,14 +27965,12 @@ th {{ background:#efefef; text-align:left; }}
             if name.strip().upper() == VIRTUALE_ACCOUNT_NAME:
                 continue
             rv = _stat_pack7_year_row_cells(y_ini, y_fin, y_se, y_su, j)
-            d_row = y_fin[j] - y_ini[j]
             net_j = y_se[j] - y_su[j]
             _stat_m_triple_insert(
-                stat_tv_m_c_left, stat_tv_m_c_r4, stat_tv_m_c_r3, _stat_m_row_id_c, name, rv, d_row, net_j
+                stat_tv_m_c_left, stat_tv_m_c_r4, stat_tv_m_c_r3, _stat_m_row_id_c, name, rv, y_fin[j], net_j
             )
 
         syi, syf, syse, sysu = _sums_nv(y_ini, y_fin, y_se, y_su)
-        d_sig = syf - syi
         rv_sig = _tot7(syi, syf, syse, sysu)
         n_sig = syse - sysu
         _stat_m_triple_insert(
@@ -27946,13 +27980,25 @@ th {{ background:#efefef; text-align:left; }}
             _stat_m_row_id_c,
             "TOTALI",
             rv_sig,
-            d_sig,
+            syf,
             n_sig,
         )
-        _stat_apply_month_table_headings_for_year(ry)
+        _stat_apply_month_table_headings_for_year(ry, sync=False)
+        _stat_m_sync_uniform_column_widths()
         _stat_m_invoke_month_wraps_relayout()
 
+    _stat_refresh_guard: list[bool] = [False]
+
     def _stat_refresh_trees() -> None:
+        if _stat_refresh_guard[0]:
+            return
+        _stat_refresh_guard[0] = True
+        try:
+            _stat_refresh_trees_body()
+        finally:
+            _stat_refresh_guard[0] = False
+
+    def _stat_refresh_trees_body() -> None:
         db = db_holder[0]
         td = date.today()
         try:
@@ -27982,9 +28028,10 @@ th {{ background:#efefef; text-align:left; }}
                     _stat_refresh_category_tables()
                 return
             _stat_m_clear()
-            _stat_apply_month_table_headings_placeholder()
-            _stat_apply_conti_column_heading(ry)
+            _stat_apply_month_table_headings_placeholder(sync=False)
+            _stat_apply_conti_column_heading(ry, sync=False)
             _stat_m_insert_placeholder("(Nessun dato)", _empty_m, None, None)
+            _stat_m_sync_uniform_column_widths()
             _stat_m_invoke_month_wraps_relayout()
             return
 
@@ -29410,21 +29457,24 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     _STAT_TK_PRINT_RED_ACT = "#cc0000"
     _STAT_TK_BARS_BLUE = "#1565c0"
     _STAT_TK_BARS_BLUE_ACT = "#0d47a1"
-
-    stat_print_btn = tk.Label(
-        stat_mode_actions,
-        text="Stampa…",
+    _stat_action_btn_kw = dict(
         cursor="hand2",
         highlightthickness=0,
-        font=filter_ui_font,
-        padx=8,
-        pady=2,
-        bg=_STAT_TK_PRINT_RED,
+        font=_stat_ctrl_btn_font,
+        padx=12,
+        pady=6,
         fg="#ffffff",
         relief=tk.RAISED,
         bd=1,
     )
-    stat_print_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+    stat_print_btn = tk.Label(
+        stat_mode_actions,
+        text="Stampa…",
+        bg=_STAT_TK_PRINT_RED,
+        **_stat_action_btn_kw,
+    )
+    stat_print_btn.pack(side=tk.LEFT, padx=(0, 10))
     stat_print_btn.bind("<Button-1>", lambda _e: _stat_open_print_dialog())
     stat_print_btn.bind("<Enter>", lambda _e: stat_print_btn.configure(bg=_STAT_TK_PRINT_RED_ACT))
     stat_print_btn.bind("<Leave>", lambda _e: stat_print_btn.configure(bg=_STAT_TK_PRINT_RED))
@@ -29432,17 +29482,10 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     stat_bars_btn = tk.Label(
         stat_mode_actions,
         text="Grafico a barre saldi (PDF)",
-        cursor="hand2",
-        highlightthickness=0,
-        font=filter_ui_font,
-        padx=8,
-        pady=2,
         bg=_STAT_TK_BARS_BLUE,
-        fg="#ffffff",
-        relief=tk.RAISED,
-        bd=1,
+        **_stat_action_btn_kw,
     )
-    stat_bars_btn.pack(side=tk.LEFT, padx=(0, 8))
+    stat_bars_btn.pack(side=tk.LEFT, padx=(0, 10))
     stat_bars_btn.bind("<Button-1>", lambda _e: _stat_open_saldi_bars_direct())
     stat_bars_btn.bind("<Enter>", lambda _e: stat_bars_btn.configure(bg=_STAT_TK_BARS_BLUE_ACT))
     stat_bars_btn.bind("<Leave>", lambda _e: stat_bars_btn.configure(bg=_STAT_TK_BARS_BLUE))
@@ -29450,17 +29493,10 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     stat_bars_flussi_btn = tk.Label(
         stat_mode_actions,
         text="Grafico a barre scostamenti (PDF)",
-        cursor="hand2",
-        highlightthickness=0,
-        font=filter_ui_font,
-        padx=8,
-        pady=2,
         bg=_STAT_TK_BARS_BLUE,
-        fg="#ffffff",
-        relief=tk.RAISED,
-        bd=1,
+        **_stat_action_btn_kw,
     )
-    stat_bars_flussi_btn.pack(side=tk.LEFT, padx=(0, 8))
+    stat_bars_flussi_btn.pack(side=tk.LEFT, padx=(0, 10))
     stat_bars_flussi_btn.bind("<Button-1>", lambda _e: _stat_open_flussi_bars_direct())
     stat_bars_flussi_btn.bind("<Enter>", lambda _e: stat_bars_flussi_btn.configure(bg=_STAT_TK_BARS_BLUE_ACT))
     stat_bars_flussi_btn.bind("<Leave>", lambda _e: stat_bars_flussi_btn.configure(bg=_STAT_TK_BARS_BLUE))
@@ -29468,15 +29504,8 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     stat_category_chart_btn = tk.Label(
         stat_mode_actions,
         text="Grafici per categoria (PDF)",
-        cursor="hand2",
-        highlightthickness=0,
-        font=filter_ui_font,
-        padx=8,
-        pady=2,
         bg=_STAT_TK_BARS_BLUE,
-        fg="#ffffff",
-        relief=tk.RAISED,
-        bd=1,
+        **_stat_action_btn_kw,
     )
     stat_category_chart_btn.bind("<Button-1>", _stat_open_category_chart_menu)
     stat_category_chart_btn.bind("<Enter>", lambda _e: stat_category_chart_btn.configure(bg=_STAT_TK_BARS_BLUE_ACT))
@@ -29485,15 +29514,8 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     stat_categories_by_year_btn = tk.Label(
         stat_mode_actions,
         text="Categorie per anno",
-        cursor="hand2",
-        highlightthickness=0,
-        font=filter_ui_font,
-        padx=8,
-        pady=2,
         bg=_STAT_TK_BARS_BLUE,
-        fg="#ffffff",
-        relief=tk.RAISED,
-        bd=1,
+        **_stat_action_btn_kw,
     )
     stat_categories_by_year_btn.bind("<Button-1>", lambda _e: _stat_open_categories_by_year_table())
     stat_categories_by_year_btn.bind(
@@ -29506,15 +29528,8 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     stat_aggregate_categories_btn = tk.Label(
         stat_mode_actions,
         text="Categorie aggregate",
-        cursor="hand2",
-        highlightthickness=0,
-        font=filter_ui_font,
-        padx=8,
-        pady=2,
         bg=_STAT_TK_BARS_BLUE,
-        fg="#ffffff",
-        relief=tk.RAISED,
-        bd=1,
+        **_stat_action_btn_kw,
     )
     stat_aggregate_categories_btn.bind(
         "<Button-1>",
@@ -29532,15 +29547,8 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     stat_aggregate_category_history_btn = tk.Label(
         stat_mode_actions,
         text="Categorie aggregate",
-        cursor="hand2",
-        highlightthickness=0,
-        font=filter_ui_font,
-        padx=8,
-        pady=2,
         bg=_STAT_TK_BARS_BLUE,
-        fg="#ffffff",
-        relief=tk.RAISED,
-        bd=1,
+        **_stat_action_btn_kw,
     )
     stat_aggregate_category_history_btn.bind(
         "<Button-1>",

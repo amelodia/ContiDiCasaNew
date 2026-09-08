@@ -80,6 +80,7 @@ Punti collegati: `ent_amt`, filtri Movimenti, `ent_per_amt`, dialog **Modifica i
 
 - I pulsanti tipo «tab» per **modalità/preset ricerca** in Movimenti usano **`MOV_FILTER_TAB_*`** in `main_app.py` e i token Opzioni **`mov_filter_tab_btn_*`**; la **barra tab delle pagine** (Movimenti, Nuove registrazioni, …), il footer saldi su periodiche ecc. restano sulle **`CDC_TIPO_TASTI_*`** (gruppo palette **Finestra login e barra schede pagine** / tipo tasti). Nella **finestra di login**, **Accedi** usa **`mov_pulisci_accedi_*`** (come «Pulisci filtri» in Movimenti e «Cancella valori» in Nuova registrazione/Periodiche); **Nuova utenza** usa **`ui_action_blue_*`**; **Esci** usa **`mov_btn_print_search_*`**, risolti con **`cdc_ui_theme.resolved_hex`** (`security_auth._login_movimenti_action_button_colors`).
 
-## Ricerca Movimenti — preset «Ultimi N mesi» con date future comprese
+## Ricerca Movimenti — preset «Ultimo anno» / «Nm»
 
-- L'intervallo si ancora alla **data odierna** (inizio = oggi − N mesi), non all'ultima data futura del dataset (`_preset_rolling_start_date` in `main_app.py`).
+- Ancora alla **data odierna** (non all’ultima data futura del dataset): **Ultimo anno** = 1 gennaio dell’anno in corso; **1m** = giorno 1 del mese corrente; **Nm** (N>1) = giorno 1 del N-esimo mese precedente (`_preset_rolling_start_date` in `main_app.py`).
+- Tendina **Anno** subito prima di **Date a scelta** (senza etichetta «anno»); **dal/al** e calendari visibili **solo** con Date a scelta; default **al** = oggi; nei calendari filtri l’ultimo giorno selezionabile è l’**ultima data di registrazione** del DB (`build_immissione_calendar_toplevel`).
