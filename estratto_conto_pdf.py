@@ -28,8 +28,10 @@ Alcuni PDF (es. estratti a colonne) espongono il testo con **uno spazio tra ogni
 si collassano gli spazi sulla riga prima del riconoscimento. Le date possono comparire **attaccate**
 (``05/01/202605/01/2026``); l'importo in colonna entrate può avere il simbolo **€** subito dopo le cifre.
 
-**Estratti BancoPosta / Poste (conto corrente):** se in testata compare «BancoPosta» / «Poste Italiane» con colonne
-**DARE** / **AVERE**, si usa lo stesso parser a due colonne degli estratti BCC (seconda colonna → importi **positivi**).
+**Estratti BancoPosta / Poste (conto corrente):** riconoscimento anche via ``poste.it`` / ABI ``07601``. Layout tipico con
+colonne **Addebiti** (sinistra → importi **negativi**) e **Accrediti** (destra → **positivi**): il segno si deduce dalla
+**posizione orizzontale** dell'importo nel testo ``extraction_mode='layout'`` (non dalle euristiche sulla causale).
+Se in testata compaiono **DARE** / **AVERE** senza colonne spaziate, si usa lo stesso parser BCC.
 
 **Estratti BCC (Roma):** se nella **parte iniziale** del testo (primi ~120.000 caratteri) compare l'intestazione
 «BCC ROMA» (anche **senza spazio** tra BCC e ROMA, o con ROMA attaccata a «Banca» come ``BCC ROMABanca`` nel PDF),
@@ -612,9 +614,10 @@ def _looks_like_bcc_estratto(text: str) -> bool:
 
 def _looks_like_bancoposta_estratto(text: str) -> bool:
     """
-    True se l'estratto è BancoPosta / Poste Italiane (conto corrente a colonne DARE/AVERE).
+    True se l'estratto è BancoPosta / Poste Italiane (conto corrente).
 
-    Il layout è analogo a BCC Roma: importi in uscita in prima colonna, entrate (AVERE) in seconda colonna.
+    Layout tipico recente: colonne **Addebiti** (sinistra) e **Accrediti** (destra), anche senza
+    intestazioni DARE/AVERE nel testo estratto. Riconosce anche ``poste.it`` e ABI ``07601``.
     """
     head = (text or "")[:_BCC_HEADER_SCAN_CHARS]
     u = head.upper()
@@ -623,10 +626,17 @@ def _looks_like_bancoposta_estratto(text: str) -> bool:
         return True
     if "BANCO POSTA" in u or "BANCOPOSTA" in u.replace(" ", ""):
         return True
+    if "POSTE.IT" in u or "POSTEIT" in c:
+        return True
+    # Coordinate bancarie Poste (es. ``G 07601 03200…`` / IBAN ``…G076 01…``).
+    if "G07601" in c or re.search(r"(?i)\bG\s*07601\b", head):
+        return True
     if "POSTEITALIANE" in c or "POSTE ITALIANE" in u:
         if "DARE" in u and "AVERE" in u:
             return True
         if "ESTRATTOCONTO" in c or "CONTOCORRENTE" in c or "ELENCOMOVIMENTI" in c:
+            return True
+        if "SALDOINIZIALE" in c or "SALDO FINALE" in u:
             return True
     return False
 
@@ -651,6 +661,146 @@ def _looks_like_two_column_dare_avere_estratto(text: str) -> bool:
         or _looks_like_bancoposta_estratto(text)
         or _looks_like_dare_avere_column_estratto(text)
     )
+
+
+# BancoPosta (layout pypdf): Addebiti ~col 136–168, Accrediti ~294–326 → soglia a metà.
+_BANCOPOSTA_ACCREDITI_COL_MIN = 220
+_RE_BANCOPOSTA_LAYOUT_TWO_DATES = re.compile(
+    r"^\s*(\d{2}/\d{2}/\d{2})\s+(\d{2}/\d{2}/\d{2})\b"
+)
+_RE_BANCOPOSTA_LAYOUT_AMT = re.compile(rf"(?<![0-9,])({_AMT_CORE})(?!\d)")
+
+
+def _bancoposta_layout_amount_column_evidence(text: str) -> bool:
+    """True se almeno un importo di movimento cade nella colonna Accrediti (spaziatura layout)."""
+    found_credit_col = False
+    found_any = False
+    for raw in (text or "").splitlines():
+        if not _RE_BANCOPOSTA_LAYOUT_TWO_DATES.match(raw):
+            continue
+        u = raw.upper()
+        if "SALDO" in u and ("INIZIALE" in u or "FINALE" in u):
+            continue
+        for m in _RE_BANCOPOSTA_LAYOUT_AMT.finditer(raw):
+            found_any = True
+            if m.start() >= _BANCOPOSTA_ACCREDITI_COL_MIN:
+                found_credit_col = True
+                break
+        if found_credit_col:
+            break
+    return found_any and found_credit_col
+
+
+def _parse_bancoposta_addebiti_accrediti_layout(
+    text: str, *, max_note_len: int
+) -> tuple[list[dict[str, object]], Decimal | None]:
+    """
+    Parser BancoPosta a colonne Addebiti/Accrediti (testo ``layout`` con spazi preservati).
+
+    L'importo a sinistra della soglia è un addebito (−); a destra un accredito (+).
+    La nota è il testo dopo l'importo sulla stessa riga, più le righe successive senza doppia data.
+    """
+    if not _bancoposta_layout_amount_column_evidence(text):
+        return [], None
+
+    closing_balance: Decimal | None = None
+    rows: list[dict[str, object]] = []
+    lines = (text or "").splitlines()
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        raw_s = raw.strip()
+        if not raw_s:
+            i += 1
+            continue
+
+        u = raw.upper()
+        ck = _compact_for_keyword(raw)
+        if "SALDOFINALE" in ck or "SALDO FINALE" in u:
+            for m in _RE_BANCOPOSTA_LAYOUT_AMT.finditer(raw):
+                got = _parse_it_amount(m.group(1))
+                if got is not None:
+                    closing_balance = got
+            i += 1
+            continue
+        if "SALDOINIZIALE" in ck or "SALDO INIZIALE" in u:
+            i += 1
+            continue
+        if re.match(r"^Pag\.", raw_s, re.I):
+            i += 1
+            continue
+
+        m_dates = _RE_BANCOPOSTA_LAYOUT_TWO_DATES.match(raw)
+        if not m_dates:
+            i += 1
+            continue
+
+        amts = list(_RE_BANCOPOSTA_LAYOUT_AMT.finditer(raw))
+        if not amts:
+            i += 1
+            continue
+
+        # Un importo per riga (l'altra colonna è vuota); se ce ne fossero due, DARE + AVERE.
+        if len(amts) >= 2:
+            dare = _parse_it_amount(amts[0].group(1)) or Decimal(0)
+            avere = _parse_it_amount(amts[1].group(1)) or Decimal(0)
+            if dare != 0:
+                signed = -abs(dare)
+                amt_m = amts[0]
+            elif avere != 0:
+                signed = abs(avere)
+                amt_m = amts[1]
+            else:
+                i += 1
+                continue
+        else:
+            amt_m = amts[0]
+            val = _parse_it_amount(amt_m.group(1))
+            if val is None or val == 0:
+                i += 1
+                continue
+            if amt_m.start() >= _BANCOPOSTA_ACCREDITI_COL_MIN:
+                signed = abs(val)
+            else:
+                signed = -abs(val)
+
+        note = " ".join(raw[amt_m.end() :].split()).strip()
+        booking = _expand_yy_to_yyyy(m_dates.group(1))
+        row: dict[str, object] = {
+            "booking": booking,
+            "booking_date": booking,
+            "amount": signed,
+            "note": note[:max_note_len],
+        }
+        rows.append(row)
+
+        i += 1
+        while i < len(lines):
+            cont = lines[i]
+            cont_s = cont.strip()
+            if not cont_s:
+                i += 1
+                continue
+            if _RE_BANCOPOSTA_LAYOUT_TWO_DATES.match(cont):
+                break
+            cu = cont.upper()
+            cck = _compact_for_keyword(cont)
+            if "SALDOFINALE" in cck or "SALDO FINALE" in cu:
+                break
+            if "SALDOINIZIALE" in cck or "SALDO INIZIALE" in cu:
+                break
+            if re.match(r"^Pag\.", cont_s, re.I):
+                break
+            if _line_is_summary_not_movement(cont):
+                break
+            add = " ".join(cont.split()).strip()
+            if add:
+                prev_note = str(row.get("note", ""))
+                row["note"] = (prev_note + " " + add).strip()[:max_note_len]
+            i += 1
+
+    rows = [r for r in rows if not _note_looks_like_summary_row(str(r.get("note", "")))]
+    return rows, closing_balance
 
 
 def _bcc_line_starts_informazioni_clientela(line: str) -> bool:
@@ -1200,6 +1350,10 @@ _AMEX_HEADER_SCAN_CHARS = 120_000
 def _looks_like_amex_estratto(text: str) -> bool:
     """Riconoscimento testata estratto American Express (testo estraibile)."""
     head = (text or "")[:_AMEX_HEADER_SCAN_CHARS]
+    # «American Express» compare spesso come beneficiario SDD su estratti Poste/BancoPosta:
+    # non attivare il parser Amex (che forza tutti gli importi a debito).
+    if _looks_like_bancoposta_estratto(head):
+        return False
     u = head.upper()
     c = _compact_for_keyword(head)
     if "AMERICANEXPRESS" in c or "AMERICAN EXPRESS" in u:
@@ -1434,6 +1588,10 @@ def _amex_next_line_is_foreign_currency_label(line: str) -> bool:
 def _parse_statement_text(text: str, *, max_note_len: int) -> tuple[list[dict[str, object]], Decimal | None]:
     """Estrae movimenti e saldo finale da testo già letto dal PDF."""
     is_amex = _looks_like_amex_estratto(text)
+    if _looks_like_bancoposta_estratto(text):
+        rows_bp, cl_bp = _parse_bancoposta_addebiti_accrediti_layout(text, max_note_len=max_note_len)
+        if rows_bp:
+            return rows_bp, cl_bp
     prepared = _prepare_statement_lines(text)
     if is_amex:
         prepared = _amex_merge_wrapped_statement_lines(prepared, max_note_len=max_note_len)
@@ -1846,6 +2004,7 @@ def extract_estratto_conto_movements_from_pdf(path: Path, *, max_note_len: int =
     dbg = bool(os.environ.get("ESTRATTO_PDF_DEBUG", "").strip())
 
     peek = _peek_pdf_plain_header(reader)
+    is_bancoposta = _looks_like_bancoposta_estratto(peek)
     if _looks_like_amex_estratto(peek):
         for joiner, label_amex in (("\n\n", "amex_pos_pages"), ("\n", "amex_pos")):
             try:
@@ -1881,12 +2040,21 @@ def extract_estratto_conto_movements_from_pdf(path: Path, *, max_note_len: int =
                 return EstrattoContoPdfExtract(rows, closing_balance)
         rows, closing_balance = [], None
 
-    variants: list[tuple[str, bool, str]] = [
-        ("plain", False, "\n"),
-        ("layout", True, "\n"),
-        ("plain_pages", False, "\n\n"),
-        ("layout_pages", True, "\n\n"),
-    ]
+    # BancoPosta: priorità al layout (colonne Addebiti/Accrediti); plain collassa gli spazi.
+    if is_bancoposta:
+        variants: list[tuple[str, bool, str]] = [
+            ("layout", True, "\n"),
+            ("layout_pages", True, "\n\n"),
+            ("plain", False, "\n"),
+            ("plain_pages", False, "\n\n"),
+        ]
+    else:
+        variants = [
+            ("plain", False, "\n"),
+            ("layout", True, "\n"),
+            ("plain_pages", False, "\n\n"),
+            ("layout_pages", True, "\n\n"),
+        ]
 
     for label, layout, joiner in variants:
         text = _extract_text_from_reader(reader, layout=layout, page_joiner=joiner)

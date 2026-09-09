@@ -740,6 +740,12 @@ def _euro_strip_leading_signs(s: str) -> str:
     return t
 
 
+def _euro_text_with_leading_sign(text: str, sign: str) -> str:
+    """Sostituisce solo il segno iniziale, senza alterare il corpo numerico."""
+    sig = _euro_sign_char_to_ascii(sign)
+    return sig + _euro_strip_leading_signs(text or "")
+
+
 def _euro_amount_entry(
     parent: tk.Misc,
     textvariable: tk.StringVar,
@@ -1231,11 +1237,11 @@ def bind_euro_amount_entry_validation(
                 sign_char = "+"
             if sign_char is not None:
                 s0 = _live_amount_text(event.widget)
-                body0 = _euro_strip_leading_signs(s0)
-                if not body0:
+                signed0 = _euro_text_with_leading_sign(s0, sign_char)
+                if len(signed0) == 1:
                     _set_amount_text_and_cursor(sign_char, cursor=1)
                 else:
-                    _set_amount_text_and_cursor(sign_char + body0)
+                    _set_amount_text_and_cursor(signed0)
                 return "break"
 
         if keysym in ("BackSpace", "Delete"):
@@ -1315,11 +1321,11 @@ def bind_euro_amount_entry_validation(
             if not allow_leading_sign:
                 return "break"
             sig = _euro_sign_char_to_ascii(sym)
-            body = _euro_strip_leading_signs(s)
-            if not body:
+            signed = _euro_text_with_leading_sign(s, sig)
+            if len(signed) == 1:
                 _set_amount_text_and_cursor(sig, cursor=1)
             else:
-                _set_amount_text_and_cursor(sig + body)
+                _set_amount_text_and_cursor(signed)
             return "break"
 
         if sym.isdigit() or sym in ",.":
@@ -1376,7 +1382,7 @@ def bind_euro_amount_entry_validation(
         _set_amount_text_and_cursor(merged, cursor=cur)
         return "break"
 
-    def _validate_key_action(action: str, proposed: str, char_ins: str, _idx: str, _current: str) -> bool:
+    def _validate_key_action(action: str, proposed: str, char_ins: str, _idx: str, current: str) -> bool:
         if _programmatic_update[0]:
             return True
         try:
@@ -1390,6 +1396,17 @@ def bind_euro_amount_entry_validation(
                 if ch.isalpha():
                     return False
                 if not (ch.isdigit() or ch in "+-,." or _euro_typed_char_is_sign(ch)):
+                    return False
+                # Fallback per input che salta il binding KeyPress (alcuni layout/tastierini/IME):
+                # +/− digitato in qualunque posizione sostituisce il solo segno iniziale.
+                if _euro_typed_char_is_sign(ch):
+                    if not allow_leading_sign:
+                        return False
+                    signed = _euro_text_with_leading_sign(current or "", ch)
+                    try:
+                        entry.after_idle(lambda text=signed: _set_amount_text_and_cursor(text))
+                    except Exception:
+                        _set_amount_text_and_cursor(signed)
                     return False
         return _is_allowed_typing_text(prop, enforce_decimal_limit=(act != 0))
 
