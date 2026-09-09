@@ -22,10 +22,10 @@ def main() -> int:
     if not maj or not minor:
         print("APP_VERSION_MAJOR/MINOR non trovati in app_version.py", file=sys.stderr)
         return 1
-    if int(maj.group(1)) != 11 or int(minor.group(1)) != 2:
+    if int(maj.group(1)) != 11 or int(minor.group(1)) != 3:
         print(
             f"Linea versione non ammessa: {maj.group(1)}.{minor.group(1)}.x "
-            "(obbligatoria 11.2.x).",
+            "(obbligatoria 11.3.x).",
             file=sys.stderr,
         )
         return 1
@@ -34,9 +34,9 @@ def main() -> int:
         print("APP_VERSION_BUILD non trovato in app_version.py", file=sys.stderr)
         return 1
     n = int(m.group(1)) + 1
-    if n < 22:
+    if n < 1:
         print(
-            f"APP_VERSION_BUILD risultante {n} sotto baseline unificata 22.",
+            f"APP_VERSION_BUILD risultante {n} sotto baseline 1.",
             file=sys.stderr,
         )
         return 1
